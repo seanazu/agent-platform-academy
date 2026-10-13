@@ -1,0 +1,158 @@
+{
+  "id": "g0-3",
+  "title": "The independent-approval check",
+  "minutes": 40,
+  "youNeed": ["p2-4", "p2-5", "p1-6"],
+  "bridge": "This check is like a Playwright test that runs on every PR, except its input is the PR's reviews, and it is required by a ruleset, so nobody can merge around it.",
+  "intro": "GitHub stops an author from approving their own PR. But an agent PR's author is the bot, so the person who asked for it could approve it alone. In this lesson we build the required check that closes that gap, and wire it into fcp.",
+  "picture": {
+    "caption": "The check reads the PR and its reviews, finds the requesters, and passes only when someone else approved the latest commit.",
+    "nodes": [
+      { "id": "req", "label": "Requester (Sean)", "kind": "person" },
+      { "id": "nova", "label": "Nova (bot author)", "kind": "agent" },
+      { "id": "pr", "label": "The PR", "kind": "file" },
+      { "id": "rev", "label": "Reviewer (Inna)", "kind": "person" },
+      { "id": "chk", "label": "independent-approval", "kind": "check" }
+    ],
+    "steps": [
+      { "from": "req", "to": "nova", "text": "Sean assigns a ticket. Nova does the work." },
+      { "from": "nova", "to": "pr", "text": "Nova opens the PR with 'Requested-by: @sean' in the body." },
+      { "from": "chk", "to": "pr", "text": "The check runs on every push and review. It reads the body, commits and reviews." },
+      { "from": "req", "to": "pr", "text": "Sean approves. The check sees he is the requester and stays red." },
+      { "from": "rev", "to": "pr", "text": "Inna approves the head commit. The check turns green." }
+    ]
+  },
+  "sections": [
+    {
+      "h": "Who counts as a requester",
+      "p": [
+        "A requester is anyone who should not be the only approver. The PR author is one. On an agent PR, the person in the Requested-by line is one.",
+        "Anyone who pushed a commit is one too, and so is anyone who edited the PR body. Otherwise a person could add their own name to the body or push a fix and then approve."
+      ],
+      "callout": { "kind": "wall", "text": "The requester never approves their own agent's PR, and every PR needs exactly one approval from someone else. This is one of the review rules from G0-01." }
+    },
+    {
+      "h": "Read the requester from the PR body",
+      "p": [
+        "The orchestrator writes a line like 'Requested-by: @sean' in the body of every agent PR. The check finds it with a regular expression. An agent PR without that line fails the check."
+      ],
+      "because": "Because the bot is the author, the only place the real requester is written down is the PR body.",
+      "code": {
+        "lang": "typescript",
+        "file": "ai-agents/checks/src/independent-approval.ts",
+        "text": "export interface Pr { user: { login: string }; body: string | null }\nexport interface Review { state: string; commit_id: string; user: { login: string; type: string } }\n\nconst AGENT_BOTS = new Set([\"rhino-ai-agents[bot]\"]);\nconst REQUESTED_BY = /^Requested-by:\\s*@?([A-Za-z0-9-]+)\\s*$/m;\n\nexport class MissingRequester extends Error {}\n\nexport function requesters(pr: Pr, commitAuthors: string[], bodyEditors: string[]): Set<string> {\n  const people = [pr.user.login];\n  if (AGENT_BOTS.has(pr.user.login)) {\n    const m = REQUESTED_BY.exec(pr.body ?? \"\");\n    if (!m) throw new MissingRequester(\"agent PR has no Requested-by line\");\n    people.push(m[1]);\n  }\n  return new Set([...people, ...commitAuthors, ...bodyEditors]);\n}\n",
+        "notes": [
+          { "line": 4, "text": "The login of our GitHub App. Only PRs from this author are treated as agent PRs." },
+          { "line": 5, "text": "The m flag makes ^ and $ match at line starts and ends, so the line can sit anywhere in the body." },
+          { "line": 11, "text": "A human PR skips this block. Its author is already in the list." },
+          { "line": 13, "text": "No line means we cannot know who asked. Failing closed is the safe choice." },
+          { "line": 16, "text": "A Set removes duplicates, so the same person pushed and edited counts once." }
+        ]
+      }
+    },
+    {
+      "h": "Count only real approvals on the head commit",
+      "p": [
+        "A review has a state and the commit it was made on. An approval on an older commit does not count, because code changed after it. A bot's approval does not count either."
+      ],
+      "because": "Because an approval must cover the code that will merge, we match the review's commit to the PR's head commit.",
+      "code": {
+        "lang": "typescript",
+        "file": "ai-agents/checks/src/independent-approval.ts",
+        "text": "export function independentApproval(\n  reviews: Review[],\n  headSha: string,\n  excluded: Set<string>,\n): string | undefined {\n  const latest = new Map<string, Review>();\n  for (const r of reviews) {\n    if (r.user.type !== \"User\") continue;\n    if (![\"APPROVED\", \"CHANGES_REQUESTED\", \"DISMISSED\"].includes(r.state)) continue;\n    latest.set(r.user.login, r);\n  }\n  for (const [login, r] of latest) {\n    if (excluded.has(login)) continue;\n    if (r.state === \"APPROVED\" && r.commit_id === headSha) return login;\n  }\n  return undefined;\n}\n",
+        "notes": [
+          { "line": 8, "text": "Reviews from apps and bots are skipped." },
+          { "line": 9, "text": "A later plain comment does not undo an approval, so only decisive states replace the last one." },
+          { "line": 10, "text": "Reviews arrive in order, so the last decisive review per person wins." },
+          { "line": 13, "text": "The excluded set is the requesters from the previous block." },
+          { "line": 14, "text": "Approved, on the head commit, by someone else: this is the one approval we need." }
+        ]
+      },
+      "see": "$ npm test\n✔ human PR approved by a teammate passes\n✔ agent PR approved only by its requester fails\n✔ approval on an older commit fails\n✔ bot approval is ignored\nℹ pass 4",
+      "ifInstead": "If instead the 'older commit' test passes when it should fail, then you compared the review's commit to the PR base, not the head."
+    },
+    {
+      "h": "Run it as a reusable workflow",
+      "p": [
+        "The check lives in ai-agents and runs from the ai-agents-checks image. fcp calls it with a thin workflow pinned by SHA. fcp never needs to read the ai-agents repo."
+      ],
+      "because": "Because every repo should run the same check from the same image, the workflow is reusable and the caller is small.",
+      "code": {
+        "lang": "yaml",
+        "file": "fcp/.github/workflows/independent-approval.yml",
+        "text": "name: independent-approval\non:\n  pull_request:\n    types: [opened, edited, synchronize, reopened, ready_for_review]\n  pull_request_review:\n    types: [submitted, edited, dismissed]\npermissions:\n  contents: read\n  pull-requests: read\njobs:\n  check:\n    uses: RhinoHealth/ai-agents/.github/workflows/independent-approval.yml@a1b2c3d4e5f60718293a4b5c6d7e8f9012345678\n",
+        "notes": [
+          { "line": 4, "text": "edited matters: changing the body can change who the requester is." },
+          { "line": 6, "text": "Dismissing an approval must re-run the check so it turns red again." },
+          { "line": 9, "text": "Read-only. The check never writes to the PR." },
+          { "line": 12, "text": "Pinned by full SHA, so a change in ai-agents cannot silently change fcp's check." }
+        ]
+      },
+      "callout": { "kind": "gotcha", "text": "The required check's name in the ruleset must match exactly what GitHub shows, for example 'independent-approval / check'. One character off and the ruleset waits for a check that never reports." }
+    }
+  ],
+  "lab": {
+    "title": "Test the check without GitHub",
+    "youNeed": ["Node 24", "a scratch folder with npm init -y", "npm i -D -E tsx typescript"],
+    "worked": [
+      { "do": "mkdir -p src test && curl -sO https://raw.githubusercontent.com/example/snippets/main/independent-approval.ts", "see": "src/independent-approval.ts" },
+      { "do": "npx tsx --test test/independent-approval.test.ts", "see": "✔ human PR approved by a teammate passes\n✔ agent PR approved only by its requester fails\nℹ pass 2" },
+      { "do": "git log --oneline -1", "see": "e4f5a6b add independent-approval check" }
+    ],
+    "faded": "Add the test 'a reviewer who pushed a fix is not independent'. The fixture PR and reviews are given; you write the commitAuthors list and the assertion.",
+    "alone": "Write a check of the same shape that fails when a PR has more than one approval. Use the same Review type and a test for two approvals on the head commit.",
+    "done": "npm test prints pass 6 and fail 0 with the six cases from the ticket."
+  },
+  "quiz": [
+    {
+      "q": "Sean edits the body of Nova's PR, then approves it. What happens?",
+      "options": [
+        { "text": "The check passes, because the body edit is not a code change", "correct": false, "why": "Editing the body makes Sean a requester, so his approval does not count." },
+        { "text": "The check fails, because body editors are requesters", "correct": true, "why": "Anyone who edited the body could have changed the Requested-by line, so they are excluded." },
+        { "text": "The check waits for a second approval", "correct": false, "why": "The rule is exactly one independent approval, not two." }
+      ]
+    },
+    {
+      "q": "Inna approves, then Nova pushes one more commit. What does the check show?",
+      "options": [
+        { "text": "Green, because Inna already approved", "correct": false, "why": "Her approval is on an older commit. New code needs a new approval." },
+        { "text": "Green, if the new commit is small", "correct": false, "why": "The check does not read diffs. It only compares commit ids." },
+        { "text": "Red, until someone approves the new head commit", "correct": true, "why": "Only an approval whose commit_id equals the head SHA counts." }
+      ]
+    },
+    {
+      "q": "Why is the fcp caller workflow pinned by SHA?",
+      "options": [
+        { "text": "So a change in ai-agents cannot change fcp's check without a PR in fcp", "correct": true, "why": "A tag or branch can move. A SHA cannot." },
+        { "text": "Because GitHub requires SHAs for reusable workflows", "correct": false, "why": "GitHub accepts branches and tags too. We choose SHAs for safety." },
+        { "text": "To make the workflow run faster", "correct": false, "why": "Pinning has no effect on speed." }
+      ]
+    }
+  ],
+  "recall": [
+    "From p2-4: what is the difference between a ruleset and branch protection?",
+    "From p1-6: how do you give a test a fake instead of a real Octokit client?"
+  ],
+  "videos": [],
+  "words": [
+    { "term": "required check", "plain": "A status a ruleset demands to be green before a PR can merge." },
+    { "term": "head commit", "plain": "The newest commit on the PR branch, the code that would merge." },
+    { "term": "reusable workflow", "plain": "A GitHub Actions workflow another repo can call as a job." },
+    { "term": "Requested-by line", "plain": "A line in an agent PR's body naming the person who asked for the work." }
+  ],
+  "tickets": [
+    {
+      "key": "G0-09",
+      "why": "This lesson is the ticket: the check, its tests, the reusable workflow and the fcp caller.",
+      "walk": [
+        "Create ai-agents/checks/src/independent-approval.ts with requesters() and independentApproval() (code above).",
+        "Add a main that reads the PR, reviews, commits and body edits with Octokit and prints pass or fail.",
+        "Write the six cases from the ticket in ai-agents/checks/test/independent-approval.test.ts and run npm test.",
+        "Add ai-agents/.github/workflows/independent-approval.yml that runs node /app/dist/independent-approval.js in the ai-agents-checks image.",
+        "Add fcp/.github/workflows/independent-approval.yml as the thin caller, pinned by SHA (code above).",
+        "With DevOps, add the check's exact name to the fcp ruleset's required checks."
+      ]
+    }
+  ],
+  "remember": "Exactly one approval, on the head commit, from someone who is not a requester."
+}

@@ -1,0 +1,387 @@
+{
+ "id": "p2-2",
+ "title": "Reusable workflows and pinning",
+ "minutes": 40,
+ "youNeed": [
+  "p2-1"
+ ],
+ "bridge": "A reusable workflow is like a shared React component: the caller passes inputs the way you pass props, and gets outputs back. Except: it runs as its own job on its own fresh machine. It shares no files with the caller, and secrets must be handed in by name.",
+ "intro": "fcp calls Byte's review workflow from another repo, and our required checks will be called the same way. This lesson shows how a workflow is shared and why we pin it by commit hash. It also shows how a job runs inside a container image we built.",
+ "picture": {
+  "caption": "A thin caller in fcp calls a reusable workflow in another repo at an exact commit. Its job runs our image on our runners and reports a check.",
+  "nodes": [
+   {
+    "id": "caller",
+    "label": "fcp/.github/workflows/independent-approval.yml",
+    "kind": "file"
+   },
+   {
+    "id": "gh",
+    "label": "GitHub",
+    "kind": "service"
+   },
+   {
+    "id": "reusable",
+    "label": "ai-agents/.github/workflows/independent-approval.yml @ sha",
+    "kind": "file"
+   },
+   {
+    "id": "runner",
+    "label": "fcp-runner-set",
+    "kind": "machine"
+   },
+   {
+    "id": "image",
+    "label": "ai-agents-checks image @ sha256 digest",
+    "kind": "service"
+   },
+   {
+    "id": "check",
+    "label": "independent-approval / check",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "caller",
+    "to": "gh",
+    "text": "a PR event matches the caller's on: block"
+   },
+   {
+    "from": "gh",
+    "to": "reusable",
+    "text": "the uses: line names the other repo's file at one exact commit"
+   },
+   {
+    "from": "gh",
+    "to": "runner",
+    "text": "the reusable file's job starts on a fresh runner"
+   },
+   {
+    "from": "runner",
+    "to": "image",
+    "text": "pulls the container image by digest and runs the steps inside it"
+   },
+   {
+    "from": "image",
+    "to": "check",
+    "text": "node /app/dist/independent-approval.js sets the exit code"
+   },
+   {
+    "from": "check",
+    "to": "caller",
+    "text": "the check appears on the PR under the caller's name"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "A reusable workflow you already use",
+   "p": [
+    "In p2-1 you saw frontend-ci.yaml call ./.github/workflows/_check-changes-reusable.yml with two inputs. That file is a reusable workflow: a workflow whose on: block is workflow_call, which means 'another workflow starts me'. The underscore in its name is only an fcp habit for files that are never run directly.",
+    "Below is that file, shortened. Inputs are declared like props with a type and a description. Outputs map a job's output to a name the caller can read."
+   ],
+   "because": "We read the inputs and outputs block first because it is the whole contract between caller and callee (the called workflow).",
+   "code": {
+    "lang": "yaml",
+    "file": "fcp/.github/workflows/_check-changes-reusable.yml (shortened)",
+    "text": "name: Check for changes to a specific component\non:\n  workflow_call:\n    inputs:\n      pattern:\n        description: 'Regex pattern to match changed file paths'\n        required: true\n        type: string\n      component:\n        required: true\n        type: string\n    outputs:\n      has_changes:\n        value: ${{ jobs.check-changes.outputs.has_changes }}\n\njobs:\n  check-changes:\n    runs-on: fcp-runner-set\n    outputs:\n      has_changes: ${{ steps.check.outputs.has_changes }}\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          fetch-depth: 0",
+    "notes": [
+     {
+      "line": 3,
+      "text": "workflow_call is the trigger. This file never runs on push; a caller's uses: line starts it."
+     },
+     {
+      "line": 5,
+      "text": "Each input has a type (string, boolean, number). The caller passes them under with:."
+     },
+     {
+      "line": 12,
+      "text": "Outputs are declared at the workflow level and point at a job's outputs."
+     },
+     {
+      "line": 17,
+      "text": "The job is ordinary. It gets its own runner, exactly like a job in the caller."
+     },
+     {
+      "line": 24,
+      "text": "fetch-depth: 0 clones the full history, so git merge-base can find where the branch left main."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Calling across repos",
+   "p": [
+    "The caller side is one job with a uses: line instead of steps. Inside the same repo the path starts with ./. Across repos the form is owner/repo/.github/workflows/file.yml@ref, and the ref must be a commit hash, a tag or a branch. fcp's byte-review.yml calls RhinoHealth/byte/.github/workflows/review.yml this way.",
+    "Three rules. First, the called repo must allow it. For a private repo that is Settings, Actions, Access, 'Accessible from repositories in the organization'. G0-09 asks for this on ai-agents.",
+    "Second, secrets do not flow by default: the caller lists them under secrets:, or writes secrets: inherit. Third, a called workflow cannot ask for a permission its caller did not grant. byte-review.yml's comment on issues: read is the scar from that."
+   ],
+   "because": "We copy fcp's real caller because the independent-approval caller in G0-09 is this file with a different uses: line and different events.",
+   "code": {
+    "lang": "yaml",
+    "file": "fcp/.github/workflows/byte-review.yml (shortened)",
+    "text": "permissions:\n  contents: read\n  packages: read\n  pull-requests: read\n  issues: read\n\njobs:\n  review:\n    uses: RhinoHealth/byte/.github/workflows/review.yml@48950220713205732f6246b7ebe46b31c77dda64 # byte-v2026.09.28\n    with:\n      worker_image: ${{ vars.BYTE_WORKER_IMAGE }}\n      app_slug: ${{ vars.BYTE_GITHUB_APP_SLUG }}\n    secrets:\n      byte_app_id: ${{ secrets.BYTE_GITHUB_APP_ID }}\n      byte_app_private_key: ${{ secrets.BYTE_GITHUB_APP_PRIVATE_KEY }}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The caller's permissions are the ceiling. review.yml can use these and nothing more."
+     },
+     {
+      "line": 9,
+      "text": "Another repo, one exact commit. The comment after # is a human label; GitHub ignores it."
+     },
+     {
+      "line": 10,
+      "text": "with: passes inputs. vars.* are repo variables: plain values set in Settings, not secrets."
+     },
+     {
+      "line": 13,
+      "text": "secrets: passes each secret by name. Nothing else from the caller's secrets is visible."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Pinning by SHA: a tag can move, a hash cannot",
+   "p": [
+    "actions/checkout@v7 means 'whatever commit the v7 tag points at today'. Whoever controls that repo can move the tag to new code, and your job would run it with your token. A commit hash (SHA) is the content itself; it cannot be changed. That is why fcp writes the 40-character hash and keeps the version as a comment.",
+    "To find the hash for a tag, ask the API. The comment keeps the tag name next to it so a human can read the line. Renovate (p2-6) updates both together.",
+    "The same idea applies to Docker images. node:24-bookworm-slim is a tag that moves; node:24-bookworm-slim@sha256:... is one exact image. Byte and our images pin the base by digest."
+   ],
+   "because": "We resolve tags to hashes with the API because Renovate and zizmor (a workflow checker, taught in p2-3) do the same. You need to recognise the output.",
+   "code": {
+    "lang": "bash",
+    "file": "terminal",
+    "text": "gh api repos/actions/checkout/commits/v7.0.1 --jq .sha\ndocker pull node:24-bookworm-slim\ndocker inspect --format '{{index .RepoDigests 0}}' node:24-bookworm-slim",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The commits endpoint accepts a tag name and returns that commit. .sha is the 40-character hash."
+     },
+     {
+      "line": 2,
+      "text": "Pulling the tag downloads today's image for it."
+     },
+     {
+      "line": 3,
+      "text": "RepoDigests holds the sha256 digest of what you pulled. Put that after @ in the FROM line or the container: line."
+     }
+    ]
+   },
+   "see": "3d3c42e5aac5ba805825da76410c181273ba90b1\n...\nnode@sha256:9f1c2d...",
+   "ifInstead": "If instead gh api answers 404 for the tag, check the spelling of the tag. Tags are case-sensitive, and some actions tag v7 without a patch number."
+  },
+  {
+   "h": "Running a job inside a container image",
+   "p": [
+    "A job can say container: image. The runner pulls that image and runs every step inside it, with the working directory mounted in. Tools baked into the image are there without an install step, and the caller's repo is never needed.",
+    "This is how G0-09 runs the independent-approval check: the logic lives in the private ai-agents repo, built into the ai-agents-checks image. fcp's job pulls the image from the inf ECR registry and runs one command. fcp never checks out ai-agents and needs no token for it.",
+    "The sketch below is the reusable side, written from G0-09's description. The ticket says: runs-on fcp-runner-set, container pinned by digest, run node /app/dist/independent-approval.js."
+   ],
+   "because": "We run the check from an image because the code it judges must not change the code that judges it. fcp's PR never touches /app.",
+   "code": {
+    "lang": "yaml",
+    "file": "ai-agents/.github/workflows/independent-approval.yml (sketch from G0-09)",
+    "text": "name: independent-approval\non:\n  workflow_call:\n\njobs:\n  check:\n    runs-on: fcp-runner-set\n    container: 123456789012.dkr.ecr.us-east-1.amazonaws.com/ai-agents-checks@sha256:<digest from the images.yml build>\n    permissions:\n      contents: read\n      pull-requests: read\n    steps:\n      - run: node /app/dist/independent-approval.js\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n          PR_NUMBER: ${{ github.event.pull_request.number }}\n          GITHUB_REPOSITORY: ${{ github.repository }}",
+    "notes": [
+     {
+      "line": 6,
+      "text": "The job id is check, so GitHub names the check 'independent-approval / check'. The ruleset needs that exact text."
+     },
+     {
+      "line": 7,
+      "text": "Our own runners, inside inf, so the ECR pull works. Confirm with DevOps that fcp-runner-set may pull from inf ECR."
+     },
+     {
+      "line": 8,
+      "text": "No checkout step. The image holds the built code at /app/dist; the digest pins exactly which build."
+     },
+     {
+      "line": 13,
+      "text": "One command. Its exit code is the check result. p2-5 shows what the script does with Octokit."
+     },
+     {
+      "line": 15,
+      "text": "The job's own token, read-only, is enough: the check only reads the PR, its reviews and commits."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "A container: job needs a Linux runner and Docker on it. fcp-runner-set runs in containerMode dind (Docker inside Docker) for this reason. GitHub-hosted ubuntu runners also work."
+   }
+  },
+  {
+   "h": "What crosses the line, and what does not",
+   "p": [
+    "Between caller and callee only four things cross: inputs, secrets you named, the permissions ceiling, and outputs. No files, no environment variables, no checkout. If a reusable job needs the repo's code, it runs its own checkout step.",
+    "Keep callers thin: events, permissions, uses:, with:, secrets:. Everything that can change lives in the reusable file, so one bump of the pinned hash updates every caller. Byte's scripts/fleet-sync.sh moves the pins of every caller together."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Agents never dispatch workflows and never edit .github/workflows. A fixer that wants to change a workflow posts a patch for a person (G5 pipeline fixer)."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Share a workflow, pin it, run a container job",
+  "youNeed": [
+   "the actions-lab repo from p2-1",
+   "gh CLI",
+   "Docker Desktop running"
+  ],
+  "worked": [
+   {
+    "do": "cd actions-lab && gh api repos/actions/checkout/commits/v7.0.1 --jq .sha",
+    "see": "3d3c42e5aac5ba805825da76410c181273ba90b1"
+   },
+   {
+    "do": "Create .github/workflows/_greet.yml: on: workflow_call with input name (string, required) and output greeting; one job on ubuntu-latest with a step id: say that writes greeting=Hello $NAME to $GITHUB_OUTPUT, with env NAME: ${{ inputs.name }}.",
+    "see": "(file saved; keep the outputs: block at both the job and the workflow level, as in the check-changes example)"
+   },
+   {
+    "do": "Create .github/workflows/ci.yml: on push to main; job greet with uses: ./.github/workflows/_greet.yml and with: name: Sean; job node with needs: greet, container: node:24-bookworm-slim, and a step run: node --version && echo \"${{ needs.greet.outputs.greeting }}\".",
+    "see": "(file saved)"
+   },
+   {
+    "do": "git add -A && git commit -m 'Reusable workflow and container job' && git push",
+    "see": "main -> main"
+   },
+   {
+    "do": "gh run watch",
+    "see": "✓ greet / say\n✓ node\n  ✓ Initialize containers\n  ✓ Run node --version"
+   },
+   {
+    "do": "gh run view --log | grep -E 'v24|Hello Sean'",
+    "see": "node\tRun node --version\t... v24.x.y\nnode\tRun node --version\t... Hello Sean"
+   }
+  ],
+  "faded": "Pin the container image by digest. Run docker pull node:24-bookworm-slim, then docker inspect --format '{{index .RepoDigests 0}}' node:24-bookworm-slim, and change the container: line to node:24-bookworm-slim@sha256:<digest>. Push and confirm the run is still green. The edit of the container: line is yours to make.",
+  "alone": "Add a second caller workflow named nightly.yml with a schedule trigger. It calls _greet.yml with name: night. Then add an actions/checkout step to _greet.yml and pin it to the v7.0.1 hash you resolved. Then open gh run view --log and find the line that proves which commit of checkout ran.",
+  "done": "ci.yml shows two jobs. The node job ran inside the pinned image and printed the greeting from the reusable workflow's output."
+ },
+ "quiz": [
+  {
+   "q": "fcp's caller grants pull-requests: read. Byte's review.yml asks for pull-requests: write. What happens?",
+   "options": [
+    {
+     "text": "The called workflow gets write, because it declares it.",
+     "correct": false,
+     "why": "The caller's permissions are a ceiling. A callee can only lower them."
+    },
+    {
+     "text": "The run fails at startup.",
+     "correct": true,
+     "why": "GitHub refuses a called workflow that asks for more than the caller granted. byte-review.yml's comment on issues: read describes exactly this."
+    },
+    {
+     "text": "The run works but write calls return 403 later.",
+     "correct": false,
+     "why": "GitHub checks the permission ceiling before any job starts, not at API call time."
+    }
+   ]
+  },
+  {
+   "q": "Why write actions/checkout@3d3c42e...  # v7.0.1 instead of actions/checkout@v7.0.1?",
+   "options": [
+    {
+     "text": "Because hashes download faster than tags.",
+     "correct": false,
+     "why": "Speed is the same; both resolve to one commit at run time."
+    },
+    {
+     "text": "Because a tag can be moved to different code later, and a hash cannot.",
+     "correct": true,
+     "why": "The owner of the action's repo can re-point a tag. The 40-character SHA names the content itself."
+    },
+    {
+     "text": "Because GitHub requires hashes in reusable workflows.",
+     "correct": false,
+     "why": "GitHub accepts tags and branches too. The hash is our choice, enforced by zizmor (p2-3) in G7-28."
+    }
+   ]
+  },
+  {
+   "q": "A job has container: <image>@sha256:... and no checkout step. Where does the code it runs come from?",
+   "options": [
+    {
+     "text": "From the caller's checkout, which is mounted into the container.",
+     "correct": false,
+     "why": "Jobs share no files. The caller's job never ran a checkout for this one."
+    },
+    {
+     "text": "From inside the image, built earlier and pinned by digest.",
+     "correct": true,
+     "why": "That is the point of G0-09's design. The check's code is in /app in the image, out of reach of the PR being judged."
+    },
+    {
+     "text": "GitHub clones the repo automatically into every container.",
+     "correct": false,
+     "why": "Nothing is cloned unless a step does it. The runner starts empty."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p2-1: what does a job with if: false report, and why does that matter for required checks?",
+  "From p1-8: why is the base image in a Dockerfile pinned by digest and the process run as a non-root user?"
+ ],
+ "videos": [
+  {
+   "title": "GitHub Actions Reusable Workflows FULL TUTORIAL with Examples: Templates on Steroids",
+   "url": "https://www.youtube.com/watch?v=lRypYtmbKMs",
+   "channel": "CoderDave",
+   "minutes": 9,
+   "why": "Shows workflow_call, inputs and secrets with concrete examples."
+  },
+  {
+   "title": "GitHub Actions Policy Update: Blocking & SHA Pinning Explained!",
+   "url": "https://www.youtube.com/watch?v=4dnniFk5i2Q",
+   "channel": "Mickey Gousset",
+   "minutes": 12,
+   "why": "GitHub staff member explains why and how to pin actions by SHA."
+  }
+ ],
+ "words": [
+  {
+   "term": "reusable workflow",
+   "plain": "A workflow with on: workflow_call that other workflows start with a uses: line, passing inputs and secrets."
+  },
+  {
+   "term": "caller",
+   "plain": "The thin workflow that names the reusable one, its events, its permissions and its inputs."
+  },
+  {
+   "term": "pin by SHA",
+   "plain": "Write an action or workflow at its 40-character commit hash, with the tag as a comment, so the code cannot move."
+  },
+  {
+   "term": "digest",
+   "plain": "The sha256 of one exact Docker image; image@sha256:... never changes, a tag can."
+  },
+  {
+   "term": "container job",
+   "plain": "A job with container: image; every step runs inside that image on the runner."
+  },
+  {
+   "term": "repo variable",
+   "plain": "A plain, non-secret value set in Settings and read as vars.NAME."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G0-09",
+   "why": "The independent-approval check is a reusable workflow in ai-agents that runs our image by digest, with a thin SHA-pinned caller in fcp."
+  },
+  {
+   "key": "G2-09",
+   "why": "BYTE-GOLD pins its actions by SHA and builds a local image from the PR, never pushed and never repinned."
+  },
+  {
+   "key": "G7-28",
+   "why": "zizmor's unpinned-uses policy asks for SHAs; you now know what it is looking for and why."
+  }
+ ],
+ "remember": "Share workflows by calling them at an exact commit. Run a check from an image pinned by digest, so the PR being judged can never change the judge."
+}

@@ -1,0 +1,541 @@
+{
+ "id": "g4-2",
+ "title": "The plan: schema, grill and approval",
+ "minutes": 55,
+ "youNeed": [
+  "g4-1",
+  "p7-3",
+  "p8-1"
+ ],
+ "bridge": "A Nova plan is like a PR description written before the code, validated by a zod schema like a form. Except: the definition of done and the QA checks come first, and the requester must press Approve before any code is written.",
+ "intro": "This lesson defines the plan every Nova run writes before coding. It also covers the questions Nova asks first on bigger tickets, and the Approve / Change / Stop buttons. The plan is what the requester approves and what everything after it is judged by.",
+ "picture": {
+  "caption": "From a readiness verdict to an approved plan. No build VM runs until the requester says yes.",
+  "nodes": [
+   {
+    "id": "wf",
+    "label": "ticketToPr workflow",
+    "kind": "service"
+   },
+   {
+    "id": "req",
+    "label": "requester",
+    "kind": "person"
+   },
+   {
+    "id": "planner",
+    "label": "planner session (lite VM)",
+    "kind": "agent"
+   },
+   {
+    "id": "plan",
+    "label": ".nova/plan.json",
+    "kind": "file"
+   },
+   {
+    "id": "qa",
+    "label": "QA agent co-sign",
+    "kind": "check"
+   },
+   {
+    "id": "slack",
+    "label": "Slack plan message",
+    "kind": "service"
+   }
+  ],
+  "steps": [
+   {
+    "from": "wf",
+    "to": "req",
+    "text": "bigger or fuzzy ticket: posts up to 5 questions in Jira and Slack (the grill)"
+   },
+   {
+    "from": "req",
+    "to": "wf",
+    "text": "answers arrive as the answerQuestion signal; readiness runs again"
+   },
+   {
+    "from": "wf",
+    "to": "planner",
+    "text": "claims a lite VM; the planner writes done, QA checks, steps, estimate, risk"
+   },
+   {
+    "from": "planner",
+    "to": "plan",
+    "text": "structured output; Plan.safeParse sends errors back to fix"
+   },
+   {
+    "from": "plan",
+    "to": "qa",
+    "text": "the QA agent co-signs the QA plan (lesson g4-3)"
+   },
+   {
+    "from": "wf",
+    "to": "slack",
+    "text": "renders the plan with Approve, Change and Stop buttons"
+   },
+   {
+    "from": "req",
+    "to": "wf",
+    "text": "Approve sends the decidePlan signal; a full VM is claimed at once"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start from a plan on a branch",
+   "p": [
+    "After a Nova run plans a ticket, the branch nova/RH-1234 holds one file: .nova/plan.json. Open it and the first key is definition_of_done, in the requester's words. Then qa_plan: 3 to 5 checks, each saying what a user sees. Then the steps, the VM size, an estimate and a risk.",
+    "Three programs read this file: the harness in the VM, the orchestrator, and the Slack app that renders it. So its shape lives in the shared package as a zod schema. The field names are snake_case because that is the file format.",
+    "A schema is a description of a shape that can check data at runtime. zod gives us both the check and the TypeScript type from one definition."
+   ]
+  },
+  {
+   "h": "The schema, part 1: a QA check and a step",
+   "p": [
+    "A QA check says in plain words what a user does and sees. It also says what a test reads to confirm it. That is a test ID, an ARIA role, visible text, a row count or an API response. Never a class name. That is the FE review rule, and it is enforced by the enum.",
+    "A step names what to do, the files it touches, and the model and effort to use. The defaults are Opus 5.5 at medium, per the routing table."
+   ],
+   "because": "We make the checks concrete and observable up front, so later a tester can run them without reading Nova's code.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/shared/src/schemas.ts (Plan, part 1)",
+    "text": "import { z } from \"zod\";\nexport const QACheck = z.object({\n  id: z.string().regex(/^QA-\\d$/),\n  user_sees: z.string(),  // \"With no projects, the table shows 'No projects yet'\"\n  reads: z.array(z.enum([\"test_id\", \"aria_role\", \"visible_text\", \"row_count\", \"api_response\"])).min(1),\n  level: z.enum([\"unit\", \"story\", \"e2e\", \"api\", \"browser_only\"]),\n  edge_case: z.boolean().default(false),\n  proof: z.enum([\"video\", \"screenshots_760_1440\", \"transcript\", \"test_output\"]),\n});\nexport const Step = z.object({\n  what: z.string(),\n  files: z.array(z.string()),\n  model: z.enum([\"claude-opus-5-5\", \"claude-sonnet-5-5\", \"claude-haiku-5-5\"]).default(\"claude-opus-5-5\"),\n  effort: z.enum([\"low\", \"medium\", \"high\", \"xhigh\"]).default(\"medium\"),\n});\nconst ScreenState = z.enum([\"loading\", \"empty\", \"error\", \"filled\", \"bad_data\"]);",
+    "notes": [
+     {
+      "line": 3,
+      "text": "Check ids are QA-1 to QA-9. The regex rejects anything else, so links from checks.json and the PR table stay simple."
+     },
+     {
+      "line": 4,
+      "text": "The plain-words line a reviewer and the QA agent read. It describes the screen, not the code."
+     },
+     {
+      "line": 5,
+      "text": "What the test reads. At least one, and only observable things: no class names, no snapshot dumps."
+     },
+     {
+      "line": 6,
+      "text": "The level the test is written at. browser_only means the QA agent checks it by hand in a browser."
+     },
+     {
+      "line": 7,
+      "text": "edge_case defaults to false. The Plan schema later demands at least one true."
+     },
+     {
+      "line": 8,
+      "text": "The proof the PR will show: a video, screenshots at 760 and 1440, a transcript or test output."
+     },
+     {
+      "line": 13,
+      "text": "The model per step, defaulting to Opus 5.5. A cheap step can name Haiku."
+     },
+     {
+      "line": 16,
+      "text": "The five screen states a UI change must say how to reach: loading, empty, error, filled, bad data."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The schema, part 2: the plan and its rule",
+   "p": [
+    "The Plan object puts definition_of_done first and limits it to 5 lines. The QA plan has 3 to 5 checks. screen_states is a partial record: a map from some of the five states to a line saying how to reach each one.",
+    "superRefine adds a rule that spans fields: the QA plan needs an edge case, and a UI change needs screen states. zod reports it as an issue with our message, and the harness sends that message back to the planner."
+   ],
+   "because": "A rule across fields cannot be expressed per field, so superRefine carries the two rules reviewers care about most.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/shared/src/schemas.ts (Plan, part 2)",
+    "text": "export const Plan = z.object({\n  definition_of_done: z.array(z.string()).min(1).max(5),  // first, in the requester's words\n  qa_plan: z.array(QACheck).min(3).max(5),\n  screen_states: z.partialRecord(ScreenState, z.string()).optional(),  // UI only\n  steps: z.array(Step),\n  sandbox: z.enum([\"lite\", \"full\", \"wide\"]),  // plan small, build big\n  workflow: z.string().optional(),  // why a dynamic workflow helps here, and roughly how big\n  estimate_minutes: z.number().int(),  // Nova's own guess; measured, never a limit\n  risk: z.enum([\"low\", \"med\", \"high\"]),\n  risk_reason: z.string(),\n}).superRefine((p, ctx) => {  // the harness sends these errors back to the planner to fix\n  const ui = p.steps.some((s) => s.files.some((f) => f.startsWith(\"frontend/src/\")));\n  if (!p.qa_plan.some((c) => c.edge_case) || (ui && !p.screen_states))\n    ctx.addIssue({ code: \"custom\", message: \"the QA plan needs an edge case, and a UI change lists how to reach its screen states\" });\n});\nexport type Plan = z.infer<typeof Plan>;",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Done comes first, 1 to 5 lines, in the requester's own words. It is what the requester approves."
+     },
+     {
+      "line": 3,
+      "text": "3 to 5 checks. Fewer is not a plan; more is a test suite, not a plan."
+     },
+     {
+      "line": 4,
+      "text": "z.partialRecord: keys from ScreenState, each optional. Only UI changes fill it."
+     },
+     {
+      "line": 6,
+      "text": "The VM size for the build. Planning happens on lite; the plan says what the build needs."
+     },
+     {
+      "line": 8,
+      "text": "Nova's own estimate in minutes. It drives G3's check-ins and is measured; it is never a limit."
+     },
+     {
+      "line": 11,
+      "text": "superRefine runs after the field checks and can look at the whole plan."
+     },
+     {
+      "line": 12,
+      "text": "A plan is a UI change when any step touches frontend/src/."
+     },
+     {
+      "line": 14,
+      "text": "One custom issue with a clear message. The planner reads it and fixes the plan."
+     },
+     {
+      "line": 16,
+      "text": "The Plan type for the whole codebase, derived from the schema."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The planner step: ask for the shape, then check it",
+   "p": [
+    "The planner is an agent session on a lite VM. It loads the plan-and-grill skill and the codebase skill, reads code, and ends with structured output. z.toJSONSchema turns the zod schema into the JSON Schema the SDK's outputFormat needs.",
+    "The option io: \"input\" matters. It builds the schema for what goes in: fields with a default, like edge_case, are optional for the model. Without it, zod describes the output shape, where every default is already filled in.",
+    "The harness still runs Plan.safeParse on the result. The model's JSON matches the schema, but superRefine rules are not in JSON Schema. So safeParse is what catches a missing edge case."
+   ],
+   "because": "The model can only promise the JSON shape; our cross-field rules are checked by code and sent back as a fix request.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/plan.ts (the shape, per G4-07)",
+    "text": "import { Plan } from \"@rhinohealth/ai-agents-shared\";\nimport { z } from \"zod\";\n// The planner session ends with structured output in the Plan shape (G4-07, how 1).\nexport const planOutputFormat = { type: \"json_schema\" as const, schema: z.toJSONSchema(Plan, { io: \"input\" }) };\n// After the session: check the result once more, and send any error back to the planner to fix.\nexport function acceptPlan(structuredOutput: unknown): { plan: Plan } | { fix: string } {\n  const parsed = Plan.safeParse(structuredOutput);\n  if (parsed.success) return { plan: parsed.data };\n  return { fix: parsed.error.issues.map((i) => `${i.path.join(\".\")}: ${i.message}`).join(\"\\n\") };\n}",
+    "notes": [
+     {
+      "line": 4,
+      "text": "The JSON Schema for the planner's structured output, in input mode so defaults stay optional."
+     },
+     {
+      "line": 7,
+      "text": "safeParse never throws. It returns success with data, or an error with a list of issues."
+     },
+     {
+      "line": 8,
+      "text": "A good plan becomes the typed Plan the rest of the harness uses."
+     },
+     {
+      "line": 9,
+      "text": "Each issue has a path (qa_plan.2.id) and a message. Joined, they are the fix request the planner gets."
+     }
+    ]
+   },
+   "ifInstead": "If z.toJSONSchema throws about an unrepresentable type, check that zod is version 4; version 3 has no toJSONSchema."
+  },
+  {
+   "h": "The grill, part 1: hand back or ask",
+   "p": [
+    "For bigger or fuzzy tickets, and whenever readiness says ask, Nova asks before planning. We call this the grill: specific questions, at most 5, each with Nova's default guess. No VM runs while Nova waits.",
+    "This block is workflow code inside ticketToPr, right after readiness. It must stay deterministic: no Node APIs, no fetch, no clock. Every model call and every Jira or Slack post is an activity. Its timeout is a safety net, never a work limit."
+   ],
+   "because": "Asking before planning is cheap and avoids plans built on guesses, and a clear small fix skips it entirely.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (grill block, part 1)",
+    "text": "import { proxyActivities } from \"@temporalio/workflow\";\nimport type * as activities from \"../activities/index.js\";\nimport type { Readiness } from \"../activities/readiness.js\";\nimport { waitForPerson } from \"../waiting.js\";  // G3: remind after 1 day, park after 2\nimport { LONG } from \"../policies.js\";  // G3-29: a 7-day safety net and 2-minute heartbeats, never a work limit\n\nconst { checkReadiness } = proxyActivities<typeof activities>({ startToCloseTimeout: \"5 minutes\" });\nconst { writeGrillQuestions } = proxyActivities<typeof activities>(LONG);  // an Opus session: never cut off\nconst { handBack, postQuestions, recordAnswers } = proxyActivities<typeof activities>({ startToCloseTimeout: \"2 minutes\" });\n\nasync function readinessAndGrill(h: Handoff, run: RunState): Promise<Readiness | undefined> {\n  let r = await checkReadiness(h.key);\n  if (r.verdict === \"hand_back\") {\n    await handBack(h.key, h.requester, r.reason);\n    return undefined;\n  }",
+    "notes": [
+     {
+      "line": 1,
+      "text": "proxyActivities gives typed stubs for activities. Calling one records a command in the workflow history."
+     },
+     {
+      "line": 4,
+      "text": "waitForPerson is G3-38's helper: a reminder after 1 day, parking after 2, and the Stop button."
+     },
+     {
+      "line": 5,
+      "text": "LONG = 7-day startToCloseTimeout and 2-minute heartbeats. The 7 days catch a dead worker, nothing else."
+     },
+     {
+      "line": 7,
+      "text": "checkReadiness from lesson g4-1: one Sonnet call, 5 minutes is plenty."
+     },
+     {
+      "line": 8,
+      "text": "writeGrillQuestions is an Opus session. It gets LONG so it is never cut off mid-thought."
+     },
+     {
+      "line": 12,
+      "text": "hand_back means the ticket cannot be done as written. Nova tells the requester why and the run ends."
+     },
+     {
+      "line": 15,
+      "text": "undefined tells the caller the run is over. No VM was claimed."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The grill, part 2: the question loop",
+   "p": [
+    "The loop runs when readiness says ask, or once for any ticket that is not small. Readiness may already hold questions. If not, an Opus session writes them from the ticket text and the skill's \"how to ask\" section.",
+    "Answers come back as the answerQuestion signal, from a Jira comment (lesson g4-1) or the Slack thread. The workflow clears run.answer before posting, so a fast reply is not lost. After the answers, readiness runs again.",
+    "A question that keeps coming back is flagged to the requester, not looped on. Two rounds is the limit, and then a person decides how to make the ticket clear."
+   ],
+   "because": "We want one round of good questions, not an agent that keeps asking until the person gives up.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (grill block, part 2)",
+    "text": "  let rounds = 0;\n  while (r.verdict === \"ask\" || (r.size !== \"small\" && rounds === 0)) {\n    const questions = r.questions.length ? r.questions : await writeGrillQuestions(h.key);  // Opus 5.5 medium, no VM\n    if (!questions.length) break;\n    await setState(run, \"Needs info\", `${questions.length} questions for the requester`);\n    run.answer = undefined;  // before posting, so a quick answer is not lost; the answerQuestion signal (G3) sets it\n    await postQuestions(h.key, h.requester, questions);\n    if (!(await waitForPerson(run, \"question\", () => run.answer !== undefined, h))) return undefined;  // parked or stopped\n    await recordAnswers(h.key, questions, run.answer!);\n    r = await checkReadiness(h.key);\n    rounds += 1;\n    if (rounds === 2 && r.verdict === \"ask\") {\n      await flagToRequester(run, \"The same questions are still open. Please edit the ticket or reply.\");\n      break;\n    }\n  }\n  return r;\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Enter when readiness says ask, or on the first round for a bigger or fuzzy ticket."
+     },
+     {
+      "line": 3,
+      "text": "Use readiness's questions if it wrote any; otherwise ask Opus 5.5 at medium to write them. Still no VM."
+     },
+     {
+      "line": 5,
+      "text": "Nova state becomes Needs info (lesson g4-1), one of the three states that ping a person."
+     },
+     {
+      "line": 6,
+      "text": "Clear the answer slot before posting. The signal handler fills it; a reply that lands early is kept."
+     },
+     {
+      "line": 8,
+      "text": "waitForPerson returns false when the run was parked or stopped. Then the grill ends without a plan."
+     },
+     {
+      "line": 9,
+      "text": "A short summary of the answers goes onto the ticket, so the ticket stays the source of truth."
+     },
+     {
+      "line": 10,
+      "text": "Readiness again, now with the answers in the ticket text."
+     },
+     {
+      "line": 12,
+      "text": "Round two still unclear: flag it and stop asking. A person edits the ticket or replies."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The plan message: Approve, Change, Stop",
+   "p": [
+    "The plan is posted as a Jira comment and a Slack message. The Slack version uses Block Kit, Slack's JSON layout language. It has a header, text sections, a context line and an actions block with buttons.",
+    "Everything fits one screen: done, the QA checks with the co-sign note, files, estimate, risk, and a link to the full plan. The estimate line says \"not a limit\" on purpose, so people read it the same way we do."
+   ],
+   "because": "The requester decides from one screen, so the message shows done and the checks and links the rest.",
+   "code": {
+    "lang": "json",
+    "file": "Slack plan message blocks (built by ai-agents/harness/src/plan-render.ts)",
+    "text": "{\n  \"text\": \"RH-1234: plan v2 is ready for your OK\",\n  \"blocks\": [\n    { \"type\": \"header\", \"text\": { \"type\": \"plain_text\", \"text\": \"RH-1234 · plan v2 for your OK\" } },\n    { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*Done means:* a workgroup with no projects shows \\\"No projects yet\\\" in the projects table.\" } },\n    { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*QA plan* (co-signed by the QA agent)\\n1. Empty workgroup → \\\"No projects yet\\\" card (video)\\n2. Filter with no match → \\\"No results\\\" card, not the empty card (video)\\n3. _Edge:_ 1,000 projects → first page shows 25 rows (test output)\" } },\n    { \"type\": \"context\", \"elements\": [ { \"type\": \"mrkdwn\", \"text\": \"3 files · ~70 min (Nova's estimate, not a limit) · risk: low · full VM · Opus 5.5 medium · <https://rhino-fcp.atlassian.net/browse/RH-1234|full plan>\" } ] },\n    { \"type\": \"actions\", \"block_id\": \"plan_decision\", \"elements\": [\n      { \"type\": \"button\", \"action_id\": \"plan_approve\", \"style\": \"primary\", \"value\": \"nova:RH-1234|v2\",\n        \"text\": { \"type\": \"plain_text\", \"text\": \"Approve\" } },\n      { \"type\": \"button\", \"action_id\": \"plan_change\", \"value\": \"nova:RH-1234|v2\",\n        \"text\": { \"type\": \"plain_text\", \"text\": \"Change\" } },\n      { \"type\": \"button\", \"action_id\": \"plan_stop\", \"style\": \"danger\", \"value\": \"nova:RH-1234|v2\",\n        \"text\": { \"type\": \"plain_text\", \"text\": \"Stop\" },\n        \"confirm\": { \"title\": { \"type\": \"plain_text\", \"text\": \"Stop Nova on RH-1234?\" },\n                     \"text\": { \"type\": \"plain_text\", \"text\": \"The branch and notes are kept.\" },\n                     \"confirm\": { \"type\": \"plain_text\", \"text\": \"Stop\" },\n                     \"deny\": { \"type\": \"plain_text\", \"text\": \"Keep going\" } } }\n    ] }\n  ]\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The fallback text for notifications and screen readers."
+     },
+     {
+      "line": 5,
+      "text": "Done first, in the requester's words. This is the sentence they approve."
+     },
+     {
+      "line": 6,
+      "text": "The QA checks, numbered, with the proof in brackets and the edge case marked."
+     },
+     {
+      "line": 7,
+      "text": "One context line: files, estimate (not a limit), risk, VM size, model, and a link to the full plan."
+     },
+     {
+      "line": 8,
+      "text": "block_id plan_decision groups the three buttons. The Slack app handles their action ids."
+     },
+     {
+      "line": 9,
+      "text": "The value carries the ticket and the plan version. An old button cannot approve a newer plan."
+     },
+     {
+      "line": 13,
+      "text": "Stop asks for confirmation and says what is kept: the branch and the notes."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Who may decide, and what happens next",
+   "p": [
+    "Only the requester's decision counts. The Slack app looks up the clicker's Slack ID in config/people.yaml. Anyone else gets an ephemeral message: \"only <requester> can decide this plan\". In Jira, \"@Nova approve\", \"@Nova change <text>\" and \"@Nova stop\" do the same.",
+    "Change opens a modal for free text. The planner gets the text and posts plan v2. The button value carries the version, so an old Approve cannot approve a plan it never saw.",
+    "On Approve, the decidePlan signal arrives. The workflow claims a full VM at once (G3: claim early) and the state moves to Working. While waiting, the state is Awaiting approval. Stop keeps the branch and notes and destroys the VM.",
+    "Approving a plan is not approving the PR. The PR still needs exactly one approval from a person who is not the requester. The plan approval is about what to build; the PR approval is about what was built."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "No code is written before a person approves the plan. The requester approves done and the QA plan together, so the checks Nova is judged by are agreed up front."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Validate a plan with zod on your laptop",
+  "youNeed": [
+   "Node 24",
+   "npm",
+   "a terminal"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/academy/g4-2 && cd ~/academy/g4-2 && npm init -y && npm pkg set type=module",
+    "see": "Wrote to ~/academy/g4-2/package.json."
+   },
+   {
+    "do": "npm install zod@4 && npm install --save-dev tsx@4.20.3 typescript@5.9.3 @types/node@24.12.2",
+    "see": "added packages, no errors. npm ls zod shows a 4.x version."
+   },
+   {
+    "do": "Save both schema blocks from this lesson, part 1 then part 2, as schemas.ts (one import of zod at the top).",
+    "see": "schemas.ts exports QACheck, Step and Plan."
+   },
+   {
+    "do": "Save this as try-plan.ts:\nimport { z } from \"zod\";\nimport { Plan } from \"./schemas.js\";\nconsole.log(z.toJSONSchema(Plan, { io: \"input\" }).required);\nconst plan = {\n  definition_of_done: [\"An empty workgroup shows 'No projects yet'\"],\n  qa_plan: [\n    { id: \"QA-1\", user_sees: \"Empty workgroup shows the card\", reads: [\"visible_text\"], level: \"e2e\", proof: \"video\" },\n    { id: \"QA-2\", user_sees: \"A filter with no match shows 'No results'\", reads: [\"visible_text\"], level: \"e2e\", proof: \"video\" },\n    { id: \"QA-3\", user_sees: \"1,000 projects: the first page shows 25 rows\", reads: [\"row_count\"], level: \"unit\", proof: \"test_output\" },\n  ],\n  steps: [{ what: \"Add the empty card\", files: [\"frontend/src/components/ProjectsTable.tsx\"] }],\n  sandbox: \"full\", estimate_minutes: 70, risk: \"low\", risk_reason: \"one component, no data change\",\n};\nconst r = Plan.safeParse(plan);\nconsole.log(r.success ? \"ok\" : r.error.issues.map((i) => i.message));",
+    "see": "A plan with three QA checks, none marked edge_case, and a UI step with no screen_states."
+   },
+   {
+    "do": "npx tsx try-plan.ts",
+    "see": "[ 'definition_of_done', 'qa_plan', 'steps', 'sandbox', 'estimate_minutes', 'risk', 'risk_reason' ]\n[ 'the QA plan needs an edge case, and a UI change lists how to reach its screen states' ]"
+   }
+  ],
+  "faded": "Fix the plan: add edge_case: true to QA-3 and a screen_states object with empty and filled lines. Run it again. The last line is yours to predict before you run it: what does the second console.log print now?",
+  "alone": "Write check-qa.ts that calls QACheck.safeParse twice: once with id \"QA-10\" and once with reads: []. Print each issue's path and message. Explain in one sentence which line of the schema rejected each one.",
+  "done": "You can read a zod issue list, and you can say why io: \"input\" leaves the defaults out of required."
+ },
+ "quiz": [
+  {
+   "q": "Why does the plan start with definition_of_done and the QA checks?",
+   "options": [
+    {
+     "text": "Because the schema needs a first field",
+     "correct": false,
+     "why": "Order in JSON is not the point. The point is what the requester approves."
+    },
+    {
+     "text": "So the requester approves done and the checks together, and Nova is judged by what was agreed",
+     "correct": true,
+     "why": "Writing done and the checks first is why Nova can prove its work instead of claiming it."
+    },
+    {
+     "text": "So the planner can skip reading the code",
+     "correct": false,
+     "why": "The planner still reads code on a lite VM; the order is about agreement, not effort."
+    }
+   ]
+  },
+  {
+   "q": "What is estimate_minutes?",
+   "options": [
+    {
+     "text": "A limit: the run stops when it passes",
+     "correct": false,
+     "why": "Nothing cuts a run in the middle. Limits never cut work in progress."
+    },
+    {
+     "text": "Nova's own guess, measured and used for check-ins, never a limit",
+     "correct": true,
+     "why": "G3's check-ins ask how it is going past the estimate; the number is learned from, not enforced."
+    },
+    {
+     "text": "The VM's startToCloseTimeout in minutes",
+     "correct": false,
+     "why": "That is a 7-day safety net on the activity, unrelated to the plan."
+    }
+   ]
+  },
+  {
+   "q": "A teammate who is not the requester clicks Approve in Slack. What happens?",
+   "options": [
+    {
+     "text": "The plan is approved; any engineer can approve",
+     "correct": false,
+     "why": "Only the requester's decision counts. people.yaml maps the Slack ID to check this."
+    },
+    {
+     "text": "They get an ephemeral message that only the requester can decide, and nothing changes",
+     "correct": true,
+     "why": "The Slack app refuses the click and tells them why; the workflow keeps waiting."
+    },
+    {
+     "text": "The run stops because the wrong person touched it",
+     "correct": false,
+     "why": "A wrong click is not a stop. Stop is its own button, for the requester, with a confirmation."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From lesson g4-1: which three Nova states send a notification to a person?",
+  "From lesson p7-3: what does condition() do in a workflow, and why is there no deadline on waiting for a person?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "schema",
+   "plain": "A description of a data shape that code can check at runtime; zod gives a type from it too."
+  },
+  {
+   "term": "superRefine",
+   "plain": "A zod rule that looks at the whole object and adds an issue with your own message."
+  },
+  {
+   "term": "JSON Schema",
+   "plain": "The standard JSON way to describe a shape; the SDK's outputFormat needs it."
+  },
+  {
+   "term": "grill",
+   "plain": "Nova's round of specific questions to the requester before planning a bigger ticket."
+  },
+  {
+   "term": "definition of done",
+   "plain": "1 to 5 lines, in the requester's words, that say when the ticket is finished."
+  },
+  {
+   "term": "Block Kit",
+   "plain": "Slack's JSON layout language for messages with sections and buttons."
+  },
+  {
+   "term": "ephemeral message",
+   "plain": "A Slack reply only one person sees, used to refuse a click politely."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G4-07",
+   "why": "This lesson explained the Plan schema and how the planner's output is checked.",
+   "walk": [
+    "Add QACheck, Step, ScreenState and Plan to ai-agents/shared/src/schemas.ts (code above) and export the Plan type.",
+    "Create ai-agents/harness/src/plan.ts: the planner session ends with outputFormat and z.toJSONSchema(Plan, { io: \"input\" }). Then Plan.safeParse sends errors back.",
+    "Planner model: Opus 5.5 at medium; high for fuzzy or cross-module tickets (readiness size). It loads plan-and-grill and the codebase skill and reads code on the lite VM.",
+    "Each QA check reads test IDs, ARIA roles, visible text or row counts. Never class names or snapshot dumps.",
+    "For a UI change, the plan says how to reach loading, empty, error, filled and bad data.",
+    "Save the plan as .nova/plan.json on the branch and in S3 next to the transcript. G4-14 renders it."
+   ]
+  },
+  {
+   "key": "G4-12",
+   "why": "This lesson walked through the grill block line by line.",
+   "walk": [
+    "Add readinessAndGrill (code above) to G3's ticketToPr in ai-agents/orchestrator/src/workflows/ticket-to-pr.ts, right after readiness.",
+    "Write the activities writeGrillQuestions, postQuestions, recordAnswers and handBack. writeGrillQuestions uses Opus 5.5 at medium on the ticket text, at most 5 questions, each with a default guess.",
+    "postQuestions writes one Jira comment that mentions the requester, and posts in the ticket's Slack thread. Nova state: Needs info.",
+    "Answers arrive as the answerQuestion signal from Jira (G4-05) or the G3 Slack app. recordAnswers writes a short summary on the ticket.",
+    "Run readiness again with the answers. On the second ask, flag it to the requester and stop asking.",
+    "Reminders and parking come from G3-38: remind after 1 day, park with a note after 2."
+   ]
+  },
+  {
+   "key": "G4-14",
+   "why": "This lesson showed the Slack plan message and who may decide.",
+   "walk": [
+    "Create ai-agents/harness/src/plan-render.ts: Plan to Jira ADF and to the Slack blocks above. One screen, with a link to the full plan.",
+    "In the G3 Slack app, handle action ids plan_approve, plan_change and plan_stop. Look up the clicker in config/people.yaml; only the requester's Approve and Stop count.",
+    "Anyone else gets an ephemeral \"only <requester> can decide this plan\".",
+    "Change opens a modal for free text; the planner gets it and posts plan v2. The button value carries the version.",
+    "In Jira, \"@Nova approve\", \"@Nova change <text>\" and \"@Nova stop\" (G4-05) send the same signals.",
+    "State is Awaiting approval while waiting. On approve, claim a full VM at once and move to Working."
+   ]
+  }
+ ],
+ "remember": "Done and the QA checks come first, a zod schema checks the plan, questions come before planning, and only the requester approves."
+}

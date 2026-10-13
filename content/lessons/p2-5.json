@@ -1,0 +1,427 @@
+{
+ "id": "p2-5",
+ "title": "Talking to GitHub from code",
+ "minutes": 45,
+ "youNeed": [
+  "p2-4",
+  "p1-1"
+ ],
+ "bridge": "Octokit is like the typed API client you use in the dashboard: one method per endpoint, typed results, no hand-written URLs. Except: paging is explicit (you ask for the next page), and rate limits are per token. What you may do comes from the token, not from the code.",
+ "intro": "The independent-approval check, the metrics job and the PR step of every agent run all read or write GitHub from TypeScript. This lesson teaches the few Octokit calls they need: read a PR, its reviews, commits and checks, and open a draft PR.",
+ "picture": {
+  "caption": "The check reads four things about a PR through Octokit and computes who approved independently. Its exit code becomes the check result.",
+  "nodes": [
+   {
+    "id": "script",
+    "label": "node /app/dist/independent-approval.js",
+    "kind": "service"
+   },
+   {
+    "id": "octokit",
+    "label": "Octokit (token from the job)",
+    "kind": "service"
+   },
+   {
+    "id": "api",
+    "label": "api.github.com",
+    "kind": "cloud"
+   },
+   {
+    "id": "logic",
+    "label": "requesters() and independentApprovers()",
+    "kind": "file"
+   },
+   {
+    "id": "check",
+    "label": "exit code 0 or 1",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "script",
+    "to": "octokit",
+    "text": "new Octokit({ auth: token })"
+   },
+   {
+    "from": "octokit",
+    "to": "api",
+    "text": "GET the PR, then every page of reviews and commits"
+   },
+   {
+    "from": "api",
+    "to": "logic",
+    "text": "the PR body, the review list and the commit authors"
+   },
+   {
+    "from": "logic",
+    "to": "check",
+    "text": "no approver outside the requester set means process.exitCode = 1"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "One client, one token",
+   "p": [
+    "Install @octokit/rest and create a client with a token. In a workflow the token is github.token or an App token from a step. In the broker it is the installation token from p2-4. On your laptop it is gh auth token. The client has one method per endpoint under octokit.rest.<area>.<name>, for example octokit.rest.pulls.get.",
+    "Every method takes an object with owner, repo and the endpoint's fields, and returns { data, status, headers }. The data type is generated from GitHub's API schema, so your editor completes pr.user.login and pr.body for you."
+   ],
+   "because": "We read the PR first because its body carries the Requested-by: line that G0-09 needs. Its head sha is what every other read is compared against.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/checks/src/independent-approval.ts, the main() part (sketch; the functions above it are in G0-09)",
+    "text": "import { Octokit } from \"@octokit/rest\";\nimport { independentApprovers, requesters } from \"./independent-approval-rules.js\";\n\nconst token = process.env.GITHUB_TOKEN;\nif (!token) throw new Error(\"GITHUB_TOKEN is not set\");\nconst [owner, repo] = process.env.GITHUB_REPOSITORY!.split(\"/\");\nconst pull_number = Number(process.env.PR_NUMBER);\n\nconst octokit = new Octokit({ auth: token });\n\nconst { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number });\nconst headSha = pr.head.sha;\nconsole.log(`PR #${pull_number} by ${pr.user.login}, head ${headSha.slice(0, 7)}`);",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The REST client. @octokit/auth-app (p2-4) is only needed where tokens are minted; here one is handed in."
+     },
+     {
+      "line": 4,
+      "text": "The reusable workflow passes github.token as GITHUB_TOKEN. Read-only is enough for this check."
+     },
+     {
+      "line": 6,
+      "text": "GITHUB_REPOSITORY looks like RhinoHealth/fcp; GitHub sets it in every job."
+     },
+     {
+      "line": 9,
+      "text": "One client per process. It adds the Authorization header and the API version for you."
+     },
+     {
+      "line": 11,
+      "text": "Destructure data straight away; status and headers are rarely needed."
+     },
+     {
+      "line": 12,
+      "text": "Approvals on an older commit do not count, so we keep the head sha to compare with each review."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Lists come in pages: paginate",
+   "p": [
+    "Reviews and commits are lists, and GitHub returns at most 100 per page. octokit.paginate(method, params) follows the Link: next header until the end and gives you one array. Forgetting this is the classic bug: a PR with 31 commits where only the first 30 are checked.",
+    "With the lists in hand, the two pure functions from G0-09 decide. requesters() builds the set of people who are part of the change. independentApprovers() keeps approvals on the head sha from people outside that set."
+   ],
+   "because": "We fetch every page because a missing page would hide a commit author or a review. This check fails closed only if it sees everything.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/checks/src/independent-approval.ts, main() continued",
+    "text": "const reviews = await octokit.paginate(octokit.rest.pulls.listReviews, { owner, repo, pull_number, per_page: 100 });\nconst commits = await octokit.paginate(octokit.rest.pulls.listCommits, { owner, repo, pull_number, per_page: 100 });\n\nconst commitAuthors = commits.map((c) => c.author?.login).filter((l): l is string => !!l);\nconst bodyEditors: string[] = []; // body edit history needs the GraphQL userContentEdits field; see the GraphQL section\n\nconst people = requesters({ user: { login: pr.user.login }, body: pr.body }, commitAuthors, bodyEditors);\nconst approvers = independentApprovers(\n  reviews.map((r) => ({ state: r.state, commit_id: r.commit_id, user: { login: r.user!.login, type: r.user!.type } })),\n  headSha,\n  people,\n);\n\nif (approvers.size === 0) {\n  console.log(`no independent approval on ${headSha.slice(0, 7)}; requesters: ${[...people].join(\", \")}`);\n  process.exitCode = 1;\n} else {\n  console.log(`approved by ${[...approvers].join(\", \")}`);\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "paginate takes the method itself, not its result, and returns the merged array of data."
+     },
+     {
+      "line": 4,
+      "text": "A commit's GitHub author can be null when the email is unknown; the type guard drops those."
+     },
+     {
+      "line": 5,
+      "text": "An honest gap: REST has no body-edit history. The ticket lists body editors as requesters, so GraphQL fills it in."
+     },
+     {
+      "line": 7,
+      "text": "The pure function throws MissingRequester for an agent PR with no Requested-by: line, which fails the check."
+     },
+     {
+      "line": 9,
+      "text": "Map the API objects to the small Review shape the function declares, so the logic has no Octokit types in it."
+     },
+     {
+      "line": 16,
+      "text": "Set exitCode instead of calling process.exit, so the log is flushed before Node ends."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Checks on a commit",
+   "p": [
+    "A check run is one result on one commit: name, status, conclusion, head_sha, started_at. The metrics job asks whether the first pushed commit of an agent PR was green on every required check (G1-16's firstPassGreen). The call is checks.listForRef with the sha as ref.",
+    "Workflow runs are a level above: one run per workflow file per event, with jobs inside. G1-06 lists runs of cloud-ci.yml on main and reads each run's jobs to find the unit-test job's conclusion. The same shapes you saw in gh run list are what the API returns."
+   ],
+   "because": "We read check runs by sha because a PR's checks change on every push. The question is always about one specific commit.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/checks.ts (sketch, feeds G1-16's firstPassGreen)",
+    "text": "export const checkRunsFor = async (owner: string, repo: string, sha: string) => {\n  const runs = await octokit.paginate(octokit.rest.checks.listForRef, { owner, repo, ref: sha, per_page: 100 });\n  return runs.map((c) => ({\n    name: c.name,\n    head_sha: c.head_sha,\n    conclusion: c.conclusion, // \"success\" | \"failure\" | \"skipped\" | ... | null while running\n    started_at: c.started_at ?? \"\",\n  }));\n};\n\n// workflow runs of one file on main, for red-main hours (G1-06)\nconst { data } = await octokit.rest.actions.listWorkflowRuns({\n  owner, repo, workflow_id: \"cloud-ci.yml\", branch: \"main\", status: \"completed\", per_page: 100,\n});\nconst { data: jobs } = await octokit.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: data.workflow_runs[0].id });",
+    "notes": [
+     {
+      "line": 2,
+      "text": "checks.listForRef returns check runs for one commit; paginate again, a busy commit can have dozens."
+     },
+     {
+      "line": 6,
+      "text": "conclusion is null until the run ends. A required check that is skipped reports \"skipped\" and counts as passing."
+     },
+     {
+      "line": 12,
+      "text": "workflow_id accepts the file name. branch and status filter on the server, so the list is small."
+     },
+     {
+      "line": 15,
+      "text": "Jobs carry name and conclusion; G1-06 matches the name against 'Cloud Unit Tests' or the old 'Unit Tests'."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Open a draft PR",
+   "p": [
+    "Writing is the same shape. pulls.create takes base, head, title, body and draft. Agent PRs open as drafts with the Requested-by: line in the body, because the independent-approval check and Byte read it there. Then addLabels and requestReviewers, each a separate call that can fail without undoing the PR.",
+    "fcp's weekly-dependency-upgrades.yml does exactly this inside a github-script step, where the client is already there as github. The code below is the same calls from a plain script."
+   ],
+   "because": "We open PRs from code, never from a shell with gh. The broker is the only place with a write token, and it logs every write.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/github-pr.ts (sketch; the calls mirror fcp's weekly-dependency-upgrades.yml)",
+    "text": "export const openDraftPr = async (branch: string, title: string, body: string, requester: string) => {\n  const { data: pr } = await octokit.rest.pulls.create({\n    owner, repo,\n    base: \"main\",\n    head: branch,\n    title,\n    body: `${body}\\n\\nRequested-by: @${requester}`,\n    draft: true,\n  });\n  await octokit.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: [\"ai-agent\"] })\n    .catch((e) => console.warn(`label failed: ${e.message}`));\n  await octokit.rest.pulls.requestReviewers({ owner, repo, pull_number: pr.number, team_reviewers: [\"frontend-guild\"] })\n    .catch((e) => console.warn(`reviewers failed: ${e.message}`));\n  return pr.html_url;\n};",
+    "notes": [
+     {
+      "line": 5,
+      "text": "head is the branch name in the same repo. For a fork it would be login:branch; agents never work from forks."
+     },
+     {
+      "line": 7,
+      "text": "The Requested-by: trailer is a contract: G0-09's regex reads exactly this line."
+     },
+     {
+      "line": 8,
+      "text": "draft: true. A draft is not ready for review; the harness flips it when its own checks are green."
+     },
+     {
+      "line": 10,
+      "text": "Labels live on the issues API, because every PR is also an issue. The PR number is the issue number."
+     },
+     {
+      "line": 12,
+      "text": "team_reviewers takes team slugs, as the weekly upgrade workflow does with backend-guild."
+     }
+    ]
+   }
+  },
+  {
+   "h": "GraphQL when REST is too chatty",
+   "p": [
+    "REST gives one resource per call. For 300 PRs with their review timeline, that is thousands of calls. GraphQL lets you ask for exactly the fields you want, nested, in one request. G1-03 pulls PRs with their commits and timeline events this way, 50 per page, one week per query. It splits by week because GitHub search stops at 1000 results.",
+    "Octokit has octokit.graphql(query, variables). The ticket uses global fetch against https://api.github.com/graphql instead, to keep the metrics workspace small; the query text is the same either way."
+   ],
+   "because": "We use GraphQL for the metrics job because one nested query per week is cheap. REST would hit the rate limit on the first backfill.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/github.ts (from G1-03, the query)",
+    "text": "const QUERY = `\nquery($q: String!, $after: String) {\n  search(query: $q, type: ISSUE, first: 50, after: $after) {\n    pageInfo { hasNextPage endCursor }\n    nodes { ... on PullRequest {\n      number createdAt mergedAt bodyText author { login }\n      commits(first: 100) { nodes { commit { authoredDate message } } }\n      timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT, PULL_REQUEST_REVIEW], first: 50) {\n        nodes { __typename\n          ... on ReadyForReviewEvent { createdAt }\n          ... on PullRequestReview { createdAt state author { login __typename } } } }\n    } }\n  }\n}`;\n// called as graphql(QUERY, { q: `repo:${repo} is:pr created:${weekStart}..${weekEnd}`, after })",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Variables are declared with types. $q is the search string, $after the page cursor."
+     },
+     {
+      "line": 4,
+      "text": "Paging in GraphQL: ask for pageInfo, pass endCursor back as after until hasNextPage is false."
+     },
+     {
+      "line": 6,
+      "text": "Only the fields the metrics need. Nothing per person is stored later; login is used to find the team and dropped."
+     },
+     {
+      "line": 8,
+      "text": "timelineItems filtered to two event types: when the PR became ready, and each review with its state."
+     },
+     {
+      "line": 11,
+      "text": "__typename on the author tells a User from a Bot, so Byte's reviews do not count as a person's first review."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Tokens, limits and what the code never does",
+   "p": [
+    "Never put a personal token in code or in a VM. In a workflow use github.token or a create-github-app-token step. In the broker use the installation token minted per run. On your laptop use gh auth token for a lab. The token decides what succeeds: a read-only token makes pulls.create return 403, which is correct.",
+    "Rate limits are per token: 5000 REST calls per hour for an installation, and GraphQL has its own point budget. Octokit retries nothing by default. The metrics job stores each day's raw pull as a JSON artifact. Then a fix can be recomputed without calling the API again."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Code with a write token opens PRs and pushes branches. It never calls pulls.merge, never dispatches a workflow, and never edits rulesets. The broker refuses those endpoints."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Read a PR and open a draft from TypeScript",
+  "youNeed": [
+   "actions-lab with the PR from p2-4 (or any PR in it)",
+   "gh CLI logged in",
+   "Node 24"
+  ],
+  "worked": [
+   {
+    "do": "mkdir octo-lab && cd octo-lab && npm init -y && npm pkg set type=module && npm install @octokit/rest@22.0.1 tsx@4.23.15",
+    "see": "added N packages"
+   },
+   {
+    "do": "Write prs.ts: create new Octokit({ auth: process.env.GITHUB_TOKEN }); call octokit.paginate(octokit.rest.pulls.list, { owner: 'seanazu', repo: 'actions-lab', state: 'all', per_page: 100 }); print number, title, state and user.login for each.",
+    "see": "(file saved)"
+   },
+   {
+    "do": "GITHUB_TOKEN=$(gh auth token) npx tsx prs.ts",
+    "see": "#1 Try open seanazu"
+   },
+   {
+    "do": "Add reviews.ts: pulls.get for PR 1, then paginate pulls.listReviews and pulls.listCommits; print head sha, each review's user.login, state and commit_id, and each commit author.",
+    "see": "head 9f1c2d3\nreviews: (none)\ncommits: seanazu"
+   },
+   {
+    "do": "GITHUB_TOKEN=$(gh auth token) npx tsx reviews.ts",
+    "see": "head 9f1c2d3 ..."
+   },
+   {
+    "do": "Add open.ts with the openDraftPr function from the lesson (owner seanazu, repo actions-lab, label 'lab', no team reviewers). Before running: cd ../actions-lab && git switch -c from-code && echo y >> README.md && git commit -am 'From code' && git push -u origin from-code",
+    "see": "from-code -> from-code"
+   },
+   {
+    "do": "cd ../octo-lab && GITHUB_TOKEN=$(gh auth token) npx tsx open.ts",
+    "see": "https://github.com/seanazu/actions-lab/pull/2"
+   },
+   {
+    "do": "gh pr view 2 --json isDraft,body --jq '{isDraft, body}'",
+    "see": "{\"isDraft\":true,\"body\":\"...\\n\\nRequested-by: @seanazu\"}"
+   }
+  ],
+  "faded": "Add checks.ts. Get PR 2's head sha with pulls.get. Then paginate checks.listForRef with ref: sha and print name and conclusion for each check run. The call is in the lesson; the mapping of the output to one line per check is yours.",
+  "alone": "Copy requesters() and independentApprovers() from G0-09 into rules.ts. Write independent.ts that reads PR 2, its reviews and commits, calls both functions and prints the independent approvers. Approve the PR from a second GitHub account if you have one. If not, reason from the output why the set is empty when you are the author.",
+  "done": "Three scripts ran with gh auth token. One listed PRs, one printed reviews and commits by head sha, and one opened a draft PR. The draft PR's body ends with a Requested-by: line."
+ },
+ "quiz": [
+  {
+   "q": "A PR has 140 commits. octokit.rest.pulls.listCommits({ ..., per_page: 100 }) returns 100. What do you do?",
+   "options": [
+    {
+     "text": "Call it twice with page: 2 by hand.",
+     "correct": false,
+     "why": "Works today, breaks at 201. paginate follows every page for you."
+    },
+    {
+     "text": "Use octokit.paginate(octokit.rest.pulls.listCommits, params) and get one array.",
+     "correct": true,
+     "why": "paginate follows the Link: next header until the end; a missing page would hide a commit author."
+    },
+    {
+     "text": "Set per_page: 1000.",
+     "correct": false,
+     "why": "GitHub caps per_page at 100; the extra is ignored silently."
+    }
+   ]
+  },
+  {
+   "q": "Why do agent PRs end their body with Requested-by: @login?",
+   "options": [
+    {
+     "text": "So Slack can mention the person.",
+     "correct": false,
+     "why": "The Slack thread is tracked by the orchestrator; this line is for the check."
+    },
+    {
+     "text": "Because the PR author is the bot, so the independent-approval check needs to know which person asked for it.",
+     "correct": true,
+     "why": "G0-09 reads that line with a regex and adds the person to the requester set, who then cannot be the approver."
+    },
+    {
+     "text": "Because GitHub requires a trailer in draft PRs.",
+     "correct": false,
+     "why": "GitHub has no such rule; this is our own contract between the harness and the check."
+    }
+   ]
+  },
+  {
+   "q": "A script with a read-only App token calls pulls.create and gets 403. What is wrong?",
+   "options": [
+    {
+     "text": "Nothing; the token decides what may happen, and read-only cannot open a PR.",
+     "correct": true,
+     "why": "Permissions live in the token, not the code. The metrics job's token is read-only on purpose."
+    },
+    {
+     "text": "Octokit needs auth: { type: 'app' } for writes.",
+     "correct": false,
+     "why": "The auth option shape is the same; only the token's permissions differ."
+    },
+    {
+     "text": "The PR must be opened with gh instead.",
+     "correct": false,
+     "why": "gh would fail the same way with that token, and agents never shell out to gh with a write token."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p2-4: what narrows an installation token to one repo, and how long does the token live?",
+  "From p1-5: what does z.infer give you from a zod schema?"
+ ],
+ "videos": [
+  {
+   "title": "How to use GitHub REST API for Beginners",
+   "url": "https://www.youtube.com/watch?v=OvfLavRD1Os",
+   "channel": "Andy's Tech Tutorials",
+   "minutes": 6,
+   "why": "Six-minute first call to the GitHub REST API with a token."
+  },
+  {
+   "title": "Open Source Friday with Octokit - GitHub's SDKs for JS, Ruby, .NET and more!",
+   "url": "https://www.youtube.com/watch?v=qP4h7GP5kfM",
+   "channel": "GitHub",
+   "minutes": 50,
+   "why": "GitHub's own session on Octokit.js, auth and pagination."
+  }
+ ],
+ "words": [
+  {
+   "term": "Octokit",
+   "plain": "The official GitHub client for JavaScript: octokit.rest.<area>.<method> for REST, octokit.graphql for GraphQL."
+  },
+  {
+   "term": "paginate",
+   "plain": "octokit.paginate(method, params): follows every page of a list and returns one array."
+  },
+  {
+   "term": "check run",
+   "plain": "One check result on one commit: name, conclusion, head_sha, started_at."
+  },
+  {
+   "term": "workflow run",
+   "plain": "One execution of a workflow file for one event, with jobs inside; what gh run list shows."
+  },
+  {
+   "term": "draft PR",
+   "plain": "A PR opened with draft: true, not yet asking for review; agents open PRs this way."
+  },
+  {
+   "term": "GraphQL",
+   "plain": "GitHub's other API: one query names exactly the nested fields you want, paged with cursors."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G0-09",
+   "why": "main() of the check reads the PR, reviews and commits with Octokit and sets the exit code from the two pure functions."
+  },
+  {
+   "key": "G1-03",
+   "why": "The nightly job pulls PRs with their timeline through the GraphQL query you read here."
+  },
+  {
+   "key": "G1-06",
+   "why": "Red-main hours come from listing workflow runs on main and each run's jobs."
+  },
+  {
+   "key": "G1-16",
+   "why": "firstPassGreen needs check runs by head sha, the checks.listForRef call."
+  }
+ ],
+ "remember": "Use one Octokit client per token and paginate every list. Compare reviews and checks to the head sha, and let the token (not the code) decide what is allowed."
+}

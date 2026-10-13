@@ -1,0 +1,433 @@
+{
+ "id": "p1-2",
+ "title": "Files, processes and streams",
+ "minutes": 45,
+ "youNeed": [
+  "p1-1"
+ ],
+ "bridge": "Node's fs, child_process and stream modules are like the File and fetch APIs in the browser. Except: they reach the real disk and real programs on the machine. A strange file name can become a command, and a big file can fill memory, unless you use execFile and streams.",
+ "intro": "The harness reads its task from a file, runs git and test tools, and saves logs. The gateway passes long model answers through without holding them. This lesson teaches the three Node tools behind that: fs/promises, execFile and streams.",
+ "picture": {
+  "caption": "Read a task, run git safely, and move a big file through a stream in small chunks.",
+  "nodes": [
+   {
+    "id": "task",
+    "label": "runs/task.json",
+    "kind": "file"
+   },
+   {
+    "id": "script",
+    "label": "your script (tsx)",
+    "kind": "service"
+   },
+   {
+    "id": "git",
+    "label": "git (another program)",
+    "kind": "service"
+   },
+   {
+    "id": "log",
+    "label": "runs/big.log (67 MB)",
+    "kind": "file"
+   },
+   {
+    "id": "tap",
+    "label": "count tap + gzip",
+    "kind": "service"
+   },
+   {
+    "id": "out",
+    "label": "runs/out/big.log.gz",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "task",
+    "to": "script",
+    "text": "readFile and JSON.parse: the task for this run"
+   },
+   {
+    "from": "script",
+    "to": "git",
+    "text": "execFile(\"git\", [\"rev-parse\", ...]): a list of arguments, no shell"
+   },
+   {
+    "from": "git",
+    "to": "script",
+    "text": "stdout comes back as a string; a failure comes back as an error with the exit code"
+   },
+   {
+    "from": "log",
+    "to": "tap",
+    "text": "the file flows in chunks of 64 KB; the tap counts each one and passes it on"
+   },
+   {
+    "from": "tap",
+    "to": "out",
+    "text": "gzip writes the result; memory stays small whatever the file size"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Read and write files with fs/promises",
+   "p": [
+    "node:fs/promises gives async functions for files: readFile, writeFile, mkdir. The harness reads /run/nova/task.json the same way and writes /run/nova/status.json.",
+    "In an ES module you can await at the top level, so a small script needs no main function. JSON.parse returns any, so we cast it here; lesson p1-5 replaces the cast with a real check."
+   ],
+   "because": "We use the promise versions because they read like the async code you write in React, with no callbacks.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/files.ts",
+    "text": "import { execFile } from \"node:child_process\";\nimport { mkdir, readFile, writeFile } from \"node:fs/promises\";\nimport { promisify } from \"node:util\";\n\nconst exec = promisify(execFile);\nconst git = (...args: string[]) => exec(\"git\", args, { cwd: process.cwd() }); // argv, never a shell string\n\nconst task = JSON.parse(await readFile(\"runs/task.json\", \"utf8\")) as { jiraKey: string; title: string };\nconst { stdout } = await git(\"rev-parse\", \"--short\", \"HEAD\");\nconst sha = stdout.trim();\nawait mkdir(\"runs/out\", { recursive: true });\nawait writeFile(\"runs/out/status.json\", JSON.stringify({ jiraKey: task.jiraKey, sha }, null, 2) + \"\\n\");\nconsole.log(`task ${task.jiraKey} at ${sha}: ${task.title}`);",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The node: prefix says this is built into Node, not a package from npm."
+     },
+     {
+      "line": 8,
+      "text": "\"utf8\" returns a string; without it you get a Buffer of bytes. The cast is a promise to tsc, not a check."
+     },
+     {
+      "line": 9,
+      "text": "Runs git and waits. stdout is what git printed, with a newline at the end."
+     },
+     {
+      "line": 11,
+      "text": "Creates runs/out and any missing parents, and does not fail if it exists."
+     },
+     {
+      "line": 2,
+      "text": "Writes the whole string at once. Fine for small files; big ones use streams (below)."
+     }
+    ]
+   },
+   "see": "task RH-1234 at bf27ec8: Fix the empty table state",
+   "ifInstead": "If instead you see ENOENT: no such file or directory, open 'runs/task.json', run the script from ~/p1-lab, where runs/ is."
+  },
+  {
+   "h": "Run another program: execFile",
+   "p": [
+    "execFile starts a program with a list of arguments and collects what it prints. promisify turns its callback into a promise, so you can await it. The result has stdout and stderr.",
+    "The harness's checkpoint (G3-26) runs git this way: a small git() helper, then add, commit and push. The kb_search tool runs the kb CLI the same way."
+   ],
+   "because": "We wrap execFile in a small git() helper, so every git call has the same folder and the same safe form.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/checkpoint.ts (G3-26, shortened: the start of checkpoint())",
+    "text": "import { execFile } from \"node:child_process\";\nimport { promisify } from \"node:util\";\n\nconst exec = promisify(execFile);\nconst git = (...args: string[]) => exec(\"git\", args, { cwd: \"/work/fcp\" }); // argv, never a shell string\n\nawait git(\"add\", \"-A\");\nconst staged = await git(\"diff\", \"--cached\", \"--quiet\").then(() => false, () => true); // exit 1: something is staged\nif (staged) {\n  // [skip ci]: cloud-ci runs on push to any branch and would take the QA locks at every checkpoint.\n  await git(\"commit\", \"-m\", `wip(${run.jiraKey}): ${step.title} [skip ci]`);\n}",
+    "notes": [
+     {
+      "line": 5,
+      "text": "/work/fcp is the checkout on every VM, so each git call runs there."
+     },
+     {
+      "line": 8,
+      "text": "git diff --quiet answers with its exit code: 0 means no changes, 1 means changes."
+     },
+     {
+      "line": 8,
+      "text": "A non-zero exit rejects the promise. Here that rejection means 'yes, something is staged'."
+     },
+     {
+      "line": 11,
+      "text": "step.title comes from a model. As one argument it can never become a command."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Why never a shell string",
+   "p": [
+    "exec, without File, runs your string through /bin/sh. Quotes, $( ) and ; in the string are then shell syntax. A Jira title is text from a person, and a title with a quote in it can run a command.",
+    "execFile passes each argument straight to the program, with no shell in between. Whatever the text holds, it stays one argument."
+   ],
+   "because": "We show the attack once because 'escape the quotes' feels safe, and it is not.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/inject.ts",
+    "text": "import { exec, execFile } from \"node:child_process\";\nimport { promisify } from \"node:util\";\n\nconst title = 'oops\"; echo INJECTED; echo \"'; // a title from a ticket\nconst a = await promisify(exec)(`echo \"${title}\"`);\nconsole.log(\"exec:\", JSON.stringify(a.stdout));\nconst b = await promisify(execFile)(\"echo\", [title]);\nconsole.log(\"execFile:\", JSON.stringify(b.stdout));",
+    "notes": [
+     {
+      "line": 4,
+      "text": "The quote closes the string in the shell, and echo INJECTED becomes a second command."
+     },
+     {
+      "line": 5,
+      "text": "The shell sees: echo \"oops\"; echo INJECTED; echo \"\". Three commands."
+     },
+     {
+      "line": 7,
+      "text": "echo gets one argument, the whole title, and prints it back unchanged."
+     }
+    ]
+   },
+   "see": "exec: \"oops\\nINJECTED\\n\\n\"\nexecFile: \"oops\\\"; echo INJECTED; echo \\\"\\n\"",
+   "callout": {
+    "kind": "wall",
+    "text": "Platform code never builds a shell string from input. Ticket text, branch names, file names and model output go in an argument list."
+   }
+  },
+  {
+   "h": "When the program fails",
+   "p": [
+    "If the program exits with a non-zero code, the promise rejects. The error has code (the exit code), stdout and stderr. If the program is not installed at all, the error says spawn <name> ENOENT.",
+    "Read the exit code before you treat a failure as a crash. Some tools, like git diff --quiet, use it as an answer."
+   ],
+   "because": "We read code and stderr because the message a person needs is in stderr, not in the stack trace.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/inject.ts (continued)",
+    "text": "try {\n  await promisify(execFile)(\"git\", [\"rev-parse\", \"nope\"]);\n} catch (e) {\n  const err = e as { code: number; stderr: string };\n  console.log(\"code\", err.code, \"stderr\", err.stderr.trim().split(\"\\n\")[0]);\n}\ntry {\n  await promisify(execFile)(\"gti\", [\"status\"]); // a typo: no such program\n} catch (e) {\n  console.log(String(e));\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "git exits with 128 because nope is not a commit."
+     },
+     {
+      "line": 5,
+      "text": "For a program that ran, code is its exit code."
+     },
+     {
+      "line": 8,
+      "text": "For a program that does not exist, code is the string ENOENT."
+     }
+    ]
+   },
+   "see": "code 128 stderr fatal: ambiguous argument 'nope': unknown revision or path not in the working tree.\nError: spawn gti ENOENT"
+  },
+  {
+   "h": "Streams: data in chunks",
+   "p": [
+    "A stream moves data in chunks, about 64 KB at a time, instead of all at once. A readable stream gives chunks, a writable one takes them, and a Transform sits in the middle and may change them.",
+    "pipeline connects them, waits until the last chunk is written, and closes every stream if one fails. The gateway does this with a model's answer. A Transform called tap feeds each chunk to the meter and passes it on."
+   ],
+   "because": "We stream because a 67 MB log, or a model answer that takes minutes, should never sit whole in memory.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/streams.ts",
+    "text": "import { createReadStream, createWriteStream } from \"node:fs\";\nimport { Transform } from \"node:stream\";\nimport { pipeline } from \"node:stream/promises\";\nimport { createGzip } from \"node:zlib\";\n\nlet bytes = 0;\nconst count = new Transform({\n  transform(chunk: Buffer, _encoding, done) {\n    bytes += chunk.length; // look at the chunk, then pass it on unchanged\n    done(null, chunk);\n  },\n});\n\nawait pipeline(createReadStream(\"runs/big.log\"), count, createGzip(), createWriteStream(\"runs/out/big.log.gz\"));\nconst mb = (n: number) => (n / 1024 / 1024).toFixed(1);\nconsole.log(`read ${mb(bytes)} MB; memory in use ${mb(process.memoryUsage().rss)} MB`);",
+    "notes": [
+     {
+      "line": 7,
+      "text": "A Transform is a stream you write: chunks go in, chunks come out."
+     },
+     {
+      "line": 10,
+      "text": "Hands the same chunk to the next stream. The gateway's tap does exactly this after meter.feed(chunk)."
+     },
+     {
+      "line": 14,
+      "text": "Read, count, compress, write. The promise settles when the file is closed, or rejects on the first error."
+     },
+     {
+      "line": 16,
+      "text": "rss is all the memory the process holds. It stays near 100 MB however big the file is."
+     }
+    ]
+   },
+   "see": "read 66.8 MB; memory in use 94.3 MB"
+  },
+  {
+   "h": "Streams from fetch",
+   "p": [
+    "Node 24 has fetch built in. res.body is a web stream, the kind browsers use. Readable.fromWeb turns it into a Node stream, so pipeline can write it to a file or to an HTTP response.",
+    "The gateway streams Anthropic's answer to the VM like this, chunk by chunk, so the agent sees tokens as they arrive."
+   ],
+   "because": "We convert the web stream once at the edge because every Node tool, pipeline included, expects a Node stream.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/fetch-stream.ts",
+    "text": "import { createWriteStream } from \"node:fs\";\nimport { Readable } from \"node:stream\";\nimport { pipeline } from \"node:stream/promises\";\nimport type { ReadableStream } from \"node:stream/web\";\n\nconst res = await fetch(\"https://registry.npmjs.org/zod\");\nif (!res.ok || !res.body) throw new Error(`download failed: ${res.status}`);\nawait pipeline(Readable.fromWeb(res.body as ReadableStream), createWriteStream(\"runs/out/zod.json\"));\nconsole.log(\"saved\", res.headers.get(\"content-type\"));",
+    "notes": [
+     {
+      "line": 4,
+      "text": "Only the type, for the cast below. verbatimModuleSyntax wants import type for it."
+     },
+     {
+      "line": 7,
+      "text": "fetch does not throw on 404 or 500; check ok yourself."
+     },
+     {
+      "line": 8,
+      "text": "Web stream in, Node stream out. The cast fixes a known mismatch between fetch's types and node:stream/web."
+     }
+    ]
+   },
+   "see": "saved application/json",
+   "ifInstead": "If instead tsc says 'Argument of type ReadableStream<Uint8Array<ArrayBuffer>> is not assignable', add the as ReadableStream cast and the import type line."
+  }
+ ],
+ "lab": {
+  "title": "Files, git and a 67 MB stream in ~/p1-lab",
+  "youNeed": [
+   "~/p1-lab from p1-1",
+   "git"
+  ],
+  "worked": [
+   {
+    "do": "cd ~/p1-lab && printf 'node_modules\\n**/dist\\nruns/\\n' > .gitignore && git init -q && git add -A && git commit -qm 'lab start'",
+    "see": "(no output)"
+   },
+   {
+    "do": "mkdir -p runs && echo '{ \"jiraKey\": \"RH-1234\", \"title\": \"Fix the empty table state\" }' > runs/task.json",
+    "see": "(no output)"
+   },
+   {
+    "do": "Create svc/src/files.ts from the first section, then: npx tsx svc/src/files.ts && cat runs/out/status.json",
+    "see": "task RH-1234 at bf27ec8: Fix the empty table state\n{\n  \"jiraKey\": \"RH-1234\",\n  \"sha\": \"bf27ec8\"\n}\n(your sha differs)"
+   },
+   {
+    "do": "Create svc/src/inject.ts from both inject.ts blocks, then: npx tsx svc/src/inject.ts",
+    "see": "exec: \"oops\\nINJECTED\\n\\n\"\nexecFile: \"oops\\\"; echo INJECTED; echo \\\"\\n\"\ncode 128 stderr fatal: ambiguous argument 'nope': unknown revision or path not in the working tree.\nError: spawn gti ENOENT"
+   },
+   {
+    "do": "yes 'step ok: checks passed for RH-1234' | head -n 2000000 > runs/big.log && ls -lh runs/big.log",
+    "see": "-rw-r--r--  1 <you>  staff    67M  runs/big.log"
+   },
+   {
+    "do": "Create svc/src/streams.ts, then: npx tsx svc/src/streams.ts && ls -lh runs/out/big.log.gz",
+    "see": "read 66.8 MB; memory in use 94.3 MB\n-rw-r--r--  1 <you>  staff   199K  runs/out/big.log.gz"
+   },
+   {
+    "do": "Create svc/src/fetch-stream.ts, then: npx tsx svc/src/fetch-stream.ts && npm run typecheck",
+    "see": "saved application/json\n> tsc -p tsconfig.json --noEmit\n(no errors)"
+   }
+  ],
+  "faded": "Write svc/src/log-commits.ts: run git log --oneline -5 with execFile through the same git() helper, and write the lines to runs/out/commits.txt. Left to you: the argument list for git log and the writeFile line.",
+  "alone": "Write svc/src/count-lines.ts. It counts the lines of runs/big.log that contain RH-1234, using createReadStream and a Transform (or node:readline), never readFile. Print the count and the memory in use. Then write a readFile version and compare the memory number.",
+  "done": "files.ts prints your commit sha, inject.ts shows INJECTED only for exec, and streams.ts reads 66.8 MB with memory near 100 MB."
+ },
+ "quiz": [
+  {
+   "q": "A Jira title goes into git commit -m. Which call is safe?",
+   "options": [
+    {
+     "text": "exec(`git commit -m \"${title}\"`) after replacing every \" with \\\"",
+     "correct": false,
+     "why": "The shell has many special characters: $( ), backticks, newlines. Escaping by hand misses some."
+    },
+    {
+     "text": "execFile(\"git\", [\"commit\", \"-m\", title])",
+     "correct": true,
+     "why": "No shell runs, so the title stays one argument whatever it contains."
+    },
+    {
+     "text": "exec(\"git commit -m \" + JSON.stringify(title))",
+     "correct": false,
+     "why": "JSON quoting is not shell quoting; $( ) inside double quotes still runs."
+    }
+   ]
+  },
+  {
+   "q": "In checkpoint.ts, git diff --cached --quiet rejects with exit code 1. What does the code conclude?",
+   "options": [
+    {
+     "text": "git crashed, so the checkpoint fails",
+     "correct": false,
+     "why": "For --quiet, exit 1 is an answer, not a crash."
+    },
+    {
+     "text": "Nothing is staged, so there is nothing to commit",
+     "correct": false,
+     "why": "That is exit 0."
+    },
+    {
+     "text": "Something is staged, so it commits",
+     "correct": true,
+     "why": "The then(() => false, () => true) turns the rejection into staged = true."
+    }
+   ]
+  },
+  {
+   "q": "Why does the gateway pass Anthropic's answer through pipeline instead of await res.text()?",
+   "options": [
+    {
+     "text": "The VM sees tokens as they arrive, memory stays small, and an error closes both sides",
+     "correct": true,
+     "why": "Streaming keeps the agent responsive and the gateway light, and pipeline handles failures."
+    },
+    {
+     "text": "Because res.text() does not exist in Node",
+     "correct": false,
+     "why": "It exists; it waits for the whole body first."
+    },
+    {
+     "text": "Because pipeline makes the model answer faster",
+     "correct": false,
+     "why": "The model is as fast either way; streaming changes when you see the tokens."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p1-1: why do relative imports end in .js in a NodeNext project, even though the files are .ts?"
+ ],
+ "videos": [
+  {
+   "title": "Node.js Ultimate Beginner's Guide in 7 Easy Steps",
+   "url": "https://www.youtube.com/watch?v=ENrzD9HAZK4",
+   "channel": "Fireship",
+   "minutes": 16,
+   "why": "Fast tour of Node runtime, modules, http server and npm for browser-only devs."
+  },
+  {
+   "title": "Node.js Tutorial - 24 - Streams and Buffers",
+   "url": "https://www.youtube.com/watch?v=br8VB99qPzE",
+   "channel": "Codevolution",
+   "minutes": 10,
+   "why": "Clear, slow-paced explanation of streams and buffers with simple code examples."
+  }
+ ],
+ "words": [
+  {
+   "term": "fs/promises",
+   "plain": "Node's async file functions: readFile, writeFile, mkdir."
+  },
+  {
+   "term": "execFile",
+   "plain": "Starts a program with a list of arguments and no shell; collects stdout and stderr."
+  },
+  {
+   "term": "shell injection",
+   "plain": "When text put into a shell string runs as a command because of quotes or $( )."
+  },
+  {
+   "term": "exit code",
+   "plain": "The number a program ends with: 0 means success; others mean failure or an answer."
+  },
+  {
+   "term": "stream",
+   "plain": "Data that moves in chunks, so a big file or a long answer never sits whole in memory."
+  },
+  {
+   "term": "Transform",
+   "plain": "A stream in the middle of a pipeline that sees each chunk and may change it."
+  },
+  {
+   "term": "pipeline",
+   "plain": "Connects streams, waits for the end, and closes all of them if one fails."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-26",
+   "why": "checkpoint.ts runs git through execFile with an argument list, and reads git's exit codes."
+  },
+  {
+   "key": "G0-13",
+   "why": "The gateway streams the model's answer through a Transform tap with pipeline and Readable.fromWeb."
+  },
+  {
+   "key": "G7-10",
+   "why": "frontend/scripts/verify.ts runs git and the tools with execFileSync, never a shell string."
+  },
+  {
+   "key": "G2-01",
+   "why": "The BYTE-GOLD miner reads fcp's history with execFileSync and git log."
+  }
+ ],
+ "remember": "Files with fs/promises, programs with execFile and an argument list, big data with streams and pipeline."
+}

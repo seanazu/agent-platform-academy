@@ -1,0 +1,720 @@
+{
+ "id": "g5-2",
+ "title": "routineRun and the triggers",
+ "minutes": 60,
+ "youNeed": [
+  "g5-1",
+  "p7-4",
+  "p7-5"
+ ],
+ "bridge": "routineRun is like one reusable GitHub Actions job that every routine calls with its own inputs. Except: it is a Temporal workflow, so it can wait for days and survive restarts. Its ID is the root cause, so a second event with the same cause joins the open run instead of starting another.",
+ "intro": "Every routine runs the same workflow, routineRun. This lesson writes it, then wires the three ways it starts. A small Action reports red CI, the Jira poll finds triaged Bugs, and schedules start the crews. No new public webhook anywhere.",
+ "picture": {
+  "caption": "Three kinds of trigger, one workflow, one run per root cause.",
+  "nodes": [
+   {
+    "id": "ci",
+    "label": "trigger Action on fcp-runner-set",
+    "kind": "check"
+   },
+   {
+    "id": "svc",
+    "label": "trigger service POST /v1/events",
+    "kind": "service"
+   },
+   {
+    "id": "broker",
+    "label": "broker (read-only GitHub)",
+    "kind": "service"
+   },
+   {
+    "id": "jira",
+    "label": "Jira poll (G3-28 registry)",
+    "kind": "service"
+   },
+   {
+    "id": "sched",
+    "label": "Temporal schedules",
+    "kind": "service"
+   },
+   {
+    "id": "wf",
+    "label": "routineRun",
+    "kind": "service"
+   },
+   {
+    "id": "vm",
+    "label": "fresh VM with Nova's harness",
+    "kind": "machine"
+   }
+  ],
+  "steps": [
+   {
+    "from": "ci",
+    "to": "svc",
+    "text": "red main or a red renovate/ branch: posts the run ID with an OIDC token"
+   },
+   {
+    "from": "svc",
+    "to": "broker",
+    "text": "re-reads the run, its failed jobs and each job's first error line"
+   },
+   {
+    "from": "svc",
+    "to": "wf",
+    "text": "signal-with-start on cifix:fcp:<fingerprint>; a second red push joins the open run"
+   },
+   {
+    "from": "jira",
+    "to": "wf",
+    "text": "a triaged Bug starts bugfix:RH-1240 through startRun"
+   },
+   {
+    "from": "sched",
+    "to": "wf",
+    "text": "sched:fe-dead-code at 04:17, Sunday to Thursday; overlap SKIP"
+   },
+   {
+    "from": "wf",
+    "to": "vm",
+    "text": "gather, gate, then one VM; shadow saves the result, otherwise shipPr"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "routineRun, part 1: Nova's activities, two signals",
+   "p": [
+    "Routines must not fork Nova. So routineRun reuses ticketToPr's activities unchanged: acquireSandbox, workInSandbox and releaseSandbox from G3. The PR half of ticketToPr (scope judge, draft PR, Byte, findings, ready) moves into a child workflow, shipPr, that both use. Agree that split with the G4 owner.",
+    "A signal is a message sent to a running workflow (lesson p7-3). addTrigger lets another event with the same root cause join the run. decidePlan carries the same Slack Approve, Change and Stop buttons as Nova, for the bug fixers' plans.",
+    "The timeouts are safety nets. The 7-day start-to-close timeout and 5-minute heartbeats only catch a dead worker; they never limit the work."
+   ],
+   "because": "We reuse Nova's activities and its PR half, so the walls and review layers are built once for every routine.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/workflows/routine-run.ts (part 1 of 2)",
+    "text": "// ai-agents/orchestrator/src/workflows/routine-run.ts: sketch, not final code. Workflow code: deterministic, no Node APIs.\nimport { proxyActivities, defineSignal, setHandler, sleep, executeChild, workflowInfo } from \"@temporalio/workflow\";\nimport type * as activities from \"../activities/index.js\";\nimport type { PlanDecision, RoutineRequest, RunOutcome, Trigger } from \"@rhinohealth/ai-agents-shared\";\nimport { TaskSpec } from \"../routines/task-spec.js\";  // pure code, safe to bundle into a workflow\nimport { shipPr } from \"./ship-pr.js\";  // the PR half of ticketToPr, shared with Nova\nconst { loadCharter, preRunGate, saveShadowResult } = proxyActivities<typeof activities>({ startToCloseTimeout: \"1 minute\" });\nconst { acquireSandbox } = proxyActivities<typeof activities>({ startToCloseTimeout: \"10 minutes\" });\nconst { releaseSandbox } = proxyActivities<typeof activities>({ startToCloseTimeout: \"5 minutes\" });\nconst { workInSandbox } = proxyActivities<typeof activities>({  // ticketToPr's activity (G3)\n  startToCloseTimeout: \"7 days\", heartbeatTimeout: \"5 minutes\" });  // no work-time limit: these only catch a dead worker\nexport const addTrigger = defineSignal<[Trigger]>(\"addTrigger\");  // target of signal-with-start (G5-09)\nexport const decidePlan = defineSignal<[PlanDecision]>(\"decidePlan\");  // same Slack buttons as Nova; bug fixers (G5-27)",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Workflow code: no Node APIs, no fetch, no clock for logic. All I/O is in activities."
+     },
+     {
+      "line": 3,
+      "text": "Only the types of the activities. The worker runs the real ones."
+     },
+     {
+      "line": 5,
+      "text": "Pure code that builds the session's task from the charter. Pure, so it may run inside a workflow."
+     },
+     {
+      "line": 6,
+      "text": "The PR half of ticketToPr as a child workflow, shared with Nova."
+     },
+     {
+      "line": 7,
+      "text": "Short activities with a 1-minute safety net."
+     },
+     {
+      "line": 10,
+      "text": "G3's agent-run activity: the harness works in the VM."
+     },
+     {
+      "line": 11,
+      "text": "Liveness by heartbeat. 7 days is a safety net, never a work limit."
+     },
+     {
+      "line": 12,
+      "text": "The signal that signal-with-start sends. Each one adds a trigger to the run."
+     },
+     {
+      "line": 13,
+      "text": "The plan decision from Slack or Jira, used by the bug fixers (lesson g5-7)."
+     }
+    ]
+   }
+  },
+  {
+   "h": "routineRun, part 2: gather, gate, work, ship",
+   "p": [
+    "The body reads in order. Collect triggers, load the charter, wait the gather window, ask the gate. Then claim a VM, work, release it, and either save the shadow result or ship a PR.",
+    "preRunGate checks, in order: G3's kill switch, routine:<name>:paused, incident mode (lesson g5-4) and one open PR per routine (lesson g5-3). A gate that says wait parks the run on a timer and never starts a VM.",
+    "In shadow, nothing is opened: the diff and the proof go to S3 for the weekly comparison. Otherwise the run creates or links a Jira ticket first, so the PR title reads [FE] RH-1234 and add-jira-links works."
+   ],
+   "because": "The gate runs before acquireSandbox, so a paused routine or a storm never costs a VM.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/workflows/routine-run.ts (part 2 of 2)",
+    "text": "export async function routineRun(req: RoutineRequest): Promise<string> {\n  const triggers: Trigger[] = [];  // every event with the same root cause lands here\n  let planDecision: PlanDecision | undefined;  // read by the bug fixers' plan step (G5-27)\n  setHandler(addTrigger, (t) => void triggers.push(t));\n  setHandler(decidePlan, (d) => { planDecision = d; });\n  const charter = await loadCharter(req.routine, req.charterSha);\n  if (req.trigger) triggers.push(req.trigger);  // schedules and Jira start without a signal\n  if (charter.gather_minutes) await sleep(charter.gather_minutes * 60_000);  // 7 for red main, 0 for bugs (G5-17)\n  const gate = await preRunGate(charter, triggers);\n  if (gate.verdict !== \"go\") return park(charter, gate);  // kill switch, paused, incident mode, an open PR: no VM\n  const task = TaskSpec.fromCharter(charter, triggers);  // goal, done, skills, paths, model and effort\n  const vm = await acquireSandbox({ runId: workflowInfo().runId, agent: req.routine, ...charter.vm });\n  let result: RunOutcome;\n  try {  // a bigger bug fix returns needs_plan_approval, waits on decidePlan, then resumes in the same VM (G5-27)\n    result = await workInSandbox(vm, task);\n  } finally {\n    await releaseSandbox(vm);\n  }\n  if (charter.effectiveStage === \"shadow\") return saveShadowResult(charter, result);  // opens nothing: diff + proof to S3\n  return executeChild(shipPr, { args: [{ charter, result }] });\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Every event with the same root cause lands in this list."
+     },
+     {
+      "line": 4,
+      "text": "Each addTrigger signal pushes one more trigger. Signals that arrive early are buffered until the handler is set."
+     },
+     {
+      "line": 6,
+      "text": "The charter at one ai-agents commit, so a replay sees the same rules."
+     },
+     {
+      "line": 7,
+      "text": "Schedules and Jira start the run with a trigger in its input, not with a signal."
+     },
+     {
+      "line": 8,
+      "text": "The gather window: 7 minutes for red main, 0 for bugs. Durable: a worker restart does not reset it."
+     },
+     {
+      "line": 9,
+      "text": "Kill switch, paused, incident mode, an open PR. Any of them: no VM."
+     },
+     {
+      "line": 10,
+      "text": "Park the run on a timer and re-check later (G3's waiting rules)."
+     },
+     {
+      "line": 11,
+      "text": "Goal, done list, skills, paths, model and effort, from the charter and the triggers. No maxTurns, no budget."
+     },
+     {
+      "line": 12,
+      "text": "A fresh VM, tagged with this run and routine, of the charter's size."
+     },
+     {
+      "line": 16,
+      "text": "The VM is released even if the work fails."
+     },
+     {
+      "line": 19,
+      "text": "The lower of the charter's stage and any override (lesson g5-3). Shadow opens nothing."
+     },
+     {
+      "line": 20,
+      "text": "Not shadow: the shared PR half runs as a child workflow."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "loadCharter needs req.charterSha, but the G5-09 trigger Action and the G5-13 bug poll and schedules start routineRun without one. Nothing in the tickets says who pins the commit. Decide it in the PR: for example, startRun reads the head sha of ai-agents main and puts it in the request."
+   }
+  },
+  {
+   "h": "Root cause as the workflow ID, part 1",
+   "p": [
+    "When main goes red, every push and every PR fails the same way. One run per root cause is the first wall against a storm of agents. The trick is to compute the workflow ID from the cause.",
+    "The trigger service lives behind POST /v1/events in the orchestrator service on inf-rhinohealth, on node:http like Byte's broker. It is internal only, so there is still no new public webhook. Callers prove who they are with GitHub OIDC: issuer, audience rhino-ai-agents, an allow-listed repository, and the trigger workflow on main as job_workflow_ref.",
+    "It never trusts the request body. It re-reads the run by run_id through the broker, read-only. That gives the failing jobs and each job's first error line."
+   ],
+   "because": "An ID made from the root cause turns many red events into one run without any locking code.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/triggers/github-events.ts (part 1 of 2)",
+    "text": "// ai-agents/orchestrator/src/triggers/github-events.ts: sketch: POST /v1/events → one routineRun per root cause\nimport { createHash } from \"node:crypto\";\nimport { WorkflowExecutionAlreadyStartedError, WorkflowIdReusePolicy, type Client } from \"@temporalio/client\";\nimport { addTrigger, routineRun } from \"../workflows/routine-run.js\";\nconst ROUTINES: Record<string, string> = {  // \"<workflow name>|<main or renovate>\" → routine\n  \"[FRONTEND] - CI|main\": \"fe-ci-fixer\", \"[CLOUD] - CI|main\": \"be-ci-fixer\", \"[CLIENT] - CI|main\": \"be-ci-fixer\",\n  \"[FRONTEND] - CI|renovate\": \"fe-upgrade-fixer\", \"[CLOUD] - CI|renovate\": \"be-upgrade-fixer\",\n  \"[CLIENT] - CI|renovate\": \"be-upgrade-fixer\", \"[SDK] - CI|renovate\": \"be-upgrade-fixer\" };\n\nexport async function onFailedRun(temporal: Client, ev: WorkflowRunEvent): Promise<string | undefined> {\n  const run = await broker.github.getRun(ev.repo, ev.run_id);  // re-read from GitHub; never trust the body\n  const kind = run.head_branch === \"main\" ? \"main\" : run.head_branch.startsWith(\"renovate/\") ? \"renovate\" : undefined;\n  const routine = kind && ROUTINES[`${run.name}|${kind}`];  // run.name: the workflow's name in GitHub's JSON\n  if (!routine || run.conclusion !== \"failure\") return undefined;\n  const workflowId = kind === \"renovate\"\n    ? `upgrade:${ev.repo}:pr-${await broker.github.prForBranch(ev.repo, run.head_branch)}`\n    : `cifix:${ev.repo}:${fingerprint(await broker.github.lastGreenSha(ev.repo, run.workflow_id, { branch: \"main\" }),\n                                      await broker.github.failedJobs(ev.repo, run.id))}`;  // name + first error line of each log",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The endpoint the trigger Action calls."
+     },
+     {
+      "line": 5,
+      "text": "A map from \"workflow name|branch kind\" to the routine that handles it."
+     },
+     {
+      "line": 6,
+      "text": "Frontend CI red on main wakes fe-ci-fixer; cloud and client CI wake be-ci-fixer."
+     },
+     {
+      "line": 7,
+      "text": "The same CI red on a renovate/ branch wakes an upgrade fixer instead."
+     },
+     {
+      "line": 11,
+      "text": "Re-read the run from GitHub through the broker. The body only tells us where to look."
+     },
+     {
+      "line": 12,
+      "text": "main, renovate, or undefined for any other branch."
+     },
+     {
+      "line": 14,
+      "text": "No routine for this workflow and branch, or the run did not fail: nothing to do."
+     },
+     {
+      "line": 16,
+      "text": "A Renovate failure: one run per Renovate PR."
+     },
+     {
+      "line": 17,
+      "text": "Red main: the fingerprint starts from the last green commit of this workflow on main."
+     },
+     {
+      "line": 18,
+      "text": "Plus each failed job's name and the first error line of its log."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Root cause as the workflow ID, part 2",
+   "p": [
+    "Signal-with-start sends a signal to the workflow with that ID, and starts it first if it is not running (lesson p7-4). So the first red push starts the run, and the next ones join it.",
+    "The fingerprint uses the last green commit, the failing job names and each normalized first error. The last green commit does not move while main stays red, so later pushes give the same ID. Normalizing drops what changes between runs of the same failure: hashes and numbers.",
+    "REJECT_DUPLICATE means a closed run's ID cannot start again. A root cause that returns after its run closed is likely ping-pong. It goes to a person in #ai-agents-alerts, never to a new run."
+   ],
+   "because": "We send a second event for the same cause into the open run, and send a returning cause to a person.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/triggers/github-events.ts (part 2 of 2)",
+    "text": "  await temporal.workflow.signalWithStart(routineRun, { workflowId, taskQueue: queueFor(routine), args: [{ routine }],\n    signal: addTrigger, signalArgs: [Trigger.fromRun(run)],  // joins an open run\n    typedSearchAttributes: agentAttribute(routine),  // Agent=cifix|upgrade, as startRun sets it (G3-25)\n    workflowIdReusePolicy: WorkflowIdReusePolicy.REJECT_DUPLICATE,  // one run per root cause\n  }).catch(async (err: unknown) => {\n    if (!(err instanceof WorkflowExecutionAlreadyStartedError)) throw err;\n    await alerts.post(`${workflowId} came back after its run closed; a person should look (ping-pong?)`);\n  });\n  return workflowId;\n}\n\nexport function fingerprint(baseSha: string, jobs: FailedJob[]): string {\n  const parts = jobs.map((j) => `${j.name}|${normalize(j.firstError)}`).sort();\n  return createHash(\"sha256\").update([baseSha, ...parts].join(\"\\n\")).digest(\"hex\").slice(0, 12);\n}\nexport function normalize(line: string): string {  // drop what changes between runs of the same failure\n  return line.toLowerCase().replace(/\\b[0-9a-f]{7,40}\\b|0x[0-9a-f]+/g, \"<hex>\").replace(/\\d+(\\.\\d+)?/g, \"<n>\").slice(0, 200);\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Signal the run with this ID, starting it first if needed. queueFor reads the charter's queue key."
+     },
+     {
+      "line": 2,
+      "text": "The signal and its argument: this run as a Trigger."
+     },
+     {
+      "line": 3,
+      "text": "Agent=cifix or upgrade, as G3-25's startRun sets it, so the kill switch's batch stop finds these runs."
+     },
+     {
+      "line": 4,
+      "text": "An ID whose run already closed may not start again."
+     },
+     {
+      "line": 6,
+      "text": "That rejection arrives as this error. Any other error is re-thrown."
+     },
+     {
+      "line": 7,
+      "text": "A returning root cause goes to a person: probably ping-pong."
+     },
+     {
+      "line": 12,
+      "text": "The root cause as 12 hex characters."
+     },
+     {
+      "line": 13,
+      "text": "Sorted, so the order in which jobs failed does not change the ID."
+     },
+     {
+      "line": 14,
+      "text": "sha256 of the last green commit and the job parts, cut to 12 characters."
+     },
+     {
+      "line": 16,
+      "text": "Lowercase, hashes to <hex>, numbers to <n>, at most 200 characters."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "Unit-test fingerprint and normalize with node:test on 10 saved logs from real red builds (lesson g5-9). The same failure on two commits must give the same ID."
+   }
+  },
+  {
+   "h": "The trigger Action, part 1: when it runs",
+   "p": [
+    "A small workflow in fcp wakes the CI and upgrade fixers. workflow_run fires when another workflow finishes; we watch the four CI workflows and keep failures on main or renovate/ branches.",
+    "It runs on fcp-runner-set, which lives inside inf-rhinohealth, so it reaches the internal trigger service. It holds no secret. id-token: write lets it ask GitHub for an OIDC token, a short-lived signed statement of which repo and workflow it is.",
+    "Cloud, client and SDK CI run on push to every branch, so Renovate branches get checks without a PR. Frontend CI runs on pull_request."
+   ],
+   "because": "A tiny Action on our own runners, with no secrets and no PR code, is the safest bridge to the orchestrator.",
+   "code": {
+    "lang": "yaml",
+    "file": ".github/workflows/ai-agents-routine-trigger.yml (fcp, part 1 of 2)",
+    "text": "# .github/workflows/ai-agents-routine-trigger.yml (fcp): sketch\nname: \"[AI-AGENTS] - Routine trigger\"\non:\n  workflow_run:\n    workflows: [\"[FRONTEND] - CI\", \"[CLOUD] - CI\", \"[CLIENT] - CI\", \"[SDK] - CI\"]\n    types: [completed]\n\npermissions:\n  id-token: write   # the OIDC token proves \"this workflow, in RhinoHealth/fcp\" to the trigger service\n  contents: read\n\njobs:\n  report:\n    if: >-\n      github.event.workflow_run.conclusion == 'failure' &&\n      (github.event.workflow_run.head_branch == 'main' ||\n       startsWith(github.event.workflow_run.head_branch, 'renovate/'))\n    runs-on: fcp-runner-set   # inside inf-rhinohealth, so it reaches the internal trigger service\n    steps:",
+    "notes": [
+     {
+      "line": 4,
+      "text": "Runs when one of the listed workflows finishes."
+     },
+     {
+      "line": 5,
+      "text": "The four CI workflows we watch, by their exact names."
+     },
+     {
+      "line": 6,
+      "text": "Only finished runs; the job checks the result."
+     },
+     {
+      "line": 9,
+      "text": "Lets the job get an OIDC token that proves \"this workflow, in RhinoHealth/fcp\"."
+     },
+     {
+      "line": 10,
+      "text": "Nothing to write."
+     },
+     {
+      "line": 15,
+      "text": "Only failures."
+     },
+     {
+      "line": 16,
+      "text": "On main, or on a branch that starts with renovate/."
+     },
+     {
+      "line": 18,
+      "text": "Our self-hosted runners inside inf-rhinohealth."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The trigger Action, part 2: report, nothing else",
+   "p": [
+    "The step never checks out code and never puts event fields into a shell. Fields like a branch name come from the event and could be crafted by an attacker. Read in JavaScript from context.payload, they stay data, so nothing can be injected.",
+    "A workflow_run workflow only fires from the default branch's copy. Test it after merge with a planted failure on a throwaway branch named renovate/test-trigger, while every routine is in shadow.",
+    "Copy the file into infrastructure and gitops for the pipeline fixer, on their own runner sets. This Action only reports: the orchestrator never calls workflow_dispatch and never re-runs jobs."
+   ],
+   "because": "Event fields are untrusted input, so they stay in JavaScript variables and never reach a shell.",
+   "code": {
+    "lang": "yaml",
+    "file": ".github/workflows/ai-agents-routine-trigger.yml (fcp, part 2 of 2)",
+    "text": "      # No checkout and no ${{ }} inside the script: event fields are read in JS, so nothing can be injected.\n      - uses: actions/github-script@v9   # pin by SHA with the rest of the Actions (G5-04)\n        env:\n          TRIGGER_URL: ${{ vars.AI_AGENTS_TRIGGER_URL }}\n        with:\n          script: |\n            const run = context.payload.workflow_run\n            const token = await core.getIDToken(\"rhino-ai-agents\")\n            const res = await fetch(`${process.env.TRIGGER_URL}/v1/events`, {\n              method: \"POST\",\n              headers: {authorization: `Bearer ${token}`, \"content-type\": \"application/json\"},\n              body: JSON.stringify({kind: \"github.workflow_run\", repo: context.repo.repo, run_id: run.id})\n            })\n            if (!res.ok) core.setFailed(`trigger service answered ${res.status}`)",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The rule for this step: no code from the repo, no expressions pasted into the script."
+     },
+     {
+      "line": 2,
+      "text": "Runs JavaScript with context and core ready. Pin it by SHA like the other Actions."
+     },
+     {
+      "line": 4,
+      "text": "The repo variable AI_AGENTS_TRIGGER_URL: the internal address of the trigger service."
+     },
+     {
+      "line": 7,
+      "text": "The finished run, read as a JavaScript object."
+     },
+     {
+      "line": 8,
+      "text": "An OIDC token for the audience rhino-ai-agents. The service checks it."
+     },
+     {
+      "line": 10,
+      "text": "POST /v1/events with the token as a Bearer header."
+     },
+     {
+      "line": 12,
+      "text": "Only the run's ID and repo. The service re-reads everything else."
+     },
+     {
+      "line": 14,
+      "text": "A non-2xx answer fails this job, so a broken bridge shows up red."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Jira Bugs and schedules, part 1: the bug poll",
+   "p": [
+    "Bug tickets are the most important trigger. They reuse G3-28's Jira poll registry, like Nova's hand-off (lesson g4-1), so there is one Jira mechanism and still no public webhook. The poll runs every 5 minutes, which is enough for bugs.",
+    "Each match starts bugfix:RH-1240 on the ai-agents-bugfix queue through startRun, so a repeat poll is a no-op. Anyone can opt a bug out with the label no-routine. If a person takes the ticket during a run, the run gets a stop signal, posts what it found, and ends.",
+    "PHI never enters a prompt. The broker's Jira scope returns summary, description and comments, never attachments. Agree with Security (Ronen) on a label for tickets that might hold customer data, and add it to the JQL."
+   ],
+   "because": "Reusing the poll registry keeps one tested way to read Jira and one run per ticket.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/triggers/schedules.ts (part 1 of 2)",
+    "text": "// ai-agents/orchestrator/src/triggers/schedules.ts: sketch; G5's part of the file G3-28 creates. Safe to run twice.\nimport { ScheduleAlreadyRunning, ScheduleOverlapPolicy, type Client, type Workflow } from \"@temporalio/client\";\nimport { noiseSweep, routineRun, shadowReport, teamDigest, trustLadder } from \"../workflows/index.js\";\n\nconst BUG_JQL = (label: string) =>\n  'project = RH AND issuetype = Bug AND statusCategory = \"To Do\" AND assignee is EMPTY ' +\n  `AND labels = ${label} AND labels not in (no-routine)`; // + Security's customer-data label\n// Bug polls use G3-28's registry, like Nova's: one Jira mechanism, one run per ticket (bugfix:RH-1240).\nfor (const team of [\"fe\", \"be\"] as const) {\n  QUERIES.set(`bugfix-${team}`, { name: `bugfix-${team}`, agent: \"bugfix\", every: \"5 minutes\",\n    jql: BUG_JQL(team.toUpperCase()), // the label agreed in G5-07 (proposal: FE / BE)\n    toStart: (issue) => [routineRun, { routine: `${team}-bug-fixer`, trigger: { kind: \"jira\", key: issue.key } }] });\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "G5's part of the file G3-28 creates. Running it again changes nothing."
+     },
+     {
+      "line": 3,
+      "text": "The housekeeping workflows the schedules start (lessons g5-3 and g5-4)."
+     },
+     {
+      "line": 5,
+      "text": "Bugs in To Do, unassigned, with the team label."
+     },
+     {
+      "line": 7,
+      "text": "Anyone can opt a bug out. Security's customer-data label joins this line."
+     },
+     {
+      "line": 9,
+      "text": "One poll per team: bugfix-fe and bugfix-be."
+     },
+     {
+      "line": 10,
+      "text": "Every 5 minutes; agent bugfix picks the ai-agents-bugfix queue."
+     },
+     {
+      "line": 11,
+      "text": "The label agreed in G5-07: FE or BE."
+     },
+     {
+      "line": 12,
+      "text": "Start routineRun for fe-bug-fixer or be-bug-fixer with a jira trigger. startRun gives ID bugfix:<key>."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Jira Bugs and schedules, part 2: the crews",
+   "p": [
+    "Scheduled routines and housekeeping jobs run from Temporal schedules (lesson p7-5). They are the dead-code sweep, the KB ingest, the idle close, the digest, the trust ladder and the shadow report. All at odd minutes, in the Asia/Jerusalem time zone; 0-4 in cron means Sunday to Thursday.",
+    "ensureCronSchedules runs at worker start next to G3-28's ensureSchedules. It creates each schedule, or updates it if it exists. Overlap SKIP means a slow run never stacks a second one. Weekly code-health routines run on Sunday."
+   ],
+   "because": "Schedules in code, created idempotently at start, mean a deploy is the only way a crew's timetable changes.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/triggers/schedules.ts (part 2 of 2)",
+    "text": "const CRON: Record<string, [cron: string, workflow: Workflow, args: unknown[]]> = { // odd minutes; 0-4 = Sun–Thu\n  \"fe-dead-code\": [\"17 4 * * 0-4\", routineRun, [{ routine: \"fe-dead-code\" }]],\n  \"kb-ingest\": [\"41 6 * * 1\", routineRun, [{ routine: \"kb-ingest\" }]], // G6-20\n  \"noise-close\": [\"23 3 * * *\", noiseSweep, [\"fcp\"]],   // G5-02\n  \"team-digest\": [\"37 6 * * 0-4\", teamDigest, []],      // G5-03\n  \"trust-ladder\": [\"51 5 * * *\", trustLadder, []],      // G5-15\n  \"shadow-report\": [\"13 7 * * 0\", shadowReport, []],    // G5-16\n};\n\n/** At worker start, next to G3-28's ensureSchedules (the Jira polls). */\nexport async function ensureCronSchedules(client: Client): Promise<void> {\n  for (const [name, [cron, workflowType, args]] of Object.entries(CRON)) {\n    const scheduleId = `sched:${name}`;\n    const schedule = {\n      spec: { cronExpressions: [cron], timezone: \"Asia/Jerusalem\" },\n      action: { type: \"startWorkflow\" as const, workflowType, args, workflowId: scheduleId, taskQueue: queueFor(name) },\n      policies: { overlap: ScheduleOverlapPolicy.SKIP }, // a slow run never stacks a second one\n    };\n    await client.schedule.create({ scheduleId, ...schedule }).catch(async (err: unknown) => {\n      if (!(err instanceof ScheduleAlreadyRunning)) throw err;\n      await client.schedule.getHandle(scheduleId).update((previous) => ({ ...previous, ...schedule }));\n    });\n  }\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Name to [cron, workflow, args]. Odd minutes keep us off the busy top of the hour."
+     },
+     {
+      "line": 2,
+      "text": "04:17, Sunday to Thursday: the FE dead-code sweep (lesson g5-8)."
+     },
+     {
+      "line": 3,
+      "text": "Monday 06:41: the brain's weekly ingest, a routine with its own charter (G6-20)."
+     },
+     {
+      "line": 4,
+      "text": "Daily idle-PR close (lesson g5-3)."
+     },
+     {
+      "line": 5,
+      "text": "The daily team digest at 06:37 on working days."
+     },
+     {
+      "line": 7,
+      "text": "Sunday 07:13: the weekly shadow report."
+     },
+     {
+      "line": 13,
+      "text": "The schedule ID, also used as the started workflow's ID."
+     },
+     {
+      "line": 15,
+      "text": "Cron times are Israel time."
+     },
+     {
+      "line": 17,
+      "text": "If the previous run is still going, skip this one."
+     },
+     {
+      "line": 20,
+      "text": "The schedule exists already: not an error for us."
+     },
+     {
+      "line": 21,
+      "text": "Update it with the current spec, so a changed cron line takes effect."
+     }
+    ]
+   }
+  }
+ ],
+ "lab": {
+  "title": "Test routineRun with mocked activities",
+  "youNeed": [
+   "Node 22 or newer",
+   "npm",
+   "about 300 MB of disk for node_modules",
+   "no Temporal server: the test starts its own"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/academy/g5-2/src ~/academy/g5-2/test && cd ~/academy/g5-2 && npm init -y >/dev/null && npm pkg set type=module",
+    "see": "(no output)"
+   },
+   {
+    "do": "npm install @temporalio/workflow@1.24.0 @temporalio/worker@1.24.0 @temporalio/testing@1.24.0 @temporalio/client@1.24.0 @temporalio/activity@1.24.0 && npm install --save-dev typescript@5.9.3 tsx@4.20.3 @types/node@24",
+    "see": "added <n> packages\nfound 0 vulnerabilities"
+   },
+   {
+    "do": "Save src/types.ts and src/activities.ts:\n// src/types.ts\nexport interface Trigger { kind: string; ref: string }\nexport interface RoutineRequest { routine: string; charterSha: string; trigger?: Trigger }\nexport interface Charter { name: string; effectiveStage: \"shadow\" | \"drafts\" | \"normal\"; gather_minutes?: number; vm: { size: string } }\nexport interface Gate { verdict: \"go\" | \"wait\"; reason: string }\nexport interface Task { goal: string; triggers: Trigger[] }\nexport interface RunOutcome { diff: string }\n\n// src/activities.ts\n// The real activities live in orchestrator/src/activities/ (G3, G5). The test replaces every one with a mock.\nimport type { Charter, Gate, RunOutcome, Task, Trigger } from \"./types.js\";\nexport interface Activities {\n  loadCharter(name: string, sha: string): Promise<Charter>;\n  preRunGate(c: Charter, triggers: Trigger[]): Promise<Gate>;\n  acquireSandbox(req: { runId: string; agent: string; size: string }): Promise<string>;\n  workInSandbox(vm: string, task: Task): Promise<RunOutcome>;\n  releaseSandbox(vm: string): Promise<void>;\n  saveShadowResult(c: Charter, r: RunOutcome): Promise<string>;\n}",
+    "see": "Two small files: the shapes, and the activity interface the test mocks."
+   },
+   {
+    "do": "Save src/workflows.ts, a lab copy of routineRun with the same steps (TaskSpec, park and shipPr are small stand-ins):\nimport { proxyActivities, defineSignal, setHandler, sleep, executeChild, workflowInfo } from \"@temporalio/workflow\";\nimport type { Activities } from \"./activities.js\";\nimport type { Charter, Gate, RoutineRequest, RunOutcome, Task, Trigger } from \"./types.js\";\n\nconst { loadCharter, preRunGate, saveShadowResult } = proxyActivities<Activities>({ startToCloseTimeout: \"1 minute\" });\nconst { acquireSandbox } = proxyActivities<Activities>({ startToCloseTimeout: \"10 minutes\" });\nconst { releaseSandbox } = proxyActivities<Activities>({ startToCloseTimeout: \"5 minutes\" });\nconst { workInSandbox } = proxyActivities<Activities>({ startToCloseTimeout: \"7 days\", heartbeatTimeout: \"5 minutes\" });\nexport const addTrigger = defineSignal<[Trigger]>(\"addTrigger\");\n\nconst fromCharter = (c: Charter, triggers: Trigger[]): Task => ({ goal: `${c.name}: ${triggers.length} trigger(s)`, triggers });\nconst park = (c: Charter, gate: Gate): string => `${c.name} parked: ${gate.reason}`;  // the real one waits on a timer\n\nexport async function shipPr(c: Charter, r: RunOutcome): Promise<string> { return `PR for ${c.name}: ${r.diff}`; }\n\nexport async function routineRun(req: RoutineRequest): Promise<string> {\n  const triggers: Trigger[] = [];\n  setHandler(addTrigger, (t) => void triggers.push(t));\n  const charter = await loadCharter(req.routine, req.charterSha);\n  if (req.trigger) triggers.push(req.trigger);\n  if (charter.gather_minutes) await sleep(charter.gather_minutes * 60_000);\n  const gate = await preRunGate(charter, triggers);\n  if (gate.verdict !== \"go\") return park(charter, gate);\n  const vm = await acquireSandbox({ runId: workflowInfo().runId, agent: req.routine, size: charter.vm.size });\n  let result: RunOutcome;\n  try {\n    result = await workInSandbox(vm, fromCharter(charter, triggers));\n  } finally {\n    await releaseSandbox(vm);\n  }\n  if (charter.effectiveStage === \"shadow\") return saveShadowResult(charter, result);\n  return executeChild(shipPr, { args: [charter, result] });\n}",
+    "see": "src/workflows.ts exports addTrigger, shipPr and routineRun."
+   },
+   {
+    "do": "Save test/routine-run.test.ts:\nimport { after, before, test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { fileURLToPath } from \"node:url\";\nimport { TestWorkflowEnvironment } from \"@temporalio/testing\";\nimport { DefaultLogger, Runtime, Worker } from \"@temporalio/worker\";\nimport { addTrigger, routineRun } from \"../src/workflows.js\";\nimport type { Charter, Gate, Task } from \"../src/types.js\";\n\nRuntime.install({ logger: new DefaultLogger(\"WARN\") });  // quiet: only warnings and errors\nlet env: TestWorkflowEnvironment;\nbefore(async () => { env = await TestWorkflowEnvironment.createTimeSkipping(); });\nafter(async () => { await env?.teardown(); });\n\nfunction mocks(charter: Charter, gate: Gate = { verdict: \"go\", reason: \"\" }) {\n  const calls: string[] = [];\n  let task: Task | undefined;\n  const activities = {\n    loadCharter: async () => charter,\n    preRunGate: async () => gate,\n    acquireSandbox: async () => { calls.push(\"acquire\"); return \"vm-1\"; },\n    workInSandbox: async (_vm: string, t: Task) => { calls.push(\"work\"); task = t; return { diff: \"+1 -1\" }; },\n    releaseSandbox: async () => { calls.push(\"release\"); },\n    saveShadowResult: async () => { calls.push(\"shadow\"); return \"saved to S3\"; },\n  };\n  return { activities, calls, task: () => task };\n}\n\nasync function run(m: ReturnType<typeof mocks>, start: (taskQueue: string) => Promise<string>): Promise<string> {\n  const taskQueue = `q-${Math.random()}`;\n  const worker = await Worker.create({ connection: env.nativeConnection, taskQueue, activities: m.activities,\n    workflowsPath: fileURLToPath(new URL(\"../src/workflows.ts\", import.meta.url)) });\n  return worker.runUntil(start(taskQueue));\n}\n\nconst shadow: Charter = { name: \"fe-ci-fixer\", effectiveStage: \"shadow\", gather_minutes: 7, vm: { size: \"lite\" } };\n\ntest(\"a shadow run saves its result and opens nothing\", async () => {\n  const m = mocks(shadow);\n  const out = await run(m, (taskQueue) => env.client.workflow.execute(routineRun,\n    { taskQueue, workflowId: \"cifix:fcp:abc\", args: [{ routine: \"fe-ci-fixer\", charterSha: \"sha1\" }] }));\n  assert.equal(out, \"saved to S3\");\n  assert.deepEqual(m.calls, [\"acquire\", \"work\", \"release\", \"shadow\"]);\n});\n\ntest(\"a gate that says wait never claims a VM\", async () => {\n  const m = mocks(shadow, { verdict: \"wait\", reason: \"#2501 is still open\" });\n  const out = await run(m, (taskQueue) => env.client.workflow.execute(routineRun,\n    { taskQueue, workflowId: \"cifix:fcp:def\", args: [{ routine: \"fe-ci-fixer\", charterSha: \"sha1\" }] }));\n  assert.equal(out, \"fe-ci-fixer parked: #2501 is still open\");\n  assert.deepEqual(m.calls, []);\n});\n\ntest(\"events with the same root cause join one run\", async () => {\n  const m = mocks(shadow);\n  await run(m, async (taskQueue) => {\n    const opts = { taskQueue, workflowId: \"cifix:fcp:ghi\", args: [{ routine: \"fe-ci-fixer\", charterSha: \"sha1\" }],\n      signal: addTrigger, signalArgs: [{ kind: \"github.workflow_run\", ref: \"run-1\" }] } as const;\n    const handle = await env.client.workflow.signalWithStart(routineRun, opts);\n    await env.client.workflow.signalWithStart(routineRun, { ...opts, signalArgs: [{ kind: \"github.workflow_run\", ref: \"run-2\" }] });\n    return handle.result();\n  });\n  assert.equal(m.task()?.triggers.length, 2);\n});",
+    "see": "Three tests: shadow, a gate that says wait, and two events joining one run."
+   },
+   {
+    "do": "node --import tsx --test --test-reporter=spec \"test/**/*.test.ts\"",
+    "see": "✔ a shadow run saves its result and opens nothing\n✔ a gate that says wait never claims a VM\n✔ events with the same root cause join one run\nℹ tests 3\nℹ pass 3\nℹ fail 0\n(the first run downloads Temporal's test server once; a WARN about heartbeat details is harmless)"
+   },
+   {
+    "do": "Explain why the third test is fast although the charter says gather_minutes: 7.",
+    "see": "createTimeSkipping() skips timers while the test waits for the result, so sleep(7 minutes) passes at once."
+   }
+  ],
+  "faded": "Add a test for a normal-stage charter (effectiveStage: \"normal\"). Copy the shadow test and change the charter. The assertions are left to you: the result should be the shipPr string, and calls should not contain \"shadow\".",
+  "alone": "Write a test that starts the run with execute, no signal, and the input trigger { kind: \"jira\", ref: \"RH-1240\" }. Use a charter with no gather_minutes. Assert that workInSandbox saw exactly one trigger, with ref RH-1240.",
+  "done": "Four or more tests pass, and you can point to the line in routineRun that each one proves."
+ },
+ "quiz": [
+  {
+   "q": "main is red. Ten minutes later a second push fails the same job with the same first error. What happens?",
+   "options": [
+    {
+     "text": "A second routineRun starts for the new push",
+     "correct": false,
+     "why": "Same last green commit, same jobs, same normalized error: the same fingerprint, so the same ID."
+    },
+    {
+     "text": "Signal-with-start finds the open run with that ID and adds the trigger to it",
+     "correct": true,
+     "why": "One run per root cause: the second event joins through addTrigger."
+    },
+    {
+     "text": "The trigger service drops it because it is a duplicate",
+     "correct": false,
+     "why": "It is not dropped. It joins the open run as another trigger."
+    }
+   ]
+  },
+  {
+   "q": "Why does the trigger Action read the branch name in JavaScript instead of with ${{ }} in a shell?",
+   "options": [
+    {
+     "text": "JavaScript is faster than bash on the runner",
+     "correct": false,
+     "why": "Speed is not the point. Safety is."
+    },
+    {
+     "text": "A branch name is attacker-controlled input; pasted into a shell it could run commands",
+     "correct": true,
+     "why": "Read from context.payload, it stays a string. That is how script injection is avoided."
+    },
+    {
+     "text": "${{ }} expressions do not work in workflow_run workflows",
+     "correct": false,
+     "why": "They work, which is exactly why they are dangerous inside run scripts."
+    }
+   ]
+  },
+  {
+   "q": "Where does the bug fixer's trigger come from?",
+   "options": [
+    {
+     "text": "A Jira webhook to a new public URL",
+     "correct": false,
+     "why": "There is no new public webhook. The poll reads Jira."
+    },
+    {
+     "text": "G3-28's Jira poll registry: triaged Bugs every 5 minutes, one run per ticket through startRun",
+     "correct": true,
+     "why": "The same mechanism as Nova's hand-off, with the team label in the JQL."
+    },
+    {
+     "text": "The trigger Action in fcp",
+     "correct": false,
+     "why": "That Action reports CI failures, not Jira tickets."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From lesson g5-1: which key in a charter names the task queue, and which names the routine's run ID?",
+  "From lesson p7-4: what does signal-with-start do when the workflow is not running yet?"
+ ],
+ "videos": [
+  {
+   "title": "Temporal for React Developers",
+   "url": "https://www.youtube.com/watch?v=Cxaf8E00GMM",
+   "channel": "Temporal",
+   "minutes": 27,
+   "why": "TypeScript SDK introduced at a React conference, for frontend developers."
+  }
+ ],
+ "words": [
+  {
+   "term": "routineRun",
+   "plain": "The one Temporal workflow every routine runs: gather, gate, work in a VM, then shadow or ship."
+  },
+  {
+   "term": "shipPr",
+   "plain": "The PR half of ticketToPr as a child workflow, shared by Nova and the routines."
+  },
+  {
+   "term": "fingerprint",
+   "plain": "A short hash of the last green commit, the failing job names and their normalized first errors: the root cause."
+  },
+  {
+   "term": "gather window",
+   "plain": "The minutes a run waits so other events with the same cause can join it."
+  },
+  {
+   "term": "signal-with-start",
+   "plain": "Send a signal to a workflow, starting it first if it is not running."
+  },
+  {
+   "term": "OIDC token",
+   "plain": "A short-lived signed statement from GitHub of which repo and workflow a job is."
+  },
+  {
+   "term": "REJECT_DUPLICATE",
+   "plain": "A reuse policy: a closed workflow's ID cannot start again."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G5-08",
+   "why": "This lesson walked through routineRun line by line, and the lab tested it with mocked activities.",
+   "walk": [
+    "Add orchestrator/src/workflows/routine-run.ts (code above). Reuse ticketToPr's activities unchanged.",
+    "With the G4 owner, move the PR half of ticketToPr into the child workflow shipPr in workflows/ship-pr.ts.",
+    "Write preRunGate: kill switch, routine:<name>:paused, incident mode, one open PR per routine. A wait parks the run on a timer.",
+    "Write TaskSpec.fromCharter in routines/task-spec.ts. No maxTurns, no maxBudgetUsd, no taskBudget, no time limit.",
+    "Create or link the Jira ticket before the PR. In shadow, save the diff and proof to S3 instead.",
+    "Register keyword search attributes Routine, RunKind, RoutineOutcome and Stage on namespace ai-agents.",
+    "Use G3-25's queues and slots: ai-agents-cifix, -upgrade, -flaky, -bugfix, -health, -security with 2, 2, 1, 2, 1, 1 slots."
+   ]
+  },
+  {
+   "key": "G5-09",
+   "why": "This lesson explained the trigger service, the fingerprint and signal-with-start.",
+   "walk": [
+    "Add orchestrator/src/triggers/github-events.ts (code above) behind POST /v1/events in the orchestrator service. Internal only.",
+    "Check callers with GitHub OIDC: the issuer, audience rhino-ai-agents, an allow-listed repository, and job_workflow_ref equal to the trigger workflow on main.",
+    "Re-read the run through the broker (read-only, actions: read) for the failing jobs and each job's first error line.",
+    "Put the signal-with-start form of startRun in fanout.ts with the G3 owner, with REJECT_DUPLICATE.",
+    "Unit-test fingerprint and normalize in orchestrator/test/github-events.test.ts on 10 saved logs from real red builds."
+   ]
+  },
+  {
+   "key": "G5-12",
+   "why": "This lesson showed the trigger Action and why it reads the event in JavaScript.",
+   "walk": [
+    "Add .github/workflows/ai-agents-routine-trigger.yml to fcp (code above) and set the repo variable AI_AGENTS_TRIGGER_URL.",
+    "Pin actions/github-script by SHA. Permissions: id-token: write and contents: read.",
+    "After merge, plant a failure on a throwaway branch renovate/test-trigger while every routine is in shadow.",
+    "Copy the file to infrastructure (infrastructure-runner-set) and gitops (gitops-runner-set), and add both repos to the OIDC allow-list."
+   ]
+  },
+  {
+   "key": "G5-13",
+   "why": "This lesson walked through the bug poll and the cron schedules.",
+   "walk": [
+    "Add the bug queries and ensureCronSchedules to orchestrator/src/triggers/schedules.ts (code above).",
+    "Call ensureCronSchedules at worker start, next to G3-28's ensureSchedules.",
+    "Skip no-routine tickets. When a person takes the ticket during a run, send the stop signal.",
+    "Agree with Security (Ronen) on a customer-data label and add it to the bug JQL.",
+    "Schedules use ScheduleOverlapPolicy.SKIP and Asia/Jerusalem; weekly code-health routines run on Sunday."
+   ]
+  }
+ ],
+ "remember": "One workflow for every routine, and its ID is the root cause: later events join, a closed cause goes to a person."
+}

@@ -1,0 +1,449 @@
+{
+ "id": "p3-1",
+ "title": "Accounts, regions and IAM",
+ "minutes": 45,
+ "youNeed": [
+  "p2-3"
+ ],
+ "bridge": "An IAM role is like a user with a scoped token, except nobody holds a password for it. A machine or a CI job assumes the role and gets credentials that expire within hours. An AWS account is like a separate GitHub org: nothing crosses between accounts unless policies on both sides allow it.",
+ "intro": "Every sandbox VM runs in its own AWS account, and IAM checks every call it makes. This lesson shows who may do what in AWS: accounts, regions, roles, policies and trust. At the end you give a VM the smallest role it needs, the way G3-11 does.",
+ "picture": {
+  "caption": "A caller becomes a role through STS, then IAM checks every request against the role's policies and the account's SCP.",
+  "nodes": [
+   {
+    "id": "caller",
+    "label": "a VM or a CI job",
+    "kind": "machine"
+   },
+   {
+    "id": "sts",
+    "label": "STS (the token service)",
+    "kind": "service"
+   },
+   {
+    "id": "trust",
+    "label": "trust policy: who may assume",
+    "kind": "file"
+   },
+   {
+    "id": "creds",
+    "label": "temporary credentials (expire)",
+    "kind": "file"
+   },
+   {
+    "id": "api",
+    "label": "AWS API: ec2, autoscaling, s3",
+    "kind": "cloud"
+   },
+   {
+    "id": "perm",
+    "label": "permission policies + SCP",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "caller",
+    "to": "sts",
+    "text": "asks to assume the role ai-agent-sandbox"
+   },
+   {
+    "from": "sts",
+    "to": "trust",
+    "text": "checks the role's trust policy: is this caller allowed in?"
+   },
+   {
+    "from": "trust",
+    "to": "creds",
+    "text": "yes: STS returns a key, a secret and a session token with an expiry"
+   },
+   {
+    "from": "creds",
+    "to": "api",
+    "text": "the caller signs every request with them"
+   },
+   {
+    "from": "api",
+    "to": "perm",
+    "text": "IAM checks the role's policies and the account's SCP"
+   },
+   {
+    "from": "perm",
+    "to": "caller",
+    "text": "allowed, or AccessDenied: anything not allowed is denied"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start from who you are",
+   "p": [
+    "Every AWS question starts with two facts: which account am I in, and which identity am I? The AWS CLI answers both with one command, get-caller-identity.",
+    "In this course you never call real AWS. You run moto, a free program that pretends to be AWS on your laptop. The lab shows how to start it. The commands are the same ones you would run against the real cloud."
+   ],
+   "because": "We start with get-caller-identity because a wrong account or a wrong role explains most AWS surprises.",
+   "code": {
+    "lang": "bash",
+    "file": "your laptop (moto running, see the lab)",
+    "text": "source ~/academy/aws/moto.env     # fake keys and AWS_ENDPOINT_URL=http://localhost:5055\necho \"$AWS_ENDPOINT_URL\"          # every CLI call goes to moto, never to AWS\naws sts get-caller-identity       # which account, which identity",
+    "notes": [
+     {
+      "line": 1,
+      "text": "moto.env sets fake keys (test/test), the region us-east-1 and the endpoint. You create it in the lab."
+     },
+     {
+      "line": 2,
+      "text": "If this prints nothing, the CLI would try real AWS with fake keys and fail. Safe, but wrong."
+     },
+     {
+      "line": 3,
+      "text": "STS is the AWS service that says who you are and hands out temporary credentials."
+     }
+    ]
+   },
+   "see": "{\n    \"UserId\": \"AKIAIOSFODNN7EXAMPLE\",\n    \"Account\": \"123456789012\",\n    \"Arn\": \"arn:aws:sts::123456789012:user/moto\"\n}",
+   "ifInstead": "If instead you see 'Could not connect to the endpoint URL', moto is not running. Start it in the other tab (lab step 1)."
+  },
+  {
+   "h": "Accounts and regions",
+   "p": [
+    "An AWS account is a separate box for resources, permissions and bills. It has a 12-digit ID. Our accounts include inf (123456789012), dev, qa, prod and solutions (367879749310). Nothing in one account can touch another unless both sides allow it.",
+    "G3-02 creates a new account, ai-agents, only for sandboxes. Sandboxes read untrusted text, so they get a box with no path to prod, QA or dev. DevOps creates accounts in Control Tower, AWS's tool for an organization of accounts, outside the infrastructure repo.",
+    "A region is a place on the map with its own copy of every service. Ours is us-east-1 (North Virginia). Inside a region are availability zones (AZs): separate data centers, named us-east-1a, us-east-1b and so on. We spread sandbox subnets over three AZs, so one data center failing does not stop runs."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "The separate account is a wall, not a habit. An agent that escapes its VM reaches only the ai-agents account. That account holds no customer data and no keys."
+   }
+  },
+  {
+   "h": "Policies: lists of allowed actions",
+   "p": [
+    "A policy is a JSON document. Each statement has an Effect (Allow or Deny), the Actions it covers, and the Resources they apply to. A Condition can narrow it further, for example 'only if the tag says so'.",
+    "Two rules decide every request. First, everything is denied unless some policy allows it. Second, an explicit Deny anywhere beats every Allow. Resources are named by ARNs, Amazon Resource Names: arn:aws:<service>:<region>:<account>:<what>."
+   ],
+   "because": "We write the sandbox's extra permission as one narrow statement because the role should allow exactly one action on exactly our groups.",
+   "code": {
+    "lang": "json",
+    "file": "~/academy/aws/lifecycle.json",
+    "text": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [{\n    \"Effect\": \"Allow\",\n    \"Action\": \"autoscaling:CompleteLifecycleAction\",\n    \"Resource\": \"arn:aws:autoscaling:us-east-1:123456789012:autoScalingGroup:*:autoScalingGroupName/ai-agents-sandbox-*\"\n  }]\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The policy language version. Always this exact date string; it is not today's date."
+     },
+     {
+      "line": 4,
+      "text": "Allow. Without a matching Allow, the answer is no."
+     },
+     {
+      "line": 5,
+      "text": "One action: tell the Auto Scaling group 'my setup is done' (p3-4). Nothing else."
+     },
+     {
+      "line": 6,
+      "text": "Only groups whose name starts with ai-agents-sandbox-, in this account and region. The * matches the group's ID part."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Roles and trust policies",
+   "p": [
+    "A role is an identity with no password. It has two kinds of documents. The trust policy says who may become the role. The permission policies say what the role may do once someone has become it.",
+    "Becoming a role is called assuming it. The caller asks STS, STS checks the trust policy, and returns temporary credentials: a key, a secret and a session token. They expire, usually after one hour, so a leaked copy dies on its own."
+   ],
+   "because": "We trust the EC2 service and nothing else, because only a VM should ever wear the sandbox role.",
+   "code": {
+    "lang": "json",
+    "file": "~/academy/aws/trust.json",
+    "text": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [{\n    \"Effect\": \"Allow\",\n    \"Principal\": { \"Service\": \"ec2.amazonaws.com\" },\n    \"Action\": \"sts:AssumeRole\"\n  }]\n}",
+    "notes": [
+     {
+      "line": 5,
+      "text": "Principal is who may assume the role. Here: the EC2 service, on behalf of a VM that carries this role."
+     },
+     {
+      "line": 6,
+      "text": "AssumeRole is the STS action that hands out the temporary credentials."
+     },
+     {
+      "line": 4,
+      "text": "A trust policy has no Resource line: the resource is the role itself."
+     }
+    ]
+   }
+  },
+  {
+   "h": "CI gets a role through OIDC",
+   "p": [
+    "In p2-3 a GitHub job proved who it was with an OIDC token. AWS can trust that token. The trust policy names GitHub's OIDC provider as the principal and pins the token's claims.",
+    "G3-02 adds such a role to the ai-agents account for the nightly image smoke test (G3-16). The solutions account trusts repo:RhinoHealth/*, every repo in the org. Ours trusts one repo and one GitHub environment."
+   ],
+   "because": "We pin the sub claim to one repo and one environment. Otherwise any repo in the org could use this role.",
+   "code": {
+    "lang": "json",
+    "file": "terraform/accounts/ai-agents/aws/global/iam/github-actions (the trust part, as JSON)",
+    "text": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [{\n    \"Effect\": \"Allow\",\n    \"Principal\": {\n      \"Federated\": \"arn:aws:iam::<AI_AGENTS_ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com\"\n    },\n    \"Action\": \"sts:AssumeRoleWithWebIdentity\",\n    \"Condition\": {\n      \"StringEquals\": {\n        \"token.actions.githubusercontent.com:aud\": \"sts.amazonaws.com\",\n        \"token.actions.githubusercontent.com:sub\": \"repo:RhinoHealth/infrastructure:environment:ai-agents\"\n      }\n    }\n  }]\n}",
+    "notes": [
+     {
+      "line": 6,
+      "text": "Federated: an outside identity provider, here GitHub's, registered once in the account."
+     },
+     {
+      "line": 8,
+      "text": "The OIDC version of AssumeRole: the caller hands in a signed token instead of AWS credentials."
+     },
+     {
+      "line": 11,
+      "text": "aud: the token must be meant for AWS STS."
+     },
+     {
+      "line": 12,
+      "text": "sub: the token must come from the infrastructure repo, running in the ai-agents environment. This line is the wall."
+     }
+    ]
+   }
+  },
+  {
+   "h": "A machine's role: the instance profile",
+   "p": [
+    "A VM gets its role through an instance profile, a small wrapper that EC2 attaches to the VM. Programs on the VM then fetch the role's temporary credentials from the metadata service (p3-3).",
+    "G3-11 gives the sandbox role two things. One is the AWS managed policy AmazonSSMManagedInstanceCore, so the SSM agent works (p3-5). The other is the CompleteLifecycleAction statement above. The agent's user is in the docker group, which is as good as root. So the agent can use anything this role can.",
+    "AmazonSSMManagedInstanceCore allows ssm:GetParameter on every parameter. That is why the ai-agents account keeps no secrets in Parameter Store."
+   ],
+   "because": "We build the role with the CLI first, because seeing each piece makes the Terraform version in p4-3 familiar.",
+   "code": {
+    "lang": "bash",
+    "file": "~/academy/aws (moto running)",
+    "text": "aws iam create-role --role-name ai-agent-sandbox \\\n  --assume-role-policy-document file://trust.json\naws iam attach-role-policy --role-name ai-agent-sandbox \\\n  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore\naws iam put-role-policy --role-name ai-agent-sandbox \\\n  --policy-name complete-lifecycle --policy-document file://lifecycle.json\naws iam create-instance-profile --instance-profile-name ai-agent-sandbox\naws iam add-role-to-instance-profile --instance-profile-name ai-agent-sandbox \\\n  --role-name ai-agent-sandbox",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Creates the role with its trust policy. A role with no permission policy can do nothing."
+     },
+     {
+      "line": 3,
+      "text": "Attaches a managed policy: one AWS writes and updates, shared by many roles."
+     },
+     {
+      "line": 5,
+      "text": "Adds an inline policy: one that lives inside this role only."
+     },
+     {
+      "line": 7,
+      "text": "The instance profile is what a launch template names (p3-3). It holds exactly one role."
+     }
+    ]
+   }
+  },
+  {
+   "h": "SCPs: walls above every role",
+   "p": [
+    "A service control policy (SCP) is set on the organization, above the account. It limits what any identity in the account can do, even an administrator. An SCP never grants anything; it only takes away.",
+    "G3-02 attaches three SCPs to the ai-agents account. The first allows only us-east-1. The second stops anyone taking the account out of the organization.",
+    "The third is the important one. Nobody except TerraformDeploymentRole may create VPC peering, Transit Gateway attachments or NAT gateways. That turns 'the sandbox network has no way out' into a wall. Ronen writes the real SCPs; this is a sketch."
+   ],
+   "because": "We deny network exits in an SCP because nobody inside the account can edit an SCP.",
+   "code": {
+    "lang": "json",
+    "file": "SCP sketch for the ai-agents account (set in Control Tower, outside the repo)",
+    "text": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    { \"Sid\": \"NoWayOutExceptTerraform\", \"Effect\": \"Deny\",\n      \"Action\": [\"ec2:CreateVpcPeeringConnection\", \"ec2:AcceptVpcPeeringConnection\",\n                 \"ec2:CreateTransitGatewayVpcAttachment\", \"ec2:CreateNatGateway\"],\n      \"Resource\": \"*\",\n      \"Condition\": { \"ArnNotLike\": { \"aws:PrincipalArn\": \"arn:aws:iam::*:role/TerraformDeploymentRole\" } } },\n    { \"Sid\": \"UsEast1Only\", \"Effect\": \"Deny\",\n      \"NotAction\": [\"iam:*\", \"sts:*\", \"organizations:*\", \"support:*\"],\n      \"Resource\": \"*\",\n      \"Condition\": { \"StringNotEquals\": { \"aws:RequestedRegion\": \"us-east-1\" } } },\n    { \"Sid\": \"StayInTheOrg\", \"Effect\": \"Deny\", \"Action\": \"organizations:LeaveOrganization\", \"Resource\": \"*\" }\n  ]\n}",
+    "notes": [
+     {
+      "line": 5,
+      "text": "The four ways a private network could get a path out or a link to another network."
+     },
+     {
+      "line": 8,
+      "text": "ArnNotLike: the deny applies to every caller except TerraformDeploymentRole, which a person runs."
+     },
+     {
+      "line": 10,
+      "text": "NotAction: deny everything except global services. Check AWS's region-deny example for the full list to exempt."
+     },
+     {
+      "line": 12,
+      "text": "aws:RequestedRegion is the region a request is sent to. Anything but us-east-1 is denied."
+     },
+     {
+      "line": 13,
+      "text": "Without this, an admin inside the account could leave the organization and drop every SCP."
+     }
+    ]
+   }
+  }
+ ],
+ "lab": {
+  "title": "Make the sandbox role on a fake AWS",
+  "youNeed": [
+   "uv (brew install uv; you used it in p2-3)",
+   "AWS CLI v2 (brew install awscli)",
+   "two terminal tabs"
+  ],
+  "worked": [
+   {
+    "do": "Tab 1: mkdir -p ~/academy/aws && cd ~/academy/aws && MOTO_IAM_LOAD_MANAGED_POLICIES=true uvx --from 'moto[server]' moto_server -p 5055",
+    "see": " * Running on http://127.0.0.1:5055\nPress CTRL+C to quit"
+   },
+   {
+    "do": "Tab 2: cd ~/academy/aws && printf 'export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test\\nexport AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1\\nexport AWS_ENDPOINT_URL=http://localhost:5055\\n' > moto.env && source moto.env && aws sts get-caller-identity",
+    "see": "{\n    \"UserId\": \"AKIAIOSFODNN7EXAMPLE\",\n    \"Account\": \"123456789012\",\n    \"Arn\": \"arn:aws:sts::123456789012:user/moto\"\n}"
+   },
+   {
+    "do": "Save trust.json and lifecycle.json from sections 4 and 3. Then: aws iam create-role --role-name ai-agent-sandbox --assume-role-policy-document file://trust.json --query Role.Arn --output text",
+    "see": "arn:aws:iam::123456789012:role/ai-agent-sandbox"
+   },
+   {
+    "do": "aws iam attach-role-policy --role-name ai-agent-sandbox --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore && aws iam list-attached-role-policies --role-name ai-agent-sandbox --output text",
+    "see": "ATTACHEDPOLICIES\tarn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore\tAmazonSSMManagedInstanceCore"
+   },
+   {
+    "do": "P=arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore; aws iam get-policy-version --policy-arn $P --version-id $(aws iam get-policy --policy-arn $P --query Policy.DefaultVersionId --output text) --query 'PolicyVersion.Document.Statement[0].[Resource, Action[?starts_with(@, `ssm:GetParam`)]]'",
+    "see": "[\n    \"*\",\n    [\n        \"ssm:GetParameter\",\n        \"ssm:GetParameters\"\n    ]\n]"
+   },
+   {
+    "do": "aws iam put-role-policy --role-name ai-agent-sandbox --policy-name complete-lifecycle --policy-document file://lifecycle.json && aws iam list-role-policies --role-name ai-agent-sandbox --output text",
+    "see": "POLICYNAMES\tcomplete-lifecycle"
+   },
+   {
+    "do": "aws iam create-instance-profile --instance-profile-name ai-agent-sandbox --query InstanceProfile.Arn --output text && aws iam add-role-to-instance-profile --instance-profile-name ai-agent-sandbox --role-name ai-agent-sandbox",
+    "see": "arn:aws:iam::123456789012:instance-profile/ai-agent-sandbox"
+   },
+   {
+    "do": "aws sts assume-role --role-arn arn:aws:iam::123456789012:role/ai-agent-sandbox --role-session-name lab --query '[AssumedRoleUser.Arn, Credentials.Expiration]' --output text",
+    "see": "arn:aws:sts::123456789012:assumed-role/ai-agent-sandbox/lab\t2026-10-13T15:58:27.114810+00:00\n(moto does not check trust policies. Real STS would refuse you here: the trust policy lets in only ec2.amazonaws.com.)"
+   }
+  ],
+  "faded": "Make the CI role from section 5. Save its trust policy as oidc-trust.json, with 123456789012 in place of <AI_AGENTS_ACCOUNT_ID>. Create the role ai-agents-github-actions with it, the same way as step 3. Left to you: one get-role command that prints only the Condition block of the trust policy (hint: --query 'Role.AssumeRolePolicyDocument.Statement[0].Condition').",
+  "alone": "Build the read-only plan role from G7-30 in moto. Its trust policy lets in only arn:aws:iam::123456789012:role/GitHubActionsTerraformPlan (an AWS principal, not a service). Attach the managed policy ReadOnlyAccess. Add an inline policy that denies s3:GetObject, secretsmanager:GetSecretValue, ssm:GetParameter* and kms:Decrypt on every resource. List both kinds of policies. Then write one sentence: why does a read-only role need that deny?",
+  "done": "ai-agent-sandbox has one managed policy, one inline policy and an instance profile. You can name the line in the managed policy that rules out secrets in Parameter Store."
+ },
+ "quiz": [
+  {
+   "q": "A role's policy allows s3:* on the runs bucket. The account's SCP denies s3:DeleteObject. Can the role delete an object?",
+   "options": [
+    {
+     "text": "Yes: the role's own Allow is more specific than the SCP",
+     "correct": false,
+     "why": "Specific or not does not matter. An explicit Deny anywhere wins over every Allow."
+    },
+    {
+     "text": "No: an explicit Deny anywhere beats every Allow",
+     "correct": true,
+     "why": "That is the second rule of evaluation, and the reason SCPs work as walls."
+    },
+    {
+     "text": "Only if the trust policy also allows it",
+     "correct": false,
+     "why": "The trust policy says who may become the role, not what the role may do."
+    }
+   ]
+  },
+  {
+   "q": "Why does the sandbox instance role hold almost nothing?",
+   "options": [
+    {
+     "text": "Because we assume the agent can become root on its VM, so it can use anything the role can",
+     "correct": true,
+     "why": "The agent's user is in the docker group, which is root-equivalent. The role is what an escaped agent would get."
+    },
+    {
+     "text": "Because IAM charges for each permission a role holds",
+     "correct": false,
+     "why": "IAM has no per-permission price. The reason is blast radius."
+    },
+    {
+     "text": "Because the SSM agent refuses to run with larger roles",
+     "correct": false,
+     "why": "SSM works with any role that includes its managed policy."
+    }
+   ]
+  },
+  {
+   "q": "Which part of the CI role's trust policy stops a workflow in another RhinoHealth repo from assuming it?",
+   "options": [
+    {
+     "text": "Principal Federated token.actions.githubusercontent.com",
+     "correct": false,
+     "why": "Every GitHub repo uses that same provider, so it does not tell repos apart."
+    },
+    {
+     "text": "Action sts:AssumeRoleWithWebIdentity",
+     "correct": false,
+     "why": "That names how the role is assumed, not who may do it."
+    },
+    {
+     "text": "The sub condition repo:RhinoHealth/infrastructure:environment:ai-agents",
+     "correct": true,
+     "why": "sub carries the repo and environment from the OIDC token. Pinning it is the wall."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p2-3: what does a GitHub OIDC token prove about a job, and who checks the proof?",
+  "From p2-4: why does a GitHub App installation token have nothing static to paste?"
+ ],
+ "videos": [
+  {
+   "title": "Learn AWS IAM in less than 10 minutes",
+   "url": "https://www.youtube.com/watch?v=9Pk2J_5qnlk",
+   "channel": "AWS Developers",
+   "minutes": 9,
+   "why": "Official, recent AWS explainer of users, roles and policies."
+  },
+  {
+   "title": "AWS VPC & Subnets For Beginners",
+   "url": "https://www.youtube.com/watch?v=TUTqYEZZUdc",
+   "channel": "Sam Meech-Ward",
+   "minutes": 17,
+   "why": "Visual explanation of VPC, public/private subnets, NAT and EC2 placement."
+  }
+ ],
+ "words": [
+  {
+   "term": "AWS account",
+   "plain": "A separate box for resources, permissions and bills, with a 12-digit ID; ours for sandboxes is ai-agents."
+  },
+  {
+   "term": "region and AZ",
+   "plain": "A region is a place with its own copy of every service (us-east-1); an AZ is one data center inside it."
+  },
+  {
+   "term": "IAM role",
+   "plain": "An identity with no password that a VM, a CI job or a service assumes to get temporary credentials."
+  },
+  {
+   "term": "policy",
+   "plain": "A JSON list of Allow or Deny statements: actions, resources and conditions."
+  },
+  {
+   "term": "trust policy",
+   "plain": "The policy on a role that says who may assume it."
+  },
+  {
+   "term": "temporary credentials",
+   "plain": "A key, secret and session token from STS that expire on their own, usually after an hour."
+  },
+  {
+   "term": "SCP",
+   "plain": "A service control policy on the organization that caps what anyone in an account can do; it only takes away."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-02",
+   "why": "Creates the ai-agents account with its SCPs and a CI role whose trust pins one repo and one environment."
+  },
+  {
+   "key": "G3-11",
+   "why": "The sandbox instance role: SSM core plus CompleteLifecycleAction on the sandbox groups, and nothing else."
+  },
+  {
+   "key": "G7-30",
+   "why": "A read-only plan role per account: a trust policy, ReadOnlyAccess, and a Deny on data reads."
+  }
+ ],
+ "remember": "Every role answers two questions: who may become it (trust policy) and what it may do (permission policies); everything else is denied."
+}

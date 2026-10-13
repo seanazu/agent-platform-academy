@@ -1,0 +1,469 @@
+{
+ "id": "p6-3",
+ "title": "Grafana dashboards and alerts",
+ "minutes": 50,
+ "youNeed": [
+  "p6-2"
+ ],
+ "bridge": "A Grafana dashboard JSON is like a React page written as data. Panels are the components, and each target is the data hook (a query). Templating variables are props that come from the URL. Except: there is no code at all. A sidecar loads the JSON from a folder, and every panel is one query against a time-series store.",
+ "intro": "G1 ships four dashboards and a handful of alert rules, all as files in the infrastructure repo. This lesson reads one dashboard JSON panel by panel and explains the query languages inside the panels. It shows how an alert rule is written and routed to Slack.",
+ "picture": {
+  "caption": "Dashboards are JSON files in a folder of the infrastructure repo. A sidecar loads them into Grafana, where panels query VictoriaMetrics and VictoriaLogs. Alert rules are YAML evaluated by vmalert and sent to Slack.",
+  "nodes": [
+   {
+    "id": "json",
+    "label": "modules/grafana/dashboards/AI-Agents/*.json",
+    "kind": "file"
+   },
+   {
+    "id": "sidecar",
+    "label": "Grafana sidecar",
+    "kind": "service"
+   },
+   {
+    "id": "graf",
+    "label": "grafana.example.com, folder AI-Agents",
+    "kind": "service"
+   },
+   {
+    "id": "vm",
+    "label": "VictoriaMetrics / VictoriaLogs",
+    "kind": "service"
+   },
+   {
+    "id": "rules",
+    "label": "alerting/templates/alert_rules/ai-spend.yml",
+    "kind": "file"
+   },
+   {
+    "id": "slack",
+    "label": "#ai-agents-alerts",
+    "kind": "person"
+   }
+  ],
+  "steps": [
+   {
+    "from": "json",
+    "to": "sidecar",
+    "text": "a merged PR adds or changes a JSON file; the sidecar loads every file in the folder"
+   },
+   {
+    "from": "sidecar",
+    "to": "graf",
+    "text": "the folder name becomes the Grafana folder; uid keeps the URL stable"
+   },
+   {
+    "from": "graf",
+    "to": "vm",
+    "text": "each panel sends its expr with the time range and the variable values"
+   },
+   {
+    "from": "rules",
+    "to": "vm",
+    "text": "vmalert evaluates every rule's expr on its interval"
+   },
+   {
+    "from": "vm",
+    "to": "slack",
+    "text": "a rule true for its for: duration fires; labels route it to the channel"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "A dashboard is a JSON file in a folder",
+   "p": [
+    "Open infrastructure/modules/grafana/dashboards/. Each subfolder is a Grafana folder and each JSON file is one dashboard.",
+    "G1-09 adds AI-Agents/ai-agents-operations.json. The sidecar (a small helper container next to Grafana) loads every file there. So a dashboard change is a PR, reviewed like code, and a bad edit is a revert.",
+    "The top of the file names the dashboard and gives it a stable uid (the URL). It tags it and sets the default time range. Then templating declares variables and panels lists the charts."
+   ],
+   "because": "We keep dashboards as files in git because 'who changed this panel and why' must be answerable. A dashboard is also reviewed for the no-person rule like any code.",
+   "code": {
+    "lang": "json",
+    "file": "infrastructure/modules/grafana/dashboards/AI-Agents/ai-agents-operations.json (from G1-09, the head)",
+    "text": "{\n  \"title\": \"AI agents: operations\",\n  \"uid\": \"ai-agents-ops\",\n  \"tags\": [\"ai-agents\"],\n  \"time\": { \"from\": \"now-7d\", \"to\": \"now\" },\n  \"templating\": { \"list\": [ {\n    \"name\": \"agent\", \"type\": \"query\", \"multi\": true, \"includeAll\": true,\n    \"datasource\": { \"type\": \"victoriametrics-metrics-datasource\" },\n    \"query\": \"label_values(ai_agents_llm_cost_usd_total, agent)\" } ] },\n  \"panels\": [",
+    "notes": [
+     {
+      "line": 3,
+      "text": "uid is the dashboard's identity. Alerts and links point at /d/ai-agents-ops, so never change it after it ships."
+     },
+     {
+      "line": 5,
+      "text": "Default range: the last 7 days. The delivery dashboard uses now-12w because weekly numbers need weeks."
+     },
+     {
+      "line": 7,
+      "text": "A variable named agent: a dropdown, multi-select, with an All option. Panels use it as $agent."
+     },
+     {
+      "line": 8,
+      "text": "The datasource type for VictoriaMetrics on inf. On your laptop the type is prometheus; the queries are the same."
+     },
+     {
+      "line": 9,
+      "text": "label_values asks the store which agent values exist on that series, so the dropdown fills itself."
+     }
+    ]
+   }
+  },
+  {
+   "h": "A panel is one query drawn one way",
+   "p": [
+    "Each panel has a type: timeseries for lines, stat for one big number, table or barchart. It has a gridPos (x, y, width, height on a 24-column grid), and targets: the queries. The query language for metrics is PromQL, also used by VictoriaMetrics. Three building blocks cover most panels.",
+    "rate(x[5m]) is the per-second increase of a counter over the window. increase(x[1d]) is the total increase over the window. sum by (agent) (...) adds series up, keeping one line per agent. Label matchers go inside braces: {agent=~\"$agent\"} uses the variable as a regex, so All works."
+   ],
+   "because": "We draw cost as increase per day, not as the raw counter, because the raw counter only climbs. The question is how much today, not how much ever.",
+   "code": {
+    "lang": "json",
+    "file": "ai-agents-operations.json (two panels from G1-09)",
+    "text": "    { \"title\": \"Cost per agent, USD per day\", \"type\": \"timeseries\", \"gridPos\": { \"x\": 0, \"y\": 0, \"w\": 12, \"h\": 8 },\n      \"targets\": [ { \"expr\": \"sum by (agent) (increase(ai_agents_llm_cost_usd_total{agent=~\\\"$agent\\\"}[1d]))\" } ] },\n    { \"title\": \"Cache-read share (healthy at 80% or more)\", \"type\": \"stat\", \"gridPos\": { \"x\": 0, \"y\": 8, \"w\": 6, \"h\": 6 },\n      \"fieldConfig\": { \"defaults\": { \"unit\": \"percentunit\", \"thresholds\": { \"mode\": \"absolute\", \"steps\": [\n        { \"color\": \"red\", \"value\": null }, { \"color\": \"yellow\", \"value\": 0.7 }, { \"color\": \"green\", \"value\": 0.8 } ] } } },\n      \"targets\": [ { \"expr\": \"sum(rate(ai_agents_llm_tokens_total{type=\\\"cache_read\\\",agent=~\\\"$agent\\\"}[6h])) / sum(rate(ai_agents_llm_tokens_total{type=~\\\"input|cache_read|cache_write\\\",agent=~\\\"$agent\\\"}[6h]))\" } ] },",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Half the width (12 of 24), 8 rows tall, top left. The next panel at x 12 sits beside it."
+     },
+     {
+      "line": 2,
+      "text": "increase over one day, summed per agent. The $agent variable is substituted before the query is sent."
+     },
+     {
+      "line": 3,
+      "text": "stat shows one number with a colour. Good for a share or a count you want to see at a glance."
+     },
+     {
+      "line": 4,
+      "text": "percentunit means the value is 0 to 1 and shown as a percent. Thresholds colour it: red below 0.7, yellow to 0.8, green above."
+     },
+     {
+      "line": 6,
+      "text": "A ratio of two rates over 6 hours: cache-read tokens over all input-side tokens. Under 70% something breaks the prompt cache."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Panels over events: LogsQL",
+   "p": [
+    "Errors and rejected tool calls are events in VictoriaLogs, not metrics. A panel can name a different datasource and use LogsQL: a filter, a pipe, and a stats step. event.name:api_error agent:~\"$agent\" | stats by (agent, status_code) count() gives one count per agent and status over the time range.",
+    "The same shape works for anything the harness logs as an event: tool decisions, hook rejections, step changes. That is why events carry the same tags as metrics (agent, run, step)."
+   ],
+   "because": "We count errors from events, not from a counter. The status code and tool name are the detail that makes the number useful, and detail belongs in events.",
+   "code": {
+    "lang": "json",
+    "file": "ai-agents-operations.json (the two logs panels from G1-09)",
+    "text": "    { \"title\": \"API errors\", \"type\": \"timeseries\", \"gridPos\": { \"x\": 6, \"y\": 8, \"w\": 9, \"h\": 6 },\n      \"datasource\": { \"type\": \"victoriametrics-logs-datasource\" },\n      \"targets\": [ { \"expr\": \"event.name:api_error agent:~\\\"$agent\\\" | stats by (agent, status_code) count()\" } ] },\n    { \"title\": \"Rejected tool calls\", \"type\": \"timeseries\", \"gridPos\": { \"x\": 15, \"y\": 8, \"w\": 9, \"h\": 6 },\n      \"datasource\": { \"type\": \"victoriametrics-logs-datasource\" },\n      \"targets\": [ { \"expr\": \"event.name:tool_decision decision:reject agent:~\\\"$agent\\\" | stats by (agent, tool_name) count()\" } ] }\n  ]\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "A per-panel datasource overrides the dashboard default. Metrics panels and logs panels live side by side."
+     },
+     {
+      "line": 3,
+      "text": "field:value filters, :~ for a regex, then | stats by (...) count(). Check the exact field names in VictoriaLogs first."
+     },
+     {
+      "line": 6,
+      "text": "A rejected tool call is a hook saying no (p8-4). Many rejections of one tool means the guidance, not the wall, needs work."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "Before writing any panel, open vmui and VictoriaLogs and run the query there. Series and field names differ from what the client docs say, because the collector renames them (p6-1)."
+   }
+  },
+  {
+   "h": "Alert rules: a query that is true for too long",
+   "p": [
+    "An alert rule is a query plus a duration. vmalert runs the expr every interval; when it returns a value and stays true for the for: duration, the alert fires. Labels on the rule decide where it goes; annotations are the human text in the message.",
+    "G1-10's burn-rate rule compares month-to-date spend with a straight line to the monthly budget. It does this per scope (people, and each agent), and warns when spend is more than 25% ahead. It is an alert, never a stop; nothing pauses an agent."
+   ],
+   "because": "We alert on the forecast, not on the total. A bad month should be caught while there is still time to act.",
+   "code": {
+    "lang": "yaml",
+    "file": "infrastructure/multi_tenant/accounts/infrastructure/victoria-metrics/alerting/templates/alert_rules/ai-spend.yml (from G1-10, first rule)",
+    "text": "- name: ai-spend\n  interval: 1h\n  rules:\n    - alert: AISpendAheadOfBudget\n      # Month-to-date spend more than 25% ahead of a straight line to the monthly budget.\n      expr: |-\n        sum by (scope) (ai_spend_mtd_usd)\n          > 1.25 * sum by (scope) (ai_spend_budget_usd) * day_of_month() / days_in_month()\n      for: 6h\n      labels:\n        severity: warning\n        cloud.account.name: inf\n        service.name: ai-agents\n        service.component: spend\n      annotations:\n        summary: \"[AI spend «{{ $labels.scope }}»] month-to-date is more than 25% ahead of budget\"\n        description: \"An alert, never a stop. The AI spend dashboard shows which teams or agents drive it.\"\n        external_link: \"https://grafana.example.com/d/ai-spend\"",
+    "notes": [
+     {
+      "line": 1,
+      "text": "A rule group with a name and an evaluation interval. The chart in infrastructure collects these files; look there for how they are joined."
+     },
+     {
+      "line": 7,
+      "text": "Both series are written by the nightly job per scope; budget comes from settings/spend-limits.yaml."
+     },
+     {
+      "line": 8,
+      "text": "day_of_month() / days_in_month() is the straight line: on the 10th of a 30-day month, a third of the budget."
+     },
+     {
+      "line": 9,
+      "text": "True for 6 hours before firing, so one odd data point does not page anyone."
+     },
+     {
+      "line": 10,
+      "text": "Routing is by labels. The existing alert rules in that folder use these names; copy them so the route to Slack matches."
+     },
+     {
+      "line": 16,
+      "text": "{{ $labels.scope }} is filled from the firing series, so the Slack message says which scope."
+     }
+    ]
+   },
+   "see": "In Slack, #ai-agents-alerts:\n[FIRING] [AI spend «nova»] month-to-date is more than 25% ahead of budget\nAn alert, never a stop. The AI spend dashboard shows which teams or agents drive it.\nhttps://grafana.example.com/d/ai-spend"
+  },
+  {
+   "h": "Routing to Slack and the second rule",
+   "p": [
+    "The rule does not know about Slack. vmalert sends firing alerts to Alertmanager.",
+    "Alertmanager's routes match labels (service.name, severity) to a receiver. Here that is a Slack webhook for #ai-agents-alerts that mentions Sean and Nir. Adding a new alert means copying the label set the routes expect; adding a new channel means a route change with DevOps.",
+    "The second rule in the same file, AICacheReadShareLow, fires per agent when the cache-read share stays under 70% for 2 hours. It is the stat panel from the operations dashboard turned into a rule: the same expression, a threshold and a for:."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "No alert stops, pauses or throttles an agent. Spend ceilings act between turns in the harness, in shadow mode first (G0-16); Grafana only tells people."
+   }
+  },
+  {
+   "h": "Reading the G3 alert queries",
+   "p": [
+    "Walkthrough g3-15 writes alerts in both languages, so read one of each here. A group with type: vlogs runs LogsQL against VictoriaLogs. A group without it runs PromQL against VictoriaMetrics.",
+    "LogsQL first. field:=\"value\" is an exact match; field:value (from the panels above) matches a word inside the field. Filters on separate lines must all be true, like AND. Each pipe step works on what the step before it returns.",
+    "PromQL next. increase(x[15m]) is how much a counter grew in the last 15 minutes. It returns one number per series, for example 1 if one VM died. > 0 keeps only the series that grew, and each series left is one firing alert.",
+    "up is a series the scraper writes for every target: 1 if the last scrape worked, 0 if it failed. With for: 5m the alert fires only after five minutes of 0."
+   ],
+   "because": "We read these two queries now because the G3 alert tickets are copies of them with other names.",
+   "code": {
+    "lang": "yaml",
+    "file": "a trimmed copy of the G3 alert rules (g3-15)",
+    "text": "- name: lab-logs\n  type: vlogs\n  interval: 5m\n  rules:\n    - alert: RepeatedBlockedEgress\n      expr: |-\n        log.processing.type:=\"squid_access\"\n        squid.result_code:=\"DENIED\"\n        | stats by (source.address) count() as denied\n        | filter denied:>5\n- name: lab-metrics\n  interval: 5m\n  rules:\n    - alert: SandboxDied\n      expr: sum by (agent) (increase(ai_agents_vm_dead_total[15m])) > 0\n    - alert: ServiceDown\n      expr: up{namespace=\"ai-agents\", job=~\"broker|llm-gateway\"} == 0\n      for: 5m",
+    "notes": [
+     {
+      "line": 2,
+      "text": "type: vlogs makes every expr in this group LogsQL. vmalert runs it over the last interval: here, the last 5 minutes of logs."
+     },
+     {
+      "line": 7,
+      "text": ":= is an exact match on the whole field value. Only proxy access logs pass."
+     },
+     {
+      "line": 8,
+      "text": "A second filter line: the proxy also said DENIED. Both must be true."
+     },
+     {
+      "line": 9,
+      "text": "One row per source address (one sandbox VM), with the count of matching lines named denied."
+     },
+     {
+      "line": 10,
+      "text": "filter keeps rows where denied is over 5. Each row left fires one alert, labelled with that address."
+     },
+     {
+      "line": 15,
+      "text": "increase over 15 minutes, added up per agent. More than 0 means at least one VM died in that window."
+     },
+     {
+      "line": 17,
+      "text": "up == 0: the broker or gateway did not answer its last scrape. =~ is a regex match on the job label."
+     },
+     {
+      "line": 18,
+      "text": "for: 5m waits until the query has been true for 5 minutes, so one missed scrape pages nobody."
+     }
+    ]
+   },
+   "see": "If you run the PromQL expr in vmui on a quiet day, the result is empty: no series grew, so nothing fires. The LogsQL query in VictoriaLogs shows rows like {source.address=10.60.1.17, denied=12} only when a sandbox kept hitting blocked sites."
+  },
+  {
+   "h": "The rules every AI-Agents dashboard keeps",
+   "p": [
+    "No panel has a person dimension: variables are agent, team, suite, split. People see their own spend in /usage, nowhere else.",
+    "Throughput never appears without change failure next to it (G1-12 puts merged PRs and change failure in one panel). The baseline (the 12 weeks before October) is drawn as a reference line. Counts sit next to medians because weekly numbers for 25 engineers are noisy.",
+    "Walk Nir through the delivery dashboard before it is shared. A dashboard that can be misread is worse than none."
+   ]
+  }
+ ],
+ "lab": {
+  "title": "Grafana and Prometheus in Docker, one dashboard and one alert",
+  "youNeed": [
+   "Docker Desktop running",
+   "the metrics-lab server from p6-2 running on port 9464"
+  ],
+  "worked": [
+   {
+    "do": "mkdir grafana-lab && cd grafana-lab && mkdir -p provisioning/datasources provisioning/dashboards dashboards",
+    "see": "(no output)"
+   },
+   {
+    "do": "Create prometheus.yml: global scrape_interval 15s; scrape_configs with job_name lab and static_configs targets ['host.docker.internal:9464']; rule_files ['/etc/prometheus/rules.yml'].",
+    "see": "(file saved)"
+   },
+   {
+    "do": "Create rules.yml: groups with one group named lab, interval 15s, one rule alert LabNoTraffic, expr sum(rate(lab_requests_total[1m])) == 0, for 1m, labels severity: warning, annotations summary: 'no lab requests for a minute'.",
+    "see": "(file saved)"
+   },
+   {
+    "do": "Create provisioning/datasources/ds.yaml: apiVersion 1; datasources: one named Prometheus, type prometheus, url http://prometheus:9090, isDefault true. Create provisioning/dashboards/dash.yaml: apiVersion 1; providers: one named Lab, folder Lab, type file, options path /var/lib/grafana/dashboards.",
+    "see": "(two files saved)"
+   },
+   {
+    "do": "Create dashboards/lab.json: title 'Lab', uid 'lab', time now-15m to now, schemaVersion 39, panels with one timeseries at gridPos x 0 y 0 w 24 h 8 titled 'Requests per second by agent' and one target with expr sum by (agent) (rate(lab_requests_total[1m])) and legendFormat '{{agent}}'.",
+    "see": "(file saved)"
+   },
+   {
+    "do": "Create compose.yaml with two services: prometheus (image prom/prometheus:latest, ports 9090:9090, volumes ./prometheus.yml:/etc/prometheus/prometheus.yml and ./rules.yml:/etc/prometheus/rules.yml) and grafana (image grafana/grafana:latest, ports 3000:3000, environment GF_SECURITY_ADMIN_PASSWORD=admin, volumes ./provisioning:/etc/grafana/provisioning and ./dashboards:/var/lib/grafana/dashboards). Then docker compose up -d",
+    "see": "✔ Container grafana-lab-prometheus-1  Started\n✔ Container grafana-lab-grafana-1     Started"
+   },
+   {
+    "do": "docker compose run --rm --entrypoint promtool prometheus check rules /etc/prometheus/rules.yml",
+    "see": "Checking /etc/prometheus/rules.yml\n  SUCCESS: 1 rules found"
+   },
+   {
+    "do": "for i in $(seq 1 30); do curl -s 'localhost:9464/work?agent=nova' > /dev/null; curl -s 'localhost:9464/work?agent=cifix' > /dev/null; sleep 1; done",
+    "see": "(30 seconds of traffic)"
+   },
+   {
+    "do": "Open http://localhost:3000 (admin / admin, skip the password change), folder Lab, dashboard Lab.",
+    "see": "Two lines, nova and cifix, rising to about 1 request per second, then falling to zero"
+   },
+   {
+    "do": "Wait about a minute with no traffic, then open http://localhost:9090/alerts",
+    "see": "LabNoTraffic (1 active)  FIRING"
+   }
+  ],
+  "faded": "Add a stat panel to lab.json: title 'Share of nova', unit percentunit, thresholds red below 0.5 and green at 0.5. Its expr is sum(rate(lab_requests_total{agent=\"nova\"}[5m])) / sum(rate(lab_requests_total[5m])). The sidecar in Grafana re-reads the file within about ten seconds; reload the page. The fieldConfig block is in the lesson; the gridPos that places it under the first panel is yours.",
+  "alone": "Add a templating variable agent (type query, query label_values(lab_requests_total, agent), multi, includeAll) and change the first panel's expr to use {agent=~\"$agent\"}. Then write a second alert rule LabErrors that fires when sum(rate(lab_errors_total[5m])) > 0 for 30s. Check it with promtool, restart Prometheus, and make it fire with the fail=1 endpoint from p6-2.",
+  "done": "Grafana shows a provisioned dashboard from your JSON with a working $agent dropdown. promtool accepted both rules, and both alerts fired in the Prometheus alerts page when you made them true."
+ },
+ "quiz": [
+  {
+   "q": "How does a new dashboard reach grafana.example.com?",
+   "options": [
+    {
+     "text": "You build it in the Grafana UI and click Save.",
+     "correct": false,
+     "why": "UI edits are lost on the next sync and leave no review trail; the files in git are the source."
+    },
+    {
+     "text": "A PR adds a JSON file under modules/grafana/dashboards/AI-Agents/, and the sidecar loads it after merge.",
+     "correct": true,
+     "why": "The folder name becomes the Grafana folder, and the uid in the file keeps the URL stable."
+    },
+    {
+     "text": "The nightly metrics job creates it through the Grafana API.",
+     "correct": false,
+     "why": "The job writes series, not dashboards."
+    }
+   ]
+  },
+  {
+   "q": "AISpendAheadOfBudget fires for scope nova. What happens to Nova's runs?",
+   "options": [
+    {
+     "text": "The gateway stops accepting Nova's requests until the month ends.",
+     "correct": false,
+     "why": "An alert never stops anything; spend ceilings act between turns in the harness, in shadow mode first."
+    },
+    {
+     "text": "Nothing changes in the runs; Sean and Nir get a Slack message with a link to the spend dashboard.",
+     "correct": true,
+     "why": "The annotation says it in the message itself: an alert, never a stop."
+    },
+    {
+     "text": "Nova's warm pool is scaled to zero.",
+     "correct": false,
+     "why": "No alert touches infrastructure; people decide what to do with the information."
+    }
+   ]
+  },
+  {
+   "q": "Why does the delivery dashboard draw merged PRs and change failure in the same panel?",
+   "options": [
+    {
+     "text": "To save space on the grid.",
+     "correct": false,
+     "why": "Layout is not the reason; the two numbers belong together for a reason of meaning."
+    },
+    {
+     "text": "Because throughput alone rewards the wrong thing; more merges with more failures is not better.",
+     "correct": true,
+     "why": "G1-12 states it: throughput never appears without change failure beside it."
+    },
+    {
+     "text": "Because PromQL cannot plot them separately.",
+     "correct": false,
+     "why": "Any series can be its own panel; the choice is deliberate."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p6-2: what does increase(x[1d]) give you for a counter, and why not plot the raw counter?",
+  "From p6-1: which store holds events, and for how long?"
+ ],
+ "videos": [
+  {
+   "title": "Server Monitoring // Prometheus and Grafana Tutorial",
+   "url": "https://www.youtube.com/watch?v=9TJx7QTrTyo",
+   "channel": "Christian Lempa",
+   "minutes": 25,
+   "why": "Very popular hands-on setup of Prometheus scraping and a Grafana dashboard."
+  },
+  {
+   "title": "Creating alerts with Grafana | Grafana for Beginners Ep 11",
+   "url": "https://www.youtube.com/watch?v=6W8Nu4b_PXM",
+   "channel": "Grafana",
+   "minutes": 17,
+   "why": "Official Grafana beginner episode on alert rules and notifications."
+  }
+ ],
+ "words": [
+  {
+   "term": "panel",
+   "plain": "One chart on a dashboard: a type (timeseries, stat, table), a position, and one or more queries."
+  },
+  {
+   "term": "target",
+   "plain": "One query inside a panel, with its expr and legend format."
+  },
+  {
+   "term": "templating variable",
+   "plain": "A dropdown such as $agent, filled by label_values, substituted into every query."
+  },
+  {
+   "term": "PromQL",
+   "plain": "The metrics query language: rate, increase, sum by, label matchers in braces."
+  },
+  {
+   "term": "LogsQL",
+   "plain": "VictoriaLogs' query language: field:value filters, a pipe, and stats by (...) count()."
+  },
+  {
+   "term": "alert rule",
+   "plain": "An expr plus a for: duration; true for that long means it fires, with labels for routing."
+  },
+  {
+   "term": "sidecar",
+   "plain": "The helper container next to Grafana that loads every dashboard JSON from the folder."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G1-09",
+   "why": "The operations dashboard is the JSON you read panel by panel."
+  },
+  {
+   "key": "G1-10",
+   "why": "The spend view and its two alert rules are this lesson's alert half."
+  },
+  {
+   "key": "G1-11",
+   "why": "The eval scoreboard repeats a panel per suite with a pass-rate band; the same panel and variable mechanics."
+  },
+  {
+   "key": "G1-12",
+   "why": "The delivery dashboard applies the team-only, baseline-line, throughput-with-failure rules."
+  }
+ ],
+ "remember": "A dashboard is JSON in git, and a panel is one query drawn one way. An alert is a query true for too long: it tells people and stops nothing."
+}

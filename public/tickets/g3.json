@@ -1,0 +1,1340 @@
+[
+ {
+  "key": "G3-01",
+  "title": "[Platform] Create RhinoHealth/ai-agents repo: npm workspaces, CI, ruleset",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   2,
+   2
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G0: the rhino-ai-agents GitHub App (no bypass) and the fcp main ruleset as the pattern. G0's LLM gateway code also lives here. DevOps: ECR repos and runner-group access.",
+  "what": "A new private repo, RhinoHealth/ai-agents, set up as one npm workspace in TypeScript on Node 24 (like Byte) for the orchestrator, broker, harness, Slack app, gateway and a shared package, with evals/ as a small Python project beside it. It gets CI (lint, typecheck, tests, image builds, a harness release) and a main ruleset.",
+  "why": "Every G3 service, and G0's gateway, lives here. One workspace gives one lockfile, one CI and the same walls for all agent code.",
+  "how": [
+   "Create the private repo RhinoHealth/ai-agents: TypeScript on Node 24, npm workspaces, ESM (\"type\": \"module\"), like Byte, so Byte's broker becomes the base of ours (G3-07). Workspaces shared/, gateway/, broker/, orchestrator/, harness/ and slack-app/ (checks/, metrics/ and drills/ come later), each `@rhinohealth/ai-agents-<pkg>` with src/*.ts in kebab-case and test/*.test.ts. tsconfig.base.json: strict, target ES2023, module and moduleResolution NodeNext, verbatimModuleSyntax. evals/ is its own small uv project (Python 3.13), because Harbor and its adapters are Python.",
+   "Follow Byte's style, not fcp's black/isort: ESLint with typescript-eslint (eslint.config.js), tsc, tests with node:test and node:assert/strict run through tsx, exact-pinned dependencies and few runtime ones. Only evals/ keeps fcp's Python style (black and isort at 120 columns, flake8 with select=F, through pre-commit).",
+   ".github/workflows/ci.yml on pull_request and push to main, runs-on fcp-runner-set, actions/setup-node (24, npm cache): job `lint` (`npm ci`, `npm run lint`, `npm run typecheck`), job `test` (`npm ci`, `npm test`, `npm run build`), and job `evals` (astral-sh/setup-uv, `uv sync --frozen --project evals`, pre-commit, `uv run --project evals pytest`). Ask DevOps to let the repo use the runner group.",
+   "images.yml on main: build the orchestrator, broker, gateway, slack-app and checks images (FROM node:24-bookworm-slim pinned by digest, `npm ci --ignore-scripts`, non-root user 10001, like Byte's Dockerfile) and push them to inf ECR. Add ai-agents-orchestrator, ai-agents-broker, ai-agents-slack-app and ai-agents-checks (the required checks, G0-09) to multi_tenant/accounts/infrastructure/artifacts/artifacts.hcl with tags_immutability_enabled = true (G0-15 adds ai-agents-llm-gateway the same way). release-harness.yml bundles harness/ with esbuild into one file, nova-worker.mjs (the shared package and every dependency inside, `#!/usr/bin/env node` on top). The harness imports the Agent SDK from `@anthropic-ai/claude-agent-sdk/core`, the SDK's documented entry for bundled apps, and runs the image's pinned claude through pathToClaudeCodeExecutable, so the SDK's own binary isn't needed. The release attaches ai-agents-harness-<version>.tgz (nova-worker.mjs, workflows/, prompts/, settings/protected-paths.yaml); the Packer image unpacks it (G3-14) with nothing to install.",
+   "Ruleset on main: PR required, exactly 1 approval, dismiss stale approvals, required checks lint, test and evals, no force push or delete, no bypass for the rhino-ai-agents app. No CODEOWNERS file.",
+   "Add a short AGENTS.md (what lives where, how to run tests) and a CLAUDE.md that only says `@AGENTS.md`, like frontend/."
+  ],
+  "code": {
+   "file": "ai-agents/package.json",
+   "lang": "json",
+   "text": "{\n  \"name\": \"@rhinohealth/ai-agents\",\n  \"version\": \"0.1.0\",\n  \"private\": true,\n  \"description\": \"AI agent platform: LLM gateway, broker, Temporal orchestrator, nova-worker harness, Slack app.\",\n  \"type\": \"module\",\n  \"workspaces\": [\"shared\", \"gateway\", \"broker\", \"orchestrator\", \"harness\", \"slack-app\"],\n  \"scripts\": {\n    \"build\": \"npm run build --workspaces --if-present\",\n    \"lint\": \"eslint .\",\n    \"typecheck\": \"npm run typecheck --workspaces --if-present\",\n    \"test\": \"node --import tsx --test \\\"*/test/**/*.test.ts\\\"\",\n    \"check\": \"npm run lint && npm run typecheck && npm test && npm run build\"\n  },\n  \"engines\": {\n    \"node\": \">=24\"\n  },\n  \"devDependencies\": {\n    \"@types/node\": \"24.12.2\",\n    \"eslint\": \"10.8.0\",\n    \"tsx\": \"4.20.3\",\n    \"typescript\": \"5.9.3\",\n    \"typescript-eslint\": \"8.65.0\"\n  }\n}"
+  }
+ },
+ {
+  "key": "G3-02",
+  "title": "[DevOps] Bootstrap the ai-agents AWS account and its Terragrunt tree",
+  "team": [
+   "devops"
+  ],
+  "days": 1,
+  "w": [
+   2,
+   2
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "Tal (VantaOwner) for the new account; Ronen for the SCPs.",
+  "what": "Create the ai-agents AWS account in Control Tower, add by hand the two roles that Terraform and CI need, and add terraform/accounts/ai-agents/ to the new Terragrunt tree, copied from the solutions account.",
+  "why": "Sandboxes read untrusted input, so they get an account of their own with no path to prod, QA or dev. Everything else in G3 is deployed into it.",
+  "how": [
+   "Create the account `ai-agents` in Control Tower (outside the repo), in its own OU. Attach SCPs: us-east-1 only, deny leaving the org, and deny VPC peering, Transit Gateway attachments and NAT gateways to every role except TerraformDeploymentRole. This turns 'no peering' into an infra wall.",
+   "Bootstrap once, by hand: TerraformDeploymentRole, with the same trust policy as the solutions account's role (367879749310), so Terragrunt can assume it. New accounts arrive without it.",
+   "Add terraform/accounts/ai-agents/account.hcl, aws/cloud.hcl, aws/us-east-1/region.hcl and aws/global/region.hcl, copied from terraform/accounts/solutions/ (drop the GCP parts and cloud_environments).",
+   "Add aws/global/iam/github-actions/ from solutions' main.tf, but trust only `repo:RhinoHealth/infrastructure:environment:ai-agents` (solutions trusts every repo). Its first user is the nightly image smoke test (G3-16).",
+   "Add a GitHub environment `ai-agents` in the infrastructure repo with AWS_ROLE_ARN and AWS_REGION, like the other accounts.",
+   "Run `terragrunt plan` locally over VPN and paste it into the PR; a person applies. Add the new account ID next to the others in the README."
+  ],
+  "code": {
+   "file": "terraform/accounts/ai-agents/account.hcl",
+   "lang": "hcl",
+   "text": "# Set common variables for the ai-agents account (sandboxes for AI coding agents). Pulled in by\n# terraform/root.hcl and passed to child modules as inputs. Copied from solutions/account.hcl.\nlocals {\n  account_name = \"ai-agents\"\n  project      = \"rhinofcp\"\n\n  # Created in Control Tower; TerraformDeploymentRole was bootstrapped by hand (see README).\n  assume_role_arn = \"arn:aws:iam::<AI_AGENTS_ACCOUNT_ID>:role/TerraformDeploymentRole\"\n\n  # Prefix for sandbox resources. Not \"agents\": in this repo that word means Rhino Client VMs.\n  name_prefix = \"ai-agents\"\n\n  tags = {\n    account_name          = \"ai-agents\"\n    VantaNonProd          = \"true\"\n    VantaContainsUserData = \"false\" # fake seed data only, never PHI\n    VantaOwner            = \"tal@example.com\"\n    created_by            = \"terraform\"\n    project               = \"rhinofcp\"\n  }\n}"
+  }
+ },
+ {
+  "key": "G3-03",
+  "title": "[DevOps] Add modules/aws-vpc-private: sandbox subnets with no route out",
+  "team": [
+   "devops"
+  ],
+  "days": 1,
+  "w": [
+   2,
+   3
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "",
+  "what": "A private-only variant of modules/aws-vpc: private subnets in 3 AZs, no NAT, no internet gateway, flow logs always on, an S3 gateway endpoint that only reaches our buckets, and the interface endpoints a sandbox needs.",
+  "why": "modules/aws-vpc always adds public subnets, a single NAT and public IPs on launch. A sandbox must have no way out except the egress proxy and our own services.",
+  "how": [
+   "Copy modules/aws-vpc to modules/aws-vpc-private. Keep terraform-aws-modules/vpc 6.5.1; set public_subnets = [], create_igw = false, enable_nat_gateway = false, map_public_ip_on_launch = false.",
+   "Private subnets: three /18s cut from vpc_cidr (room for many VMs; the fourth /18 is left for the proxy's own subnets in G3-09). Flow logs always on, to the module's S3 bucket, with force_destroy = false and a 365-day expiry.",
+   "S3 gateway endpoint with a policy that allows only var.s3_allowed_buckets. The current module allows `*`, which would let a presigned URL to anyone's bucket work from inside.",
+   "Interface endpoints through terraform-aws-modules/vpc/aws//modules/vpc-endpoints for var.interface_endpoints, with private DNS and a security group that allows 443 from the VPC only.",
+   "Outputs: vpc, private_subnets, endpoints_sg_id, flow_log_bucket. Run `tofu fmt -check` and `terragrunt hcl format --check` (what terrugrunt-lint.yml runs)."
+  ],
+  "code": {
+   "file": "modules/aws-vpc-private/main.tf",
+   "lang": "hcl",
+   "text": "# Private-only VPC for AI agent sandboxes: no IGW, no NAT, no public subnets.\n# The only ways out are the egress proxy (G3-09) and PrivateLink to inf (G3-17).\nmodule \"vpc\" {\n  source  = \"terraform-aws-modules/vpc/aws\"\n  version = \"6.5.1\"\n\n  name            = local.vpc_name\n  cidr            = var.vpc_cidr\n  azs             = slice(data.aws_availability_zones.available.names, 0, 3)\n  private_subnets = [for n in range(3) : cidrsubnet(var.vpc_cidr, 2, n)] # three /18s\n  public_subnets  = []\n\n  create_igw                = false\n  enable_nat_gateway        = false\n  map_public_ip_on_launch   = false\n  enable_dns_hostnames      = true\n  enable_flow_log           = true\n  flow_log_destination_type = \"s3\"\n  flow_log_destination_arn  = module.s3_bucket.s3_bucket_arn\n  tags                      = var.tags\n}\n\nresource \"aws_vpc_endpoint\" \"s3\" {\n  vpc_id            = module.vpc.vpc_id\n  service_name      = \"com.amazonaws.${var.aws_region}.s3\"\n  vpc_endpoint_type = \"Gateway\"\n  route_table_ids   = module.vpc.private_route_table_ids\n\n  # Only our buckets: a presigned URL to someone else's bucket must not work from here.\n  policy = jsonencode({\n    Version   = \"2012-10-17\"\n    Statement = [{ Effect = \"Allow\", Principal = \"*\", Action = [\"s3:GetObject\", \"s3:PutObject\"],\n    Resource = [for b in var.s3_allowed_buckets : \"arn:aws:s3:::${b}/*\"] }]\n  })\n}"
+  }
+ },
+ {
+  "key": "G3-04",
+  "title": "[DevOps] Build the ai-agents VPC: endpoints, DNS firewall, runs bucket",
+  "team": [
+   "devops"
+  ],
+  "days": 1,
+  "w": [
+   3,
+   3
+  ],
+  "flag": null,
+  "deps": [
+   "G3-02",
+   "G3-03"
+  ],
+  "needs": "",
+  "what": "The Terragrunt units that build the sandbox network in the ai-agents account: the private VPC, a Route 53 DNS firewall, a private DNS zone for our service names, and the encrypted S3 bucket for run transcripts and artifacts.",
+  "why": "This is the box every sandbox runs in. The DNS firewall closes the last quiet way out (DNS lookups that carry data), and the bucket is where runs save their work outside the VM.",
+  "how": [
+   "terraform/accounts/ai-agents/aws/us-east-1/core-services/vpc/terragrunt.hcl with modules/aws-vpc-private and vpc_cidr 10.60.0.0/16 (not in the used list: 10.10, 10.15, 10.20, 10.30, 10.50, 10.130.x, 10.101.160; confirm with DevOps). Never peered.",
+   "core-services/runs-bucket/: S3 bucket rhino-ai-agents-runs with its own KMS key, public access blocked, versioning on, and a 30-day expiry (transcripts are kept 30 days).",
+   "core-services/dns-firewall/: aws_route53_resolver_firewall_domain_list 'allowed' (the proxy allow-list, `*.amazonaws.com`, `*.ai-agents.example.com`), an ALLOW rule for it, a BLOCK rule (NXDOMAIN) for `*`, and the association with the VPC. Log queries to CloudWatch.",
+   "core-services/private-zone/: a Route 53 private zone ai-agents.example.com attached to the VPC. G3-09 adds proxy., G3-17 adds broker., gateway. and otel.",
+   "Plan locally over VPN, paste it into the PR, a person applies."
+  ],
+  "code": {
+   "file": "terraform/accounts/ai-agents/aws/us-east-1/core-services/vpc/terragrunt.hcl",
+   "lang": "hcl",
+   "text": "include \"root\" {\n  path   = find_in_parent_folders(\"root.hcl\")\n  expose = true\n}\n\nterraform {\n  source = \"${get_parent_terragrunt_dir(\"root\")}/..//modules/aws-vpc-private/\"\n}\n\nlocals {\n  account = read_terragrunt_config(find_in_parent_folders(\"account.hcl\"))\n}\n\n# Sandbox VPC. NOT peered with inf, dev, qa or prod (an SCP denies peering). The only ways out:\n# the egress proxy (core-services/egress-proxy) and PrivateLink to the agent services on inf.\ninputs = {\n  vpc_cidr = \"10.60.0.0/16\" # confirm it is free with DevOps before apply\n\n  # Presigned uploads go to the runs bucket; ECR keeps image layers in its own S3 bucket.\n  s3_allowed_buckets = [\"rhino-ai-agents-runs\", \"prod-${include.root.locals.aws_region}-starport-layer-bucket\"]\n\n  interface_endpoints = [\"ssm\", \"ssmmessages\", \"ec2messages\", \"ecr.api\", \"ecr.dkr\", \"logs\", \"autoscaling\"]\n\n  tags = local.account.locals.tags\n}"
+  }
+ },
+ {
+  "key": "G3-05",
+  "title": "[DevOps] Add a Nexus npm proxy and ECR pull-through cache for sandboxes",
+  "team": [
+   "devops"
+  ],
+  "days": 0.5,
+  "w": [
+   3,
+   3
+  ],
+  "flag": null,
+  "deps": [
+   "G3-02"
+  ],
+  "needs": "Nave: whether FCP Lab can take a registry prefix for third-party images.",
+  "what": "An npm proxy repository in Nexus, ECR pull-through cache rules in the ai-agents account for Docker Hub and public ECR, and pull access to our rhino-* images in inf ECR.",
+  "why": "Sandboxes reinstall packages when a lockfile changes, and FCP Lab pulls images. With no internet, those must come from mirrors we run.",
+  "how": [
+   "In modules/nexus-oss/locals.tf add `npm = { \"npmjs\" = \"https://registry.npmjs.org\" }` to repositories, and a nexus_repository_npm_proxy next to the pypi proxy in repositories.tf. The S3 blob store comes from the existing for_each.",
+   "Read access from sandboxes: decide in G3-12 between anonymous read on the npm and pypi proxies only, or a read-only Nexus user limited to those two repos. Either way it can read only public packages.",
+   "terraform/accounts/ai-agents/aws/us-east-1/core-services/ecr-pull-through/: aws_ecr_pull_through_cache_rule for docker-hub (credentials in Secrets Manager `ecr-pullthroughcache/docker-hub`, the same Docker Hub account as `docker-hub-secrets`) and for ecr-public.",
+   "Add `arn:aws:iam::<AI_AGENTS_ACCOUNT_ID>:root` to allowed_principals in multi_tenant/accounts/infrastructure/artifacts/aws-ecr/terragrunt.hcl.",
+   "Ask Nave whether FCP Lab can take a registry prefix for postgres, redis, minio and orthanc. If not, add that setting in fcp-local-lab."
+  ],
+  "code": {
+   "file": "modules/nexus-oss/repositories.tf",
+   "lang": "hcl",
+   "text": "# npm proxy for AI agent sandboxes (G3) and CI. Same shape as the pypi proxy above.\nresource \"nexus_repository_npm_proxy\" \"this\" {\n  for_each = local.repositories.npm # { \"npmjs\" = \"https://registry.npmjs.org\" }\n\n  name   = each.key\n  online = true\n\n  storage {\n    blob_store_name                = nexus_blobstore_s3.this[\"npm\"].name\n    strict_content_type_validation = true\n  }\n\n  proxy {\n    remote_url       = each.value\n    content_max_age  = local.cache_ttl_minutes\n    metadata_max_age = local.cache_ttl_minutes\n  }\n\n  negative_cache {\n    enabled = true\n    ttl     = local.cache_ttl_minutes\n  }\n\n  http_client {\n    blocked    = false\n    auto_block = true\n  }\n\n  depends_on = [\n    time_sleep.wait_3_mins\n  ]\n}"
+  }
+ },
+ {
+  "key": "G3-06",
+  "title": "[DevOps] Run Temporal for ai-agents on inf: RDS, Vault secret, Helm release",
+  "team": [
+   "devops"
+  ],
+  "days": 2,
+  "w": [
+   3,
+   4
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "Andy (knows our Temporal setup) as reviewer.",
+  "what": "A small Temporal of its own for AI agents on inf-rhinohealth: its own RDS Postgres, a Vault secret synced by External Secrets, and the upstream Temporal chart as a Terraform helm_release, with the Temporal namespace ai-agents.",
+  "why": "Temporal runs the long steps of every agent run: wait for approval, ask and wait, retry, resume. Waiting costs nothing and survives restarts. It must not share the product's Temporal.",
+  "how": [
+   "Follow n8n: multi_tenant/accounts/infrastructure/ai-agents/ai-agents.hcl (namespace ai-agents, Temporal namespace ai-agents, Vault paths, hostnames) and units ai-agents/temporal/{secrets,sg,rds,repository}.",
+   "secrets: a small module like modules/n8n-secrets that generates the DB password into kvv2 `infrastructure/ai-agents/temporal`. sg: like n8n/sg, Postgres from the inf VPC only. rds: tfr:///terraform-aws-modules/rds/aws 6.12.0, db.t4g.small, deletion_protection, 14-day backups, Postgres 17 (what modules/aws/rds uses for product Temporal) unless Temporal 1.31 is confirmed on 18.",
+   "repository: a new modules/ai-agents-temporal: the namespace, an ExternalSecret from vault-store, then helm_release of chart temporal 1.5.0 from https://go.temporal.io/helm-charts. Start the values from gitops/cloud/temporal/values.yaml: fullnameOverride temporal, system worker on, maxConns 6 and 2, numHistoryShards 128 (fixed forever after the first install), namespace ai-agents with 30-day retention.",
+   "Search attributes Agent, JiraKey and RunKind (Keyword) with a post-install Job like gitops/cloud/temporal/templates/search-attributes-init-job.yaml.",
+   "Web UI on an envoy-internal HTTPRoute (temporal-ai-agents.example.com), so only VPN/Teleport users reach it, like n8n. The frontend stays ClusterIP; a NetworkPolicy lets only pods in the ai-agents namespace reach port 7233.",
+   "Scrape metrics with a VMServiceScrape like gitops/cloud/temporal/templates/vmservicescrape.yaml. Plan locally, paste into the PR, a person applies."
+  ],
+  "code": {
+   "file": "modules/ai-agents-temporal/main.tf",
+   "lang": "hcl",
+   "text": "resource \"kubernetes_namespace_v1\" \"this\" {\n  metadata { name = var.namespace } # \"ai-agents\"\n}\n\n# DB password from Vault (kvv2 infrastructure/ai-agents/temporal), synced by External Secrets.\nresource \"kubectl_manifest\" \"temporal_db_secret\" {\n  yaml_body = yamlencode({\n    apiVersion = \"external-secrets.io/v1\"\n    kind       = \"ExternalSecret\"\n    metadata   = { name = \"temporal-db\", namespace = kubernetes_namespace_v1.this.metadata[0].name }\n    spec = {\n      refreshInterval = \"5m\"\n      secretStoreRef  = { name = \"vault-store\", kind = \"ClusterSecretStore\" }\n      target          = { name = \"temporal-db\", creationPolicy = \"Owner\" }\n      data            = [{ secretKey = \"password\", remoteRef = { key = var.vault_path, property = \"DB_PASSWORD\" } }]\n    }\n  })\n}\n\nresource \"helm_release\" \"temporal\" {\n  name        = \"temporal\"\n  namespace   = kubernetes_namespace_v1.this.metadata[0].name\n  repository  = \"https://go.temporal.io/helm-charts\"\n  chart       = \"temporal\"\n  version     = \"1.5.0\" # the same chart as product Temporal (gitops/cloud/temporal)\n  max_history = 10\n\n  values = [templatefile(\"${path.module}/templates/temporal_values.yml.tpl\", {\n    db_endpoint        = var.db_endpoint\n    num_history_shards = 128 # cannot change after the first install\n    temporal_namespace = \"ai-agents\" # retention 30d\n  })]\n\n  depends_on = [kubectl_manifest.temporal_db_secret]\n}"
+  }
+ },
+ {
+  "key": "G3-07",
+  "title": "[Platform] Broker: per-run capabilities and one-repo GitHub tokens",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   3,
+   3
+  ],
+  "flag": null,
+  "deps": [
+   "G3-01"
+  ],
+  "needs": "G0: the rhino-ai-agents GitHub App and its private key in Vault.",
+  "what": "The broker service (ai-agents/broker, TypeScript, started from Byte's broker) and its core: the orchestrator opens a run scope and gets back a random capability; every sandbox call carries it; the broker mints GitHub App tokens (1 hour, one repo, narrow permissions) and never hands them out.",
+  "why": "Agents never hold keys. Byte proved the pattern (a broker holds the token, the worker gets a per-run capability); Nova needs it as a shared service on inf, outside the VM. Starting from Byte's own broker code reuses code that is already security-reviewed and tested, so the days go to the new scopes instead of a port.",
+  "how": [
+   "Move the core of RhinoHealth/byte src/broker.ts (capability check with timingSafeEqual, the 1 MiB body limit, /health without auth and 401 for everything else, the audit log, refused writes recorded, and the secret guard from src/secret-guard.ts that refuses to echo the token or the capability) and its tests (test/broker.test.ts) into ai-agents/broker/, then add scopes. It stays on node:http with a small router, like Byte. Byte keeps its own copy until it can import the package (no Byte change this quarter).",
+   "Internal API on its own port, never on the sandbox-facing listener: POST /internal/runs with {run_id, agent, repo, branch, read_repos, jira_key, slack_channel, slack_thread_ts} returns the capability (randomBytes(32), hex); DELETE /internal/runs/{id} revokes it. Store only sha256(capability) and the scope, in Postgres through pg (database broker on the ai-agents RDS).",
+   "Mint installation tokens with @octokit/auth-app: `auth({ type: \"installation\", installationId, repositoryNames: [<one repo>], permissions })` with contents and pull_requests write, checks and actions read. Never ask for `workflows`: GitHub then refuses any push that changes .github/workflows. Read-only tokens for read_repos (for example RhinoHealth/rnd-kb). Cache per run and refresh at 50 minutes.",
+   "GET /v1/scope tells the harness what this run may do. POST /v1/gh is a small allow-list like Byte's /v1/command: create a draft PR, mark the run's own PR ready, view/diff/checks, comment on the run's own PR. Edits to the PR body keep the `<!-- ai-agents:locked-checks -->` block the orchestrator wrote (G0-18). Never merge, approve or change settings.",
+   "Ship it as a hardened container like Byte's: node:24-bookworm-slim pinned by digest, non-root user 10001, read-only root filesystem, all capabilities dropped, no-new-privileges (the same flags Byte uses for its broker container).",
+   "node:test, starting from Byte's broker tests: a wrong or expired capability gets 401; a scope for repo A cannot read repo B; the token never appears in a response or a log line."
+  ],
+  "code": {
+   "file": "ai-agents/broker/src/scopes.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/broker/src/scopes.ts — sketch. Byte's capability pattern (src/broker.ts), as a shared service on inf.\nimport { createHash } from \"node:crypto\";\nimport { createAppAuth } from \"@octokit/auth-app\";\nimport type { Pool } from \"pg\";\nimport { config } from \"./config.js\";\n\nexport interface RunScope { // the zod schema lives in shared/src/schemas.ts\n  runId: string;\n  agent: string; // \"nova\", \"cifix\", ...\n  repo: string; // \"RhinoHealth/fcp\": the one repo this run may write\n  branch: string; // \"nova/RH-1234\": the one ref the git proxy lets it push\n  readRepos: string[]; // read-only, e.g. [\"RhinoHealth/rnd-kb\"]\n  jiraKey: string | null; slackChannel: string | null; slackThreadTs: string | null;\n  expiresAt: string;\n}\n\n// Never \"workflows\": without it GitHub refuses any push that changes .github/workflows/.\nconst WRITE_PERMISSIONS = { contents: \"write\", pull_requests: \"write\", checks: \"read\", actions: \"read\" };\nconst auth = createAppAuth({ appId: config.githubAppId, privateKey: config.githubAppPrivateKey }); // from Vault, never in a VM\n\nexport const mintToken = async (scope: RunScope): Promise<string> => { // 1 hour, one repo; it never leaves the broker\n  const { token } = await auth({\n    type: \"installation\", installationId: config.installationId,\n    repositoryNames: [scope.repo.split(\"/\")[1] ?? \"\"], permissions: WRITE_PERMISSIONS,\n  });\n  return token;\n};\n\n// Byte compares its one capability with timingSafeEqual; here there is one per run, so we look up its sha256.\nexport const scopeFor = async (authorization: string | undefined, db: Pool): Promise<RunScope | null> => {\n  if (!authorization?.startsWith(\"Bearer \")) return null; // -> 401\n  const digest = createHash(\"sha256\").update(authorization.slice(\"Bearer \".length)).digest(\"hex\"); // only digests are stored\n  const { rows } = await db.query<{ scope: RunScope }>(\"SELECT scope FROM run_scopes WHERE capability_sha256 = $1\", [digest]);\n  const scope = rows[0]?.scope;\n  return scope && new Date(scope.expiresAt) > new Date() ? scope : null; // missing or expired -> 401\n};"
+  }
+ },
+ {
+  "key": "G3-08",
+  "title": "[DevOps] Packer image ai-agent-sandbox: base tools and a locked-down host",
+  "team": [
+   "devops",
+   "be"
+  ],
+  "days": 2,
+  "w": [
+   3,
+   4
+  ],
+  "flag": null,
+  "deps": [
+   "G3-02"
+  ],
+  "needs": "Open infrastructure PR #1724 (aws_ami_users) to share the AMI with the ai-agents account. Nave reviews the toolchain.",
+  "what": "A new Packer image, ai-agent-sandbox, built from rhino-base-ubuntu-24, with Docker, Node 24 (fcp's frontend and the nova-worker harness), Python 3.13 and uv (fcp's backend), git, a non-root `agent` user, and host rules that keep the instance role out of the agent's reach. One AMI serves all three sizes; the size is the instance type.",
+  "why": "Every run starts from this image, so what is in it is what every sandbox can do. Getting the host rules right here is cheaper than checking each VM later.",
+  "how": [
+   "Add packer/images/ai-agent-sandbox/{packer_vars.hcl,playbook.yml,README.md} and the role packer/ansible/roles/ai_agent_sandbox/. Source: owner self, `rhino-base-ubuntu-24-v1-release-*`; instance_type m8i.2xlarge for build speed; volume_size 120.",
+   "Install Docker CE with compose, Node 24 (frontend/package.json needs node >=24.15.0, so the plan's Node 22 is too old; the nova-worker harness runs on it too), Python 3.13 and uv (fcp's backend needs them), git, jq. No gh CLI: GitHub calls go through the broker. Our own code arrives as the harness tarball in G3-14, never through pip.",
+   "Create user `agent` (uid 1001) for the harness. The docker group is root-equivalent, so we treat VM root as reachable by the agent (G3-12) and keep the instance role near-empty.",
+   "Lock IMDS: an iptables OUTPUT rule (saved with netfilter-persistent) so only root, which runs the SSM agent, reaches 169.254.169.254, plus a DOCKER-USER rule that drops it for containers. Hop limit 1 comes from the launch template (G3-11).",
+   "A small root `spot-watch` systemd timer that polls the Spot interruption notice every 5 s and writes /run/nova/preempt (used in G3-20). Turn off unattended-upgrades: the image is rebuilt nightly instead.",
+   "Build in inf like the other images: `./build.sh ai-agent-sandbox infrastructure/aws-us-east-1 testing`; add the image to build-packer.yml's choices; share the AMI with the ai-agents account (PR #1724)."
+  ],
+  "code": {
+   "file": "packer/ansible/roles/ai_agent_sandbox/tasks/main.yml",
+   "lang": "yaml",
+   "text": "---\n# ai-agent-sandbox: one fresh VM per agent run. No keys live here (the broker and LLM gateway hold them).\n- name: Install Docker, Node 24 (frontend + nova-worker), Python 3.13 and uv (fcp's backend), git and jq\n  ansible.builtin.include_tasks: toolchain.yml\n\n- name: Create the non-root user the harness runs as\n  ansible.builtin.user:\n    name: agent\n    uid: 1001\n    groups: [docker] # docker = root-equivalent, which is why the instance role holds almost nothing\n    shell: /bin/bash\n\n- name: Only root (the SSM agent) may reach the instance metadata service\n  ansible.builtin.shell: |\n    iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j REJECT 2>/dev/null ||\n      iptables -A OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j REJECT\n    iptables -C DOCKER-USER -d 169.254.169.254 -j DROP 2>/dev/null ||\n      iptables -I DOCKER-USER -d 169.254.169.254 -j DROP\n    netfilter-persistent save\n\n- name: Install the Spot interruption watcher (writes /run/nova/preempt)\n  ansible.builtin.copy:\n    src: spot-watch.sh\n    dest: /usr/local/bin/spot-watch\n    mode: \"0755\"\n\n- name: Run spot-watch every 5 seconds\n  ansible.builtin.include_tasks: spot_watch_timer.yml\n\n- name: Turn off unattended upgrades (the image is rebuilt nightly instead)\n  ansible.builtin.systemd:\n    name: unattended-upgrades\n    enabled: false\n    state: stopped"
+  }
+ },
+ {
+  "key": "G3-09",
+  "title": "[DevOps] Run an internal Squid egress proxy for the sandbox VPC",
+  "team": [
+   "devops"
+  ],
+  "days": 2,
+  "w": [
+   3,
+   4
+  ],
+  "flag": null,
+  "deps": [
+   "G3-04"
+  ],
+  "needs": "Security confirms the allow-list in G3-12.",
+  "what": "Two small EC2 instances running Squid behind an internal NLB in the ai-agents VPC, with a short domain allow-list and access logs in VictoriaLogs. They are the only machines in the account with a route to the internet.",
+  "why": "A sandbox reads untrusted text. If it can reach only a short list of sites, an injected prompt has nowhere to send our code. modules/squid-proxy is a public, basic-auth Helm release in a product cluster, so we reuse its config template, not the module.",
+  "how": [
+   "New modules/aws-egress-proxy: two /28 proxy subnets (from the VPC's spare /18) with an IGW route, the only route out in this VPC; an ASG of 2 small instances (t3.small to start) from rhino-base-ubuntu-24 with public IPs; an internal NLB on 3128 in the sandbox subnets. Unit core-services/egress-proxy/.",
+   "squid.conf from modules/squid-proxy/templates/squid_proxy.tpl without basic auth and proxy protocol: callers are allowed by source subnet, a dstdomain allow-list, deny everything else, CONNECT to 443 only, no caching, version hidden.",
+   "Starting allow-list: nexus.example.com only. The LLM gateway, broker and OTel collector are reached over PrivateLink, not through Squid. github.com and api.github.com stay off on purpose: all git and API traffic goes through the broker, and an open github.com would let an injected prompt push our code to someone else's repo with their own token.",
+   "Ship /var/log/squid/access.log with Vector to logs.example.com with processing type `squid_access`, so vector-aggregator's existing parser fills squid.result_code and source.address. Ask DevOps to add ai-agents to the long-term storage accounts.",
+   "Security groups: proxy ingress 3128 from the sandbox SG only. Sandbox egress (G3-11) only to the proxy NLB on 3128 and to endpoints on 443. Add proxy.ai-agents.example.com to the private zone.",
+   "Image env for sandboxes (G3-14): HTTPS_PROXY and HTTP_PROXY = http://proxy.ai-agents.example.com:3128, NO_PROXY = .amazonaws.com,.ai-agents.example.com."
+  ],
+  "code": {
+   "file": "modules/aws-egress-proxy/templates/squid.conf.tpl",
+   "lang": "text",
+   "text": "# Internal egress proxy for AI agent sandboxes. Based on modules/squid-proxy/templates/squid_proxy.tpl,\n# without basic auth (callers are known by subnet) and without proxy protocol (internal NLB).\nhttp_port 3128\n\nacl SSL_ports port 443\nacl CONNECT method CONNECT\nhttp_access deny !SSL_ports\nhttp_access deny CONNECT !SSL_ports\n\nacl sandboxes src ${sandbox_cidrs}\nacl whitelist dstdomain \"/etc/squid/sites.whitelist.txt\"\n\nhttp_access allow sandboxes whitelist\nhttp_access deny all\n\n# Blocked tries are a signal: G3-31 alerts Security on repeats (possible prompt injection).\naccess_log daemon:/var/log/squid/access.log squid\ncache deny all\nhttpd_suppress_version_string on\nvia off\nforwarded_for delete\n\n# Allow to upload large files\nclient_request_buffer_max_size 512 MB"
+  }
+ },
+ {
+  "key": "G3-10",
+  "title": "[Platform] Broker: git proxy that checks repo and branch before pushing",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   4,
+   4
+  ],
+  "flag": null,
+  "deps": [
+   "G3-07"
+  ],
+  "needs": "",
+  "what": "A git smart-HTTP proxy inside the broker. The sandbox's git remote points at the broker; the broker checks the repo and every ref being pushed, then adds the 1-hour token and forwards to GitHub.",
+  "why": "Byte's broker has no git at all: its model can't push. Nova must push its branch, but only its own branch in its own repo, and the token must never enter the VM.",
+  "how": [
+   "Routes: GET /git/{owner}/{repo}.git/info/refs?service=git-upload-pack|git-receive-pack, POST .../git-upload-pack and .../git-receive-pack. Push only to the scope's repo; fetch from the scope's repo or read_repos.",
+   "For receive-pack, read the pkt-line commands before the pack: every ref must be refs/heads/<scope.branch> (for example nova/RH-1234); no deletes, no tags, no other branches. Then stream the same bytes to https://github.com/<repo>.git with fetch (a streamed body, duplex \"half\") and `Authorization: Basic` of `x-access-token:<token>`, and stream GitHub's answer back.",
+   "Remember the last sha this run pushed. If the push's old sha is different, someone else pushed to Nova's branch: refuse with a clear message so Nova stops and asks (playbook).",
+   "In the image, a git credential helper reads /run/nova/capability, and the remote is https://broker.ai-agents.example.com/git/RhinoHealth/fcp.git. No other git credentials exist in the VM.",
+   "Audit every push: run, ref, old and new sha, bytes, allowed or refused and why.",
+   "node:test against a local bare repo behind a fake upstream (a node:http server): a push to main is refused, to another repo refused, a delete refused, a moved branch refused, the run's own branch accepted."
+  ],
+  "code": {
+   "file": "ai-agents/broker/src/git-proxy.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/broker/src/git-proxy.ts — sketch. The token is added here, after the checks, never in the VM.\nimport type { IncomingMessage, ServerResponse } from \"node:http\";\nimport { Readable } from \"node:stream\";\n\nconst ZERO = \"0\".repeat(40);\nexport class Refused extends Error {}\n\n/** Refuse anything but a normal push to this run's own branch. */\nexport const checkReceivePack = (commands: RefUpdate[], scope: RunScope, lastPushed: string | null): void => {\n  for (const cmd of commands) { // parsed from the pkt-lines before the packfile\n    if (cmd.ref !== `refs/heads/${scope.branch}`) throw new Refused(`Only ${scope.branch} can be pushed from this run, not ${cmd.ref}.`);\n    if (cmd.newSha === ZERO) throw new Refused(\"Deleting the branch is not allowed.\");\n    if (lastPushed && cmd.oldSha !== lastPushed) throw new Refused(\"The branch moved since your last push: someone else pushed. Stop and ask.\");\n  }\n};\n\n// POST /git/{owner}/{repo}.git/git-receive-pack\nexport const receivePack = async (req: IncomingMessage, res: ServerResponse, scope: RunScope, repo: string): Promise<void> => {\n  if (repo !== scope.repo) return deny(res, scope, \"git.push\", `this run may push only to ${scope.repo}`);\n  const { head, rest } = await readCommands(req); // pkt-lines, then the rest of the stream\n  try {\n    checkReceivePack(parsePktLines(head), scope, await pushes.last(scope.runId));\n  } catch (why) {\n    if (why instanceof Refused) return deny(res, scope, \"git.push\", why.message);\n    throw why;\n  }\n  const token = await tokens.forScope(scope); // 1 hour, one repo\n  const upstream = await fetch(`https://github.com/${scope.repo}.git/git-receive-pack`, {\n    method: \"POST\", duplex: \"half\", // a streamed request body\n    body: Readable.toWeb(Readable.from(chain(head, rest))),\n    headers: { Authorization: basic(\"x-access-token\", token), \"Content-Type\": req.headers[\"content-type\"] ?? \"\" },\n  });\n  await pushes.record(scope, head, upstream.status); // audit + last pushed sha\n  res.writeHead(upstream.status, { \"Content-Type\": upstream.headers.get(\"content-type\") ?? \"\" });\n  if (upstream.body) Readable.fromWeb(upstream.body).pipe(res);\n};"
+  }
+ },
+ {
+  "key": "G3-11",
+  "title": "[DevOps] Launch templates for lite, full and wide with a near-empty role",
+  "team": [
+   "devops"
+  ],
+  "days": 1,
+  "w": [
+   4,
+   4
+  ],
+  "flag": null,
+  "deps": [
+   "G3-04",
+   "G3-09"
+  ],
+  "needs": "",
+  "what": "One launch template per size (lite m8i.xlarge, full m8i.2xlarge, wide m8i.4xlarge) that boots the promoted ai-agent-sandbox AMI with IMDSv2 and hop limit 1, an encrypted gp3 disk, no public IP, the sandbox security group and an instance role that can do almost nothing.",
+  "why": "The launch template sets the 'no keys' wall for every VM. We assume the agent can reach root on its VM (docker), so the role must hold nothing worth stealing.",
+  "how": [
+   "New modules/aws-sandbox-pool (G3-15 adds the groups to it) and the unit terraform/accounts/ai-agents/aws/us-east-1/sandboxes/terragrunt.hcl with sizes = { lite = \"m8i.xlarge\", full = \"m8i.2xlarge\", wide = \"m8i.4xlarge\" }.",
+   "image_id = resolve:ssm:/ai-agents/sandbox/ami-id, so promoting an image (G3-16) is one parameter change. Create the parameter with the first image.",
+   "metadata_options: tokens required, hop limit 1, instance metadata tags off. Root disk gp3 120 GiB, encrypted with the sandbox KMS key, volume_initialization_rate 300 MiB/s (check the pinned aws provider 6.64.0 supports it). The key policy must allow the AutoScaling service-linked role.",
+   "Instance role ai-agent-sandbox: AmazonSSMManagedInstanceCore, plus autoscaling:CompleteLifecycleAction on the sandbox ASGs only. That managed policy can read any SSM parameter, so the account keeps no secrets in Parameter Store.",
+   "Security group: no ingress. Egress only to the proxy NLB on 3128, the endpoints security group on 443 and the PrivateLink endpoint (G3-17).",
+   "Tags on instance and volume: ai-agents:managed=true and ai-agents:size, so the sweeper (G3-22) can find them."
+  ],
+  "code": {
+   "file": "modules/aws-sandbox-pool/launch_templates.tf",
+   "lang": "hcl",
+   "text": "resource \"aws_launch_template\" \"sandbox\" {\n  for_each = var.sizes # { lite = \"m8i.xlarge\", full = \"m8i.2xlarge\", wide = \"m8i.4xlarge\" }\n\n  name          = \"${var.name_prefix}-sandbox-${each.key}\"\n  image_id      = \"resolve:ssm:/ai-agents/sandbox/ami-id\" # promoted by the nightly smoke test (G3-16)\n  instance_type = each.value\n\n  iam_instance_profile { name = aws_iam_instance_profile.sandbox.name } # SSM core only\n  vpc_security_group_ids = [aws_security_group.sandbox.id]              # no ingress at all\n  metadata_options {\n    http_endpoint               = \"enabled\"\n    http_tokens                 = \"required\"\n    http_put_response_hop_limit = 1 # containers on the docker bridge can't get a token\n    instance_metadata_tags      = \"disabled\"\n  }\n\n  block_device_mappings {\n    device_name = \"/dev/sda1\"\n    ebs {\n      volume_type                = \"gp3\"\n      volume_size                = 120\n      encrypted                  = true\n      kms_key_id                 = aws_kms_key.sandbox.arn\n      volume_initialization_rate = 300 # MiB/s; check aws provider 6.64.0 supports this argument\n    }\n  }\n\n  dynamic \"tag_specifications\" {\n    for_each = [\"instance\", \"volume\"]\n    content {\n      resource_type = tag_specifications.value\n      tags          = merge(var.tags, { \"ai-agents:managed\" = \"true\", \"ai-agents:size\" = each.key })\n    }\n  }\n}"
+  }
+ },
+ {
+  "key": "G3-12",
+  "title": "[Security] Threat-model the agent runtime: trifecta, egress, tokens, data",
+  "team": [
+   "sec"
+  ],
+  "days": 1,
+  "w": [
+   4,
+   4
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "Ronen leads; Sean and a DevOps engineer attend. Input: the G3 design and G0's gateway and GitHub App design.",
+  "what": "A half-day threat-model session on the runtime design while it is being built, ending in a written list of risks, owners and the open decisions G3 is waiting on.",
+  "why": "The walls only work if they are in the right places. Finding a gap in week 4 costs a ticket; finding it after the pilot costs trust.",
+  "how": [
+   "Walk the lethal trifecta for each part: untrusted input (tickets, code, Slack, web pages), outward actions (push, comment, post), private data (none: fake seed data only, no PHI, no staging or prod credentials, no Teleport, no VPN).",
+   "Check each wall: no keys in the VM (capability only, the token stays in the broker, no `workflows` permission), egress (Squid list, DNS firewall, S3 endpoint policy, PrivateLink ports), merging (ruleset, exactly 1 approval, the requester can't approve), never apply, destroy, sync or workflow_dispatch.",
+   "Name the known soft spots: the docker group is root on the VM; push-triggered CI (cloud-ci, client-ci and sdk-ci run on push to any branch) runs the agent's branch with CI's OIDC role and Vault, so G0's narrowing of the gha-runners Vault role must land before agents push; Slack and Jira text as injection sources; the capability shows in the account's SSM command history.",
+   "Decide: github.com on the proxy list or not; Nexus read access (anonymous vs a read-only user); the proxy's own IGW subnets vs Squid on inf behind PrivateLink; rootless Docker as a Q1 item.",
+   "Write ai-agents/docs/threat-model.md: risk, wall or guidance, owner, ticket. It is re-checked in the W8 review (G3-40)."
+  ],
+  "code": null
+ },
+ {
+  "key": "G3-13",
+  "title": "[Platform] Broker: one Jira issue, one Slack thread, artifacts, audit log",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   4,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G3-07"
+  ],
+  "needs": "G4: the Nova Jira service account. A Slack bot token: a Slack admin creates the app early (G3-30 builds it).",
+  "what": "The rest of the broker's sandbox API: read and comment on the run's one Jira issue, post into the run's one Slack thread, get presigned URLs for the run's own S3 prefix, send heartbeats, and one audit line for every call.",
+  "why": "The harness must talk to people and save its work without holding Jira, Slack or AWS credentials. Each scope is one issue, one thread and one prefix.",
+  "how": [
+   "GET /v1/jira/issue and POST /v1/jira/comment: only scope.jira_key, with the Nova service account token (Vault infrastructure/ai-agents/jira-nova, from G4-04). Return summary, description and comments only, never attachments: screenshots and logs may hold customer data.",
+   "POST /v1/slack/post: only scope.slack_channel and scope.slack_thread_ts. No new top-level messages, no other channels, no DMs, links not unfurled. Byte's secret guard (src/secret-guard.ts, moved in G3-07) checks every text.",
+   "POST /v1/artifacts/url: a 15-minute presigned PUT or GET (getSignedUrl from @aws-sdk/s3-request-presigner) for s3://rhino-ai-agents-runs/runs/<run_id>/<name>; GET /v1/artifacts?prefix= lists the run's own objects (needed to resume). Names are sanitized; another run's prefix is never reachable.",
+   "POST /v1/heartbeat {step, progress, checkpoint}: stores last_seen. The orchestrator reads it on the internal port (G3-20).",
+   "Audit: one JSON line per call (run_id, agent, jira_key, endpoint, allow or deny, reason, bytes) to stdout for Vector and VictoriaLogs, and ai_agents_broker_requests_total{agent,endpoint,decision} on /metrics."
+  ],
+  "code": {
+   "file": "ai-agents/broker/src/people.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/broker/src/people.ts — sketch. One issue, one thread, one prefix per run.\nimport { GetObjectCommand, PutObjectCommand, S3Client } from \"@aws-sdk/client-s3\";\nimport { getSignedUrl } from \"@aws-sdk/s3-request-presigner\";\nimport { WebClient } from \"@slack/web-api\";\nimport { z } from \"zod\";\n\nconst s3 = new S3Client({});\nconst slack = new WebClient(config.slackBotToken); // the bot token stays in the broker\nconst SlackPost = z.object({ text: z.string().min(1) });\nconst JiraComment = z.object({ issue_key: z.string(), text: z.string().min(1) }); // wire names don't change\nconst ArtifactRequest = z.object({ name: z.string(), write: z.boolean() });\n\nexport const peopleRoutes: Record<string, (body: unknown, scope: RunScope) => Promise<Reply>> = {\n  \"POST /v1/slack/post\": async (body, scope) => {\n    if (!scope.slackChannel || !scope.slackThreadTs) return deny(scope, \"slack.post\", \"this run has no Slack thread\");\n    const text = guard(SlackPost.parse(body).text, scope); // refuses token-like strings: Byte's secret guard\n    const resp = await slack.chat.postMessage({ channel: scope.slackChannel, thread_ts: scope.slackThreadTs, text, unfurl_links: false });\n    return allow(scope, \"slack.post\", { ts: resp.ts }); // never a new top-level message, never a DM\n  },\n  \"POST /v1/jira/comment\": async (body, scope) => {\n    const { issue_key, text } = JiraComment.parse(body);\n    if (issue_key !== scope.jiraKey) return deny(scope, \"jira.comment\", `only ${scope.jiraKey} can be commented on`);\n    await jira.addComment(scope.jiraKey, guard(text, scope));\n    return allow(scope, \"jira.comment\");\n  },\n  \"POST /v1/artifacts/url\": async (body, scope) => {\n    const { name, write } = ArtifactRequest.parse(body);\n    const key = `runs/${scope.runId}/${safeName(name)}`; // never another run's prefix\n    const params = { Bucket: RUNS_BUCKET, Key: key };\n    const url = await getSignedUrl(s3, write ? new PutObjectCommand(params) : new GetObjectCommand(params), { expiresIn: 900 });\n    return allow(scope, \"artifacts.url\", { key, url });\n  },\n};"
+  }
+ },
+ {
+  "key": "G3-14",
+  "title": "[DevOps] Bake FCP Lab, caches, browsers, Claude Code and skills",
+  "team": [
+   "devops",
+   "be"
+  ],
+  "days": 1.5,
+  "w": [
+   4,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G3-08",
+   "G3-05"
+  ],
+  "needs": "G0: fcp-local-lab moved into the RhinoHealth org (Nave). G8: the RhinoHealth/claude-plugins marketplace. G1: the OTel endpoint and managed-settings values.",
+  "what": "The heavy part of the image: a bare git mirror of fcp, npm and uv caches, Playwright's browser, FCP Lab with its images built and its fake seed data in place, Claude Code pinned, managed settings, our plugins and the nova-worker harness (TypeScript, from its release tarball).",
+  "why": "A run should spend its time on the ticket, not on downloads. Everything slow and identical for every run is done once a night here.",
+  "how": [
+   "Git: `git clone --mirror` fcp to /var/cache/git/fcp.git with a short-lived GitHub App token from the build job (an env var, never written to disk), then the work checkout /work/fcp with `--reference`. At run time origin is the broker (G3-10).",
+   "Caches, as user agent: `npm ci` in frontend/ and `npx playwright install chromium` (system deps installed as root in toolchain.yml); `uv sync --frozen` in cloud/ and client/, and the SDK installed into its own venv. Keep node_modules: freshen reuses them unless a lockfile changed.",
+   "FCP Lab from RhinoHealth/fcp-local-lab at a pinned tag into /opt/fcp-lab, FCP_LAB_HOME=/var/lib/fcp-lab. `lab up --source /work/fcp --id sandbox --mode snapshot --refreshable`, check `lab status sandbox --json` says ready, then `lab stop sandbox`: images built, fake data seeded, memory free. Never a prod or staging dump.",
+   "Claude Code: `npm install -g --prefix /usr/local @anthropic-ai/claude-code@<pinned>`, so it is /usr/local/bin/claude; the harness passes that path as pathToClaudeCodeExecutable, so its pinned @anthropic-ai/claude-agent-sdk runs exactly the binary the smoke test passed. DISABLE_UPDATES=1 and CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1.",
+   "/etc/claude-code/managed-settings.json: OTel on, to otel.ai-agents.example.com, content flags off, Fable off, agent teams off (values from G0 and G1). Plugins from RhinoHealth/claude-plugins at a pinned ref into /opt/claude-plugins: the same ones people use.",
+   "Harness: download ai-agents-harness-<version>.tgz from the latest ai-agents release with the build job's token, unpack it into /opt/ai-agents/harness (one bundled file, nova-worker.mjs, plus workflows/, prompts/ and settings/; nothing to install), link /usr/local/bin/nova-worker, and copy its workflows/*.js into the agent user's ~/.claude/workflows/ (skip until the first release exists). No wheel and no pip install of our code. Write /etc/ai-agent-sandbox/manifest.json with the mirror sha, lockfile hashes and the lab, Claude Code and harness versions; freshen (G3-18) and the PR receipt read it."
+  ],
+  "code": {
+   "file": "packer/ansible/roles/ai_agent_sandbox/tasks/bake_fcp.yml",
+   "lang": "yaml",
+   "text": "---\n# Slow, identical-for-every-run work, done once per nightly image. Fake seed data only.\n- name: Bare mirror of fcp (token from the build job, never written to disk)\n  ansible.builtin.command: >-\n    git -c credential.helper='!f() { echo username=x-access-token; echo \"password=$GH_TOKEN\"; }; f'\n    clone --mirror https://github.com/RhinoHealth/fcp.git /var/cache/git/fcp.git\n  environment: { GH_TOKEN: \"{{ lookup('env', 'GH_BUILD_TOKEN') }}\" }\n  args: { creates: /var/cache/git/fcp.git }\n- name: Work checkout that borrows objects from the mirror\n  become_user: agent\n  ansible.builtin.command: git clone --reference /var/cache/git/fcp.git /var/cache/git/fcp.git /work/fcp\n  args: { creates: /work/fcp/.git }\n- name: Fill the npm cache and install Playwright's Chromium (system deps came from toolchain.yml)\n  become_user: agent\n  ansible.builtin.shell: npm ci && npx playwright install chromium\n  args: { chdir: /work/fcp/frontend }\n- name: Build FCP Lab's images and seed its fake data, then stop it (images and data are kept)\n  become_user: agent\n  ansible.builtin.shell: |\n    lab up --source /work/fcp --id sandbox --mode snapshot --refreshable\n    lab status sandbox --json | jq -e '.state == \"ready\"'\n    lab stop sandbox\n  environment: { FCP_LAB_HOME: /var/lib/fcp-lab }\n  # `lab` = fcp-local-lab's CLI (python3 /opt/fcp-lab/lab), pinned by tag in group_vars/all.yml\n- name: Claude Code, pinned and never self-updating (/usr/local/bin/claude, the binary the harness runs)\n  ansible.builtin.command: npm install -g --prefix /usr/local @anthropic-ai/claude-code@{{ claude_code_version }}\n- name: nova-worker, one bundled file from the ai-agents release (downloaded by the build job; no npm or pip install)\n  ansible.builtin.shell: |\n    mkdir -p /opt/ai-agents/harness && cd /opt/ai-agents/harness\n    tar -xzf /tmp/ai-agents-harness-{{ harness_version }}.tgz --strip-components=1   # nova-worker.mjs, workflows/, prompts/, settings/\n    chmod 0755 nova-worker.mjs && ln -sf /opt/ai-agents/harness/nova-worker.mjs /usr/local/bin/nova-worker   # Node 24\n    install -d -o agent -g agent /home/agent/.claude /home/agent/.claude/workflows\n    install -o agent -g agent -m 0644 workflows/*.js /home/agent/.claude/workflows/"
+  }
+ },
+ {
+  "key": "G3-15",
+  "title": "[DevOps] Warm pools per size, setup-before-stop hook and Spot groups",
+  "team": [
+   "devops"
+  ],
+  "days": 2,
+  "w": [
+   4,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G3-11",
+   "G3-14"
+  ],
+  "needs": "",
+  "what": "An Auto Scaling group per size with a warm pool of stopped VMs (2 lite, 2 full, 0 wide to start), a lifecycle hook that lets each VM finish its setup before it is stopped, and separate Spot groups with no warm pool for retryable routines.",
+  "why": "A VM from the warm pool starts in about a minute, and a stopped VM costs only its disk (about $8–10 a month). Spot is about 56% cheaper for routines that can simply retry.",
+  "how": [
+   "In modules/aws-sandbox-pool: one aws_autoscaling_group per size, desired 0, min 0, max 3, in the sandbox subnets, from the size's launch template. The steady state is all-warm: nothing is in service until a run claims a VM.",
+   "warm_pool: pool_state Stopped, min_size from var.warm_pool_size (lite 2, full 2, wide 0), reuse_on_scale_in = false so a used VM never goes back.",
+   "initial_lifecycle_hook on EC2_INSTANCE_LAUNCHING, heartbeat 1800 s, default ABANDON. Add a `sandbox-warm` systemd unit to the image role: it reads /latest/meta-data/autoscaling/target-lifecycle-state; for Warmed:Stopped it starts FCP Lab once (pulls, warms the disk), stops it and completes the hook; for InService it completes at once.",
+   "Claimed VMs leave the group: the claim activity (G3-18) raises desired by 1, waits for InService, then calls DetachInstances with ShouldDecrementDesiredCapacity. From then on Temporal owns the VM.",
+   "Spot groups for lite and full: mixed_instances_policy with 0% on-demand, price-capacity-optimized, overrides m8i/m7i/m6i of the same size, no warm pool. Nova and bug fixers stay on the on-demand groups because they wait on people.",
+   "Check the account's On-Demand and Spot vCPU quotas (the final cap on parallel VMs) and request what we need."
+  ],
+  "code": {
+   "file": "modules/aws-sandbox-pool/asg.tf",
+   "lang": "hcl",
+   "text": "resource \"aws_autoscaling_group\" \"sandbox\" {\n  for_each = var.sizes\n\n  name                = \"${var.name_prefix}-sandbox-${each.key}\"\n  vpc_zone_identifier = var.subnet_ids\n  min_size            = 0\n  max_size            = 3 # only claims in flight live here; claimed VMs are detached\n  desired_capacity    = 0\n\n  launch_template {\n    id      = aws_launch_template.sandbox[each.key].id\n    version = \"$Latest\"\n  }\n\n  warm_pool {\n    pool_state                  = \"Stopped\" # a stopped VM costs only its disk\n    min_size                    = var.warm_pool_size[each.key] # lite 2, full 2, wide 0 to start\n    max_group_prepared_capacity = var.warm_pool_size[each.key]\n    instance_reuse_policy {\n      reuse_on_scale_in = false # a used VM never goes back to the pool\n    }\n  }\n\n  # The VM finishes setup (FCP Lab started once, images pulled, disk warmed) before it is stopped.\n  initial_lifecycle_hook {\n    name                 = \"finish-setup\"\n    lifecycle_transition = \"autoscaling:EC2_INSTANCE_LAUNCHING\"\n    heartbeat_timeout    = 1800\n    default_result       = \"ABANDON\"\n  }\n\n  # + dynamic \"tag\" blocks (propagate_at_launch) for var.tags, ai-agents:managed=true, ai-agents:size\n}"
+  }
+ },
+ {
+  "key": "G3-16",
+  "title": "[DevOps] Nightly image build with a smoke test, promotion and rollback",
+  "team": [
+   "devops",
+   "be"
+  ],
+  "days": 1.5,
+  "w": [
+   5,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G3-14",
+   "G3-11"
+  ],
+  "needs": "",
+  "what": "A nightly workflow in the infrastructure repo that builds ai-agent-sandbox, boots it in the ai-agents account, runs a smoke test (FCP Lab ready and one Playwright spec passing), and only then promotes it. The previous image stays one command away.",
+  "why": "Every run starts from this image. A broken image would break every run at once, so nothing is promoted without proof, and rollback must be instant.",
+  "how": [
+   "New .github/workflows/build-ai-agent-sandbox.yml: a nightly cron at an odd minute, runs-on infrastructure-runner-set, actions pinned by SHA like the rest of the repo. A person owns it; agents never dispatch workflows.",
+   "Build on the testing channel, so an image that is never promoted expires after 72 h: `./build.sh ai-agent-sandbox infrastructure/aws-us-east-1 testing`.",
+   "Smoke job (environment ai-agents, the OIDC role from G3-02): launch one VM from the new AMI with the full launch template; over SSM run `nova-worker --version` (the harness loads on Node 24), resume the baked lab and run `lab test sandbox --suite frontend-e2e --spec not-found-page.spec.ts` (a small new .github/scripts/ssm-run.sh sends the command and waits for it). Always terminate the VM.",
+   "Promote on pass: disable the AMI's deprecation and retag it channel=release (the AMI belongs to inf, so these two calls use the inf role), copy /ai-agents/sandbox/ami-id to /ai-agents/sandbox/ami-id-previous, write the new id. packer_image_cleaner keeps the two newest release images, so only promoted images count.",
+   "On failure: leave it on testing and post to #ai-agents-alerts with the lab report. Rollback: write ami-id-previous back into ami-id; the sweeper (G3-22) replaces warm VMs within a day, or terminate them by hand.",
+   "Start nightly; move to every few hours once the pilot is busy."
+  ],
+  "code": {
+   "file": ".github/workflows/build-ai-agent-sandbox.yml",
+   "lang": "yaml",
+   "text": "  smoke:\n    needs: build\n    runs-on: infrastructure-runner-set\n    environment: ai-agents\n    env:\n      AMI: ${{ needs.build.outputs.ami_id }}\n    steps:\n      - uses: aws-actions/configure-aws-credentials@<sha> # v6\n        with: { role-to-assume: \"${{ vars.AWS_ROLE_ARN }}\", aws-region: us-east-1 }\n      - name: Boot the new image and run the smoke test over SSM\n        run: |\n          id=$(aws ec2 run-instances --launch-template LaunchTemplateName=ai-agents-sandbox-full \\\n            --image-id \"$AMI\" --query 'Instances[0].InstanceId' --output text)\n          echo \"VM=$id\" >> \"$GITHUB_ENV\"\n          aws ec2 wait instance-status-ok --instance-ids \"$id\"\n          # the harness loads, then resume the baked, stopped lab (check the lab resume command with Nave)\n          .github/scripts/ssm-run.sh \"$id\" \"sudo -iu agent sh -c 'nova-worker --version && lab start sandbox && \\\n            lab test sandbox --suite frontend-e2e --spec not-found-page.spec.ts'\"\n      - name: Promote (the previous image stays for rollback)\n        run: |\n          prev=$(aws ssm get-parameter --name /ai-agents/sandbox/ami-id --query Parameter.Value --output text)\n          aws ssm put-parameter --name /ai-agents/sandbox/ami-id-previous --value \"$prev\" --overwrite\n          aws ssm put-parameter --name /ai-agents/sandbox/ami-id --value \"$AMI\" --overwrite\n          # with the inf role (the AMI's owner): disable-image-deprecation + tag channel=release\n      - name: Always remove the smoke VM\n        if: always()\n        run: aws ec2 terminate-instances --instance-ids \"$VM\""
+  }
+ },
+ {
+  "key": "G3-17",
+  "title": "[DevOps] Deploy agent services on inf: Helm, Vault secrets, PrivateLink",
+  "team": [
+   "devops"
+  ],
+  "days": 2,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G3-06",
+   "G3-04",
+   "G3-13"
+  ],
+  "needs": "G0-15: modules/ai-agents-service and the gateway release (this ticket answers its open question: sandboxes reach the gateway over PrivateLink). G1-02: the collector's OTLP/HTTP port goes on the same NLB, so sandboxes need neither otel.example.com on the proxy list nor the ingest token.",
+  "what": "Terraform helm_release units on inf for the orchestrator worker, broker and Slack app (G0-15 already runs the LLM gateway), with secrets from Vault through External Secrets, IRSA roles into the ai-agents account, and a PrivateLink path so sandboxes reach only the broker, gateway and OTel ports.",
+  "why": "These services hold the credentials, so they run on inf, outside the sandboxes. PrivateLink lets sandboxes call them without peering the VPCs.",
+  "how": [
+   "Reuse G0-15's modules/ai-agents-service (local chart: Deployment, Service, ExternalSecret, VMServiceScrape): units multi_tenant/accounts/infrastructure/ai-agents/{orchestrator-worker,broker,slack-app}/ next to G0-15's llm-gateway/. Replicas: orchestrator-worker 2, broker 2, slack-app 1, fixed (KEDA is off on inf).",
+   "Images from inf ECR ai-agents-*, pinned by digest. Pods run non-root with a read-only root filesystem and all capabilities dropped; no service-account token unless IRSA needs it.",
+   "ExternalSecrets from vault-store: infrastructure/ai-agents/{broker,slack-app,orchestrator,jira-nova} (GitHub App key, Slack and Jira tokens), the gateway's token-signing key for the orchestrator (G0-13 mints run tokens with it), and a broker DB user on the ai-agents RDS.",
+   "IRSA: orchestrator-worker assumes ai-agents-orchestrator in the ai-agents account (start, stop, terminate and tag instances with ai-agents:managed=true; SetDesiredCapacity and DetachInstances on the sandbox ASGs; ssm:SendCommand with AWS-RunShellScript on tagged instances). The broker may put and get objects under rhino-ai-agents-runs/runs/* to presign URLs.",
+   "PrivateLink, unit ai-agents/sandbox-privatelink/: an internal NLB in inf (Terraform aws_lb, bound to pods with TargetGroupBinding) for the broker's sandbox port, the gateway and the OTel collector only, never the broker's internal port or envoy-internal; an endpoint service that allows only the ai-agents account; the interface endpoint and private-zone records in the sandbox VPC. TLS on the NLB with an ACM certificate for *.ai-agents.example.com.",
+   "NetworkPolicies: only orchestrator-worker reaches the broker's internal port and Temporal. Vector annotations (logs.rhinofcp.com/processing.enabled) on every pod."
+  ],
+  "code": {
+   "file": "multi_tenant/accounts/infrastructure/ai-agents/sandbox-privatelink/main.tf",
+   "lang": "hcl",
+   "text": "# Sandboxes reach exactly three things on inf: the broker's sandbox port, the LLM gateway and the\n# OTel collector. Not envoy-internal (that would expose every internal tool) and not Temporal.\nlocals {\n  sandbox_ports = { broker = 443, gateway = 8443, otel = 4318 }\n}\n\nresource \"aws_lb\" \"sandbox_facing\" {\n  name               = \"ai-agents-sandbox-facing\"\n  internal           = true\n  load_balancer_type = \"network\"\n  subnets            = var.inf_private_subnets\n  tags               = var.tags\n}\n\nresource \"aws_lb_listener\" \"this\" {\n  for_each          = local.sandbox_ports\n  load_balancer_arn = aws_lb.sandbox_facing.arn\n  port              = each.value\n  protocol          = \"TLS\"\n  certificate_arn   = var.acm_certificate_arn # *.ai-agents.example.com\n  default_action {\n    type             = \"forward\"\n    target_group_arn = aws_lb_target_group.this[each.key].arn # pods bound with TargetGroupBinding\n  }\n}\n\nresource \"aws_vpc_endpoint_service\" \"sandbox_facing\" {\n  acceptance_required        = false\n  network_load_balancer_arns = [aws_lb.sandbox_facing.arn]\n  allowed_principals         = [\"arn:aws:iam::${var.ai_agents_account_id}:root\"] # nobody else\n  tags                       = var.tags\n}\n\n# The consumer side (aws_vpc_endpoint + private-zone records broker., gateway., otel.) lives in\n# terraform/accounts/ai-agents/aws/us-east-1/core-services/inf-services-endpoint/."
+  }
+ },
+ {
+  "key": "G3-18",
+  "title": "[Platform] Sandbox activities: claim a VM of the right size and freshen it",
+  "team": [
+   "plat"
+  ],
+  "days": 2,
+  "w": [
+   5,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G3-15",
+   "G3-10"
+  ],
+  "needs": "",
+  "what": "Temporal activities in the orchestrator that take a VM of the right size from its warm pool as soon as the work is known, detach it so Temporal owns it, and bring it to the exact commit, redoing only what changed.",
+  "why": "Starting from a warm, pre-built VM and doing only the delta is what makes a run start in minutes. Checking that the base is healthy first means a later failure belongs to the change, not to main.",
+  "how": [
+   "acquireSandbox({ size, runId, agent, jiraKey, spot }) (the name G5-08's routineRun uses too): raise desired by 1 on ai-agents-sandbox-<size> (or its Spot group for retryable routines), wait for a new InService VM, DetachInstances with decrement, tag ai-agents:run-id, agent and jira, and set the lease tag ai-agents:lease-until. If two claims race for one VM, the loser's detach fails and it takes the next.",
+   "Idempotent: on retry it first looks for a VM already tagged with this run-id. Count cold starts (empty pool) as a metric.",
+   "Open the run's broker scope (POST /internal/runs) and mint the run's gateway token (HMAC-signed, G0-13); write the task, the capability and the gateway token to /run/nova/ over SSM (mode 0600, owner agent). Neither is a key to an outside service, and both die with the run.",
+   "freshenSandbox(vm, sha): as agent, `git fetch origin <sha>` through the broker and check it out; compare lockfile hashes with /etc/ai-agent-sandbox/manifest.json and reinstall only what changed (npm ci in frontend/, uv sync in cloud/ and client/); on full and wide, `lab refresh sandbox --accept-branch`, adding --rebuild or --migrate only when the lab asks, then `lab status sandbox --json` must say ready.",
+   "FCP Lab won't start: throw an ApplicationFailure of type LabNotReady; the workflow retries once on a fresh VM, then reports in Slack with the `lab report` output (playbook).",
+   "Plan small, build big: ticketToPr claims lite for the plan and full for the build (G3-24). Activities are plain async functions on AWS SDK v3; unit-test the ASG and EC2 path with aws-sdk-client-mock."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/activities/sandbox.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/activities/sandbox.ts — sketch. Activities may use Node APIs; workflow code may not.\nimport { heartbeat } from \"@temporalio/activity\";\nimport { AutoScalingClient, AutoScalingServiceException, DetachInstancesCommand, SetDesiredCapacityCommand } from \"@aws-sdk/client-auto-scaling\";\nimport { CreateTagsCommand, EC2Client } from \"@aws-sdk/client-ec2\";\nimport { setTimeout as sleep } from \"node:timers/promises\";\n\nconst asg = new AutoScalingClient({});\nconst ec2 = new EC2Client({});\n/** Take a warm VM of the right size, detach it, and tag it as this run's. Temporal owns it after this. */\nexport const acquireSandbox = async (req: ClaimRequest): Promise<Sandbox> => {\n  const existing = await findInstance({ \"ai-agents:run-id\": req.runId }); // safe to retry\n  if (existing) return existing;\n  const group = `ai-agents-sandbox-${req.size}${req.spot ? \"-spot\" : \"\"}`;\n  const before = await inServiceIds(group);\n  await asg.send(new SetDesiredCapacityCommand({ AutoScalingGroupName: group, DesiredCapacity: (await desired(group)) + 1, HonorCooldown: false }));\n  for (;;) {\n    heartbeat(\"waiting for a warm VM\");\n    for (const instanceId of (await inServiceIds(group)).filter((id) => !before.includes(id))) {\n      try { // two claims may race for one VM: the loser's detach fails and it tries the next\n        await asg.send(new DetachInstancesCommand({ InstanceIds: [instanceId], AutoScalingGroupName: group, ShouldDecrementDesiredCapacity: true }));\n      } catch (err) {\n        if (err instanceof AutoScalingServiceException) continue;\n        throw err;\n      }\n      await ec2.send(new CreateTagsCommand({ Resources: [instanceId], Tags: [\n        { Key: \"ai-agents:run-id\", Value: req.runId },\n        { Key: \"ai-agents:agent\", Value: req.agent },\n        { Key: \"ai-agents:jira\", Value: req.jiraKey ?? \"-\" },\n        { Key: \"ai-agents:lease-until\", Value: leaseUntil({ hours: 2 }) }, // renewed while the run lives\n      ] }));\n      return { instanceId, size: req.size, spot: req.spot, runId: req.runId };\n    }\n    await sleep(5_000);\n  }\n};"
+  }
+ },
+ {
+  "key": "G3-19",
+  "title": "[Platform] Harness nova-worker: Agent SDK session, gateway, our tools",
+  "team": [
+   "plat"
+  ],
+  "days": 2,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G3-01",
+   "G3-13"
+  ],
+  "needs": "G0-13: the gateway's run token (HMAC, minted by the orchestrator) and its client settings. G6: kb_search over rnd-kb.",
+  "what": "nova-worker, the program that runs inside each VM: it reads the task, starts a Claude Agent SDK session that talks only to our LLM gateway, and gives the model three tools of ours (ask_human, post_progress, kb_search) that go through the broker.",
+  "why": "This is where the agent does the work. A thin wrapper around the SDK, with no turn or time limits, lets the model do the job while the walls stay in the infrastructure.",
+  "how": [
+   "harness/src/: main.ts (`nova-worker run /run/nova/task.json`, behind a `#!/usr/bin/env node` bin), session.ts (the options), tools.ts (an in-process MCP server built with createSdkMcpServer and tool() with zod input schemas). It runs as user agent under systemd (G3-20).",
+   "Options: model and effort from the routing table (G3-33; Opus 5.5 at medium by default), cwd /work/fcp on every VM so a stored session resumes, settingSources ['project'], permissionMode 'dontAsk' with an allowedTools list, WebFetch and WebSearch in disallowedTools, and pathToClaudeCodeExecutable /usr/local/bin/claude, the pinned binary the nightly smoke test passed (G3-14). No maxTurns, no maxBudgetUsd, no taskBudget.",
+   "No key in the VM. `env` replaces the subprocess environment, so it spreads process.env first; then ANTHROPIC_BASE_URL is the gateway over PrivateLink, ANTHROPIC_AUTH_TOKEN is the gateway run token (G0-13), stepEnv (G1-14) adds the OTel tags and the x-ai-agents-step header (agent, Jira key and run ride inside the run token), and ENABLE_TOOL_SEARCH=true plus CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1 because both are off behind a gateway. With no API key Claude Code can't fetch feature flags, so set the permission mode explicitly and check the features we need (the Workflow tool) in G4's W6 spike.",
+   "Tools: ask_human posts the question to the ticket's thread and ends the turn with status needs_answer; post_progress posts a short update; kb_search runs the `kb search` CLI from rnd-kb-tooling (G6-10, baked into the image) over the local rnd-kb mirror in $KB_DIR, refreshed read-only through the broker, so Nova ranks pages exactly like people and BRAIN-QA. The CLI is the boundary between our TypeScript and Shai's Python.",
+   "Write /run/nova/status.json (step, state, session_id, result). A timer (setInterval) sends a heartbeat to the broker every 30 s; the model runs in the claude subprocess, so a long thinking turn still counts as alive.",
+   "Set CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1 (helpers can't start helpers) and CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS by size (3 lite, 6 full, 12 wide).",
+   "main.ts puts the gateway URL and the run token into process.env at start, so every session in the VM (Nova, the QA agent, judges, reviewers) reaches the gateway the same way. allowedTools names Workflow, so the research and review-panel workflows (G4-09, G4-19) can run under dontAsk."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/session.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/session.ts — sketch. No key in the VM: the gateway adds it.\nimport { createSdkMcpServer, type Options, type SessionStore } from \"@anthropic-ai/claude-agent-sdk/core\";\n\nexport const buildOptions = (task: Task, hooks: Options[\"hooks\"], store: SessionStore): Options => {\n  const route = routeFor(task.job); // Opus 5.5 at medium unless the plan picked another row (G3-33)\n  return {\n    model: route.model,\n    effort: route.effort,\n    cwd: \"/work/fcp\", // the same on every VM, so a stored session resumes anywhere\n    settingSources: [\"project\"], // fcp's CLAUDE.md/AGENTS.md and .claude/; managed settings load anyway\n    allowedTools: [\"Read\", \"Grep\", \"Glob\", \"Edit\", \"Write\", \"Bash\", \"TodoWrite\",\n      \"Workflow\", \"mcp__nova__ask_human\", \"mcp__nova__post_progress\", \"mcp__nova__kb_search\"], // Workflow: G4-09, G4-19\n    disallowedTools: [\"WebFetch\", \"WebSearch\"], // the proxy blocks the web anyway; say so up front\n    permissionMode: \"dontAsk\", // nobody sits at a prompt: anything not allowed is refused\n    mcpServers: { nova: createSdkMcpServer({ name: \"nova\", tools: [askHuman, postProgress, kbSearch] }) }, // call the broker\n    hooks, // walls (G3-21) and the progress watcher (G3-32)\n    sessionStore: store, // transcripts to S3 through the broker (G3-23)\n    resume: task.resumeSessionId, // after a question, or on a fresh VM\n    pathToClaudeCodeExecutable: \"/usr/local/bin/claude\", // the pinned binary the nightly smoke test passed (G3-14)\n    env: {\n      ...process.env, // env REPLACES the subprocess environment, so spread it first\n      ANTHROPIC_BASE_URL: GATEWAY_URL, // https://gateway.ai-agents.example.com:8443 over PrivateLink\n      ANTHROPIC_AUTH_TOKEN: task.gatewayToken, // G0-13 run token: not an Anthropic key, dies with the run\n      ...stepEnv(task.run, task.step), // G1-14: OTel tags and the x-ai-agents-step header; agent, jira, run ride in the token\n      ENABLE_TOOL_SEARCH: \"true\", // off by default behind a gateway (G0-13)\n      CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: \"1\", // helpers can't start helpers\n      CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS: String(WORKFLOW_AGENTS[task.size]), // 3 / 6 / 12\n      ...ROUTING_ENV, // output limit and cache TTL (G3-33)\n    },\n    // No maxTurns, no maxBudgetUsd, no taskBudget: work is never cut off mid-run.\n  };\n};"
+  }
+ },
+ {
+  "key": "G3-20",
+  "title": "[Platform] Sandbox activities: run via SSM, park, retire, release",
+  "team": [
+   "plat"
+  ],
+  "days": 2,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G3-18",
+   "G3-13"
+  ],
+  "needs": "",
+  "what": "The rest of a VM's life as Temporal activities: start the harness over SSM, follow it through heartbeats, stop the VM after 10 idle minutes waiting on a person, wake it on the answer, save and destroy it after 72 hours stopped, terminate it at the end, and retry on a fresh VM after a Spot warning.",
+  "why": "A VM waiting on a person should cost about a cent an hour, not 42 cents. And every way a run ends must leave its work saved and no VM behind.",
+  "how": [
+   "workInSandbox(vm, task) (also used by G5-08's routineRun): if the harness is not already running, start it over SSM (SendCommand with AWS-RunShellScript, @aws-sdk/client-ssm) with `systemd-run --uid agent --unit nova-<run> /usr/local/bin/nova-worker run /run/nova/task.json`. A systemd unit, not a long SSM command: SSM commands time out after at most 48 hours, and runs have no time limit.",
+   "Then it follows the run: every 30 s read the last heartbeat and state from the broker's internal API, call heartbeat(progress) from @temporalio/activity, renew ai-agents:lease-until every 5 minutes, and return on done, needs_answer, preempted or failed. No heartbeat for 5 minutes throws a non-retryable ApplicationFailure of type SandboxDead (handled in G3-27). On a retry it re-attaches to the running unit.",
+   "parkSandbox(vm), used after 10 idle minutes waiting on a person: stop the instance (disk kept) and set the lease to now + 73 h. wakeSandbox(vm): start it, wait until SSM is online (about a minute), freshen again if main moved.",
+   "retireSandbox(vm) after 72 h stopped: start it, run `nova-worker checkpoint` (push the branch, upload notes; the session is already in S3), then terminate. The next answer resumes on a fresh VM.",
+   "releaseSandbox(vm): revoke the broker scope and terminate. Always called from the workflow's finally; a VM that is already gone is fine.",
+   "Spot: spot-watch writes /run/nova/preempt; the harness checkpoints and exits 'preempted'; the workflow retries the step on a fresh VM from the same group."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/activities/run.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/activities/run.ts — sketch\nimport { ApplicationFailure, heartbeat } from \"@temporalio/activity\";\nimport { EC2Client, StopInstancesCommand, TerminateInstancesCommand } from \"@aws-sdk/client-ec2\";\nimport { setTimeout as sleep } from \"node:timers/promises\";\nconst ec2 = new EC2Client({});\n\n/** Start the harness if needed, then follow it. Returns when the run ends, asks, or dies. */\nexport const workInSandbox = async (vm: Sandbox, task: Task): Promise<RunOutcome> => {\n  await ensureHarnessRunning(vm, task); // systemd-run ... nova-worker run over SSM; a retry re-attaches instead of starting twice\n  let lastLease = 0;\n  for (;;) {\n    const beat = await brokerInternal.get<Heartbeat>(`/internal/runs/${task.runId}/heartbeat`);\n    heartbeat({ step: beat.step, progress: beat.progress }); // Temporal: we're alive\n    if ([\"done\", \"needs_answer\", \"preempted\", \"failed\"].includes(beat.state)) return toOutcome(beat);\n    // No \"I'm alive\" for 5 minutes: the VM or the harness is gone.\n    if (beat.age_s > 300) throw ApplicationFailure.create({ message: \"no heartbeat for 5 minutes\", type: \"SandboxDead\", nonRetryable: true });\n    if (performance.now() - lastLease > 300_000) {\n      await tag(vm, { \"ai-agents:lease-until\": leaseUntil({ hours: 2 }) }); // the sweeper leaves live runs alone\n      lastLease = performance.now();\n    }\n    await sleep(30_000);\n  }\n};\n\n/** Waiting on a person: stop the VM and keep its disk (about $0.01/h instead of $0.42/h for full). */\nexport const parkSandbox = async (vm: Sandbox): Promise<void> => {\n  await ec2.send(new StopInstancesCommand({ InstanceIds: [vm.instanceId] }));\n  await tag(vm, { \"ai-agents:state\": \"parked\", \"ai-agents:lease-until\": leaseUntil({ hours: 73 }) });\n};\n\nexport const releaseSandbox = async (vm: Sandbox): Promise<void> => { // end of the run: no reuse, ever\n  await brokerInternal.delete(`/internal/runs/${vm.runId}`); // the capability stops working\n  await ec2.send(new TerminateInstancesCommand({ InstanceIds: [vm.instanceId] })).catch((err: Error) => {\n    if (err.name !== \"InvalidInstanceID.NotFound\") throw err; // a VM that is already gone is fine\n  });\n};"
+  }
+ },
+ {
+  "key": "G3-21",
+  "title": "[Platform] Harness wall hooks: protected paths, lint, proof before done",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G3-19"
+  ],
+  "needs": "G0: the locked-checks path list (one shared file). G4: the plan's QA checks, which are the evidence the Stop hook asks for.",
+  "what": "Three kinds of SDK hooks in the harness: PreToolUse refuses edits to protected paths and a few never-run commands, PostToolUse lints a file right after it is edited, and Stop asks for proof for each check Nova chose before it may say done.",
+  "why": "These hold every time: agents can't weaken the checks they are judged by, and 'done' needs evidence. Everything else about how Nova works stays guidance.",
+  "how": [
+   "harness/src/hooks.ts, plain HookCallback functions. Protected paths come from ai-agents/settings/protected-paths.yaml (release-harness.yml packs a copy into the harness tarball), the one file G0-18's locked-checks check also reads (CI workflows, lint and type config, eval sets, the QA checks approved in the plan), not from a list in the prompt.",
+   "PreToolUse on Edit|Write|MultiEdit|NotebookEdit: deny writes under protected paths with a calm reason and an alternative. On Bash: deny terraform, tofu or terragrunt apply/destroy, argocd app sync, gh workflow run, */dispatches and calls to 169.254.169.254. The real walls are elsewhere (no credentials, the broker); the hook gives a clear answer and a record.",
+   "Every deny goes to a refusal ledger (/run/nova/refusals.jsonl, uploaded with the artifacts). G3-31 lists it in the PR.",
+   "PostToolUse on Edit|Write: run the fast linter for that one file (`biome check --write` under frontend/; the backend's black, isort and flake8 under cloud/, client/ and sdk/) and return failures as additionalContext.",
+   "Stop: fcp's own Stop hook (G7-14) already runs verify in this session, because the harness loads fcp's project settings (settingSources [\"project\"]), so this hook doesn't run it again. For each check in the plan's QA plan, look for a passing run recorded after the last edit. Missing → decision 'block' with what is missing. If the failure is not Nova's (a flaky test, main already red at freshen), allow the stop and flag it as unproven with the reason, instead of looping.",
+   "node:test for each hook with recorded tool inputs."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/hooks.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/hooks.ts — sketch. Walls only; how to work stays guidance.\nimport type { HookCallback, HookJSONOutput, PreToolUseHookInput, StopHookInput } from \"@anthropic-ai/claude-agent-sdk/core\";\n\nconst PROTECTED = loadGlobs(\"/opt/ai-agents/harness/settings/protected-paths.yaml\"); // this repo's block; G0-18 reads the same file\nconst NEVER_RUN =\n  /\\b(terraform|tofu|terragrunt)\\b.*\\b(apply|destroy)\\b|argocd\\s+app\\s+sync|gh\\s+workflow\\s+run|\\/dispatches\\b|169\\.254\\.169\\.254/;\n\nexport const blockWalls: HookCallback = async (input) => {\n  const { tool_name: tool, tool_input } = input as PreToolUseHookInput;\n  const args = tool_input as { file_path?: string; notebook_path?: string; command?: string };\n  const path = args.file_path ?? args.notebook_path;\n  if (path && matches(path, PROTECTED)) {\n    return refuse(tool, path, \"This file is one of the checks your work is judged by. \" +\n      \"Add a new test instead, or ask the requester with ask_human.\");\n  }\n  if (tool === \"Bash\" && args.command && NEVER_RUN.test(args.command)) {\n    return refuse(tool, args.command, \"Agents never apply, destroy, sync or dispatch. Leave a note for a person.\");\n  }\n  return {};\n};\n\nexport const requireEvidence: HookCallback = async (input) => {\n  const missing = planChecks().filter((check) => !ledger.passedAfterLastEdit(check));\n  if (missing.length === 0) return {};\n  if ((input as StopHookInput).stop_hook_active && ledger.notOurs(missing)) { // flaky, or main was already red\n    ledger.flagUnproven(missing); // shown in the PR, not looped on\n    return {};\n  }\n  return { decision: \"block\", reason: `Before you stop, run these and show them passing: ${missing.join(\", \")}` };\n};\n\nconst refuse = (tool: string, target: string, why: string): HookJSONOutput => {\n  ledger.refused(tool, target, why); // listed in the PR (G3-31)\n  return { hookSpecificOutput: { hookEventName: \"PreToolUse\", permissionDecision: \"deny\", permissionDecisionReason: why } };\n};"
+  }
+ },
+ {
+  "key": "G3-22",
+  "title": "[DevOps] Sweeper: destroy orphan, old and long-stopped VMs every 15 minutes",
+  "team": [
+   "devops"
+  ],
+  "days": 1.5,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G3-15"
+  ],
+  "needs": "",
+  "what": "A Lambda in the ai-agents account that runs every 15 minutes and destroys any sandbox VM whose run is gone (its lease expired), any VM stopped for over 72 hours, orphaned disks, and warm VMs older than 24 hours, so the pool tracks the newest image. The account's vCPU quota is the final cap.",
+  "why": "Throw-away machines must really be thrown away, even when the orchestrator is down or a run crashed. Working only from tags keeps it simple and independent of Temporal.",
+  "how": [
+   "Copy modules/aws-vm-autostop (EventBridge rate(15 minutes), Python Lambda, tag-scoped IAM) to modules/aws-sandbox-sweeper; unit terraform/accounts/ai-agents/aws/us-east-1/sandboxes/sweeper/. Not attached to the VPC, so it needs no endpoints. It stays Python although the agent platform is TypeScript: the infrastructure repo builds its Lambdas in Python with uv, and DevOps owns them.",
+   "Rules: a detached VM (it has ai-agents:run-id) whose ai-agents:lease-until has passed → terminate; stopped for over 72 h → terminate (work is saved at every checkpoint); available EBS volumes tagged ai-agents:managed → delete; warm-pool VMs launched over 24 h ago → terminate inside the ASG without decrementing, so the pool refills from the current image.",
+   "IAM: ec2:TerminateInstances and ec2:DeleteVolume only with aws:ResourceTag/ai-agents:managed = true; autoscaling:TerminateInstanceInAutoScalingGroup on the sandbox ASGs only.",
+   "Start with dry_run = true (like dev-vm-autostop), log one JSON line per action, and publish CloudWatch metrics AIAgents/Sweeper (OrphansTerminated, VolumesDeleted) for G3-34. Add the namespace to the CloudWatch exporter that already feeds the aws-lambda alert rules (find its config with DevOps).",
+   "Limits: set the On-Demand and Spot vCPU quotas as the final cap; anything above waits in the Temporal slot queues (G3-25)."
+  ],
+  "code": {
+   "file": "modules/aws-sandbox-sweeper/lambda/handler.py",
+   "lang": "python",
+   "text": "\"\"\"Sandbox sweeper: every 15 minutes, remove VMs and disks that no live run owns. Based on aws-vm-autostop.\"\"\"\nimport datetime as dt\nimport json\nimport os\n\nimport boto3\n\nec2, autoscaling = boto3.client(\"ec2\"), boto3.client(\"autoscaling\")\nDRY_RUN = os.environ.get(\"DRY_RUN\", \"true\") == \"true\"  # start dry, like dev-vm-autostop\n\n\ndef handler(event, context):\n    now = dt.datetime.now(dt.UTC)\n    for inst in managed_instances(states=[\"running\", \"stopped\"]):  # tag ai-agents:managed=true only\n        tags = {t[\"Key\"]: t[\"Value\"] for t in inst.get(\"Tags\", [])}\n        if \"ai-agents:run-id\" in tags and parse(tags.get(\"ai-agents:lease-until\")) < now:\n            act(\"terminate\", inst[\"InstanceId\"], \"lease expired: no live run owns this VM\")\n        elif inst[\"State\"][\"Name\"] == \"stopped\" and stopped_since(inst) < now - dt.timedelta(hours=72):\n            act(\"terminate\", inst[\"InstanceId\"], \"stopped for over 72 h; its work is already saved\")\n        elif \"aws:autoscaling:groupName\" in tags and inst[\"LaunchTime\"] < now - dt.timedelta(hours=24):\n            act(\"recycle\", inst[\"InstanceId\"], \"warm VM older than 24 h; the pool refills from the newest image\")\n    for vol in managed_volumes(status=\"available\"):\n        act(\"delete-volume\", vol[\"VolumeId\"], \"orphaned disk\")\n\n\ndef act(action: str, resource_id: str, reason: str) -> None:\n    print(json.dumps({\"action\": action, \"id\": resource_id, \"reason\": reason, \"dry_run\": DRY_RUN}))\n    if DRY_RUN:\n        return\n    if action == \"terminate\":\n        ec2.terminate_instances(InstanceIds=[resource_id])\n    elif action == \"recycle\":\n        autoscaling.terminate_instance_in_auto_scaling_group(InstanceId=resource_id, ShouldDecrementDesiredCapacity=False)\n    else:\n        ec2.delete_volume(VolumeId=resource_id)"
+  }
+ },
+ {
+  "key": "G3-23",
+  "title": "[Platform] Harness: session store in S3 via the broker, resume anywhere",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G3-19",
+   "G3-13"
+  ],
+  "needs": "",
+  "what": "A SessionStore adapter for the Agent SDK that mirrors every transcript batch to the run's S3 prefix through broker-presigned URLs, so a session can resume on a fresh VM after a question, a crash or a Spot loss.",
+  "why": "The VM is only a workbench. If the transcript lives only on its disk, any VM failure throws away the run's thinking; with the store, nothing is lost.",
+  "how": [
+   "Copy Anthropic's TypeScript reference adapter examples/session-stores/s3 (claude-agent-sdk-typescript) into harness/src/store.ts and replace its S3Client with broker presigned URLs and fetch, because the VM has no AWS credentials: append writes one part per call, load reads the run's parts in order.",
+   "Key layout runs/<run_id>/sessions/<projectKey>/<sessionId>/[<subpath>/]part-<wall-clock ms>-<seq>.jsonl: wall clock, so parts written later on another VM sort after earlier ones. Deduplicate by entry uuid (retried batches can repeat). Implement listSubkeys so subagent transcripts resume too.",
+   "Pass sessionStore and, on resume, resume: <sessionId> from the workflow. Keep cwd /work/fcp everywhere, because the projectKey encodes it. Leave enableFileCheckpointing off: the SDK refuses it together with a store.",
+   "Watch for `{ type: \"system\", subtype: \"mirror_error\" }` messages: count them, and post_progress once if the store keeps failing, since a resumed run's store copy is its only copy.",
+   "Test with the SDK's conformance suite (copy examples/session-stores/shared/conformance.ts into harness/test/) against a fake broker, then one real resume across two VMs.",
+   "Retention: the bucket's 30-day expiry is the only retention (the SDK never deletes from a store)."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/store.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/store.ts — sketch. Adapted from the Agent SDK's S3 reference adapter (examples/session-stores/s3);\n// the VM has no AWS keys, so every object goes through a URL the broker presigns for this run's prefix.\nimport type { SessionKey, SessionStore, SessionStoreEntry } from \"@anthropic-ai/claude-agent-sdk/core\";\n\nexport class BrokerS3SessionStore implements SessionStore {\n  readonly #seen = new Set<string>(); // entry uuids already stored\n  #seq = 0;\n  constructor(private readonly broker: BrokerClient) {}\n\n  #prefix(key: SessionKey): string {\n    return `sessions/${key.projectKey}/${key.sessionId}${key.subpath ? `/${key.subpath}` : \"\"}`;\n  }\n\n  async append(key: SessionKey, entries: SessionStoreEntry[]): Promise<void> {\n    const fresh = entries.filter((e) => !(typeof e.uuid === \"string\" && this.#seen.has(e.uuid))); // retried batches repeat\n    if (fresh.length === 0) return;\n    // Wall-clock time, not a per-process counter: parts written later on another VM must sort after these.\n    const name = `${this.#prefix(key)}/part-${Date.now()}-${String(this.#seq++).padStart(6, \"0\")}.jsonl`;\n    const res = await fetch(await this.broker.artifactUrl(name, { write: true }), { method: \"PUT\", body: fresh.map((e) => JSON.stringify(e)).join(\"\\n\") });\n    if (!res.ok) throw new Error(`session store PUT failed: ${res.status}`); // the SDK retries, then reports mirror_error\n    for (const e of fresh) if (typeof e.uuid === \"string\") this.#seen.add(e.uuid);\n  }\n\n  async load(key: SessionKey): Promise<SessionStoreEntry[] | null> {\n    const parts = await this.broker.listArtifacts(`${this.#prefix(key)}/part-`); // sorted by name = by time\n    if (parts.length === 0) return null;\n    const entries: SessionStoreEntry[] = [];\n    for (const part of parts) {\n      const body = await (await fetch(await this.broker.artifactUrl(part, { write: false }))).text();\n      entries.push(...body.split(\"\\n\").filter(Boolean).map((line) => JSON.parse(line) as SessionStoreEntry));\n    }\n    return entries;\n  }\n\n  async listSubkeys(key: { projectKey: string; sessionId: string }): Promise<string[]> {\n    return this.broker.listSubkeys(this.#prefix(key)); // restores subagent transcripts too\n  }\n}"
+  }
+ },
+ {
+  "key": "G3-24",
+  "title": "[Platform] ticketToPr workflow: plan, approval, build, questions, PR",
+  "team": [
+   "plat"
+  ],
+  "days": 2,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G3-18",
+   "G3-20",
+   "G3-19"
+  ],
+  "needs": "G4: what the plan and PR steps do inside the harness (plan format, QA plan, PR story).",
+  "what": "The Temporal workflow for one Nova ticket: plan on a lite VM, wait for a person to approve, build on a full VM, ask questions and wait for answers, open the PR, and always release the VM.",
+  "why": "Temporal makes the long, human-paced parts cheap and safe: a three-day wait costs nothing and survives restarts and deploys.",
+  "how": [
+   "orchestrator/src/workflows/ticket-to-pr.ts: the workflow function ticketToPr, with signals decidePlan(decision), answerQuestion(text, by) and stop(by) (defineSignal) and a status query (defineQuery) for Slack and Jira. Workflow code stays deterministic: no Node APIs, no fetch, no Date.now() for logic; activities do all the I/O.",
+   "Plan small: claim lite as soon as the ticket arrives, freshen, run the harness in plan mode, post the plan (G4 formats it), release the lite VM.",
+   "Wait for the plan decision with condition() (reminders and parking come in G3-38). 'change' re-plans with the comment; 'reject' or stop ends the run.",
+   "Build big: claim full, freshen at the plan's base commit, run the harness in build mode with the notes. While the result needs an answer: if nobody answers within 10 minutes, park the VM; wait for answerQuestion; wake it; resume the same session.",
+   "Activities get a long startToCloseTimeout (Temporal needs one; 7 days, as in the plan, is a safety net, never a work limit: a retry re-attaches to the same VM) and a 2-minute heartbeatTimeout that catches dead workers (the LONG preset, G3-29). releaseSandbox always runs in finally, inside CancellationScope.nonCancellable so a cancelled run still frees its VM.",
+   "Tests with @temporalio/testing (TestWorkflowEnvironment.createTimeSkipping() and mocked activities): approve, change, reject, a question and answer, and a worker crash between steps all end correctly.",
+   "Each sandbox step holds a VM slot (withSlot, G3-25) and runs through runWithRecovery (G3-27), so a lost VM is replaced from the last checkpoint."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/workflows/ticket-to-pr.ts — workflow code: deterministic; no Node APIs, no fetch, no Date.now().\nimport { CancellationScope, condition, defineSignal, setHandler, workflowInfo } from \"@temporalio/workflow\";\nimport type { Handoff, PlanDecision, RunState } from \"@rhinohealth/ai-agents-shared\"; // Handoff: { key, requester, drill? } (G4-04)\nimport { act } from \"../policies.js\"; // proxied activities: 7-day start-to-close as a safety net, 2-minute heartbeats (G3-29)\nimport { waitForPerson } from \"../waiting.js\"; // reminders, then parking (G3-38); no VM runs while we wait\nexport const decidePlan = defineSignal<[PlanDecision]>(\"decidePlan\"); // Slack buttons (G3-35)\nexport const answerQuestion = defineSignal<[text: string, by: string]>(\"answerQuestion\"); // a reply in the ticket's thread\nexport async function ticketToPr(t: Handoff): Promise<string> { // workflow ID \"nova:RH-1234\": one run per ticket (G3-25)\n  const run: RunState = { stopped: false }; // shared with G4-12's grill block and the Stop button (G3-38)\n  let decision: PlanDecision | undefined;\n  setHandler(decidePlan, (d) => { decision = d; });\n  setHandler(answerQuestion, (text) => { run.answer = text; });\n  const base = await act.mainHead(); // plan and build start from the same main commit\n  const inSandbox = async (task: Task, size: Size): Promise<RunResult> => {\n    const vm = await act.acquireSandbox({ runId: workflowInfo().runId, size, agent: \"nova\", jiraKey: t.key });\n    try {\n      await act.freshenSandbox(vm, base);\n      run.answer = undefined; // cleared before the run, so a quick reply to its question is never lost\n      let result = await act.workInSandbox(vm, task); // heartbeats; no work-time limit\n      while (result.needsAnswer) {\n        const idle = !(await condition(() => run.answer !== undefined, \"10 minutes\")); // no answer yet\n        if (idle) await act.parkSandbox(vm); // stop the VM and keep its disk while a person thinks (G3-20)\n        if (!(await waitForPerson(run, \"question\", () => run.answer !== undefined, t))) return { ...result, parked: true };\n        if (idle) await act.wakeSandbox(vm); // start it again, freshen if main moved (G3-20)\n        const reply = run.answer ?? \"\"; run.answer = undefined;\n        result = await act.workInSandbox(vm, resumeTask(task, result.sessionId, reply));\n      }\n      return result;\n    } finally {\n      await CancellationScope.nonCancellable(() => act.releaseSandbox(vm)); // always: no VM is left behind\n    }\n  };\n  const plan = await inSandbox(planTask(t), \"lite\"); // plan small\n  if (plan.parked) return \"parked\";\n  await act.postPlan(t, plan);\n  if (!(await waitForPerson(run, \"plan\", () => decision !== undefined, t))) return \"parked\"; // remind at 1 day, park at 3\n  if (decision?.kind !== \"approve\") return \"stopped\";\n  const built = await inSandbox(buildTask(t, plan), \"full\"); // build big\n  return built.parked ? \"parked\" : built.prUrl;\n}"
+  }
+ },
+ {
+  "key": "G3-25",
+  "title": "[Platform] Fan-out walls: one run per thing, fixed slots, kill switch",
+  "team": [
+   "plat"
+  ],
+  "days": 2,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G3-24"
+  ],
+  "needs": "G0-13: bumping an agent's epoch kills all its live gateway tokens (the third part of the kill switch).",
+  "what": "The platform rules that stop agent storms: only the orchestrator starts runs, the workflow ID is the thing itself, each agent has its own queue with a fixed number of VM slots, a kill switch is checked before every step, and nothing inside a VM can start new runs.",
+  "why": "The fastest way to burn a budget is many agents doing work nobody needed. These are walls enforced by Temporal and the network, not by prompts.",
+  "how": [
+   "Workflow IDs: nova:RH-1234, cifix:fcp:<fingerprint>, upgrade:fcp:pr-<n>, bugfix:RH-1240. startRun calls client.workflow.start with workflowIdConflictPolicy USE_EXISTING, so a second trigger joins the open run instead of starting another.",
+   "Slots: one slots workflow per agent (nova 3, cifix 2, upgrade 2, flaky 1, bugfix 2, health 1 for dead code, test gaps, duplicates and kb-ingest, security 1) that grants and takes back slots by signal. A run holds a slot while its VM runs and gives it back while parked; extra work waits in line.",
+   "One task queue per agent (ai-agents-nova, ai-agents-cifix, ai-agents-upgrade, ai-agents-flaky, ai-agents-bugfix, ai-agents-health, ai-agents-security), plus ai-agents-orchestrator for housekeeping workflows such as the Jira polls (G3-28), so one agent can't starve another's workers.",
+   "Kill switch: a row per agent in the broker DB, read by a local activity (proxyLocalActivities) before every step (stopped → end cleanly, keep the branch) and by startRun, which then refuses new starts; a batch stop with `temporal workflow signal --namespace ai-agents --query 'Agent=\"nova\" AND ExecutionStatus=\"Running\"' --name stop`; and G0-13's epoch bump for that agent, which kills its gateway tokens.",
+   "Inside the VM: no route to Temporal and no broker endpoint that starts runs, so a dynamic workflow runs inside its ticket's VM and shares the run's backstop. Helpers can't start helpers (G3-19).",
+   "Tests in TestWorkflowEnvironment: two starts for the same ticket give one run; a 4th Nova ticket waits for a slot; the kill switch stops a run between steps.",
+   "startRun has a signal-with-start form, startOrSignal, with the same ID, queue and Agent attribute, for routines that join an open run by root cause (G5-09). ticketToPr and routineRun take a slot before acquireSandbox and give it back when the VM is parked or released: withSlot(agent, fn) in workflows/slots.ts signals request to slots:<agent> and waits for slotGranted."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/fanout.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/fanout.ts — sketch. Only the orchestrator starts runs.\nimport type { Client, Workflow } from \"@temporalio/client\";\nimport { defineSearchAttributeKey, SearchAttributeType, TypedSearchAttributes, WorkflowIdConflictPolicy } from \"@temporalio/common\";\n\nconst AGENT = defineSearchAttributeKey(\"Agent\", SearchAttributeType.KEYWORD);\n\nexport const startRun = (client: Client, agent: string, thing: string, wf: string | Workflow, ...args: unknown[]) =>\n  client.workflow.start(wf, {\n    workflowId: `${agent}:${thing}`, // nova:RH-1234 | cifix:fcp:<fingerprint> | upgrade:fcp:pr-<n> | bugfix:RH-1240\n    taskQueue: `ai-agents-${agent}`, // one queue per agent: nobody starves anybody\n    workflowIdConflictPolicy: WorkflowIdConflictPolicy.USE_EXISTING, // a second trigger joins the open run\n    typedSearchAttributes: new TypedSearchAttributes([{ key: AGENT, value: agent }]),\n    args,\n  });\n\n// ai-agents/orchestrator/src/workflows/slots.ts — workflow code. ID \"slots:<agent>\"; lives forever, continues-as-new now and then.\nimport { condition, continueAsNew, defineSignal, getExternalWorkflowHandle, setHandler, workflowInfo } from \"@temporalio/workflow\";\n\nexport const SLOTS: Record<string, number> = { nova: 3, cifix: 2, upgrade: 2, flaky: 1, bugfix: 2, health: 1, security: 1 }; // VMs in parallel per agent, to start\nexport const request = defineSignal<[workflowId: string]>(\"request\");\nexport const release = defineSignal<[workflowId: string]>(\"release\"); // on park (VM stopped) and at the end of a run\nexport const slotGranted = defineSignal(\"slotGranted\");\n\nexport async function slots(agent: string, holders: string[] = [], waiting: string[] = []): Promise<void> {\n  setHandler(request, (id) => { waiting.push(id); });\n  setHandler(release, (id) => { holders = holders.filter((h) => h !== id); });\n  while (workflowInfo().historyLength < 5000) {\n    await condition(() => waiting.length > 0 && holders.length < (SLOTS[agent] ?? 1));\n    const holder = waiting.shift()!;\n    holders.push(holder);\n    await getExternalWorkflowHandle(holder).signal(slotGranted);\n  }\n  await continueAsNew<typeof slots>(agent, holders, waiting); // carries holders and waiting along\n}"
+  }
+ },
+ {
+  "key": "G3-26",
+  "title": "[Platform] Checkpoints: push work in progress after each step that works",
+  "team": [
+   "plat"
+  ],
+  "days": 2,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G3-23",
+   "G3-10"
+  ],
+  "needs": "",
+  "what": "After every step whose checks pass, the harness commits and pushes its work to the run's branch through the broker and saves its notes; transcripts, screenshots and logs go to S3 as they are made. Any run can resume from its last checkpoint.",
+  "why": "The VM is only a workbench. Code, memory and proof are always saved outside it, so a crash, a Spot loss or a 72-hour retirement loses nothing.",
+  "how": [
+   "harness/src/checkpoint.ts, called by the step loop after a step's checks pass, and by `nova-worker checkpoint` (used by retire and on a Spot warning). git runs through execFile with an argv, never a shell string.",
+   "git: commit with `wip(RH-1234): <step> [skip ci]` and push to nova/RH-1234 through the broker. [skip ci] keeps cloud-ci (it runs on push to any branch) from taking the QA locks for every checkpoint; the commit that opens the PR has no marker.",
+   "Notes: runs/<run_id>/notes.md (plan, decisions, done, next, open questions) and a small checkpoints/<n>.json (sha, step, session id, checks) through the broker. The heartbeat carries the checkpoint sha, so the workflow always knows the latest one.",
+   "Artifacts as they are made: screenshots, Playwright traces, lab reports and command logs to runs/<run_id>/artifacts/, with a manifest the PR step (G4) links to.",
+   "Resume: a fresh VM fetches the branch at the checkpoint sha, downloads the notes and resumes the stored session; if the transcript is unusable, a new session starts seeded with the notes.",
+   "Never force-push: the broker refuses a moved branch, and protected-path edits never reach a commit (the hook refuses them)."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/checkpoint.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/checkpoint.ts — sketch\nimport { execFile } from \"node:child_process\";\nimport { readFile } from \"node:fs/promises\";\nimport { basename } from \"node:path\";\nimport { promisify } from \"node:util\";\n\nconst exec = promisify(execFile);\nconst git = (...args: string[]) => exec(\"git\", args, { cwd: \"/work/fcp\" }); // argv, never a shell string\n\n/** Save code, memory and proof outside the VM. Called after every step whose checks pass. */\nexport const checkpoint = async (run: Run, step: Step): Promise<Checkpoint> => {\n  await git(\"add\", \"-A\");\n  const staged = await git(\"diff\", \"--cached\", \"--quiet\").then(() => false, () => true); // exit 1: something is staged\n  if (staged) {\n    // [skip ci]: cloud-ci runs on push to any branch and would take the QA locks at every checkpoint.\n    await git(\"commit\", \"-m\", `wip(${run.jiraKey}): ${step.title} [skip ci]`);\n  }\n  await git(\"push\", \"origin\", `HEAD:refs/heads/${run.branch}`); // origin is the broker's git proxy\n  const sha = (await git(\"rev-parse\", \"HEAD\")).stdout.trim();\n\n  await run.broker.upload(\"notes.md\", renderNotes(run, step, sha)); // plan, done, next, questions\n  await run.broker.upload(`checkpoints/${String(step.index).padStart(3, \"0\")}.json`, JSON.stringify({\n    sha, step: step.index, session_id: run.sessionId, checks: step.checksPassed,\n  }));\n  await run.broker.heartbeat({ step: step.index, progress: run.progress(), checkpoint: sha });\n  return { sha, sessionId: run.sessionId };\n};\n\n/** Screenshots, traces, lab reports and logs go up as they are made, not at the end. */\nexport const uploadArtifact = async (run: Run, path: string, kind: string): Promise<void> => {\n  await run.broker.upload(`artifacts/${kind}/${basename(path)}`, await readFile(path));\n  run.manifest.add(kind, basename(path)); // the PR step (G4) links what the QA plan asked for\n};"
+  }
+ },
+ {
+  "key": "G3-27",
+  "title": "[Platform] Dead-house recovery: no heartbeat for 5 min, fresh VM, resume",
+  "team": [
+   "plat"
+  ],
+  "days": 2,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G3-20",
+   "G3-26"
+  ],
+  "needs": "",
+  "what": "When a run's heartbeats stop for 5 minutes, the workflow destroys that VM, takes a fresh one from the warm pool, restores the branch and memory, and resumes. After 2 lost VMs on one ticket it stops and reports in Slack.",
+  "why": "VMs crash and freeze. Recovery should be automatic and lose nothing, and a ticket that keeps killing VMs needs a person, not a third try.",
+  "how": [
+   "The heartbeat comes from a separate timer in nova-worker (G3-19), not from the model loop, so slow thinking is never taken for death. workInSandbox throws SandboxDead after 5 minutes (G3-20), and also when the EC2 status check fails or SSM goes offline.",
+   "In the workflow: catch SandboxDead (an ActivityFailure whose cause is an ApplicationFailure of that type) → release the dead VM, claim a fresh one of the same size, freshen at the last checkpoint sha, restore the notes and resume the stored session.",
+   "Count lost VMs per ticket in workflow state. On the 2nd: stop, post in the ticket's thread and on Jira what happened and where the branch and notes are, and end the run as 'needs a person'.",
+   "FCP Lab won't start (LabNotReady from G3-18): one retry on a fresh VM, then report with the `lab report` output.",
+   "Metrics ai_agents_vm_dead_total{agent,size} and ai_agents_recoveries_total{result} for G3-34.",
+   "Test with TestWorkflowEnvironment.createTimeSkipping() (an activity mock that throws SandboxDead) and in the drills by terminating a VM mid-run (G3-41)."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/workflows/recovery.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/workflows/recovery.ts — workflow code (deterministic), used by ticketToPr and routineRun.\nimport { ActivityFailure, ApplicationFailure, CancellationScope, log } from \"@temporalio/workflow\";\nimport { act } from \"../policies.js\";\n\nconst MAX_LOST_VMS = 2;\n\n/** A VM is only a workbench: if it dies, take a fresh one and carry on from the last checkpoint. */\n// RunContext (shared package) = Handoff + { runId, agent, branch, base }, built when ticketToPr or routineRun starts\nexport const runWithRecovery = async (wf: RunState, t: RunContext, task: Task, size: Size): Promise<RunResult> => {\n  for (;;) {\n    const vm = await act.acquireSandbox({ runId: t.runId, size, agent: t.agent, jiraKey: t.key });\n    try {\n      await act.freshenSandbox(vm, wf.checkpoint?.sha ?? t.base);\n      return await act.workInSandbox(vm, resumeFrom(task, wf.checkpoint));\n    } catch (err) {\n      const type = err instanceof ActivityFailure && err.cause instanceof ApplicationFailure ? err.cause.type : undefined;\n      if (type !== \"SandboxDead\" && type !== \"LabNotReady\") throw err;\n      wf.lostVms += 1;\n      log.warn(\"sandbox lost\", { run: t.runId, lost: wf.lostVms });\n      if (wf.lostVms >= MAX_LOST_VMS) {\n        await act.notify(t, \"This ticket lost two VMs in a row, so I stopped. \" +\n          `Branch ${t.branch} and my notes are saved; a person should take a look.`);\n        throw ApplicationFailure.create({ message: \"two lost VMs\", type: \"NeedsPerson\", nonRetryable: true });\n      }\n    } finally {\n      await CancellationScope.nonCancellable(() => act.releaseSandbox(vm)); // the dead VM is destroyed, never reused\n    }\n  }\n};"
+  }
+ },
+ {
+  "key": "G3-28",
+  "title": "[Platform] Trigger schedules: the Jira poll and a registry of queries",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G3-24",
+   "G3-25"
+  ],
+  "needs": "G4-04 registers Nova's query (assignee = Nova), the requester lookup and the Nova Jira token; G5-13 registers the bug-triage query and the housekeeping schedules. Agree the split with both owners: this ticket is the shared mechanism, not their rules.",
+  "what": "The orchestrator's Jira client and one schedule framework: ensureSchedules() registers every Temporal schedule idempotently at worker start, and a 1-minute pollJira schedule runs each registered Jira query and starts or joins one run per match through startRun. No new public webhooks.",
+  "why": "Polling keeps Jira access one-way (we call Jira; nothing on the internet calls us), and Temporal gives retries and history for free. One mechanism means Nova, the bug fixers and the schedules all start runs the same safe way.",
+  "how": [
+   "orchestrator/src/jira.ts on top of shared/src/jira.ts (global fetch, Jira REST v3): search with pagination, changelog, comments; it respects Jira's rate limits and retries with back-off. Token from Vault infrastructure/ai-agents/jira-nova (G4-04), synced to the orchestrator workers only.",
+   "orchestrator/src/triggers/schedules.ts: a registry of JiraQuery { name, agent, jql, every, toStart } entries and ensureSchedules(), which creates each Temporal schedule with client.schedule.create, or updates it when it already exists (overlap SKIP, a catchupWindow as long as the interval, so an outage doesn't replay a backlog).",
+   "The pollJira workflow runs one query per execution through the startMatches activity, which calls startRun(client, agent, key, …) from G3-25 for each match: the workflow ID (nova:<key>, bugfix:<key>) makes repeats no-ops.",
+   "Respect the kill switch: startRun (G3-25) refuses new starts for a stopped agent. G4's readiness check runs inside the started workflow, before any VM.",
+   "Metrics: poll duration, matches and errors per query. If Jira is down the activity retries; nothing else breaks."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/triggers/schedules.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/triggers/schedules.ts — sketch. One mechanism for every Jira trigger; no public webhooks.\nimport { type Client, type Workflow, ScheduleAlreadyRunning, ScheduleOverlapPolicy } from \"@temporalio/client\";\n// Registered by G4-04 (\"nova\") and G5-13 (\"bugfix-fe\", \"bugfix-be\"). toStart returns (workflow function, its input), or undefined to skip.\nexport interface JiraQuery { name: string; agent: string; jql: string; every: string; toStart: (issue: JiraIssue) => Promise<[Workflow, unknown] | undefined> }\nexport const QUERIES = new Map<string, JiraQuery>();\n\n/** Activity: one poll of one query. startRun refuses a stopped agent (G3-25). */\nexport const startMatches = async (name: string): Promise<number> => {\n  const q = QUERIES.get(name)!;\n  const issues = await jira.searchAll(q.jql);\n  for (const issue of issues) {\n    const start = await q.toStart(issue);\n    if (!start) continue; // e.g. no requester found yet (G4-04)\n    const [wf, input] = start;\n    await startRun(await temporalClient(), q.agent, issue.key, wf, input); // the ID (nova:RH-1234) makes repeats no-ops\n  }\n  return issues.length;\n};\n\n// workflows/poll-jira.ts — workflow code; peopleApis = proxyActivities({ ...SHORT, retry: PEOPLE_APIS }) (G3-29)\nexport async function pollJira(name: string): Promise<number> {\n  return peopleApis.startMatches(name);\n}\n\nexport const ensureSchedules = async (client: Client): Promise<void> => { // at worker start; safe to run twice\n  for (const q of QUERIES.values()) {\n    const scheduleId = `poll-jira-${q.name}`;\n    const action = { type: \"startWorkflow\" as const, workflowType: pollJira, args: [q.name],\n      workflowId: scheduleId, taskQueue: \"ai-agents-orchestrator\" };\n    const spec = { intervals: [{ every: q.every }] };\n    const policies = { overlap: ScheduleOverlapPolicy.SKIP, catchupWindow: q.every }; // an outage doesn't replay a backlog\n    await client.schedule.create({ scheduleId, action, spec, policies }).catch(async (err: unknown) => {\n      if (!(err instanceof ScheduleAlreadyRunning)) throw err;\n      await client.schedule.getHandle(scheduleId).update((prev) => ({ ...prev, action, spec, policies }));\n    });\n  }\n};"
+  }
+ },
+ {
+  "key": "G3-29",
+  "title": "[Platform] Retries, heartbeats and safe deploys for long-running workflows",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G3-24"
+  ],
+  "needs": "",
+  "what": "One set of retry policies and timeouts for every activity, heartbeats on every long activity, and the versioning and replay tests that let us deploy the orchestrator while runs are days into their life.",
+  "why": "Runs live for days, so every deploy lands in the middle of some run. Wrong retries either give up too soon or hammer a service that is down.",
+  "how": [
+   "orchestrator/src/policies.ts: a RetryPolicy per kind of call. AWS and SSM: 1 s growing to 1 min, 10 tries. Jira, Slack and GitHub through the broker: 5 s growing to 5 min, no attempt limit (G3-39 pauses the ticket on long outages). Harness steps: no automatic retry; recovery (G3-27) decides. Two activity-option presets for proxyActivities: SHORT (5 minutes) and LONG (7 days, 2-minute heartbeats).",
+   "nonRetryableErrorTypes: ScopeDenied, PlanRejected, NeedsPerson, StoppedByPerson.",
+   "Every activity longer than a minute heartbeats and has heartbeatTimeout 2 min; startToCloseTimeout (7 days) is a far safety net, never a work limit, because a retried workInSandbox re-attaches to the same VM. Activities are idempotent (claim finds its own VM by tag; release accepts a VM that is already gone).",
+   "Change workflow code with patched('<change-id>') around any new step, then deprecatePatch; delete the old branch only when no run started before the change is still open.",
+   "CI: a replay test (orchestrator/test/replay.test.ts, node:test) that runs saved workflow histories (test/histories/*.json) through Worker.runReplayHistory on every PR, so a non-deterministic change fails before it is deployed."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/policies.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/policies.ts — workflow-side helpers (deterministic). Timeouts are safety nets, not work limits.\nimport { proxyActivities, type ActivityOptions, type RetryPolicy } from \"@temporalio/workflow\";\nimport type * as activities from \"./activities/index.js\";\n\nconst NEVER_RETRY = [\"ScopeDenied\", \"PlanRejected\", \"NeedsPerson\", \"StoppedByPerson\"];\nexport const AWS: RetryPolicy = { initialInterval: \"1s\", backoffCoefficient: 2, maximumInterval: \"1 minute\",\n  maximumAttempts: 10, nonRetryableErrorTypes: NEVER_RETRY };\nexport const PEOPLE_APIS: RetryPolicy = { initialInterval: \"5s\", backoffCoefficient: 2, maximumInterval: \"5 minutes\",\n  nonRetryableErrorTypes: NEVER_RETRY }; // no attempt limit: G3-39 pauses the ticket on long outages\nexport const HARNESS_STEP: RetryPolicy = { maximumAttempts: 1 }; // recovery (G3-27) decides, not blind retries\n\nexport const SHORT: ActivityOptions = { startToCloseTimeout: \"5 minutes\" };\n// startToCloseTimeout is required by the SDK and is NOT a work limit: when 7 days pass, the retry re-attaches to the\n// harness still running on the VM. The 2-minute heartbeat is what catches a dead worker.\nexport const LONG: ActivityOptions = { startToCloseTimeout: \"7 days\", heartbeatTimeout: \"2 minutes\" };\n\n/** One place for timeouts and retries, so every workflow behaves the same (by default LONG, with AWS retries). */\nexport const act = proxyActivities<typeof activities>({ ...LONG, retry: AWS });\nexport const peopleApis = proxyActivities<typeof activities>({ ...SHORT, retry: PEOPLE_APIS });\n\n// test/replay.test.ts — on every PR: a non-deterministic workflow change fails here, not mid-run.\nimport { test } from \"node:test\";\nimport { readdir, readFile } from \"node:fs/promises\";\nimport { fileURLToPath } from \"node:url\";\nimport { Worker } from \"@temporalio/worker\";\n\ntest(\"saved workflow histories still replay\", async () => {\n  const workflowsPath = fileURLToPath(new URL(\"../src/workflows/index.ts\", import.meta.url));\n  const dir = new URL(\"./histories/\", import.meta.url); // next to this file: npm test runs from the repo root\n  for (const file of (await readdir(dir)).filter((f) => f.endsWith(\".json\")).sort()) {\n    const history = JSON.parse(await readFile(new URL(file, dir), \"utf8\"));\n    await Worker.runReplayHistory({ workflowsPath }, history, file);\n  }\n});"
+  }
+ },
+ {
+  "key": "G3-30",
+  "title": "[Platform] Slack app in Socket Mode: /nova commands and a status message",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G3-17",
+   "G3-24"
+  ],
+  "needs": "A Slack admin creates the app (Socket Mode; chat:write, commands, users:read.email, channels:history in the Nova channel) and the tokens go into Vault. Claude Tag is not an option under ZDR.",
+  "what": "Our own Slack app (@slack/bolt 5 in TypeScript, Socket Mode) with /nova RH-1234 to start, /nova status and /nova stop, and one status message per ticket that is edited in place.",
+  "why": "People hand work to Nova and follow it where they already talk. Socket Mode means no public endpoint: the app dials out to Slack.",
+  "how": [
+   "slack-app/src/app.ts with Bolt 5: `new App({ token, appToken, socketMode: true })`, then `await app.start()`. The app token (xapp-) and bot token (xoxb-) come from Vault infrastructure/ai-agents/slack-app through the ExternalSecret.",
+   "/nova RH-1234 starts or joins the run (the same ID as the Jira poll); G4-05 then changes this to 'assign the ticket to Nova' so the requester is recorded the same way as in Jira. /nova status RH-1234 → the workflow's status query; /nova stop RH-1234 → the stop signal.",
+   "One thread per ticket in the Nova channel. Its first message is the status message (Checking → Planning → Awaiting approval → Working → PR open, or Needs info / Stopped), kept current with chat.update. Its channel and ts become the run's Slack scope in the broker.",
+   "Map the Slack user to a person with config/people.yaml (Slack ID, Jira accountId, GitHub login; G4-05) and pass it as `by` on every signal, so Jira and the PR record who did what.",
+   "Ack within 3 seconds and call Temporal after; errors go back as an ephemeral message to the person who typed the command."
+  ],
+  "code": {
+   "file": "ai-agents/slack-app/src/app.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/slack-app/src/app.ts — sketch. Socket Mode: no public webhook.\nimport { App } from \"@slack/bolt\";\n\nconst app = new App({ token: process.env.SLACK_BOT_TOKEN, appToken: process.env.SLACK_APP_TOKEN, socketMode: true });\nconst USAGE = \"Try /nova RH-1234, /nova status RH-1234 or /nova stop RH-1234.\";\n\napp.command(\"/nova\", async ({ ack, command, respond }) => {\n  await ack(); // Slack needs an answer within 3 seconds; the work happens after\n  const words = command.text.trim().split(/\\s+/).filter(Boolean);\n  const [verb, key] = words.length > 1 ? [words[0], words[1]!.toUpperCase()] : [\"start\", (words[0] ?? \"\").toUpperCase()];\n  if (!JIRA_KEY.test(key)) {\n    await respond(USAGE);\n    return;\n  }\n  const by = people.bySlackId(command.user_id); // config/people.yaml (G4-05)\n  const temporal = await temporalClient();\n  const handle = temporal.workflow.getHandle(`nova:${key}`);\n  if (verb === \"start\") {\n    // G4-05 turns this into \"assign the ticket to Nova\", so the poll starts it and records the requester\n    await startRun(temporal, \"nova\", key, \"ticketToPr\", { key, requester: by.jiraAccountId }); // a Handoff (G4-04)\n    await respond(`Nova has ${key}. Follow along in its thread.`);\n  } else if (verb === \"status\") {\n    await respond(oneLine(await handle.query<RunStatus>(\"status\")));\n  } else if (verb === \"stop\") {\n    await handle.signal(\"stop\", by);\n    await respond(`Stopping ${key}. The branch and notes are kept.`);\n  } else {\n    await respond(USAGE);\n  }\n});\n\nawait app.start(); // dials out to Slack over a WebSocket"
+  }
+ },
+ {
+  "key": "G3-31",
+  "title": "[Platform] Guard rails: refused actions in the PR, alert on blocked egress",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G3-21",
+   "G3-09"
+  ],
+  "needs": "G4: the PR story section where the list goes. Security: which channel gets the alert.",
+  "what": "Every refused file edit, command, broker call and proxy request is collected per run and listed in the PR for the reviewer, and repeated blocked web requests from one sandbox raise an alert to Security.",
+  "why": "A refusal is useful information: the reviewer should see what the agent tried, and many blocked requests in a row can mean a prompt injection.",
+  "how": [
+   "Merge three sources into runs/<run_id>/refusals.json: the harness ledger (G3-21), the broker's deny audit lines for this run, and Squid denied lines from the run's VM IP (found by instance tag).",
+   "The PR step (G4) adds a 'Refused actions' section: what, when and why. Nothing refused → no section.",
+   "VictoriaLogs alert in modules/victoria-logs/alert_rules/ai-agents.yml: more than 5 denied proxy requests from one source in 5 minutes → severity high, service.name ai-agents, routed to #ai-agents-alerts and Security's channel.",
+   "The alert text says how to find the run (private IP → instance → ai-agents:run-id) and links the runbook (G3-34).",
+   "Test it with a drill ticket that asks to fetch a blocked site (G3-41)."
+  ],
+  "code": {
+   "file": "modules/victoria-logs/alert_rules/ai-agents.yml",
+   "lang": "yaml",
+   "text": "---\n# AI agent sandboxes: repeated blocked web requests can mean a prompt injection trying to get data out.\n- name: ai-agents-egress-5m\n  interval: 5m\n  type: vlogs\n  rules:\n\n  - alert: AiAgentsRepeatedBlockedEgress\n    expr: |-\n      log.processing.type:=\"squid_access\"\n      cloud.account.name:=\"ai-agents\"\n      squid.result_code:=\"DENIED\"\n      | stats by (cloud.account.name,source.address) count() as denied\n      | filter denied:>5\n    labels:\n      severity: high\n      alert_send_resolved: \"false\"\n      service.name: ai-agents\n      service.component: egress-proxy\n    annotations:\n      summary: |-\n        [AI agents] {{ index $labels \"source.address\" }} - repeated blocked web requests\n      description: |-\n        A sandbox keeps trying sites that are not on the allow-list (possible prompt injection).\n          - Find the run: the EC2 instance with this private IP, tag ai-agents:run-id\n          - Read its transcript under s3://rhino-ai-agents-runs/runs/<run_id>/\n          - Runbook: ai-agents/docs/runbooks/when-an-agent-misbehaves.md"
+  }
+ },
+ {
+  "key": "G3-32",
+  "title": "[Platform] Progress watcher: measure real progress and spot loops",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G3-21"
+  ],
+  "needs": "",
+  "what": "A watcher in the harness that reads every tool call and result, keeps score of real progress (checks that newly pass, plan items done, new facts learned), and spots loops: the same command with the same result, the same error again, undo and redo, ping-pong between two states.",
+  "why": "We don't limit time or turns, so we need another way to catch an agent going in circles. Measuring progress, not activity, never punishes a slow but useful run.",
+  "how": [
+   "harness/src/watcher.ts, a HookCallback registered for PostToolUse and PostToolUseFailure. Each event becomes a small record: tool, normalized input hash (timestamps and temp paths stripped), output hash, error signature (first error line, numbers masked), file hash after an edit.",
+   "Progress: a check command that failed before now passes; a TodoWrite item turns completed; a file or symbol is read for the first time. Each one resets the 'flat' counter.",
+   "Loops, following OpenHands' stuck detector: the same action and result 3 times; the same error signature 3 times; a file returns to an earlier hash after edits (undo and redo); A-B-A-B over 6 events.",
+   "Output: a WatcherVerdict (flat_for, loop_kind, evidence) in run state and in heartbeats. No action yet (the ladder is G3-36); log verdicts on real runs to tune the thresholds.",
+   "node:test with recorded event sequences: a healthy test-driven loop is never flagged; a flaky-test retry loop is."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/watcher.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/watcher.ts — the progress watcher: looks for progress, not activity. No clocks.\nimport type { HookCallback } from \"@anthropic-ai/claude-agent-sdk/core\";\n\nexport class Watcher {\n  readonly events: WatchEvent[] = []; // the last 200\n  readonly errors = new Map<string, number>();\n  readonly fileHashes = new Map<string, string[]>();\n  readonly failing = new Set<string>();\n  flatFor = 0;\n  onTool: HookCallback = async (input) => { // registered for PostToolUse and PostToolUseFailure\n    const ev = WatchEvent.of(input); // tool, normalized input hash, output hash, error signature, file hash\n    this.events.push(ev);\n    if (this.events.length > 200) this.events.shift();\n    this.flatFor = this.progressed(ev) ? 0 : this.flatFor + 1;\n    state.verdict = { flatFor: this.flatFor, loopKind: this.loopKind(ev), evidence: ev.evidence() }; // G3-36 acts on it\n    return {};\n  };\n\n  progressed(ev: WatchEvent): boolean {\n    const fixed = ev.isCheck && ev.passed && this.failing.has(ev.check); // a check that failed now passes\n    if (ev.isCheck) this.failing[ev.passed ? \"delete\" : \"add\"](ev.check);\n    return fixed || ev.todoCompleted || ev.firstRead; // or a plan item done, or a new fact\n  }\n\n  loopKind(ev: WatchEvent): string | null {\n    const last = this.events.slice(-6);\n    if (ev.error) this.errors.set(ev.error, (this.errors.get(ev.error) ?? 0) + 1);\n    const undo = this.rememberFile(ev); // true when an edit brings a file back to an earlier state\n    if (last.filter((e) => e.key === ev.key).length >= 3) return \"same command, same result\";\n    if (ev.error && (this.errors.get(ev.error) ?? 0) >= 3) return \"same error again\";\n    if (undo) return \"undo and redo\";\n    const keys = (from: number) => new Set(last.filter((_, i) => i % 2 === from).map((e) => e.key));\n    if (last.length === 6 && keys(0).size === 1 && keys(1).size === 1) return \"ping-pong\";\n    return null;\n  }\n}"
+  }
+ },
+ {
+  "key": "G3-33",
+  "title": "[Platform] Harness model routing: Opus 5.5 medium, one level up on failure",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G3-19"
+  ],
+  "needs": "G1: the W8–9 effort sweep that confirms each row on our code. G4: the plan names the job per step.",
+  "what": "The routing table in code (model and effort per job, chosen in the plan), the rule that a step whose checks fail is re-run one effort level higher, effort changed per message so the prompt cache stays warm, a 64K output limit, the 1-hour cache for runs that wait on people, and a test that no turn, time or budget limit is ever set.",
+  "why": "In Anthropic's tests Opus 5.5 at medium, with only failed attempts re-run at high, was both cheaper and better than running everything at high. Limits that cut a run mid-thought throw work away.",
+  "how": [
+   "harness/src/routing.ts: ROUTES from the plan's table (readiness Sonnet 5.5 low; plan Opus 5.5 medium, high when fuzzy; build Opus medium; hard build Opus high; helpers Haiku 5.5 medium; QA Sonnet 5.5 medium; CI and dependency fixers Opus low). Unknown jobs fall back to build.",
+   "The plan (G4) names the job per step and the harness looks it up. Helpers are AgentDefinitions with their own model and effort.",
+   "Escalate: when a step's checks fail, re-run that step once, one level up (low → medium → high → xhigh), then leave it to the watcher. Change effort with applyFlagSettings({ effortLevel }) on the running query (the session uses streaming input) at the step boundary instead of restarting the session; it applies from the next turn. Confirm in G4's W6 spike that cache reads stay at 80% or more.",
+   "Env: CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000 (up to 128000 for big steps, never a tight limit like 16K); CLAUDE_CODE_PROMPT_CACHE_TTL=1h for Nova and bug fixers, which wait on people, and 5m for routines.",
+   "test/no-limits.test.ts fails if the options ever get maxTurns, maxBudgetUsd or taskBudget. The per-run backstop lives between turns (G3-37)."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/routing.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/routing.ts — sketch. Starting values; G1's effort sweep confirms each row.\nexport type Effort = \"low\" | \"medium\" | \"high\" | \"xhigh\";\nexport interface Route { model: string; effort: Effort }\n\nexport const ROUTES: Record<string, Route> = {\n  readiness: { model: \"claude-sonnet-5-5\", effort: \"low\" },\n  plan: { model: \"claude-opus-5-5\", effort: \"medium\" }, // the plan asks for \"high\" on fuzzy or cross-module tickets\n  build: { model: \"claude-opus-5-5\", effort: \"medium\" }, // the default for every job not listed\n  \"build-hard\": { model: \"claude-opus-5-5\", effort: \"high\" }, // a bug in existing code, many edge cases\n  helper: { model: \"claude-haiku-5-5\", effort: \"medium\" }, // reading and search; returns file:line pointers\n  qa: { model: \"claude-sonnet-5-5\", effort: \"medium\" },\n  \"ci-fix\": { model: \"claude-opus-5-5\", effort: \"low\" }, // CI is the checker; re-run at medium if it fails\n};\nconst LEVELS: Effort[] = [\"low\", \"medium\", \"high\", \"xhigh\"];\nexport const ROUTING_ENV = {\n  CLAUDE_CODE_MAX_OUTPUT_TOKENS: \"64000\", // at 16K most long attempts were cut off\n  CLAUDE_CODE_PROMPT_CACHE_TTL: \"1h\", // Nova waits on people; routines use 5m\n};\n\nexport const routeFor = (job: string): Route => ROUTES[job] ?? ROUTES.build!;\n\n/** A step whose checks failed is re-run once, one level higher, in the same session (warm cache). */\nexport const rerunOneLevelUp = async (session: NovaSession, step: Step, route: Route): Promise<Route> => {\n  const higher = LEVELS[Math.min(LEVELS.indexOf(route.effort) + 1, LEVELS.length - 1)]!;\n  await session.query.applyFlagSettings({ effortLevel: higher }); // from the next turn; check cache reads in the W6 spike\n  await session.send(step.retryPrompt()); // streaming input: the same session, no restart\n  return { model: route.model, effort: higher };\n};\n\n// No maxTurns, no maxBudgetUsd, no taskBudget: test/no-limits.test.ts fails if one appears."
+  }
+ },
+ {
+  "key": "G3-34",
+  "title": "[DevOps] Alerts to #ai-agents-alerts and a misbehaving-agent runbook",
+  "team": [
+   "devops",
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G3-17",
+   "G3-22",
+   "G3-09"
+  ],
+  "needs": "G0-15 creates alert_rules/ai-agents.yml with the daily-spend alert and the #ai-agents-alerts receiver; this ticket adds the platform rules to both. G1-09: the agent operations dashboard to link from alerts.",
+  "what": "Alert rules for the agent platform (dead VMs, orphans, watcher hand-offs, backstop pauses, blocked egress, exhausted retries, services down, cost spikes), routed to a new #ai-agents-alerts channel, and a runbook for when an agent misbehaves.",
+  "why": "Most failures heal themselves, but people must know when they don't, and anyone on call should be able to stop an agent within a minute.",
+  "how": [
+   "Add rules to multi_tenant/accounts/infrastructure/victoria-metrics/alerting/templates/alert_rules/ai-agents.yml, the file G0-15 creates (the existing for_each picks it up). Metrics from the orchestrator and broker through their VMServiceScrapes (modules/ai-agents-service).",
+   "Use the service.name=\"ai-agents\" route to #ai-agents-alerts that G0-15 adds in templates/alertmanager/configs/slack_integration.yml.tpl; add a noresolved variant for one-shot alerts if it isn't there. Not slack_agents_*: that channel is for Rhino Client agents.",
+   "Rules: VMs died, orphans destroyed by the sweeper, watcher hand-offs to a person, backstop pauses (including shadow 'would pause'), retries exhausted, broker or gateway down (tickets pause), cache reads below 70%. Cost spikes are G0-15's daily-spend rule; blocked egress is G3-31's VictoriaLogs rule.",
+   "Runbook ai-agents/docs/runbooks/when-an-agent-misbehaves.md: find the run (Slack thread, Temporal UI, instance tag), read the transcript, stop one run (Stop button or signal), stop every run of an agent (kill switch and batch signal), revoke the agent's gateway key, run the sweeper by hand, roll back the image.",
+   "Link each alert's description to its runbook section."
+  ],
+  "code": {
+   "file": "multi_tenant/accounts/infrastructure/victoria-metrics/alerting/templates/alert_rules/ai-agents.yml",
+   "lang": "yaml",
+   "text": "---\n# AI agent platform rules (G3), next to G0-15's daily-spend rule. service.name=\"ai-agents\" -> #ai-agents-alerts.\n- name: ai-agents-5m\n  interval: 5m\n  rules:\n    - alert: AiAgentsSandboxDied\n      expr: sum by (agent, size) (increase(ai_agents_vm_dead_total[15m])) > 0\n      labels: { severity: medium, service.name: ai-agents, service.component: orchestrator }\n      annotations:\n        summary: \"[AI agents] {{ $labels.agent }}: {{ $value }} sandbox VM(s) died; recovery started\"\n\n    - alert: AiAgentsHandedToPerson\n      expr: sum by (agent) (increase(ai_agents_watcher_handoffs_total{rung=\"ask_person\"}[1h])) > 0\n      labels: { severity: low, service.name: ai-agents, service.component: harness }\n      annotations:\n        summary: \"[AI agents] {{ $labels.agent }} is stuck and asked a person\"\n\n    - alert: AiAgentsServiceDown\n      expr: up{namespace=\"ai-agents\", job=~\"broker|llm-gateway\"} == 0\n      for: 5m\n      labels: { severity: high, service.name: ai-agents, service.component: platform }\n      annotations:\n        summary: \"[AI agents] {{ $labels.job }} is down: tickets are paused (safe by default)\"\n\n    - alert: AiAgentsBackstopReached\n      expr: sum by (agent, mode) (increase(ai_agents_backstop_would_pause_total[1h])) > 0\n      labels: { severity: low, service.name: ai-agents, service.component: harness }\n      annotations:\n        summary: \"[AI agents] {{ $labels.agent }} hit the far cost backstop ({{ $labels.mode }} mode)\""
+  }
+ },
+ {
+  "key": "G3-35",
+  "title": "[Platform] Slack buttons and question threads as workflow signals",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G3-30"
+  ],
+  "needs": "G4-14 renders the plan (Block Kit), puts the plan version in the button value and decides who may click (only the requester). G4-05: config/people.yaml.",
+  "what": "The interactive layer of the Slack app: every button (plan Approve / Change / Stop, backstop Continue, Stop) and every modal becomes a Temporal signal that records who did it, and a person's reply in a ticket's thread becomes the answer to Nova's question.",
+  "why": "A person's decision must reach the waiting workflow at once, be recorded, and never be lost. G4 decides what the plan looks like and who may decide; this ticket makes the click arrive.",
+  "how": [
+   "slack-app/src/actions.ts: one app.action handler for the known action_ids, mapping each to a signal (plan_approve → decidePlan, plan_change → modal then decidePlan with the comment, plan_stop and run_stop → stop, backstop_continue → resume). The button value carries the workflow ID and, for plans, the version (G4-14).",
+   "A permission hook G4-14 fills in (only the requester decides a plan). Anyone refused gets an ephemeral message saying who can decide.",
+   "After a decision, update the message to say who decided and remove the buttons, so an old button can't fire twice. The workflow also ignores a decision that arrives after one was taken.",
+   "Questions: the broker records which workflow posted in which thread; a reply from a person (not a bot) in that thread → answerQuestion(text, by). Several replies before Nova resumes are joined.",
+   "If the signal can't be delivered (Temporal down), tell the person to try again; never drop it silently. node:test for each action with recorded Bolt payloads."
+  ],
+  "code": {
+   "file": "ai-agents/slack-app/src/actions.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/slack-app/src/actions.ts — sketch. G4-14 owns the plan's look and who may decide.\nconst SIGNALS: Record<string, string> = { plan_approve: \"decidePlan\", plan_stop: \"stop\", run_stop: \"stop\", backstop_continue: \"resume\" };\n\napp.action(/^(plan_approve|plan_change|plan_stop|run_stop|backstop_continue)$/, async ({ ack, body, action, client }) => {\n  await ack();\n  if (body.type !== \"block_actions\" || action.type !== \"button\") return;\n  const [workflowId = \"\", version = \"\"] = (action.value ?? \"\").split(\"|\"); // \"nova:RH-1234|3\": plan v3 (G4-14)\n  const person = people.bySlackId(body.user.id); // config/people.yaml (G4-05)\n  if (!(await mayDecide(person, workflowId, action.action_id))) { // G4-14: only the requester\n    return ephemeral(client, body, \"Only the requester can decide this.\");\n  }\n  if (action.action_id === \"plan_change\") {\n    await client.views.open({ trigger_id: body.trigger_id, view: changeModal(workflowId, version) });\n    return;\n  }\n  const payload = action.action_id === \"plan_approve\" ? { kind: \"approve\", by: person.email, version } : person.email;\n  try {\n    await (await temporalClient()).workflow.getHandle(workflowId).signal(SIGNALS[action.action_id]!, payload);\n  } catch { // Temporal down: never drop a decision silently\n    return ephemeral(client, body, \"That didn't reach Nova. Please try again in a minute.\");\n  }\n  await client.chat.update({ channel: body.channel?.id ?? \"\", ts: body.message?.ts ?? \"\", // no second click\n    blocks: decidedBlocks(body.message, action.action_id, person) });\n});\n\napp.event(\"message\", async ({ event }) => {\n  if (event.subtype !== undefined || event.bot_id || !event.thread_ts) return; // only people, only inside a ticket's thread\n  const workflowId = await workflowForThread(event.channel, event.thread_ts);\n  if (!workflowId) return;\n  const person = people.bySlackId(event.user);\n  await (await temporalClient()).workflow.getHandle(workflowId).signal(\"answerQuestion\", event.text ?? \"\", person.email);\n});"
+  }
+ },
+ {
+  "key": "G3-36",
+  "title": "[Platform] Watcher ladder: nudge, re-plan, think harder, fresh start, ask",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G3-32",
+   "G3-26",
+   "G3-33"
+  ],
+  "needs": "G4: review-finding fingerprints for ping-pong across review rounds.",
+  "what": "When the watcher sees no real progress, the harness steps in one rung at a time: a nudge that names the loop, a step back to re-plan, one effort level more, a fresh session from the saved progress, and finally a question to a person in Slack.",
+  "why": "A loop is a reason to change approach, not to kill the run. Each rung is cheap, and nothing is lost because the later rungs start from a checkpoint.",
+  "how": [
+   "Rungs 1–2 happen inside the turn: the watcher's hook returns additionalContext, for example 'You ran the same failing command 3 times with the same result. Try a different approach or say what blocks you.'",
+   "Rungs 3–5 happen between turns, in the step loop: rung 3 re-runs the step one effort level higher (G3-33); rung 4 checkpoints, ends the session and starts a new one seeded with notes.md; rung 5 calls ask_human with what was tried and the evidence.",
+   "Climb a rung only while progress stays flat after the previous rung; any real progress resets the ladder.",
+   "Count hand-offs as ai_agents_watcher_handoffs_total{rung} for the alerts and the weekly run review.",
+   "A review finding that comes back after a 'fix' (same fingerprint) goes straight to rung 5."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/ladder.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/ladder.ts — sketch. Steps in gently; never stops a run for being slow.\nconst RUNGS = [\"nudge\", \"replan\", \"think_harder\", \"fresh_start\", \"ask_person\"] as const; // also the metric's rung label\nconst STEP_IN_AT = [6, 9, 12, 15, 18]; // tool events with no real progress; tuned from logged verdicts\n\n/** Rungs 1-2: extra context returned by the watcher's PostToolUse hook. */\nexport const inTurnContext = (verdict: WatcherVerdict): string | undefined => {\n  if (verdict.flatFor === STEP_IN_AT[0]) {\n    return `Heads up: ${verdict.loopKind} (${verdict.evidence}). Try a different approach, or say what blocks you.`;\n  }\n  if (verdict.flatFor === STEP_IN_AT[1]) return \"Step back: write a short new plan for this step before you do anything else.\";\n  return undefined;\n};\n\n/** Rungs 3-5: at a step boundary, after a checkpoint. Real progress resets the ladder. */\nexport const betweenTurns = async (run: Run, session: NovaSession, verdict: WatcherVerdict): Promise<void> => {\n  if (verdict.flatFor === 0) {\n    run.rung = 2;\n    return;\n  }\n  const rung = RUNGS[run.rung];\n  if (!rung || verdict.flatFor < STEP_IN_AT[run.rung]!) return;\n  metrics.handoffs.add(1, { rung }); // ai_agents_watcher_handoffs_total{rung}\n  if (rung === \"think_harder\") {\n    run.route = await rerunOneLevelUp(session, run.step, run.route);\n  } else if (rung === \"fresh_start\") {\n    await checkpoint(run, run.step);\n    await run.restartSession({ seed: await run.notes() }); // new context, same branch and notes\n  } else if (rung === \"ask_person\") {\n    await askHuman(run, `I'm stuck on '${run.step.title}': ${verdict.summary()}. What should I try?`);\n  }\n  run.rung += 1;\n};"
+  }
+ },
+ {
+  "key": "G3-37",
+  "title": "[Platform] Check-ins past the estimate, a far cost backstop in shadow mode",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G3-33",
+   "G3-35"
+  ],
+  "needs": "G0: the gateway's per-run spend endpoint. G4: the estimate in the plan.",
+  "what": "When a run goes well past its own estimate, Nova posts a short check-in (what is taking time and why it is worth it) and keeps going unless someone says stop. A cost backstop far above a normal ticket pauses the run between turns and asks; for the first 4 weeks it only logs.",
+  "why": "Time is measured, never limited. The backstop exists only to catch a runaway the watcher missed, and it must never cut a run mid-thought.",
+  "how": [
+   "At each step boundary compare elapsed time with the plan's estimate. At 2× (then 4×, 8×) ask the model for a 3-line check-in and post it with post_progress. Only a Stop from a person ends the run.",
+   "Spend comes from the gateway (GET /v1/runs/{run_id}/spend from G0); the SDK's total_cost_usd is the fallback.",
+   "Backstop: NOVA_BACKSTOP_USD, set far away (later about 3× the 99th percentile of successful runs). Shadow mode: count ai_agents_backstop_would_pause_total and log the spend; nothing else.",
+   "Live mode, only after 4 weeks of data and a decision in the weekly review: finish the turn, checkpoint, exit with needs_answer and reason 'backstop'; the workflow posts Continue / Stop in the thread; Continue resumes the same session exactly where it was.",
+   "The per-agent monthly limit and the hold on new runs live in the gateway and the queues (G0, G3-25), not here."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/backstop.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/backstop.ts — sketch. Runs at step boundaries only, never mid-turn.\nconst SHADOW = (process.env.NOVA_BACKSTOP_MODE ?? \"shadow\") === \"shadow\"; // shadow for the first 4 weeks\nconst BACKSTOP_USD = Number(process.env.NOVA_BACKSTOP_USD ?? \"200\"); // far away; set from real data later\nconst CONTINUE: StepGate = { kind: \"continue\" };\n\nexport const afterStep = async (run: Run): Promise<StepGate> => {\n  if (run.elapsedMs() > run.estimate.durationMs * run.nextCheckin) {\n    const note = await run.askModel(\"In 3 short lines: what is taking time, and why is it worth it?\");\n    await run.broker.postProgress(`Check-in: I'm past my estimate of ${run.estimate.text}.\\n${note}`);\n    run.nextCheckin *= 2; // at 2x, 4x, 8x ... and keep going unless someone says stop\n  }\n\n  const spend = await run.gateway.spend(run.runId); // the gateway is the source of truth\n  if (spend < BACKSTOP_USD) return CONTINUE;\n  metrics.backstop.add(1, { mode: SHADOW ? \"shadow\" : \"live\" }); // ai_agents_backstop_would_pause_total{mode}\n  if (SHADOW) {\n    log.info(\"backstop would pause\", { run: run.runId, spend_usd: spend });\n    return CONTINUE;\n  }\n  await checkpoint(run, run.step); // nothing is lost; one tap resumes exactly here\n  return { kind: \"ask\", question: \"I've used more than the far-away budget for one ticket. Continue?\" };\n};"
+  }
+ },
+ {
+  "key": "G3-38",
+  "title": "[Platform] Waiting on people: reminders, parking and a Stop button",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G3-35",
+   "G3-20"
+  ],
+  "needs": "G4: the Jira status and assignee when a ticket is parked.",
+  "what": "Durable timers for every wait on a person: a plan not approved (remind after 1 day, park back in To Do after 3), a question not answered (remind after 1 day, park after 2), a PR not reviewed (remind after 2 days, close with a note after 14). Stop destroys the VM and keeps the branch and notes.",
+  "why": "People get busy. Nova should remind once, then step aside cleanly, and never keep a VM running while it waits.",
+  "how": [
+   "orchestrator/src/waiting.ts: waitForPerson(wf, what, done, t) on top of condition(fn, timeout), which resolves false when the timeout passes (a durable timer); ticketToPr uses it for the plan, questions and review.",
+   "Reminders go to the ticket's Slack thread and Jira, mentioning the requester. Parking posts why, moves the ticket back (G4 decides status and assignee) and ends the run as 'parked'; a later assignment starts a fresh run with the same ID.",
+   "While waiting, the VM is parked after 10 idle minutes and retired at 72 h (G3-20).",
+   "Stop (Slack button, /nova stop, @Nova stop, unassign): checkpoint if a VM is up, release the VM, revoke the scope, keep the branch and notes, and post where they are.",
+   "Drill mode, for drill tickets only: the same timers in minutes (G3-41)."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/waiting.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/waiting.ts — workflow code (deterministic). Waiting costs nothing in Temporal.\nimport { condition } from \"@temporalio/workflow\";\nimport { act } from \"./policies.js\";\n\nconst DAY = 24 * 60 * 60 * 1000;\nconst WAITS: Record<Wait, [remindAfterMs: number, parkAfterMs: number]> = {\n  plan: [1 * DAY, 3 * DAY],\n  question: [1 * DAY, 2 * DAY],\n  review: [2 * DAY, 14 * DAY],\n};\n\n/** True when the person acted; false when the ticket was parked. Stop always wins. */\nexport const waitForPerson = async (wf: RunState, what: Wait, done: () => boolean, t: Handoff): Promise<boolean> => {\n  const [remind, park] = scaled(WAITS[what], t.drill); // minutes instead of days on drill tickets\n  // condition() with a timeout resolves false when the timeout passes: a durable timer, no VM running.\n  if (await condition(() => done() || wf.stopped, remind)) return !wf.stopped;\n  await act.notify(t, REMINDERS[what](t.requester)); // Slack thread, Jira if Slack is down\n  if (await condition(() => done() || wf.stopped, park - remind)) return !wf.stopped;\n  await act.parkTicket(t, PARK_NOTES[what]); // G4 decides the Jira status and assignee\n  return false;\n};"
+  }
+ },
+ {
+  "key": "G3-39",
+  "title": "[Platform] Outages: back off, pause, resume, Slack and Jira fallback",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G3-29",
+   "G3-35"
+  ],
+  "needs": "",
+  "what": "What runs do when an outside service fails: retry with back-off; after 15 minutes without Claude, pause the ticket and resume later by itself; post on Jira when Slack is down and on Slack when Jira is down; stay safely paused when the broker or gateway is down.",
+  "why": "Outages are normal. A run should wait them out without burning a VM or losing work, and people should still hear from Nova.",
+  "how": [
+   "Claude slow or down: the SDK retries (CLAUDE_CODE_MAX_RETRIES at its default of 10). If calls still fail for 15 minutes, the harness checkpoints and exits 'paused_outage'; the workflow parks the VM and tries again after 15 min, 30 min, then every hour, resuming the stored session.",
+   "notify(t, text) (an activity): Slack thread first, Jira comment if Slack fails, and the other way around for Jira-first messages. Both down: keep the message in workflow state and send it when one comes back.",
+   "GitHub down: broker git and API calls fail closed; the harness waits and retries at the step boundary; the PR step retries with back-off.",
+   "Broker or gateway down: nothing can act without them, so tickets pause (safe by default). G3-34's alert tells DevOps; runs resume when health checks pass.",
+   "Every pause and resume posts one short line in the thread, so people know why Nova is quiet."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/activities/notify.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/activities/notify.ts — sketch\nimport { ApplicationFailure } from \"@temporalio/activity\";\n\n/** Reach the requester somewhere. Slack down -> Jira; Jira down -> Slack; both down -> retry later. */\nexport const notify = async (t: Handoff, text: string, prefer: \"slack\" | \"jira\" = \"slack\"): Promise<string> => {\n  const order = prefer === \"slack\" ? [postToThread, commentOnJira] : [commentOnJira, postToThread];\n  const errors: string[] = [];\n  for (const send of order) {\n    try {\n      await send(t, text);\n      return send.name;\n    } catch (err) {\n      if (!(err instanceof ServiceDown)) throw err; // ServiceDown: 5xx, timeouts, or still rate-limited after retries\n      errors.push(`${send.name}: ${err.message}`);\n    }\n  }\n  throw ApplicationFailure.create({ message: \"Slack and Jira are both down\", details: errors, type: \"BothDown\" }); // retried with back-off\n};\n\n// ai-agents/orchestrator/src/workflows/outage.ts — workflow code (deterministic): durable timers, no VM running.\nimport { proxyActivities, sleep } from \"@temporalio/workflow\";\nconst OUTAGE_BACKOFF = [\"15 minutes\", \"30 minutes\", \"1 hour\"];\nconst { gatewayHealthy } = proxyActivities<typeof activities>({ ...SHORT, retry: HARNESS_STEP });\n\n/** Claude was down for 15 minutes: the harness saved a checkpoint and exited. Park, wait, resume. */\nexport const waitOutOutage = async (t: Handoff, vm: Sandbox): Promise<void> => {\n  await act.notify(t, \"Claude is unavailable, so I saved my work and paused. I'll carry on by myself.\");\n  await act.parkSandbox(vm);\n  for (let attempt = 0; ; attempt++) {\n    await sleep(OUTAGE_BACKOFF[Math.min(attempt, OUTAGE_BACKOFF.length - 1)]!);\n    if (await gatewayHealthy()) return; // the caller wakes the VM and resumes the stored session\n  }\n};"
+  }
+ },
+ {
+  "key": "G3-40",
+  "title": "[Security] Design review of the built runtime before the pilot",
+  "team": [
+   "sec"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G3-12",
+   "G3-17",
+   "G3-31"
+  ],
+  "needs": "Ronen. G0's Vault narrowing and the fcp ruleset must be live by then.",
+  "what": "A review of the runtime as built, against the W4 threat model, with a few hands-on probes from a real sandbox, ending in a sign-off or a short list of blockers for the pilot.",
+  "why": "Designs drift while they are built. The walls must be checked in the real account before Nova touches real tickets.",
+  "how": [
+   "Read the deployed config: the sandbox instance role, security groups, the S3 endpoint policy, DNS firewall rules, the PrivateLink allowed principals, broker scopes, and the GitHub App's permissions (no workflows, no administration, no ruleset bypass).",
+   "Probe from a sandbox as user agent: read IMDS credentials; curl a site that is not allowed; resolve an unknown domain; push to main; push to another repo; use another run's capability; read another run's artifacts. Each must fail and show up in logs or alerts.",
+   "Check G0 is in place: the gha-runners Vault role is narrowed, and push-triggered CI on an agent branch can't reach admin secrets.",
+   "Update ai-agents/docs/threat-model.md with the findings; blockers become tickets with owners before W9."
+  ],
+  "code": null
+ },
+ {
+  "key": "G3-41",
+  "title": "[Platform] Failure drill kit: a script for every failure in the playbook",
+  "team": [
+   "plat",
+   "sec"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G3-27",
+   "G3-38",
+   "G3-39"
+  ],
+  "needs": "A drill Jira project and a scratch repo for drill PRs (ask Nave whether RhinoHealth/agent-scratchpads is meant for this).",
+  "what": "Scripted drills, one per failure in the playbook, each of which causes the failure on purpose during a test run and checks that the right thing happens.",
+  "why": "A playbook nobody has tested is a guess. Scripts make the drills repeatable after every big change.",
+  "how": [
+   "ai-agents/drills/src/ with one node:test file per area (vm.ts, agent.ts, outside-services.ts, people.ts), run by `npm run drills -w drills` and never by CI's `npm test` (they act on the real platform). Each drill starts a run on a drill ticket (minute-scale timers) and checks the outcome through Temporal queries, Slack, Jira and logs.",
+   "VM faults with AWS FIS in the ai-agents account: terminate the VM mid-run, stop it, send a Spot interruption (aws:ec2:send-spot-instance-interruptions). Orphan: launch a tagged VM with a fake run ID.",
+   "Agent faults with fixture tickets: a test that is flaky by design (a loop), a ticket that asks to edit .github/workflows (forbidden file), one that asks to fetch a blocked site, one that tries to say done with a failing check.",
+   "Service faults with drill-only switches: the gateway returns 529 for 20 minutes, the broker refuses Slack, the broker scaled to 0.",
+   "People: nobody approves, nobody answers, a person pushes to Nova's branch, main moves with a conflict, the same ticket assigned twice, five tickets at once, Stop pressed."
+  ],
+  "code": {
+   "file": "ai-agents/drills/src/vm.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/drills/src/vm.ts — sketch. Runs against the real platform with drill tickets only: `npm run drills -w drills`.\nimport assert from \"node:assert/strict\";\nimport { test } from \"node:test\";\n\nconst drill = await Drill.connect(); // Temporal, Slack, Jira, AWS FIS and metrics clients for the drill tickets\nconst MINUTES = 60_000;\n\ntest(\"drill: a VM killed mid-run resumes on a fresh VM\", async () => {\n  const run = await drill.startTicket(\"DRILL-1\", { fixture: \"small-fe-fix\" });\n  const vm = await drill.waitFor(run, { state: \"Working\" });\n  await drill.fis(\"terminate-instance\", { target: vm.instanceId }); // an AWS FIS experiment template\n  await drill.waitFor(run, { state: \"Working\", notVm: vm.instanceId, withinMs: 10 * MINUTES });\n  assert.ok(await drill.branchHasCheckpoint(run)); // nothing was lost\n  assert.ok((await drill.metric(\"ai_agents_vm_dead_total\", { agent: \"nova\" })) >= 1);\n  assert.equal(await drill.instanceExists(vm.instanceId), false); // the dead VM is gone\n});\n\ntest(\"drill: two lost VMs stop and report\", async () => {\n  const run = await drill.startTicket(\"DRILL-2\", { fixture: \"small-fe-fix\" });\n  for (let i = 0; i < 2; i++) {\n    const vm = await drill.waitFor(run, { state: \"Working\" });\n    await drill.fis(\"terminate-instance\", { target: vm.instanceId });\n  }\n  await drill.waitFor(run, { state: \"Needs a person\", withinMs: 15 * MINUTES });\n  assert.match(await drill.lastThreadMessage(run), /lost two VMs/);\n});\n\ntest(\"drill: a Spot warning pushes and retries\", async () => {\n  const run = await drill.startTicket(\"DRILL-3\", { fixture: \"ci-fix\", spot: true });\n  const vm = await drill.waitFor(run, { state: \"Working\" });\n  await drill.fis(\"send-spot-interruption\", { target: vm.instanceId });\n  await drill.waitFor(run, { state: \"Working\", notVm: vm.instanceId, withinMs: 10 * MINUTES });\n  assert.ok(await drill.branchHasCheckpoint(run));\n});"
+  }
+ },
+ {
+  "key": "G3-42",
+  "title": "[Platform] Run every failure drill with Security and fix what fails",
+  "team": [
+   "plat",
+   "sec"
+  ],
+  "days": 1,
+  "w": [
+   9,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G3-41",
+   "G3-40"
+  ],
+  "needs": "Ronen or a Security engineer for the egress and token drills.",
+  "what": "Run the whole drill kit on the real platform, fix what it finds, and finish with the goal's proof: a test ticket goes from Slack to a draft PR in a fresh VM with no key inside, and blocked traffic shows up in the proxy logs.",
+  "why": "This is how we know G3 works before real pilot tickets arrive.",
+  "how": [
+   "Run `npm run drills -w drills` (node:test) against the platform with drill tickets; keep the report under runs/drills/<date>/.",
+   "Fix small failures the same day. Anything bigger becomes a ticket with an owner, and it blocks the pilot if it touches a wall.",
+   "End-to-end proof: /nova DRILL-100 in Slack → plan → approve → draft PR on the scratch repo. Confirm the VM held no key (G3-40's probes) and the blocked-site try is in VictoriaLogs.",
+   "Add what each failure looks like in Slack, Grafana and the logs to the runbook (G3-34)."
+  ],
+  "code": null
+ }
+]

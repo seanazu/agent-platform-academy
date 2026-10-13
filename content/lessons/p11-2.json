@@ -1,0 +1,385 @@
+{
+ "id": "p11-2",
+ "title": "Brokers and capabilities",
+ "minutes": 55,
+ "youNeed": [
+  "p11-1",
+  "p1-4",
+  "p2-4"
+ ],
+ "bridge": "The broker is like a backend-for-frontend that holds the secrets, so the browser never sees an API key. Except it must also decide which sandbox may ask for what: one run, one repo, one branch. A broker that only forwards calls is a secret relay, not a wall.",
+ "intro": "Nova pushes code and opens PRs, but the VM it runs in never holds a GitHub token. The broker is a small Node service on inf. It holds the GitHub App key, mints a one-hour token for one repo, and does the GitHub calls for the run. The VM gets a capability: a random string that means 'this run'. This lesson reads Byte's design, which we start from, and the two things Nova adds: scopes and a git proxy.",
+ "picture": {
+  "caption": "The orchestrator opens a run; the VM gets a capability; the broker turns it into a narrow token that never leaves.",
+  "nodes": [
+   {
+    "id": "orch",
+    "label": "orchestrator worker",
+    "kind": "service"
+   },
+   {
+    "id": "broker",
+    "label": "broker (inf): internal port + sandbox port",
+    "kind": "service"
+   },
+   {
+    "id": "db",
+    "label": "Postgres: sha256(capability) → scope",
+    "kind": "file"
+   },
+   {
+    "id": "vm",
+    "label": "sandbox VM: nova-worker + git",
+    "kind": "machine"
+   },
+   {
+    "id": "gh",
+    "label": "GitHub (App rhino-ai-agents)",
+    "kind": "cloud"
+   },
+   {
+    "id": "audit",
+    "label": "audit log and refused writes",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "orch",
+    "to": "broker",
+    "text": "POST /internal/runs {run_id, agent, repo, branch, read_repos, jira_key, slack_thread_ts}"
+   },
+   {
+    "from": "broker",
+    "to": "db",
+    "text": "stores sha256(capability) and the scope with an expiry"
+   },
+   {
+    "from": "broker",
+    "to": "orch",
+    "text": "returns the capability: randomBytes(32) as hex, once"
+   },
+   {
+    "from": "orch",
+    "to": "vm",
+    "text": "task.json carries the capability; nothing else secret enters the VM"
+   },
+   {
+    "from": "vm",
+    "to": "broker",
+    "text": "git push to broker.ai-agents.example.com with Authorization: Bearer <capability>"
+   },
+   {
+    "from": "broker",
+    "to": "gh",
+    "text": "checks the refs, adds the 1-hour one-repo token, forwards the same bytes"
+   },
+   {
+    "from": "broker",
+    "to": "audit",
+    "text": "writes run, ref, old and new sha, allowed or refused and why"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start from Byte's broker",
+   "p": [
+    "Byte already runs this pattern on every review. Its review job starts two containers on one private Docker network. The broker holds the GitHub token, and the worker runs Claude. The worker has the capability (`openssl rand -hex 32`) and the broker's URL, nothing else. Byte's model has no git at all.",
+    "Byte's src/broker.ts has what we need. It has a capability check with `timingSafeEqual`, a 1 MiB body limit, and `/health` without auth with 401 for everything else. It has an audit log that records refused writes.",
+    "And it has a secret guard (src/secret-guard.ts) that refuses to echo the token or the capability in any response. It also has tests. G3-07 moves that core into ai-agents/broker/ and adds scopes; Byte keeps its copy this quarter.",
+    "What Byte's broker cannot do is also instructive. It is hard-scoped to one repo, one PR and one head SHA, and it never pushes. Nova needs many runs at once, each with its own repo and branch, and Nova must push. That is the whole difference."
+   ]
+  },
+  {
+   "h": "A capability is not a key",
+   "p": [
+    "A key opens a door for whoever holds it, anywhere. A capability is a random string that means 'the run with this id, until this time'.",
+    "It opens nothing by itself; the broker looks it up and decides. If it leaks, the attacker can do what that one run may do, for an hour. And they must go through a service that logs every call.",
+    "The broker stores only sha256(capability), the way a web app stores password hashes. The database can be read and still no capability is known. Expiry is part of the scope, so a run that ended gets a 401. That holds even if its capability is still in a log somewhere.",
+    "Do not mix it up with the gateway's run token from p1-4. The run token is readable claims signed with an HMAC key, and the gateway checks the signature. The capability is a random string with no claims inside; the broker checks it by looking up its hash."
+   ],
+   "because": "We look up the hash of the bearer, not the bearer itself. So a copy of the database gives an attacker nothing to present.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/scopes.ts (G3-07, part 1)",
+    "text": "import { createHash } from \"node:crypto\";\nimport type { Pool } from \"pg\";\n\nexport interface RunScope { // the zod schema lives in shared/src/schemas.ts\n  runId: string;\n  agent: string; // \"nova\", \"cifix\", ...\n  repo: string; // \"RhinoHealth/fcp\": the one repo this run may write\n  branch: string; // \"nova/RH-1234\": the one ref the git proxy lets it push\n  readRepos: string[]; // read-only, e.g. [\"RhinoHealth/rnd-kb\"]\n  jiraKey: string | null; slackChannel: string | null; slackThreadTs: string | null;\n  expiresAt: string;\n}\n\n// Byte compares its one capability with timingSafeEqual; here there is one per run, so we look up its sha256.\nexport const scopeFor = async (authorization: string | undefined, db: Pool): Promise<RunScope | null> => {\n  if (!authorization?.startsWith(\"Bearer \")) return null; // -> 401\n  const digest = createHash(\"sha256\").update(authorization.slice(\"Bearer \".length)).digest(\"hex\"); // only digests are stored\n  const { rows } = await db.query<{ scope: RunScope }>(\"SELECT scope FROM run_scopes WHERE capability_sha256 = $1\", [digest]);\n  const scope = rows[0]?.scope;\n  return scope && new Date(scope.expiresAt) > new Date() ? scope : null; // missing or expired -> 401\n};",
+    "notes": [
+     {
+      "line": 4,
+      "text": "The scope is everything the run may touch. The orchestrator writes it once at POST /internal/runs; nothing in the VM can widen it."
+     },
+     {
+      "line": 7,
+      "text": "One repo to write. read_repos may add read-only repos, like rnd-kb for the brain."
+     },
+     {
+      "line": 8,
+      "text": "One branch. The git proxy (section 4) refuses every other ref."
+     },
+     {
+      "line": 16,
+      "text": "No header, or a header that is not Bearer: null, and the caller returns 401 with no hint."
+     },
+     {
+      "line": 17,
+      "text": "Hash first, then look up. The capability string itself is never written to the database or a log."
+     },
+     {
+      "line": 20,
+      "text": "Expired scopes behave exactly like unknown ones. A run that is over cannot act."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "Byte uses timingSafeEqual because it compares one secret against one stored value. With a hash lookup the comparison is a database equality on digests, and timing no longer reveals the secret. Keep timingSafeEqual wherever a raw secret is compared."
+   }
+  },
+  {
+   "h": "One-repo tokens that never leave",
+   "p": [
+    "GitHub Apps mint installation tokens (p2-4): short-lived, scoped to chosen repos and permissions. The broker holds the App's private key, from Vault through its pod's Secret (p5-3). It asks for a token per run: one repository name, contents and pull_requests write, checks and actions read. It caches the token for the run and refreshes it at 50 minutes.",
+    "One permission is never requested: `workflows`. Without it GitHub refuses any push that changes .github/workflows. That is the first locked-checks wall (lesson p11-3), enforced by GitHub, not by us."
+   ],
+   "because": "Asking for the narrowest token per run means a leak of one token is one repo, one hour, and no workflow edits.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/scopes.ts (G3-07, part 2)",
+    "text": "import { createAppAuth } from \"@octokit/auth-app\";\nimport { config } from \"./config.js\";\n\n// Never \"workflows\": without it GitHub refuses any push that changes .github/workflows/.\nconst WRITE_PERMISSIONS = { contents: \"write\", pull_requests: \"write\", checks: \"read\", actions: \"read\" };\nconst auth = createAppAuth({ appId: config.githubAppId, privateKey: config.githubAppPrivateKey }); // from Vault, never in a VM\n\nexport const mintToken = async (scope: RunScope): Promise<string> => { // 1 hour, one repo; it never leaves the broker\n  const { token } = await auth({\n    type: \"installation\", installationId: config.installationId,\n    repositoryNames: [scope.repo.split(\"/\")[1] ?? \"\"], permissions: WRITE_PERMISSIONS,\n  });\n  return token;\n};",
+    "notes": [
+     {
+      "line": 5,
+      "text": "Write to code and PRs; read checks and Actions runs. No issues, no administration, no workflows."
+     },
+     {
+      "line": 6,
+      "text": "The private key comes from the pod's environment, filled by the ExternalSecret at infrastructure/ai-agents/broker."
+     },
+     {
+      "line": 11,
+      "text": "repositoryNames with one name. The token cannot read any other repo in the installation."
+     },
+     {
+      "line": 13,
+      "text": "The token is returned to broker code only. No route ever sends it to a caller; the secret guard double-checks."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The git proxy: check the refs, then forward",
+   "p": [
+    "Nova's git remote is https://broker.ai-agents.example.com/git/RhinoHealth/fcp.git. A credential helper in the image reads /run/nova/capability and sends it as the bearer. The broker speaks git's smart-HTTP protocol: it answers info/refs, forwards fetches, and for a push reads the commands before the pack.",
+    "Every push lists the refs it wants to update, with the old and new commit SHA for each. The broker reads that list and refuses anything that is not a normal update of refs/heads/<scope.branch>. Then it streams the same bytes to github.com with the token in the Authorization header, and streams the answer back. The VM never sees a token."
+   ],
+   "because": "The broker reads the ref commands before forwarding. So it can say no before a single byte reaches GitHub, with a message the agent can act on.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/git-proxy.ts (G3-10, the check)",
+    "text": "const ZERO = \"0\".repeat(40);\nexport class Refused extends Error {}\n\n/** Refuse anything but a normal push to this run's own branch. */\nexport const checkReceivePack = (commands: RefUpdate[], scope: RunScope, lastPushed: string | null): void => {\n  for (const cmd of commands) { // parsed from the pkt-lines before the packfile\n    if (cmd.ref !== `refs/heads/${scope.branch}`) throw new Refused(`Only ${scope.branch} can be pushed from this run, not ${cmd.ref}.`);\n    if (cmd.newSha === ZERO) throw new Refused(\"Deleting the branch is not allowed.\");\n    if (lastPushed && cmd.oldSha !== lastPushed) throw new Refused(\"The branch moved since your last push: someone else pushed. Stop and ask.\");\n  }\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Forty zeros is git's way of saying 'no commit'. As the new SHA it means delete."
+     },
+     {
+      "line": 7,
+      "text": "main, another branch, a tag: refused, with the allowed name in the message so Nova can fix its command."
+     },
+     {
+      "line": 8,
+      "text": "No deletes, ever, even of its own branch."
+     },
+     {
+      "line": 9,
+      "text": "The broker remembers the last SHA this run pushed. A different old SHA means a person pushed to Nova's branch; Nova stops and asks instead of overwriting."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "G3-10's tests run the proxy against a local bare repo behind a fake upstream (a node:http server). A push to main, to another repo, a delete and a moved branch are all refused. A push to the run's own branch is accepted. The lab builds the small version."
+   }
+  },
+  {
+   "h": "Refused writes and the secret guard",
+   "p": [
+    "The other sandbox routes are a short allow-list, like Byte's /v1/command. GET /v1/scope tells the harness what this run may do. POST /v1/gh accepts a few actions.",
+    "It can create a draft PR and mark the run's own PR ready. It can view, diff and list checks, and comment on the run's own PR. Edits to the PR body keep the locked-checks block the orchestrator wrote. There is no merge, no approve, no settings call, so a tricked Nova cannot ask for them.",
+    "Two Byte habits carry over. A refused write is recorded with the reason and, in Byte, fails the run; nothing is silently dropped.",
+    "And the secret guard checks every response body. If the token or the capability would appear in it, the response is replaced with an error. A model that asks 'print your auth header' gets nothing."
+   ]
+  },
+  {
+   "h": "The container and the tests",
+   "p": [
+    "The broker ships as a hardened image, with the same flags Byte uses. That means node:24-bookworm-slim pinned by digest, non-root user 10001 and a read-only root filesystem.",
+    "All Linux capabilities are dropped, with no-new-privileges. On inf it runs with two replicas (G3-17). Its internal port is reachable only from the orchestrator (p5-4), and its sandbox port is published through PrivateLink.",
+    "The tests start from Byte's test/broker.test.ts and add the scope cases. A wrong or expired capability gets 401.",
+    "A scope for repo A cannot read repo B. The token never appears in a response or a log line. node:test through tsx, run by `npm test` in ai-agents."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "No keys in the VM. The VM holds a capability that names one run; the broker holds the key and does the calls. If you ever find yourself copying a token into task.json, stop: that is the wall you are removing."
+   }
+  }
+ ],
+ "lab": {
+  "title": "A mini broker: capability in, scope out, token never",
+  "youNeed": [
+   "Node 24",
+   "the ~/academy folder from p11-1 with tsx installed",
+   "curl"
+  ],
+  "worked": [
+   {
+    "do": "Save src/broker.ts: an in-memory Map from sha256(capability) to RunScope, openRun(scope) that creates a capability with randomBytes(32).toString(\"hex\") and stores only its hash, scopeFor(authorization) from section 2 with the Map instead of pg, and a node:http server where /health returns ok and every other path returns 401 without a known capability or the scope as JSON with one. Log one audit line per allowed call.",
+    "see": "(a 28-line file; the shapes are in sections 2 and 6)"
+   },
+   {
+    "do": "Save src/main.ts: call openRun for run-1 (repo RhinoHealth/fcp, branch nova/RH-1234, expiresAt one hour from now), print the capability once, and listen on 8080. Then: node --import tsx src/main.ts",
+    "see": "broker on :8080; capability for run-1: b0915a91eb8b47d047f2785ad7654258d848ce803d43b2921c9d1475af18c5c3"
+   },
+   {
+    "do": "In a second terminal: curl -s -w ' [%{http_code}]\\n' localhost:8080/health",
+    "see": "ok [200]"
+   },
+   {
+    "do": "curl -s -w ' [%{http_code}]\\n' localhost:8080/v1/scope",
+    "see": "missing or unknown capability [401]"
+   },
+   {
+    "do": "CAP=<the hex from the broker's first line>; curl -s -w ' [%{http_code}]\\n' -H \"Authorization: Bearer $CAP\" localhost:8080/v1/scope",
+    "see": "{\"repo\":\"RhinoHealth/fcp\",\"branch\":\"nova/RH-1234\"} [200]"
+   },
+   {
+    "do": "Look at the broker's terminal: the audit line",
+    "see": "{\"audit\":\"scope.read\",\"run\":\"run-1\",\"path\":\"/v1/scope\"}"
+   },
+   {
+    "do": "Write test/broker.test.ts with node:test: a wrong capability and a missing header give null from scopeFor; the run's own capability gives its scope; an expired scope gives null. Then: node --import tsx --test test/broker.test.ts",
+    "see": "✔ a wrong capability gets no scope\n✔ the run's own capability gets its scope\n✔ an expired capability gets no scope\nℹ tests 3\nℹ pass 3\nℹ fail 0"
+   }
+  ],
+  "faded": "Add checkReceivePack from section 4 to src/git-proxy.ts (define RefUpdate as { ref, oldSha, newSha }). Write tests. A push to refs/heads/main throws Refused, and a delete (newSha of 40 zeros) throws. The run's own branch with a matching lastPushed passes. The last test is yours: a push whose oldSha differs from lastPushed must throw with a message that contains 'Stop and ask'.",
+  "alone": "Add a secret guard to the mini broker. Give the server a fake token constant and a route /v1/debug that (wrongly) tries to return it. Write a function guard(body, secrets) that replaces the body with an error when any secret appears in it. Wrap every response in it. Write a test proving /v1/debug returns the error and never the token. Then delete the /v1/debug route and keep the guard.",
+  "done": "/health answered without a capability, and /v1/scope answered 401 without one and 200 with it. The audit line appeared, and the three tests pass."
+ },
+ "quiz": [
+  {
+   "q": "The orchestrator wants to pass the GitHub token to the VM 'to make git faster'. Which of these is the right answer?",
+   "options": [
+    {
+     "text": "Fine, if the token is one-repo and expires in an hour",
+     "correct": false,
+     "why": "A one-hour one-repo token in a VM that reads untrusted text is still a key in the VM. The wall is gone."
+    },
+    {
+     "text": "No: the VM gets a capability, and the broker's git proxy adds the token after checking the refs",
+     "correct": true,
+     "why": "That is the design of G3-07 and G3-10. Speed is not a reason to remove a wall."
+    },
+    {
+     "text": "Fine, if the token is stored in /run/nova/capability",
+     "correct": false,
+     "why": "The file name does not matter. A token is a key; a capability is a run id the broker looks up."
+    }
+   ]
+  },
+  {
+   "q": "Why does the broker store sha256(capability) and not the capability?",
+   "options": [
+    {
+     "text": "Because Postgres cannot store 64-character strings",
+     "correct": false,
+     "why": "It can. The reason is what a leaked table would give away."
+    },
+    {
+     "text": "So a copy of the database gives an attacker nothing to present as a bearer",
+     "correct": true,
+     "why": "Like password hashes: the lookup works on the digest, the secret is never stored."
+    },
+    {
+     "text": "Because timingSafeEqual needs a fixed length",
+     "correct": false,
+     "why": "Hash lookup replaces timingSafeEqual here; the length is not the point."
+    }
+   ]
+  },
+  {
+   "q": "A push from a Nova run arrives with old SHA abc1 for refs/heads/nova/RH-1234, but the broker last recorded def2 for that run. What happens?",
+   "options": [
+    {
+     "text": "The broker forwards it; GitHub will reject it if it is wrong",
+     "correct": false,
+     "why": "GitHub would accept a force push with the right old SHA. The broker refuses first."
+    },
+    {
+     "text": "The broker refuses with 'The branch moved since your last push: someone else pushed. Stop and ask.'",
+     "correct": true,
+     "why": "A different old SHA means a person touched Nova's branch. Nova must not overwrite them; it asks in the thread."
+    },
+    {
+     "text": "The broker rebases Nova's commits on top and pushes",
+     "correct": false,
+     "why": "The broker never changes code. It checks and forwards, or refuses."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p11-1: which of the three legs does the broker narrow for Nova, and which leg is removed elsewhere?",
+  "From p2-4: how long does a GitHub App installation token live, and what is needed to mint one?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "capability",
+   "plain": "A random string, one per run, that the broker looks up to find what that run may do. It is not a key."
+  },
+  {
+   "term": "scope",
+   "plain": "What one run may touch: one repo to write, one branch, read-only repos, one Jira issue, one Slack thread, an expiry."
+  },
+  {
+   "term": "installation token",
+   "plain": "A one-hour GitHub token minted from the App's private key for chosen repos and permissions."
+  },
+  {
+   "term": "git smart-HTTP",
+   "plain": "The protocol git uses over https: info/refs to discover, upload-pack to fetch, receive-pack to push."
+  },
+  {
+   "term": "receive-pack",
+   "plain": "The push request: a list of ref updates (old SHA, new SHA, ref name) followed by the packed objects."
+  },
+  {
+   "term": "secret guard",
+   "plain": "Byte's check that no response body ever contains the token or the capability."
+  },
+  {
+   "term": "refused write",
+   "plain": "A write the broker said no to; it is recorded with the reason and never silently dropped."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-07",
+   "why": "Moves Byte's broker core into ai-agents and adds per-run scopes and one-repo tokens, exactly the code read here."
+  },
+  {
+   "key": "G3-10",
+   "why": "Adds the git proxy with checkReceivePack and the moved-branch rule."
+  },
+  {
+   "key": "G3-17",
+   "why": "Deploys the broker on inf with two ports, two replicas and the hardened container flags."
+  },
+  {
+   "key": "G0-11",
+   "why": "Narrows Vault before agents push, because CI on an agent branch runs with Vault access the broker does not control."
+  }
+ ],
+ "remember": "The VM holds a capability that names one run; the broker holds the key, checks the refs, and does the call."
+}

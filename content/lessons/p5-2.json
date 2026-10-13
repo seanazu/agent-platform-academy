@@ -1,0 +1,462 @@
+{
+ "id": "p5-2",
+ "title": "Helm releases through Terraform",
+ "minutes": 50,
+ "youNeed": [
+  "p5-1",
+  "p4-2"
+ ],
+ "bridge": "A Helm chart is like an npm package of YAML templates, and its values are the props you pass in. A `helm_release` in Terraform is like adding that package to package.json. Except Terraform state remembers the release, and apply changes real pods on inf, so a person runs apply, never an agent.",
+ "intro": "On inf-rhinohealth nothing is deployed by hand or by Argo CD. Each tool is a Terraform unit in the infrastructure repo that installs a Helm chart. n8n is the pattern; the agents' Temporal (G3-06), the gateway (G0-15), the broker (G3-17) and the brain bot (G6-22) copy it. This lesson shows the pattern end to end, from a chart on your laptop to a plan pasted into a PR.",
+ "picture": {
+  "caption": "A unit feeds a module; the module renders a chart and asks the cluster for it; a person applies.",
+  "nodes": [
+   {
+    "id": "unit",
+    "label": "unit: ai-agents/temporal/repository/terragrunt.hcl",
+    "kind": "file"
+   },
+   {
+    "id": "mod",
+    "label": "modules/ai-agents-temporal/main.tf",
+    "kind": "file"
+   },
+   {
+    "id": "person",
+    "label": "DevOps on VPN: tofu plan, then apply",
+    "kind": "person"
+   },
+   {
+    "id": "chart",
+    "label": "chart temporal 1.5.0 (go.temporal.io)",
+    "kind": "cloud"
+   },
+   {
+    "id": "api",
+    "label": "inf control plane",
+    "kind": "service"
+   },
+   {
+    "id": "rds",
+    "label": "RDS Postgres (unit rds)",
+    "kind": "cloud"
+   },
+   {
+    "id": "secret",
+    "label": "ExternalSecret → Secret temporal-db",
+    "kind": "service"
+   }
+  ],
+  "steps": [
+   {
+    "from": "unit",
+    "to": "mod",
+    "text": "passes inputs: namespace, vault_path, db_endpoint"
+   },
+   {
+    "from": "person",
+    "to": "mod",
+    "text": "tofu plan shows: + helm_release.temporal, + ExternalSecret"
+   },
+   {
+    "from": "mod",
+    "to": "chart",
+    "text": "on apply, Helm fetches version 1.5.0 and renders it with our values"
+   },
+   {
+    "from": "mod",
+    "to": "secret",
+    "text": "the ExternalSecret is created first (depends_on)"
+   },
+   {
+    "from": "secret",
+    "to": "api",
+    "text": "External Secrets writes Secret temporal-db from Vault"
+   },
+   {
+    "from": "api",
+    "to": "rds",
+    "text": "Temporal pods start and connect with the password from the Secret"
+   },
+   {
+    "from": "person",
+    "to": "unit",
+    "text": "the plan is pasted into the PR; apply happens after approval"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start with a chart on your laptop",
+   "p": [
+    "A chart is a folder of YAML templates plus a values.yaml with defaults. `helm template` fills the templates with values and prints plain Kubernetes YAML. Nothing is installed; you are reading what would be sent to the cluster.",
+    "Try it on the real chart we will use for the agents' Temporal. It is the same chart (temporal 1.5.0, app 1.31.1) that gitops/cloud/temporal wraps for the product."
+   ],
+   "because": "Rendering first shows you exactly which Deployments and Services a chart creates before any Terraform is involved.",
+   "code": {
+    "lang": "bash",
+    "file": "your laptop",
+    "text": "helm repo add temporalio https://go.temporal.io/helm-charts\nhelm search repo temporalio/temporal --version 1.5.0\nhelm show values temporalio/temporal --version 1.5.0 > defaults.yaml\ngrep -n numHistoryShards defaults.yaml\nhelm template temporal temporalio/temporal --version 1.5.0 -n ai-agents -f values.yaml > rendered.yaml\ngrep '^kind:' rendered.yaml | sort | uniq -c",
+    "notes": [
+     {
+      "line": 1,
+      "text": "A chart repository is an index of charts, like an npm registry. go.temporal.io is Temporal's own."
+     },
+     {
+      "line": 3,
+      "text": "The chart's defaults. Our values file overrides only what we need, like props over default props."
+     },
+     {
+      "line": 4,
+      "text": "Line 143 says numHistoryShards: 512 and that it cannot change after the first install. We set 128 (G3-06)."
+     },
+     {
+      "line": 5,
+      "text": "Render with our values (next section). The -n is the namespace written into every object."
+     },
+     {
+      "line": 6,
+      "text": "Count object kinds. With the values below you get 6 Deployments, 6 Services, 3 ConfigMaps, 1 Job and 1 Pod."
+     }
+    ]
+   },
+   "see": "   6 kind: Service\n   6 kind: Deployment\n   3 kind: ConfigMap\n   1 kind: Pod\n   1 kind: Job",
+   "ifInstead": "If instead you see 'No valid driver configured for default store', the chart has no database to render for. Pass the values.yaml from the next section with -f."
+  },
+  {
+   "h": "Values are the props",
+   "p": [
+    "Everything that differs between the product's Temporal and ours is a value. The module keeps them in a template file, templates/temporal_values.yml.tpl, and fills in the database endpoint and the shard count with `templatefile()`.",
+    "Three values matter most. `fullnameOverride: temporal` makes object names short (temporal-frontend, not temporal-temporal-frontend). `numHistoryShards: 128` is fixed forever after the first install, so it is chosen now, not tuned later. `existingSecret: temporal-db` points the server at the Secret that External Secrets writes."
+   ],
+   "because": "We put the database password in an existing Secret so the chart never sees the password and Terraform state never stores it.",
+   "code": {
+    "lang": "yaml",
+    "file": "values.yaml on your laptop (the shape of templates/temporal_values.yml.tpl)",
+    "text": "fullnameOverride: temporal\nserver:\n  config:\n    persistence:\n      numHistoryShards: 128        # cannot change after the first install\n      datastores:\n        default:\n          sql:\n            pluginName: postgres12\n            driverName: postgres12\n            databaseName: temporal\n            connectAddr: \"db.example.internal:5432\"   # the module passes the RDS endpoint here\n            connectProtocol: tcp\n            user: temporal\n            existingSecret: temporal-db   # written by External Secrets, never by Helm\n            secretKey: password\n            maxConns: 6\n        visibility:\n          sql:\n            pluginName: postgres12\n            driverName: postgres12\n            databaseName: temporal_visibility\n            connectAddr: \"db.example.internal:5432\"\n            user: temporal\n            existingSecret: temporal-db",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Short names. The Service other pods call is temporal-frontend, port 7233."
+     },
+     {
+      "line": 5,
+      "text": "128 shards for a small Temporal; the product's uses 512. Changing it later means a new install."
+     },
+     {
+      "line": 12,
+      "text": "In the module this is `${db_endpoint}`, an input from the rds unit. On your laptop any hostname renders."
+     },
+     {
+      "line": 15,
+      "text": "The chart only names the Secret. Lesson p5-3 shows how Vault fills it."
+     },
+     {
+      "line": 17,
+      "text": "maxConns 6 for the main store and 2 for visibility, the numbers from gitops/cloud/temporal/values.yaml."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "Old chart keys like `cassandra:` or `prometheus:` at the top level make 1.5.0 refuse to render. Copy values from gitops/cloud/temporal/values.yaml, which already targets this chart, not from an old blog post."
+   }
+  },
+  {
+   "h": "The n8n pattern: one folder, four units",
+   "p": [
+    "In the infrastructure repo, n8n lives at multi_tenant/accounts/infrastructure/n8n/ with one unit per piece. The units are secrets, sg, rds, elasticache, s3 and repository, plus an n8n.hcl with the shared facts (namespace, hostnames, Vault paths). The agents' Temporal copies this: multi_tenant/accounts/infrastructure/ai-agents/temporal/{secrets,sg,rds,repository} and an ai-agents.hcl.",
+    "A unit is a terragrunt.hcl that names a module and gives it inputs. Units depend on each other through `dependency` blocks: repository needs the rds unit's endpoint and the secrets unit's Vault path.",
+    "The brain bot's repository unit (G6-22) is the smallest example of the shape. Read it with the notes."
+   ],
+   "because": "One unit per piece keeps each plan small and lets a reviewer see exactly what a change touches.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/multi_tenant/accounts/infrastructure/brain-bot/repository/terragrunt.hcl",
+    "text": "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n\nlocals {\n  bot = read_terragrunt_config(find_in_parent_folders(\"brain-bot.hcl\"))\n}\n\nterraform {\n  source = \"../../../../../modules/ai-agents-service//\"\n}\n\ndependency \"secrets\" {\n  config_path  = \"../secrets\"\n  mock_outputs = { vault_path = \"infrastructure/brain-bot\" }\n}\n\ninputs = {\n  name              = \"brain-bot\"\n  namespace         = local.bot.locals.namespace\n  image             = \"123456789012.dkr.ecr.us-east-1.amazonaws.com/rnd-kb-bot@${local.bot.locals.image_digest}\"\n  replicas          = 1\n  vault_secret_path = dependency.secrets.outputs.vault_path\n  expose            = false\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The old tree's root.hcl: remote state in S3, providers pinned (helm 3.1.1, kubernetes 3.0.1), the inf kubeconfig."
+     },
+     {
+      "line": 6,
+      "text": "Shared facts for all brain-bot units live in brain-bot.hcl next to them, like n8n.hcl for n8n."
+     },
+     {
+      "line": 10,
+      "text": "The module is a local folder in the repo. `//` marks the module root for Terragrunt."
+     },
+     {
+      "line": 13,
+      "text": "The secrets unit must be applied first; its output is the Vault path. mock_outputs let plan run before it exists."
+     },
+     {
+      "line": 21,
+      "text": "Image pinned by digest. The digest is a local in brain-bot.hcl, so bumping the bot is a one-line PR."
+     },
+     {
+      "line": 24,
+      "text": "No Service and no HTTPRoute: the bot dials out to Slack (Socket Mode), nothing dials in."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The module, part 1: namespace and Secret",
+   "p": [
+    "The module is plain Terraform. For Temporal it creates the Kubernetes namespace and an ExternalSecret that copies the DB password from Vault into a Secret. Then it creates the Helm release. Here is the first half of modules/ai-agents-temporal/main.tf from G3-06."
+   ],
+   "because": "The namespace and the Secret must exist before the chart's pods start, or the pods crash looking for a password.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/ai-agents-temporal/main.tf (part 1)",
+    "text": "resource \"kubernetes_namespace_v1\" \"this\" {\n  metadata { name = var.namespace } # \"ai-agents\"\n}\n\n# DB password from Vault (kvv2 infrastructure/ai-agents/temporal), synced by External Secrets.\nresource \"kubectl_manifest\" \"temporal_db_secret\" {\n  yaml_body = yamlencode({\n    apiVersion = \"external-secrets.io/v1\"\n    kind       = \"ExternalSecret\"\n    metadata   = { name = \"temporal-db\", namespace = kubernetes_namespace_v1.this.metadata[0].name }\n    spec = {\n      refreshInterval = \"5m\"\n      secretStoreRef  = { name = \"vault-store\", kind = \"ClusterSecretStore\" }\n      target          = { name = \"temporal-db\", creationPolicy = \"Owner\" }\n      data            = [{ secretKey = \"password\", remoteRef = { key = var.vault_path, property = \"DB_PASSWORD\" } }]\n    }\n  })\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The Kubernetes namespace from p5-1, created by Terraform so the unit owns it."
+     },
+     {
+      "line": 6,
+      "text": "kubectl_manifest applies any YAML. We use it because ExternalSecret is not a built-in Kubernetes kind."
+     },
+     {
+      "line": 7,
+      "text": "yamlencode turns the HCL map into YAML, so you write HCL and get the same object as hand-written YAML."
+     },
+     {
+      "line": 13,
+      "text": "vault-store is the cluster-wide store that reads Vault's kvv2 mount. Lesson p5-3 looks at what it may read."
+     },
+     {
+      "line": 15,
+      "text": "Copy one key: property DB_PASSWORD at var.vault_path becomes key password in Secret temporal-db."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The module, part 2: the helm_release",
+   "p": [
+    "The second half installs the chart. `helm_release` is a Terraform resource from the helm provider: name, namespace, where the chart comes from, which version, and the values."
+   ],
+   "because": "Pinning the chart version and the shard count in code means the next person's plan shows no surprise upgrade.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/ai-agents-temporal/main.tf (part 2)",
+    "text": "resource \"helm_release\" \"temporal\" {\n  name        = \"temporal\"\n  namespace   = kubernetes_namespace_v1.this.metadata[0].name\n  repository  = \"https://go.temporal.io/helm-charts\"\n  chart       = \"temporal\"\n  version     = \"1.5.0\" # the same chart as product Temporal (gitops/cloud/temporal)\n  max_history = 10\n\n  values = [templatefile(\"${path.module}/templates/temporal_values.yml.tpl\", {\n    db_endpoint        = var.db_endpoint\n    num_history_shards = 128 # cannot change after the first install\n    temporal_namespace = \"ai-agents\" # retention 30d\n  })]\n\n  depends_on = [kubectl_manifest.temporal_db_secret]\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The release name. Helm stores each release's history in the cluster under this name."
+     },
+     {
+      "line": 6,
+      "text": "Exact chart version. Without it, apply would install whatever is newest that day."
+     },
+     {
+      "line": 7,
+      "text": "Keep 10 old revisions, so `helm rollback` can go back after a bad values change."
+     },
+     {
+      "line": 9,
+      "text": "The values file from section 2, with three holes filled by the module's inputs."
+     },
+     {
+      "line": 12,
+      "text": "The Temporal namespace (workflows), not the Kubernetes one (pods). Same word, different system."
+     },
+     {
+      "line": 15,
+      "text": "Order: Secret first, then the release. Without this, Terraform may start the pods before the password exists."
+     }
+    ]
+   }
+  },
+  {
+   "h": "RDS, digests and the other units",
+   "p": [
+    "The rds unit uses the registry module tfr:///terraform-aws-modules/rds/aws version 6.12.0: a db.t4g.small Postgres 17 with deletion_protection and 14-day backups. The sg unit opens port 5432 to the inf VPC only. The secrets unit generates the password straight into Vault at kvv2 infrastructure/ai-agents/temporal, so no person ever sees it.",
+    "Images come from inf ECR and are pinned by digest, like the brain bot's `rnd-kb-bot@${image_digest}`. A new image means a new digest in one .hcl file and a plan that shows one changed line. The ECR repo itself is one line in multi_tenant/accounts/infrastructure/artifacts/artifacts.hcl with `tags_immutability_enabled = true`.",
+    "G3-06 adds three more things you will meet later. A post-install Job creates the search attributes Agent, JiraKey and RunKind. An HTTPRoute on envoy-internal serves the web UI at temporal-ai-agents.example.com, VPN only.",
+    "An HTTPRoute is the rule that sends web traffic for one hostname to a Service. envoy-internal is inf's entry point that only the VPN reaches. A VMServiceScrape is a small Kubernetes object that tells the VictoriaMetrics agent which Service, port and path to read metrics from. VictoriaMetrics is our metrics database (p6-1), and Grafana (p6-3) draws charts from it, so this is how Grafana sees Temporal's metrics."
+   ]
+  },
+  {
+   "h": "Plan locally, paste it, a person applies",
+   "p": [
+    "The infrastructure repo's CI only checks formatting (`tofu fmt -check`, `terragrunt hcl format --check`). There is no plan in CI. The author runs `terragrunt plan` over VPN, pastes the plan into the PR, and a DevOps reviewer applies after approval.",
+    "This is also a wall for agents. An agent may write the unit and the module, run `tofu validate` and `helm template`, and post a plan a person produced. It never runs apply, destroy or sync. The DevOps routines (G8-13's infra-change skill) say the same in words; the missing credentials enforce it."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Agents never apply, destroy, sync or dispatch. A plan in a PR is the most an agent produces; the apply is a person's click over VPN."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Render the real chart and plan a helm_release",
+  "youNeed": [
+   "helm (brew install helm)",
+   "OpenTofu (brew install opentofu)",
+   "the kind cluster from p5-1 running (kubectl config current-context says kind-academy)"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/academy/helm-lab && cd ~/academy/helm-lab && helm repo add temporalio https://go.temporal.io/helm-charts",
+    "see": "\"temporalio\" has been added to your repositories"
+   },
+   {
+    "do": "Save the values.yaml from section 2 in this folder. Then: helm template temporal temporalio/temporal --version 1.5.0 -n ai-agents -f values.yaml > rendered.yaml && grep '^kind:' rendered.yaml | sort | uniq -c",
+    "see": "   6 kind: Service\n   6 kind: Deployment\n   3 kind: ConfigMap\n   1 kind: Pod\n   1 kind: Job"
+   },
+   {
+    "do": "grep -n 'numHistoryShards\\|name: temporal-db' rendered.yaml | head -3",
+    "see": "44:      numHistoryShards: 128\n535:                  name: temporal-db\n540:                  name: temporal-db"
+   },
+   {
+    "do": "Write main.tf. A terraform block with providers helm 3.1.1 and kubernetes 3.0.1, both pointed at config_path ~/.kube/config and config_context kind-academy. A kubernetes_namespace_v1 \"this\" named ai-agents. The helm_release from section 5 with values = [file(\"${path.module}/values.yaml\")] and no depends_on. Then: tofu init -input=false",
+    "see": "OpenTofu has been successfully initialized!"
+   },
+   {
+    "do": "tofu plan -input=false",
+    "see": "  # helm_release.temporal will be created\n  + resource \"helm_release\" \"temporal\" {\n      + chart      = \"temporal\"\n      + version    = \"1.5.0\"\n  # kubernetes_namespace_v1.this will be created\nPlan: 2 to add, 0 to change, 0 to destroy."
+   },
+   {
+    "do": "Read the plan for the line with numHistoryShards inside values, then stop. Do not run apply. The chart needs a Postgres that does not exist on your laptop, and the point of the lesson is the plan.",
+    "see": "(no command; you are reading)"
+   }
+  ],
+  "faded": "Add `max_history = 10` to the release and a `depends_on` on the namespace resource, then run `tofu plan` again. It should still say 2 to add, with the new argument visible. The last step is yours: change `version` to \"1.4.0\". Before you run plan, say what the plan will show for the helm_release. Hint: nothing is installed yet, so it is not an update.",
+  "alone": "p5-3 needs the External Secrets operator in your kind cluster. Add the chart repo https://charts.external-secrets.io. Render chart external-secrets/external-secrets (pick the current version with `helm search repo`) with `--include-crds` into a file, and count the kinds. Then write a second helm_release for it in main.tf, namespace external-secrets, with `create_namespace = true`, and run `tofu plan`. Expect 3 to add. Keep this folder; p5-3 applies the external-secrets release there.",
+  "done": "You rendered the Temporal chart with our values and found numHistoryShards: 128 in the output. `tofu plan` showed the helm_release and namespace to be added, with nothing applied."
+ },
+ "quiz": [
+  {
+   "q": "Temporal is slow after the pilot and you want numHistoryShards 512 instead of 128. What happens if you change the value and a person applies?",
+   "options": [
+    {
+     "text": "Helm upgrades the release in place and the pods restart with 512 shards",
+     "correct": false,
+     "why": "The shard count is written into the database at first install. The server refuses or corrupts with a different number."
+    },
+    {
+     "text": "Nothing: the chart ignores the value after install",
+     "correct": false,
+     "why": "The value is read; it is the data that cannot follow. That is worse than ignored."
+    },
+    {
+     "text": "It cannot be changed: you would need a new install with a new database",
+     "correct": true,
+     "why": "G3-06 says 'fixed forever after the first install'. That is why the number is chosen in the ticket, not tuned later."
+    }
+   ]
+  },
+  {
+   "q": "Which of these does `helm template` do?",
+   "options": [
+    {
+     "text": "Prints the YAML a chart would create, without touching any cluster",
+     "correct": true,
+     "why": "It only renders. That is why it is a safe first step on a laptop and a check an agent may run."
+    },
+    {
+     "text": "Installs the chart into the current kubectl context",
+     "correct": false,
+     "why": "That is `helm install`. People confuse the two and install into the wrong cluster."
+    },
+    {
+     "text": "Downloads the chart's images to your laptop",
+     "correct": false,
+     "why": "Images are pulled by the nodes when pods start, never by Helm."
+    }
+   ]
+  },
+  {
+   "q": "Why does the repository unit's image say rnd-kb-bot@sha256:… instead of rnd-kb-bot:latest?",
+   "options": [
+    {
+     "text": "Because ECR does not allow the latest tag",
+     "correct": false,
+     "why": "ECR allows it. Our repos set tags_immutability_enabled, but a digest is still the real pin."
+    },
+    {
+     "text": "Because a digest names exactly one image, so the plan shows a one-line change when the bot is bumped",
+     "correct": true,
+     "why": "The digest lives in brain-bot.hcl; bumping it is a reviewable PR and a visible plan line."
+    },
+    {
+     "text": "Because Kubernetes cannot pull by tag",
+     "correct": false,
+     "why": "It can. We choose not to, so nobody can move what runs under a known name."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p5-1: a Service picks pods by what, and why can a pod's IP never go in a config file?",
+  "From p4-2: what does a `dependency` block in terragrunt.hcl give you, and what are mock_outputs for?"
+ ],
+ "videos": [
+  {
+   "title": "What is Helm in Kubernetes? Helm and Helm Charts explained",
+   "url": "https://www.youtube.com/watch?v=-ykwb1d0DXU",
+   "channel": "TechWorld with Nana",
+   "minutes": 14,
+   "why": "Charts, values, templating and releases explained for first-timers."
+  },
+  {
+   "title": "How to Create Helm Charts - The Ultimate Guide",
+   "url": "https://www.youtube.com/watch?v=jUYNS90nq8U",
+   "channel": "DevOps Journey",
+   "minutes": 22,
+   "why": "Hands-on: write a chart, template values, install and upgrade a release."
+  }
+ ],
+ "words": [
+  {
+   "term": "chart",
+   "plain": "A folder of Kubernetes YAML templates plus default values, published in a chart repository."
+  },
+  {
+   "term": "values",
+   "plain": "The settings you pass to a chart; they override the chart's defaults like props over default props."
+  },
+  {
+   "term": "helm_release",
+   "plain": "The Terraform resource that installs one chart at one version with your values into one namespace."
+  },
+  {
+   "term": "release",
+   "plain": "One installed copy of a chart, with a name and a history of revisions Helm keeps in the cluster."
+  },
+  {
+   "term": "unit",
+   "plain": "A terragrunt.hcl folder in the infrastructure repo that runs one module with inputs."
+  },
+  {
+   "term": "digest",
+   "plain": "The sha256 of an image's content; pinning by digest means exactly those bytes run."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-06",
+   "why": "The agents' Temporal is this lesson's module and values: RDS unit, ExternalSecret, helm_release at chart 1.5.0, shards 128."
+  },
+  {
+   "key": "G6-22",
+   "why": "The brain bot's repository unit is the terragrunt.hcl you read here, with the image pinned by digest."
+  },
+  {
+   "key": "G3-17",
+   "why": "The broker, worker and Slack app are three more units on the shared ai-agents-service module."
+  },
+  {
+   "key": "G0-15",
+   "why": "The gateway unit creates the shared module the other services reuse."
+  }
+ ],
+ "remember": "A Terraform unit installs a pinned chart with our values. Render it with helm template first, and let a person apply the plan."
+}

@@ -1,0 +1,476 @@
+{
+ "id": "g3-12",
+ "title": "Triggers and waiting",
+ "minutes": 40,
+ "youNeed": [
+  "p7-5",
+  "g3-10",
+  "p9-2"
+ ],
+ "bridge": "A Jira poll is like a setInterval that calls fetch and starts work for each new row. Except it is a Temporal schedule. It survives restarts, keeps a history and never runs twice at once. After an outage it does not replay missed ticks.",
+ "intro": "Runs start in one way and wait in one way. Every Jira trigger is a Temporal schedule from one registry, and every run starts through startRun. Every wait on a person reminds once, then parks the ticket, and never keeps a VM running.",
+ "picture": {
+  "caption": "A schedule polls Jira every minute, startRun starts or joins the run, and the run waits for the requester with one reminder.",
+  "nodes": [
+   {
+    "id": "ticket",
+    "label": "RH-1234, assignee Nova",
+    "kind": "file"
+   },
+   {
+    "id": "sched",
+    "label": "schedule poll-jira-nova",
+    "kind": "service"
+   },
+   {
+    "id": "poll",
+    "label": "pollJira: startMatches",
+    "kind": "service"
+   },
+   {
+    "id": "start",
+    "label": "startRun: nova:RH-1234",
+    "kind": "service"
+   },
+   {
+    "id": "wf",
+    "label": "ticketToPr: waitForPerson",
+    "kind": "service"
+   },
+   {
+    "id": "person",
+    "label": "Requester",
+    "kind": "person"
+   }
+  ],
+  "steps": [
+   {
+    "from": "sched",
+    "to": "poll",
+    "text": "every minute, starts one pollJira on ai-agents-orchestrator"
+   },
+   {
+    "from": "poll",
+    "to": "ticket",
+    "text": "runs the query's JQL and finds RH-1234"
+   },
+   {
+    "from": "poll",
+    "to": "start",
+    "text": "calls startRun; a repeat with the same ID is a no-op"
+   },
+   {
+    "from": "start",
+    "to": "wf",
+    "text": "ticketToPr plans and posts the plan"
+   },
+   {
+    "from": "wf",
+    "to": "person",
+    "text": "no click for 1 day: one reminder in the thread"
+   },
+   {
+    "from": "wf",
+    "to": "ticket",
+    "text": "no click for 3 days: parks the ticket and ends the run"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Sean assigns RH-1234 to Nova",
+   "p": [
+    "Sean sets the assignee of RH-1234 to Nova. Within a minute a run starts. No webhook called us: the orchestrator asked Jira. Polling means asking a service again and again for news, instead of waiting for it to call you.",
+    "Polling keeps Jira access one-way. We call Jira; nothing on the internet calls us, so there is no new public endpoint to defend. Temporal gives the poll retries and a history for free.",
+    "Every Jira trigger in the platform works the same way. Nova's query, the bug fixers' queries and the housekeeping polls are all entries in one registry. They all start runs through startRun from lesson g3-10."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "One mechanism for every trigger means one place to apply the walls: one run per thing, the slots and the kill switch."
+   }
+  },
+  {
+   "h": "The registry and startMatches",
+   "p": [
+    "A JiraQuery has a name, an agent, a JQL query, an interval and a toStart function. JQL is Jira's query language, for example assignee = Nova AND status = \"To Do\". G4-04 registers \"nova\" and G5-13 registers \"bugfix-fe\" and \"bugfix-be\". This ticket builds the mechanism, not their rules."
+   ],
+   "because": "We keep queries in a Map that other tickets fill, because each agent's owner knows its rules best.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/triggers/schedules.ts (part 1 of 2)",
+    "text": "import { type Client, type Workflow, ScheduleAlreadyRunning, ScheduleOverlapPolicy } from \"@temporalio/client\";\n// Registered by G4-04 (\"nova\") and G5-13 (\"bugfix-fe\", \"bugfix-be\"). toStart returns (workflow function, its input), or undefined to skip.\nexport interface JiraQuery { name: string; agent: string; jql: string; every: string; toStart: (issue: JiraIssue) => Promise<[Workflow, unknown] | undefined> }\nexport const QUERIES = new Map<string, JiraQuery>();\n\n/** Activity: one poll of one query. startRun refuses a stopped agent (G3-25). */\nexport const startMatches = async (name: string): Promise<number> => {\n  const q = QUERIES.get(name)!;\n  const issues = await jira.searchAll(q.jql);\n  for (const issue of issues) {\n    const start = await q.toStart(issue);\n    if (!start) continue; // e.g. no requester found yet (G4-04)\n    const [wf, input] = start;\n    await startRun(await temporalClient(), q.agent, issue.key, wf, input); // the ID (nova:RH-1234) makes repeats no-ops\n  }\n  return issues.length;\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Client and Workflow are types; ScheduleAlreadyRunning and ScheduleOverlapPolicy are used in part 2."
+     },
+     {
+      "line": 3,
+      "text": "One registered query. every is a duration string like \"1 minute\"."
+     },
+     {
+      "line": 3,
+      "text": "toStart turns one Jira issue into a workflow and its input, or undefined to skip the issue for now."
+     },
+     {
+      "line": 4,
+      "text": "The registry: query name to query. G4-04 and G5-13 add their entries at start-up."
+     },
+     {
+      "line": 7,
+      "text": "startMatches is an activity: it does I/O, so it cannot live in workflow code."
+     },
+     {
+      "line": 9,
+      "text": "searchAll pages through every result of the JQL. The Jira client handles rate limits and back-off."
+     },
+     {
+      "line": 11,
+      "text": "Ask the query's owner whether and how to start. For Nova this finds the requester."
+     },
+     {
+      "line": 12,
+      "text": "No requester yet: skip. The next poll tries again."
+     },
+     {
+      "line": 14,
+      "text": "startRun builds nova:RH-1234. If that run is open, USE_EXISTING joins it, so polling every minute is safe."
+     },
+     {
+      "line": 16,
+      "text": "Return how many issues matched, for the metrics."
+     }
+    ]
+   }
+  },
+  {
+   "h": "pollJira and ensureSchedules",
+   "p": [
+    "A schedule is a Temporal object that starts a workflow on a timetable, like cron but durable. ensureSchedules runs when the worker starts and registers one schedule per query. Running it twice must change nothing, because every deploy restarts the worker."
+   ],
+   "because": "We create or update each schedule at start-up, so the registry in code is the one truth.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/triggers/schedules.ts (part 2 of 2)",
+    "text": "// workflows/poll-jira.ts: workflow code; peopleApis = proxyActivities({ ...SHORT, retry: PEOPLE_APIS }) (G3-29)\nexport async function pollJira(name: string): Promise<number> {\n  return peopleApis.startMatches(name);\n}\n\nexport const ensureSchedules = async (client: Client): Promise<void> => { // at worker start; safe to run twice\n  for (const q of QUERIES.values()) {\n    const scheduleId = `poll-jira-${q.name}`;\n    const action = { type: \"startWorkflow\" as const, workflowType: pollJira, args: [q.name],\n      workflowId: scheduleId, taskQueue: \"ai-agents-orchestrator\" };\n    const spec = { intervals: [{ every: q.every }] };\n    const policies = { overlap: ScheduleOverlapPolicy.SKIP, catchupWindow: q.every }; // an outage doesn't replay a backlog\n    await client.schedule.create({ scheduleId, action, spec, policies }).catch(async (err: unknown) => {\n      if (!(err instanceof ScheduleAlreadyRunning)) throw err;\n      await client.schedule.getHandle(scheduleId).update((prev) => ({ ...prev, action, spec, policies }));\n    });\n  }\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "pollJira lives in workflows/poll-jira.ts. peopleApis has SHORT timeouts and endless back-off (lesson g3-10)."
+     },
+     {
+      "line": 2,
+      "text": "The workflow is one line: one poll of one query. If Jira is down, the activity retries; nothing else breaks."
+     },
+     {
+      "line": 6,
+      "text": "Safe to run twice: create, or update if the schedule exists."
+     },
+     {
+      "line": 8,
+      "text": "One schedule per query: poll-jira-nova, poll-jira-bugfix-fe and so on."
+     },
+     {
+      "line": 9,
+      "text": "The action: start pollJira with the query's name."
+     },
+     {
+      "line": 10,
+      "text": "Housekeeping runs on ai-agents-orchestrator, not on an agent's queue. Temporal adds the start time to this workflow ID, so each poll has its own ID."
+     },
+     {
+      "line": 11,
+      "text": "Run every q.every, for Nova every minute."
+     },
+     {
+      "line": 12,
+      "text": "overlap SKIP: if the last poll is still running, skip this one. catchupWindow as long as the interval: after an outage, do not replay the missed polls."
+     },
+     {
+      "line": 13,
+      "text": "Try to create the schedule."
+     },
+     {
+      "line": 14,
+      "text": "Any error other than \"already exists\" is real. Throw it."
+     },
+     {
+      "line": 15,
+      "text": "It exists: update it in place with today's action, spec and policies."
+     }
+    ]
+   },
+   "see": "$ temporal schedule list --namespace ai-agents\n  ScheduleId               WorkflowType\n  poll-jira-nova           pollJira\n  poll-jira-bugfix-fe      pollJira\n(output trimmed)",
+   "ifInstead": "If instead a schedule is missing, the worker did not run ensureSchedules, or the query was not registered before it ran. Check the worker's start-up log."
+  },
+  {
+   "h": "The Jira client and the kill switch",
+   "p": [
+    "orchestrator/src/jira.ts builds on shared/src/jira.ts: global fetch, Jira REST v3, search with pagination, changelog and comments. It respects Jira's rate limits and retries with back-off.",
+    "Its token comes from Vault at infrastructure/ai-agents/jira-nova (G4-04), synced to the orchestrator workers only. The VMs never see it.",
+    "The kill switch still holds: startRun refuses new starts for a stopped agent. G4's readiness check runs inside the started workflow, before any VM. Count poll duration, matches and errors per query, so a broken query shows up on a dashboard."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "No new public webhooks. Nothing on the internet can start a run; only the orchestrator's own polls and the Slack app's Socket Mode connection can."
+   }
+  },
+  {
+   "h": "Waiting on people",
+   "p": [
+    "People get busy. Nova should remind once, then step aside cleanly, and never keep a VM running while it waits. There are three waits, each with a reminder and a park time.",
+    "A plan not approved: remind after 1 day, park after 3. A question not answered: remind after 1 day, park after 2. A PR not reviewed: remind after 2 days, close it with a note after 14.",
+    "Parking a ticket means: post why, move the ticket back (G4 decides the status and assignee) and end the run as parked. A later assignment starts a fresh run with the same ID, nova:RH-1234. Do not mix this up with parkSandbox (lesson g3-8). That one only stops a VM and keeps its disk, and the run goes on."
+   ]
+  },
+  {
+   "h": "waitForPerson",
+   "p": [
+    "ticketToPr calls waitForPerson for the plan, for questions and for the review. It is built on condition(fn, timeout), which resolves false when the timeout passes. That timeout is a durable timer: nothing runs while it waits."
+   ],
+   "because": "We put every wait in one function, because reminders, parking and Stop must behave the same for every kind of wait.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/waiting.ts",
+    "text": "import { condition } from \"@temporalio/workflow\";\nimport { act } from \"./policies.js\";\n\nconst DAY = 24 * 60 * 60 * 1000;\nconst WAITS: Record<Wait, [remindAfterMs: number, parkAfterMs: number]> = {\n  plan: [1 * DAY, 3 * DAY],\n  question: [1 * DAY, 2 * DAY],\n  review: [2 * DAY, 14 * DAY],\n};\n\n/** True when the person acted; false when the ticket was parked. Stop always wins. */\nexport const waitForPerson = async (wf: RunState, what: Wait, done: () => boolean, t: Handoff): Promise<boolean> => {\n  const [remind, park] = scaled(WAITS[what], t.drill); // minutes instead of days on drill tickets\n  // condition() with a timeout resolves false when the timeout passes: a durable timer, no VM running.\n  if (await condition(() => done() || wf.stopped, remind)) return !wf.stopped;\n  await act.notify(t, REMINDERS[what](t.requester)); // Slack thread, Jira if Slack is down\n  if (await condition(() => done() || wf.stopped, park - remind)) return !wf.stopped;\n  await act.parkTicket(t, PARK_NOTES[what]); // G4 decides the Jira status and assignee\n  return false;\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Workflow code: condition comes from @temporalio/workflow."
+     },
+     {
+      "line": 4,
+      "text": "One day in milliseconds. Durations can be numbers of ms or strings."
+     },
+     {
+      "line": 5,
+      "text": "For each kind of wait: when to remind and when to park, both counted from the start of the wait."
+     },
+     {
+      "line": 6,
+      "text": "Plan: remind after 1 day, park after 3."
+     },
+     {
+      "line": 7,
+      "text": "Question: remind after 1 day, park after 2."
+     },
+     {
+      "line": 8,
+      "text": "Review: remind after 2 days, close after 14."
+     },
+     {
+      "line": 12,
+      "text": "Returns true when the person acted, false when the ticket was parked or stopped."
+     },
+     {
+      "line": 13,
+      "text": "scaled turns days into minutes on drill tickets (t.drill), so a drill tests the whole path in minutes."
+     },
+     {
+      "line": 15,
+      "text": "First wait, up to the reminder time. Done or Stop ends it early. Stop returns false."
+     },
+     {
+      "line": 16,
+      "text": "No action yet: one reminder that mentions the requester, in Slack or on Jira."
+     },
+     {
+      "line": 17,
+      "text": "Second wait, for the rest of the time until parking."
+     },
+     {
+      "line": 18,
+      "text": "Still nothing: park the ticket and say why."
+     },
+     {
+      "line": 19,
+      "text": "false tells ticketToPr to end the run."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "Stop also returns false, so ticketToPr ends with \"parked\" although the person stopped it. Check run.stopped before choosing the label, and raise it with the G3-24 owner."
+   }
+  },
+  {
+   "h": "Stop, and VMs while waiting",
+   "p": [
+    "While a person thinks, the VM is parked after 10 idle minutes and retired after 72 hours stopped (lesson g3-8). The wait itself costs nothing.",
+    "Stop can come from the Slack button, /nova stop, @Nova stop or unassigning the ticket. It sets run.stopped. Then the run checkpoints if a VM is up, releases the VM and revokes the scope. It keeps the branch and notes, and posts where they are.",
+    "Drill mode is for drill tickets only. The same timers run in minutes, so the drills in lesson g3-16 can test reminders and parking in one sitting."
+   ],
+   "callout": {
+    "kind": "tip",
+    "text": "Test waitForPerson in the time-skipping environment from lesson g3-10. Three days pass in about a second, so you can check the reminder at day 1 and the park at day 3."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Trace a trigger and a wait through the code",
+  "youNeed": [
+   "this lesson open",
+   "lesson g3-10's startRun and ticketToPr",
+   "paper or a text file for your answers"
+  ],
+  "worked": [
+   {
+    "do": "Read ensureSchedules, line 8. What is the schedule ID for the query named nova?",
+    "see": "poll-jira-nova"
+   },
+   {
+    "do": "The orchestrator is deployed and its worker restarts. Read lines 13 to 15. What happens to poll-jira-nova?",
+    "see": "create throws ScheduleAlreadyRunning, so the code updates the existing schedule. Still one schedule."
+   },
+   {
+    "do": "RH-1234 still matches the JQL a minute later. Read startMatches, line 14, and startRun in lesson g3-10. How many runs exist?",
+    "see": "One. Both polls build nova:RH-1234, and USE_EXISTING joins the open run."
+   },
+   {
+    "do": "Jira is down for 20 minutes. Read line 12. How many extra polls run when Jira comes back?",
+    "see": "None. The running poll retries until Jira is back; SKIP drops the overlapping ones, and catchupWindow does not replay missed ticks."
+   },
+   {
+    "do": "Nova posts the plan at 10:00 on Monday and nobody clicks. Read waitForPerson, lines 15 to 19. When is the reminder, and when is the ticket parked?",
+    "see": "Reminder at 10:00 on Tuesday (1 day). Park at 10:00 on Thursday (3 days). waitForPerson returns false."
+   },
+   {
+    "do": "Same start, but Sean approves at 16:00 on Tuesday. Which line returns, and with what?",
+    "see": "Line 17: the second condition becomes true, and it returns !wf.stopped, which is true."
+   }
+  ],
+  "faded": "Trace a question instead. Nova asks a question at 09:00 on Wednesday and gets no answer. Write when the reminder goes out and when the ticket is parked. The last step is yours: the requester answers at 11:00 on Friday. Say what happens to that answer, and how the work can continue.",
+  "alone": "Trace a review wait on a drill ticket, where scaled turns days into minutes. Write the reminder time and the close time, and which function does the closing. Then add a new registry entry on paper: a query named \"flaky\" for agent flaky, every 5 minutes. Write its schedule ID, its task queue, and the workflow ID of a run for the issue RH-77.",
+  "done": "From the code alone, you can say why polling never starts two runs for one ticket. And when every wait reminds and parks."
+ },
+ "quiz": [
+  {
+   "q": "Why does the platform poll Jira instead of receiving a Jira webhook?",
+   "options": [
+    {
+     "text": "Polling keeps Jira access one-way: we call Jira, and nothing on the internet calls us.",
+     "correct": true,
+     "why": "No public endpoint to defend; Temporal adds retries and history."
+    },
+    {
+     "text": "Polling is faster than a webhook.",
+     "correct": false,
+     "why": "A webhook arrives sooner. A minute is fine for our tickets; one-way access matters more."
+    },
+    {
+     "text": "Jira Cloud has no webhooks.",
+     "correct": false,
+     "why": "It has them. We choose not to open an endpoint for them."
+    }
+   ]
+  },
+  {
+   "q": "The worker restarts and ensureSchedules runs again. What happens?",
+   "options": [
+    {
+     "text": "A second poll-jira-nova schedule is created, so Jira is polled twice a minute.",
+     "correct": false,
+     "why": "Schedule IDs are unique. create fails for an existing ID."
+    },
+    {
+     "text": "The schedule is deleted and created again, losing its history.",
+     "correct": false,
+     "why": "The code never deletes. It updates in place."
+    },
+    {
+     "text": "create throws ScheduleAlreadyRunning, and the code updates the existing schedule.",
+     "correct": true,
+     "why": "That makes ensureSchedules safe to run on every start."
+    }
+   ]
+  },
+  {
+   "q": "Sean presses Stop on day 2 of a plan wait. What does waitForPerson do?",
+   "options": [
+    {
+     "text": "It waits until day 3, then parks the ticket.",
+     "correct": false,
+     "why": "The condition includes wf.stopped, so the wait ends at once."
+    },
+    {
+     "text": "It returns false at once, without a reminder or parking.",
+     "correct": true,
+     "why": "Stop always wins: the condition becomes true and it returns !wf.stopped."
+    },
+    {
+     "text": "It returns true, because a person acted.",
+     "correct": false,
+     "why": "It returns !wf.stopped, which is false after a Stop."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From lesson g3-10: what does the conflict policy USE_EXISTING do when nova:RH-1234 is already open?",
+  "From lesson g3-11: what does notify do when Slack is down?"
+ ],
+ "videos": [
+  {
+   "title": "Temporal in 7 Minutes - the TL;DR Intro",
+   "url": "https://www.youtube.com/watch?v=2HjnQlnA5eY",
+   "channel": "Temporal",
+   "minutes": 7,
+   "why": "Official short intro to workflows, activities and durability."
+  }
+ ],
+ "words": [
+  {
+   "term": "polling",
+   "plain": "Asking a service again and again for news, instead of waiting for it to call you."
+  },
+  {
+   "term": "JQL",
+   "plain": "Jira Query Language, for example assignee = Nova AND status = \"To Do\"."
+  },
+  {
+   "term": "schedule",
+   "plain": "A Temporal object that starts a workflow on a timetable, like cron but durable."
+  },
+  {
+   "term": "overlap policy",
+   "plain": "What a schedule does when the last run is still going; SKIP skips the new one."
+  },
+  {
+   "term": "catchup window",
+   "plain": "How far back a schedule replays missed runs after an outage; we keep it one interval long."
+  },
+  {
+   "term": "parking a ticket",
+   "plain": "Posting why, moving the ticket back in Jira and ending the run; a later assignment starts a fresh run."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-28",
+   "why": "This lesson explained the query registry, startMatches, pollJira and ensureSchedules line by line, and why polling keeps Jira one-way.",
+   "walk": [
+    "Write ai-agents/orchestrator/src/jira.ts on top of shared/src/jira.ts: search with pagination, changelog, comments, rate limits and back-off.",
+    "Ask DevOps to sync the Vault secret infrastructure/ai-agents/jira-nova to the orchestrator workers only, through the ExternalSecret.",
+    "Create ai-agents/orchestrator/src/triggers/schedules.ts with JiraQuery, QUERIES, startMatches and ensureSchedules, and workflows/poll-jira.ts with pollJira (code above).",
+    "Call ensureSchedules(client) when the orchestrator worker starts. Run pollJira on the ai-agents-orchestrator task queue.",
+    "Agree the split with the owners: G4-04 registers \"nova\" and the requester lookup; G5-13 registers the bug-triage queries and housekeeping schedules.",
+    "Add metrics for poll duration, matches and errors per query.",
+    "Test startMatches with a fake Jira client and a fake startRun. The same issue twice gives the same workflow ID; a stopped agent is refused."
+   ]
+  },
+  {
+   "key": "G3-38",
+   "why": "This lesson explained waitForPerson line by line, the three waits, parking, Stop and drill mode.",
+   "walk": [
+    "Create ai-agents/orchestrator/src/waiting.ts with WAITS, waitForPerson, REMINDERS, PARK_NOTES and scaled (code above).",
+    "Use waitForPerson in ticketToPr for the plan (1 and 3 days), questions (1 and 2) and the review (2 and 14).",
+    "Write the parkTicket activity: post why, move the ticket back with the status and assignee G4 decides, end the run as parked.",
+    "Wire every Stop source (Slack button, /nova stop, @Nova stop, unassign) to the stop signal that sets run.stopped.",
+    "On Stop: checkpoint if a VM is up, release the VM, revoke the scope. Keep the branch and notes, and post where they are.",
+    "Make scaled return minutes when t.drill is true, for the drills in G3-41.",
+    "Test in the time-skipping environment. No click gives a reminder at day 1 and a park at day 3. A click at day 2 returns true. Stop returns false at once."
+   ]
+  }
+ ],
+ "remember": "Every trigger is a schedule that starts runs through startRun; every wait reminds once, then parks, with no VM running."
+}

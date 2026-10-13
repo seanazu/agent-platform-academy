@@ -1,0 +1,481 @@
+{
+ "id": "g3-8",
+ "title": "Sandbox activities: claim, run, park, release",
+ "minutes": 55,
+ "youNeed": [
+  "p7-2",
+  "p1-6",
+  "g3-7"
+ ],
+ "bridge": "An activity is like an API call from inside a React component: the workflow asks, the activity does the I/O. Except Temporal retries it, so it must be safe to run twice. And a long one must send heartbeats, or Temporal decides it is dead.",
+ "intro": "The workflow decides what happens to a run; activities do it. This lesson writes the activities that drive one VM through its life. They claim it, bring it to the right commit and run the harness. They park it while a person thinks, and destroy it at the end.",
+ "picture": {
+  "caption": "One run, one VM: claimed, freshened, worked, maybe parked and woken, and always released.",
+  "nodes": [
+   {
+    "id": "wf",
+    "label": "ticketToPr workflow",
+    "kind": "service"
+   },
+   {
+    "id": "acquire",
+    "label": "acquireSandbox + freshenSandbox",
+    "kind": "service"
+   },
+   {
+    "id": "vm",
+    "label": "sandbox VM",
+    "kind": "machine"
+   },
+   {
+    "id": "work",
+    "label": "workInSandbox",
+    "kind": "service"
+   },
+   {
+    "id": "broker",
+    "label": "broker internal API (heartbeats)",
+    "kind": "service"
+   },
+   {
+    "id": "park",
+    "label": "parkSandbox / wakeSandbox / retireSandbox",
+    "kind": "service"
+   },
+   {
+    "id": "release",
+    "label": "releaseSandbox",
+    "kind": "service"
+   }
+  ],
+  "steps": [
+   {
+    "from": "wf",
+    "to": "acquire",
+    "text": "claim a full VM for the build and bring it to the exact commit"
+   },
+   {
+    "from": "acquire",
+    "to": "vm",
+    "text": "detach, tag run-id and lease, write the task and capability over SSM"
+   },
+   {
+    "from": "work",
+    "to": "vm",
+    "text": "start nova-worker as a systemd unit over SSM, once"
+   },
+   {
+    "from": "work",
+    "to": "broker",
+    "text": "every 30 s read the last heartbeat; renew the lease every 5 minutes"
+   },
+   {
+    "from": "wf",
+    "to": "park",
+    "text": "needs_answer and 10 idle minutes: stop the VM, keep the disk"
+   },
+   {
+    "from": "wf",
+    "to": "release",
+    "text": "always, in finally: revoke the scope and terminate the VM"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "A VM's life in seven activities",
+   "p": [
+    "Workflow code must be deterministic: no network, no AWS calls, no Date.now() for logic (lesson p7-2). So everything that touches a VM is an activity: a plain async function that may use any Node API.",
+    "G3-18 writes two: acquireSandbox takes a VM of the right size, and freshenSandbox brings it to the exact commit. G3-20 writes the rest: workInSandbox, parkSandbox, wakeSandbox, retireSandbox and releaseSandbox. Routines use the same activities (G5-08's routineRun).",
+    "Plan small, build big. ticketToPr claims a lite VM for the plan and a full VM for the build (G3-24). Each claim is a fresh VM."
+   ]
+  },
+  {
+   "h": "Claim, part 1: safe to retry",
+   "p": [
+    "Temporal retries a failed activity. If acquireSandbox crashed right after it tagged a VM, a blind retry would claim a second one and leak the first. So the first thing it does is look for a VM already tagged with this run."
+   ],
+   "because": "We look for this run's VM before claiming, because an activity that runs twice must not take two VMs.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/activities/sandbox.ts (part 1 of 2)",
+    "text": "// ai-agents/orchestrator/src/activities/sandbox.ts: sketch. Activities may use Node APIs; workflow code may not.\nimport { heartbeat } from \"@temporalio/activity\";\nimport { AutoScalingClient, AutoScalingServiceException, DetachInstancesCommand, SetDesiredCapacityCommand } from \"@aws-sdk/client-auto-scaling\";\nimport { CreateTagsCommand, EC2Client } from \"@aws-sdk/client-ec2\";\nimport { setTimeout as sleep } from \"node:timers/promises\";\n\nconst asg = new AutoScalingClient({});\nconst ec2 = new EC2Client({});\n/** Take a warm VM of the right size, detach it, and tag it as this run's. Temporal owns it after this. */\nexport const acquireSandbox = async (req: ClaimRequest): Promise<Sandbox> => {\n  const existing = await findInstance({ \"ai-agents:run-id\": req.runId }); // safe to retry\n  if (existing) return existing;\n  const group = `ai-agents-sandbox-${req.size}${req.spot ? \"-spot\" : \"\"}`;\n  const before = await inServiceIds(group);\n  await asg.send(new SetDesiredCapacityCommand({ AutoScalingGroupName: group, DesiredCapacity: (await desired(group)) + 1, HonorCooldown: false }));",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The rule that makes this an activity: it calls AWS, which workflow code may not."
+     },
+     {
+      "line": 2,
+      "text": "heartbeat tells Temporal 'still working'. Only activities can call it."
+     },
+     {
+      "line": 7,
+      "text": "Clients with no settings: on inf they pick up IRSA credentials for ai-agents-orchestrator (lesson g3-3)."
+     },
+     {
+      "line": 11,
+      "text": "Search EC2 for an instance tagged ai-agents:run-id = this run. Found: return it. This is what makes a retry safe."
+     },
+     {
+      "line": 13,
+      "text": "The group name: ai-agents-sandbox-full, or ai-agents-sandbox-full-spot for retryable routines."
+     },
+     {
+      "line": 14,
+      "text": "Remember which VMs are already in service, so we take only the one our claim adds."
+     },
+     {
+      "line": 15,
+      "text": "Raise desired by 1. HonorCooldown: false, so the group acts at once. A warm VM starts."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "On a retry, findInstance finds this run's VM. It must also read the VM's size and Spot from its tags (ai-agents:size and the Spot tag). The G3-18 sketch does not, so a retried claim can return a Sandbox with the wrong size."
+   }
+  },
+  {
+   "h": "Claim, part 2: detach, tag, return",
+   "p": [
+    "Now the activity waits for a new InService VM, takes it out of the group and tags it. If the pool is empty, the group builds a VM from scratch. That is a cold start, and we count it as a metric."
+   ],
+   "because": "We detach before tagging, because the detach is the step only one claim can win, so it decides who owns the VM.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/activities/sandbox.ts (part 2 of 2)",
+    "text": "  for (;;) {\n    heartbeat(\"waiting for a warm VM\");\n    for (const instanceId of (await inServiceIds(group)).filter((id) => !before.includes(id))) {\n      try { // two claims may race for one VM: the loser's detach fails and it tries the next\n        await asg.send(new DetachInstancesCommand({ InstanceIds: [instanceId], AutoScalingGroupName: group, ShouldDecrementDesiredCapacity: true }));\n      } catch (err) {\n        if (err instanceof AutoScalingServiceException) continue;\n        throw err;\n      }\n      await ec2.send(new CreateTagsCommand({ Resources: [instanceId], Tags: [\n        { Key: \"ai-agents:run-id\", Value: req.runId },\n        { Key: \"ai-agents:agent\", Value: req.agent },\n        { Key: \"ai-agents:jira\", Value: req.jiraKey ?? \"-\" },\n        { Key: \"ai-agents:lease-until\", Value: leaseUntil({ hours: 2 }) }, // renewed while the run lives\n      ] }));\n      return { instanceId, size: req.size, spot: req.spot, runId: req.runId };\n    }\n    await sleep(5_000);\n  }\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Wait with no deadline. The activity's own timeouts and heartbeats cover a group that never delivers."
+     },
+     {
+      "line": 2,
+      "text": "Heartbeat on every loop, so Temporal knows the claim is alive while the VM starts."
+     },
+     {
+      "line": 3,
+      "text": "Only VMs that were not in service before our claim."
+     },
+     {
+      "line": 5,
+      "text": "Detach and lower desired, so the group does not replace the VM in service. The pool refills on its own."
+     },
+     {
+      "line": 7,
+      "text": "Two claims can race for the same new VM. The loser's detach fails with an AWS error, and it tries the next VM."
+     },
+     {
+      "line": 8,
+      "text": "Any other error is real and goes to Temporal's retry."
+     },
+     {
+      "line": 10,
+      "text": "Tag it: the run, the agent and the Jira key, so people and the sweeper can see whose VM it is."
+     },
+     {
+      "line": 14,
+      "text": "The lease: now plus 2 hours. workInSandbox renews it while the run lives (part 4)."
+     },
+     {
+      "line": 16,
+      "text": "The Sandbox value goes back to the workflow, which passes it to every later activity."
+     },
+     {
+      "line": 18,
+      "text": "No new VM yet: wait 5 seconds and look again."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "After the claim, the same activity opens the run's broker scope (POST /internal/runs) and mints the gateway run token (HMAC-signed, G0-13). Over SSM it writes the task, the capability and the token to /run/nova/, mode 0600, owner agent. Neither is a key to an outside service, and both die with the run."
+   }
+  },
+  {
+   "h": "Freshen: redo only what changed",
+   "p": [
+    "The warm VM was baked last night. freshenSandbox(vm, sha) brings it to the exact commit. As agent, it runs git fetch origin <sha> through the broker and checks it out. It compares lockfile hashes with /etc/ai-agent-sandbox/manifest.json and reinstalls only what changed: npm ci in frontend/, uv sync in cloud/ and client/.",
+    "On full and wide it runs lab refresh sandbox --accept-branch, adding --rebuild or --migrate only when the lab asks. Then lab status sandbox --json must say ready. This also proves main itself is healthy, so a later failure belongs to the change, not to main.",
+    "If FCP Lab will not start, the activity throws an ApplicationFailure of type LabNotReady. The workflow retries once on a fresh VM, then reports in Slack with the lab report output (the playbook)."
+   ]
+  },
+  {
+   "h": "Run, part 1: start once, then follow",
+   "p": [
+    "SSM commands time out after at most 48 hours, and runs have no time limit. So workInSandbox does not run nova-worker inside an SSM command. It uses SSM only to start a systemd unit: systemd-run --uid agent --unit nova-<run> /usr/local/bin/nova-worker run /run/nova/task.json. The unit lives as long as the VM does.",
+    "Then it follows the run through the broker, where the harness sends a heartbeat every 30 seconds (lesson g3-9). On a retry, ensureHarnessRunning finds the unit already running and re-attaches instead of starting a second one."
+   ],
+   "because": "We follow the harness through its heartbeats, because the orchestrator can restart without ending the run.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/activities/run.ts (part 1 of 2)",
+    "text": "// ai-agents/orchestrator/src/activities/run.ts: sketch\nimport { ApplicationFailure, heartbeat } from \"@temporalio/activity\";\nimport { EC2Client, StopInstancesCommand, TerminateInstancesCommand } from \"@aws-sdk/client-ec2\";\nimport { setTimeout as sleep } from \"node:timers/promises\";\nconst ec2 = new EC2Client({});\n\n/** Start the harness if needed, then follow it. Returns when the run ends, asks, or dies. */\nexport const workInSandbox = async (vm: Sandbox, task: Task): Promise<RunOutcome> => {\n  await ensureHarnessRunning(vm, task); // systemd-run ... nova-worker run over SSM; a retry re-attaches instead of starting twice\n  let lastLease = 0;\n  for (;;) {\n    const beat = await brokerInternal.get<Heartbeat>(`/internal/runs/${task.runId}/heartbeat`);\n    heartbeat({ step: beat.step, progress: beat.progress }); // Temporal: we're alive\n    if ([\"done\", \"needs_answer\", \"preempted\", \"failed\"].includes(beat.state)) return toOutcome(beat);\n    // No \"I'm alive\" for 5 minutes: the VM or the harness is gone.\n    if (beat.age_s > 300) throw ApplicationFailure.create({ message: \"no heartbeat for 5 minutes\", type: \"SandboxDead\", nonRetryable: true });\n    if (performance.now() - lastLease > 300_000) {\n      await tag(vm, { \"ai-agents:lease-until\": leaseUntil({ hours: 2 }) }); // the sweeper leaves live runs alone\n      lastLease = performance.now();\n    }\n    await sleep(30_000);\n  }\n};",
+    "notes": [
+     {
+      "line": 2,
+      "text": "ApplicationFailure lets us name a failure type the workflow can handle."
+     },
+     {
+      "line": 8,
+      "text": "Input: the claimed VM and the task. Output: how the run stopped."
+     },
+     {
+      "line": 9,
+      "text": "Start the systemd unit over SSM (SendCommand with AWS-RunShellScript), or re-attach if it is already running."
+     },
+     {
+      "line": 12,
+      "text": "Read the harness's last heartbeat from the broker's internal port. The VM is never called directly."
+     },
+     {
+      "line": 13,
+      "text": "Pass the step and progress on to Temporal. This is the activity's own heartbeat."
+     },
+     {
+      "line": 14,
+      "text": "Four ways a run stops: done, needs_answer (a question), preempted (Spot), failed. The workflow decides what next."
+     },
+     {
+      "line": 16,
+      "text": "No heartbeat for 5 minutes: the VM or harness is gone. Non-retryable SandboxDead, which recovery handles (G3-27)."
+     },
+     {
+      "line": 17,
+      "text": "Every 5 minutes, push the lease 2 hours ahead, so the sweeper leaves a live run alone."
+     },
+     {
+      "line": 21,
+      "text": "Look again in 30 seconds."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "No time limit cuts a run. The workflow gives this activity startToCloseTimeout \"7 days\" because the SDK requires one. When it passes, the retry re-attaches to the harness still running on the VM. Liveness comes from heartbeats, not from a clock."
+   }
+  },
+  {
+   "h": "Run, part 2: park and release",
+   "p": [
+    "When the run asks a person a question and nobody answers for 10 minutes, the workflow parks the VM. Stopped, it costs about $0.01 an hour instead of $0.42 for a full VM. wakeSandbox starts it again on the answer, waits until SSM is online (about a minute), and freshens again if main moved.",
+    "A VM parked for 72 hours is retired. retireSandbox starts it and runs nova-worker checkpoint, which pushes the branch and uploads notes. Then it terminates the VM. The next answer resumes on a fresh VM.",
+    "Spot ends a run differently. spot-watch writes /run/nova/preempt, and the harness checkpoints and exits with state preempted. workInSandbox returns preempted, and the workflow retries the step on a fresh VM from the same Spot group."
+   ],
+   "because": "We revoke the broker scope before terminating, because the capability must stop working even if the terminate call fails.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/activities/run.ts (part 2 of 2)",
+    "text": "/** Waiting on a person: stop the VM and keep its disk (about $0.01/h instead of $0.42/h for full). */\nexport const parkSandbox = async (vm: Sandbox): Promise<void> => {\n  await ec2.send(new StopInstancesCommand({ InstanceIds: [vm.instanceId] }));\n  await tag(vm, { \"ai-agents:state\": \"parked\", \"ai-agents:lease-until\": leaseUntil({ hours: 73 }) });\n};\n\nexport const releaseSandbox = async (vm: Sandbox): Promise<void> => { // end of the run: no reuse, ever\n  await brokerInternal.delete(`/internal/runs/${vm.runId}`); // the capability stops working\n  await ec2.send(new TerminateInstancesCommand({ InstanceIds: [vm.instanceId] })).catch((err: Error) => {\n    if (err.name !== \"InvalidInstanceID.NotFound\") throw err; // a VM that is already gone is fine\n  });\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The cost note: a stopped VM pays only for its disk."
+     },
+     {
+      "line": 3,
+      "text": "Stop, not terminate: the disk keeps the checkout, caches and FCP Lab state."
+     },
+     {
+      "line": 4,
+      "text": "Mark it parked. The lease becomes now plus 73 hours, past the 72-hour retire, so the sweeper does not race the workflow."
+     },
+     {
+      "line": 7,
+      "text": "release is the end of every run, success or not. The workflow calls it from finally."
+     },
+     {
+      "line": 8,
+      "text": "Revoke the scope first: from now on the capability gets 401."
+     },
+     {
+      "line": 9,
+      "text": "Terminate. A VM is never reused."
+     },
+     {
+      "line": 10,
+      "text": "Already gone (the sweeper, a Spot reclaim, a person) is fine. Any other error is thrown and retried."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Testing activities without AWS",
+   "p": [
+    "aws-sdk-client-mock replaces the send method of an AWS client class with a fake you program: 'when DescribeAutoScalingGroups is sent, answer this'. It records every command, so a test can assert what was sent. No credentials, no network.",
+    "heartbeat only works inside an activity context. MockActivityEnvironment from @temporalio/testing runs a function as if Temporal had started it, so heartbeat works and is recorded. The lab uses both."
+   ]
+  }
+ ],
+ "lab": {
+  "title": "Test acquireSandbox with aws-sdk-client-mock",
+  "youNeed": [
+   "Node 24 (node -v prints v24.x)",
+   "About 350 MB of disk for node_modules (@temporalio/testing brings a native library)",
+   "No AWS account: every AWS call is mocked"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/academy/activity-lab/src ~/academy/activity-lab/test && cd ~/academy/activity-lab && npm init -y >/dev/null && npm pkg set type=module",
+    "see": "(no output)"
+   },
+   {
+    "do": "npm i --save-exact -D tsx@4.20.3 typescript@5.9.3 @types/node@24.12.2 @temporalio/activity@1.24.0 @temporalio/testing@1.24.0 @aws-sdk/client-auto-scaling@3.1150.0 @aws-sdk/client-ec2@3.1150.0 aws-sdk-client-mock@4.1.0",
+    "see": "added <n> packages, and audited <n+1> packages in about a minute\nfound 0 vulnerabilities"
+   },
+   {
+    "do": "Save src/sandbox.ts. The top half holds the helpers the sketch assumes. acquireSandbox is the code from sections 2 and 3:\n\nimport { heartbeat } from \"@temporalio/activity\";\nimport {\n  AutoScalingClient, AutoScalingServiceException, DescribeAutoScalingGroupsCommand,\n  DetachInstancesCommand, SetDesiredCapacityCommand,\n} from \"@aws-sdk/client-auto-scaling\";\nimport { CreateTagsCommand, DescribeInstancesCommand, EC2Client } from \"@aws-sdk/client-ec2\";\nimport { setTimeout as sleep } from \"node:timers/promises\";\n\nexport interface ClaimRequest { size: \"lite\" | \"full\" | \"wide\"; runId: string; agent: string; jiraKey: string | null; spot: boolean }\nexport interface Sandbox { instanceId: string; size: string; spot: boolean; runId: string }\n\nconst asg = new AutoScalingClient({ region: \"us-east-1\" });\nconst ec2 = new EC2Client({ region: \"us-east-1\" });\n\n// Small helpers the ticket's sketch assumes. In ai-agents they live next to the activities.\nconst group = async (name: string) =>\n  (await asg.send(new DescribeAutoScalingGroupsCommand({ AutoScalingGroupNames: [name] }))).AutoScalingGroups?.[0];\nconst desired = async (name: string) => (await group(name))?.DesiredCapacity ?? 0;\nconst inServiceIds = async (name: string) =>\n  ((await group(name))?.Instances ?? []).filter((i) => i.LifecycleState === \"InService\").map((i) => i.InstanceId!);\nconst leaseUntil = ({ hours }: { hours: number }) => new Date(Date.now() + hours * 3_600_000).toISOString();\nconst findInstance = async (tags: Record<string, string>): Promise<Sandbox | null> => {\n  const out = await ec2.send(new DescribeInstancesCommand({ Filters: [\n    ...Object.entries(tags).map(([k, v]) => ({ Name: `tag:${k}`, Values: [v] })),\n    { Name: \"instance-state-name\", Values: [\"pending\", \"running\", \"stopping\", \"stopped\"] },\n  ] }));\n  const inst = out.Reservations?.[0]?.Instances?.[0];\n  if (!inst?.InstanceId) return null;\n  const tag = (k: string) => inst.Tags?.find((t) => t.Key === k)?.Value ?? \"\";\n  return { instanceId: inst.InstanceId, size: tag(\"ai-agents:size\"), spot: inst.InstanceLifecycle === \"spot\", runId: tag(\"ai-agents:run-id\") };\n};\n\n/** Take a warm VM of the right size, detach it, and tag it as this run's. Temporal owns it after this. */\nexport const acquireSandbox = async (req: ClaimRequest): Promise<Sandbox> => {\n  const existing = await findInstance({ \"ai-agents:run-id\": req.runId }); // safe to retry\n  if (existing) return existing;\n  const group = `ai-agents-sandbox-${req.size}${req.spot ? \"-spot\" : \"\"}`;\n  const before = await inServiceIds(group);\n  await asg.send(new SetDesiredCapacityCommand({ AutoScalingGroupName: group, DesiredCapacity: (await desired(group)) + 1, HonorCooldown: false }));\n  for (;;) {\n    heartbeat(\"waiting for a warm VM\");\n    for (const instanceId of (await inServiceIds(group)).filter((id) => !before.includes(id))) {\n      try { // two claims may race for one VM: the loser's detach fails and it tries the next\n        await asg.send(new DetachInstancesCommand({ InstanceIds: [instanceId], AutoScalingGroupName: group, ShouldDecrementDesiredCapacity: true }));\n      } catch (err) {\n        if (err instanceof AutoScalingServiceException) continue;\n        throw err;\n      }\n      await ec2.send(new CreateTagsCommand({ Resources: [instanceId], Tags: [\n        { Key: \"ai-agents:run-id\", Value: req.runId },\n        { Key: \"ai-agents:agent\", Value: req.agent },\n        { Key: \"ai-agents:jira\", Value: req.jiraKey ?? \"-\" },\n        { Key: \"ai-agents:lease-until\", Value: leaseUntil({ hours: 2 }) }, // renewed while the run lives\n      ] }));\n      return { instanceId, size: req.size, spot: req.spot, runId: req.runId };\n    }\n    await sleep(5_000);\n  }\n};",
+    "see": "(a 57-line file)"
+   },
+   {
+    "do": "Save test/sandbox.test.ts. group() builds a fake DescribeAutoScalingGroups answer; resolvesOnce answers in order, then resolves keeps answering:\n\nimport test, { beforeEach } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { mockClient } from \"aws-sdk-client-mock\";\nimport { MockActivityEnvironment } from \"@temporalio/testing\";\nimport {\n  AutoScalingClient, AutoScalingServiceException, DescribeAutoScalingGroupsCommand,\n  DetachInstancesCommand, SetDesiredCapacityCommand,\n} from \"@aws-sdk/client-auto-scaling\";\nimport { CreateTagsCommand, DescribeInstancesCommand, EC2Client } from \"@aws-sdk/client-ec2\";\nimport { acquireSandbox } from \"../src/sandbox.js\";\n\nconst asgMock = mockClient(AutoScalingClient);\nconst ec2Mock = mockClient(EC2Client);\nconst req = { size: \"full\" as const, runId: \"run-1\", agent: \"nova\", jiraKey: \"RH-1234\", spot: false };\nconst group = (desired: number, ...ids: string[]) => ({ AutoScalingGroups: [{ AutoScalingGroupName: \"ai-agents-sandbox-full\",\n  MinSize: 0, MaxSize: 3, DesiredCapacity: desired, DefaultCooldown: 300, AvailabilityZones: [], HealthCheckType: \"EC2\", CreatedTime: new Date(),\n  Instances: ids.map((InstanceId) => ({ InstanceId, LifecycleState: \"InService\" as const, AvailabilityZone: \"us-east-1a\", HealthStatus: \"Healthy\", ProtectedFromScaleIn: false })) }] });\n\nbeforeEach(() => { asgMock.reset(); ec2Mock.reset(); });\n\ntest(\"a claim raises desired by one, detaches the new VM and tags it\", async () => {\n  ec2Mock.on(DescribeInstancesCommand).resolves({ Reservations: [] });\n  asgMock.on(DescribeAutoScalingGroupsCommand)\n    .resolvesOnce(group(0)) // before: nothing in service\n    .resolvesOnce(group(0)) // desired is 0\n    .resolves(group(1, \"i-new\")); // the warm VM came up\n  const vm = await new MockActivityEnvironment().run(acquireSandbox, req);\n  assert.equal(vm.instanceId, \"i-new\");\n  assert.equal(asgMock.commandCalls(SetDesiredCapacityCommand)[0]!.args[0].input.DesiredCapacity, 1);\n  assert.equal(asgMock.commandCalls(DetachInstancesCommand)[0]!.args[0].input.ShouldDecrementDesiredCapacity, true);\n  const tags = ec2Mock.commandCalls(CreateTagsCommand)[0]!.args[0].input.Tags!;\n  assert.ok(tags.some((t) => t.Key === \"ai-agents:run-id\" && t.Value === \"run-1\"));\n});\n\ntest(\"a retry finds the VM already tagged with this run and claims nothing new\", async () => {\n  ec2Mock.on(DescribeInstancesCommand).resolves({ Reservations: [{ Instances: [{ InstanceId: \"i-mine\", Tags: [{ Key: \"ai-agents:run-id\", Value: \"run-1\" }, { Key: \"ai-agents:size\", Value: \"full\" }] }] }] });\n  const vm = await new MockActivityEnvironment().run(acquireSandbox, req);\n  assert.equal(vm.instanceId, \"i-mine\");\n  assert.equal(asgMock.commandCalls(SetDesiredCapacityCommand).length, 0);\n});\n\ntest(\"when another claim detached the VM first, it takes the next one\", async () => {\n  ec2Mock.on(DescribeInstancesCommand).resolves({ Reservations: [] });\n  asgMock.on(DescribeAutoScalingGroupsCommand).resolvesOnce(group(0)).resolvesOnce(group(0)).resolves(group(2, \"i-a\", \"i-b\"));\n  asgMock.on(DetachInstancesCommand, { InstanceIds: [\"i-a\"] })\n    .rejects(new AutoScalingServiceException({ name: \"ValidationError\", message: \"not part of the group\", $fault: \"client\", $metadata: {} }));\n  const vm = await new MockActivityEnvironment().run(acquireSandbox, req);\n  assert.equal(vm.instanceId, \"i-b\");\n});",
+    "see": "(a file with three tests)"
+   },
+   {
+    "do": "node --import tsx --test test/*.test.ts",
+    "see": "✔ a claim raises desired by one, detaches the new VM and tags it (2.964084ms)\n✔ a retry finds the VM already tagged with this run and claims nothing new (0.389459ms)\n✔ when another claim detached the VM first, it takes the next one (1.04825ms)\nℹ tests 3\nℹ pass 3\nℹ fail 0"
+   },
+   {
+    "do": "Break it on purpose: in src/sandbox.ts change ShouldDecrementDesiredCapacity: true to false. Run the tests again.",
+    "see": "✖ a claim raises desired by one, detaches the new VM and tags it\n  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n  false !== true\nℹ pass 2\nℹ fail 1"
+   },
+   {
+    "do": "Put true back. Then try an unmocked call: node --import tsx -e 'import(\"./src/sandbox.ts\").then((m) => m.acquireSandbox({ size: \"lite\", runId: \"r\", agent: \"n\", jiraKey: null, spot: false })).catch((e) => console.log(e.name + \": \" + e.message))'",
+    "see": "CredentialsProviderError: Could not load credentials from any providers"
+   }
+  ],
+  "faded": "Add a fourth test: a Spot claim. Mock the same three DescribeAutoScalingGroups answers with one new VM, i-spot, and run acquireSandbox with { ...req, spot: true }. The assertion is yours: the SetDesiredCapacity command must name the group ai-agents-sandbox-full-spot.",
+  "alone": "Write releaseSandbox from section 6 in src/run.ts, with an exported object brokerInternal = { delete: async (path: string) => {} }. In test/run.test.ts, replace its delete with t.mock.method(brokerInternal, \"delete\", async () => {}). Test two cases. When TerminateInstances rejects with an error named InvalidInstanceID.NotFound, releaseSandbox resolves and delete was called with /internal/runs/run-1. When it rejects with UnauthorizedOperation, releaseSandbox rejects.",
+  "done": "node --import tsx --test test/*.test.ts prints pass 6 and fail 0: three claim tests, the Spot test and two release tests."
+ },
+ "quiz": [
+  {
+   "q": "acquireSandbox tagged a VM, then the orchestrator pod restarted before the activity returned. Temporal retries it. What happens?",
+   "options": [
+    {
+     "text": "It claims a second VM, and the sweeper removes the first when its lease ends.",
+     "correct": false,
+     "why": "That would waste a VM for two hours. The first lines exist to prevent it."
+    },
+    {
+     "text": "findInstance finds the VM tagged with this run id and returns it. No new claim.",
+     "correct": true,
+     "why": "Look before you claim is what makes the activity safe to run twice."
+    },
+    {
+     "text": "Temporal returns the old result from history without running the activity.",
+     "correct": false,
+     "why": "The activity never completed, so there is no result in history. It runs again."
+    }
+   ]
+  },
+  {
+   "q": "Why is nova-worker started as a systemd unit instead of running inside the SSM command?",
+   "options": [
+    {
+     "text": "systemd starts processes faster than SSM.",
+     "correct": false,
+     "why": "Speed is not the reason."
+    },
+    {
+     "text": "SSM commands time out after at most 48 hours, and runs have no time limit.",
+     "correct": true,
+     "why": "SSM only starts the unit. The unit lives as long as the VM, and a retry re-attaches to it."
+    },
+    {
+     "text": "SSM cannot run commands as the agent user.",
+     "correct": false,
+     "why": "It can, with sudo or systemd-run --uid. The limit is the command's lifetime."
+    }
+   ]
+  },
+  {
+   "q": "workInSandbox reads a heartbeat with age_s = 420. What does it do?",
+   "options": [
+    {
+     "text": "Keeps waiting: a long thinking turn can take minutes.",
+     "correct": false,
+     "why": "The harness heartbeats every 30 s from a timer, even during a long turn. 7 minutes of silence means it is gone."
+    },
+    {
+     "text": "Retries the activity, which re-attaches to the harness.",
+     "correct": false,
+     "why": "The failure is non-retryable on purpose: re-attaching to a dead VM does not help."
+    },
+    {
+     "text": "Throws a non-retryable ApplicationFailure of type SandboxDead, which recovery handles on a fresh VM.",
+     "correct": true,
+     "why": "Over 300 seconds without a heartbeat means the VM or harness died. G3-27 replaces the VM."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From g3-7: why does a claim detach the VM with ShouldDecrementDesiredCapacity, and what refills the pool?",
+  "From p7-2: name two things workflow code must never do."
+ ],
+ "videos": [
+  {
+   "title": "Connect to AWS EC2 Using AWS SSM Session Manager",
+   "url": "https://www.youtube.com/watch?v=SwSEmvWMuMU",
+   "channel": "Tech With Yeshwanth",
+   "minutes": 19,
+   "why": "Hands-on setup of Session Manager as an SSH replacement."
+  }
+ ],
+ "words": [
+  {
+   "term": "claim",
+   "plain": "Take one warm VM for one run: raise desired, wait for InService, detach and tag it."
+  },
+  {
+   "term": "freshen",
+   "plain": "Bring a baked VM to the exact commit, redoing only what changed since the image was built."
+  },
+  {
+   "term": "park",
+   "plain": "Stop a VM while its run waits for a person; the disk stays, the cost drops to almost nothing."
+  },
+  {
+   "term": "retire",
+   "plain": "After 72 hours parked: start, checkpoint, terminate. The next answer resumes on a fresh VM."
+  },
+  {
+   "term": "re-attach",
+   "plain": "On retry, follow the harness already running on the VM instead of starting a second one."
+  },
+  {
+   "term": "aws-sdk-client-mock",
+   "plain": "A test library that fakes an AWS SDK v3 client's answers and records what was sent."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-18",
+   "why": "This lesson explained acquireSandbox line by line, what freshen does, and how to test the claim without AWS.",
+   "walk": [
+    "Write acquireSandbox in ai-agents/orchestrator/src/activities/sandbox.ts (code above) with findInstance, inServiceIds, desired and leaseUntil helpers.",
+    "After the claim, open the broker scope (POST /internal/runs) and mint the gateway run token (G0-13). Write task, capability and token to /run/nova/ over SSM, mode 0600, owner agent.",
+    "Count cold starts (empty pool) as a metric.",
+    "Write freshenSandbox(vm, sha). It fetches and checks out through the broker and reinstalls only what changed (lockfile hashes vs manifest.json). On full and wide it runs lab refresh, then expects lab status ready.",
+    "Throw ApplicationFailure type LabNotReady when FCP Lab will not start. The workflow retries once on a fresh VM, then reports with the lab report.",
+    "Unit-test the ASG and EC2 path with aws-sdk-client-mock and MockActivityEnvironment (the lab)."
+   ]
+  },
+  {
+   "key": "G3-20",
+   "why": "This lesson explained workInSandbox, parkSandbox and releaseSandbox line by line, plus wake, retire and the Spot path.",
+   "walk": [
+    "Write workInSandbox in ai-agents/orchestrator/src/activities/run.ts (code above) with ensureHarnessRunning: SSM SendCommand (AWS-RunShellScript) running systemd-run --uid agent --unit nova-<run> /usr/local/bin/nova-worker run /run/nova/task.json, or re-attach.",
+    "Follow the broker's heartbeat every 30 s, renew ai-agents:lease-until every 5 minutes, and throw non-retryable SandboxDead after 5 minutes of silence.",
+    "Write parkSandbox (stop, lease now + 73 h) and wakeSandbox (start, wait for SSM online, freshen if main moved).",
+    "Write retireSandbox: after 72 h stopped, start, run nova-worker checkpoint, terminate.",
+    "Write releaseSandbox: revoke the broker scope, terminate, accept InvalidInstanceID.NotFound. Call it from the workflow's finally.",
+    "Spot: return preempted when the harness exits on /run/nova/preempt. The workflow retries the step on a fresh VM."
+   ]
+  }
+ ],
+ "remember": "Every VM activity is safe to run twice, follows heartbeats instead of a clock, and ends in releaseSandbox."
+}

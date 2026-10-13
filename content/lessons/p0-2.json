@@ -1,0 +1,373 @@
+{
+ "id": "p0-2",
+ "title": "The big picture: what we are building",
+ "minutes": 35,
+ "youNeed": [
+  "p0-1"
+ ],
+ "bridge": "The platform is like CI for tickets. A person hands over work, a fresh machine does it, and the result is a PR with checks. Except: the worker is a model that reads untrusted text and runs commands. So it holds no keys, and every way out of its machine is a wall.",
+ "intro": "Before any code, you need the whole drawing in your head. This lesson follows one ticket from Jira to a merged PR and names every part it passes. Each part becomes a goal, a set of tickets and a few lessons later on.",
+ "picture": {
+  "caption": "One Nova run: the VM does the work, the services outside it hold every key.",
+  "nodes": [
+   {
+    "id": "req",
+    "label": "Requester",
+    "kind": "person"
+   },
+   {
+    "id": "orch",
+    "label": "Orchestrator (Temporal)",
+    "kind": "service"
+   },
+   {
+    "id": "vm",
+    "label": "Sandbox VM running nova-worker",
+    "kind": "machine"
+   },
+   {
+    "id": "gw",
+    "label": "LLM gateway",
+    "kind": "service"
+   },
+   {
+    "id": "anth",
+    "label": "Anthropic API",
+    "kind": "cloud"
+   },
+   {
+    "id": "broker",
+    "label": "Broker",
+    "kind": "service"
+   },
+   {
+    "id": "gh",
+    "label": "GitHub, Jira, Slack",
+    "kind": "cloud"
+   },
+   {
+    "id": "rev",
+    "label": "Reviewer (not the requester)",
+    "kind": "person"
+   }
+  ],
+  "steps": [
+   {
+    "from": "req",
+    "to": "orch",
+    "text": "assigns the Jira ticket to Nova; a poll every minute starts one workflow for it"
+   },
+   {
+    "from": "orch",
+    "to": "vm",
+    "text": "claims a fresh VM from a warm pool and starts the harness in it"
+   },
+   {
+    "from": "vm",
+    "to": "gw",
+    "text": "every model call goes to the gateway with a run token, never a key"
+   },
+   {
+    "from": "gw",
+    "to": "anth",
+    "text": "adds the Anthropic key, streams the answer back and counts the cost"
+   },
+   {
+    "from": "vm",
+    "to": "broker",
+    "text": "push, Jira comment or Slack post, each with the run's capability"
+   },
+   {
+    "from": "broker",
+    "to": "gh",
+    "text": "checks the run's scope, then makes the call with a short-lived token"
+   },
+   {
+    "from": "rev",
+    "to": "gh",
+    "text": "one approval from someone who did not ask for the change; a person merges"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "One ticket, start to finish",
+   "p": [
+    "Sean assigns RH-1234 to the Nova user in Jira. Nova is our ticket-to-PR agent: a program that runs Claude with tools. Every minute a poll finds tickets assigned to Nova and records who assigned them. That person is the requester.",
+    "First a cheap model call with no machine reads the ticket text. It answers ready, ask, or hand back. Then Nova writes a plan on a small VM: what done means, the checks that will prove it, and the steps. The plan goes to Jira and Slack with Approve, Change and Stop buttons.",
+    "After the requester approves, Nova builds on a bigger VM. It pushes its work after every step that passes, and asks questions in the ticket's Slack thread. It opens a draft PR. Byte, our review agent, reviews the draft, and Nova fixes or answers each finding.",
+    "Nova marks the PR ready only when CI is green and every check in the plan passed. A teammate approves, and a person merges. The ticket goes back to the requester."
+   ]
+  },
+  {
+   "h": "A fresh VM for every run",
+   "p": [
+    "The work happens on an EC2 virtual machine (VM) in an AWS account of its own, called ai-agents. Every VM starts from one image, ai-agent-sandbox, with fcp, FCP Lab, browsers, a pinned Claude Code and the harness already in it. The harness, nova-worker, is our program that runs the agent session inside the VM.",
+    "A VM comes in three sizes. Nova plans on a lite VM and builds on a full one: plan small, build big. Stopped VMs wait in warm pools, so a run gets one in about a minute.",
+    "A used VM is never reused. When the run ends, the VM is destroyed, and a sweeper deletes any VM a crashed run left behind."
+   ],
+   "because": "We give every run a fresh VM because the agent reads untrusted text and may get root on its machine.",
+   "code": {
+    "lang": "hcl",
+    "file": "modules/aws-sandbox-pool and its unit (G3-11, G3-15), shortened",
+    "text": "# One AMI for all sizes; the size is only the instance type.\nsizes          = { lite = \"m8i.xlarge\", full = \"m8i.2xlarge\", wide = \"m8i.4xlarge\" }\nwarm_pool_size = { lite = 2, full = 2, wide = 0 } # to start\n\nwarm_pool {\n  pool_state = \"Stopped\" # a stopped VM costs only its disk\n  instance_reuse_policy {\n    reuse_on_scale_in = false # a used VM never goes back to the pool\n  }\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "lite has 4 vCPUs, full 8, wide 16. AWS calls a size an instance type."
+     },
+     {
+      "line": 3,
+      "text": "How many stopped VMs wait per size. Wide VMs start cold until we know we need them."
+     },
+     {
+      "line": 6,
+      "text": "Stopped VMs keep their disk with FCP Lab already set up, so starting one is fast."
+     },
+     {
+      "line": 8,
+      "text": "The one-fresh-VM-per-run rule, written as a setting."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Four services outside the VM",
+   "p": [
+    "Four services run on inf-rhinohealth, our Kubernetes cluster for internal tools. A cluster is a group of machines that runs containers (part p5). The LLM gateway adds the Anthropic key to every model call and counts the cost. The broker holds the GitHub App key and the Jira and Slack tokens, and makes those calls for a run.",
+    "The orchestrator is a Temporal worker: it runs the workflows that drive each run. The Slack app gives people /nova commands and the Approve buttons. Temporal itself and the telemetry collector also run there.",
+    "A VM can reach only three things: the broker, the gateway and the telemetry collector. It reaches them over PrivateLink, a private AWS network path that skips the internet. Everything else on the internet goes through an egress proxy with a short allow-list."
+   ],
+   "because": "We keep every credential outside the VM, because a key inside it is a key an injected prompt could send away.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/session.ts (G3-19, a few lines)",
+    "text": "env: {\n  ...process.env, // env REPLACES the subprocess environment, so spread it first\n  ANTHROPIC_BASE_URL: GATEWAY_URL, // the gateway over PrivateLink\n  ANTHROPIC_AUTH_TOKEN: task.gatewayToken, // a run token: not an Anthropic key, dies with the run\n},\n// No maxTurns, no maxBudgetUsd, no taskBudget: work is never cut off mid-run.",
+    "notes": [
+     {
+      "line": 3,
+      "text": "Claude Code sends its model calls to this address instead of to Anthropic. It is our gateway."
+     },
+     {
+      "line": 4,
+      "text": "The VM holds a run token, signed by us. The gateway checks it and swaps in the real key."
+     },
+     {
+      "line": 6,
+      "text": "No turn, time or budget limit. How we guide a long run instead is in the guidance section below."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "No keys in the VM. The gateway holds the Anthropic key, the broker holds GitHub, Jira and Slack. The VM holds only a run token and a capability, both useless after the run."
+   }
+  },
+  {
+   "h": "Temporal: the part that waits",
+   "p": [
+    "A run can wait days for a person: for a plan approval, or an answer to a question. Temporal is the engine that runs our workflows. A workflow is a function whose progress is saved after every step. It survives restarts and deploys, and waiting costs nothing.",
+    "The workflow for one Nova ticket is ticketToPr. It claims a VM, runs the harness, waits for people, and always releases the VM at the end. Slack buttons reach it as signals, which are messages to a running workflow."
+   ],
+   "because": "We use Temporal because a three-day wait for a person must cost nothing and must survive a restart in the middle.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (G3-24, the end)",
+    "text": "const plan = await inSandbox(planTask(t), \"lite\"); // plan small\nif (plan.parked) return \"parked\";\nawait act.postPlan(t, plan);\nif (!(await waitForPerson(run, \"plan\", () => decision !== undefined, t))) return \"parked\"; // remind at 1 day, park at 3\nif (decision?.kind !== \"approve\") return \"stopped\";\nconst built = await inSandbox(buildTask(t, plan), \"full\"); // build big\nreturn built.parked ? \"parked\" : built.prUrl;",
+    "notes": [
+     {
+      "line": 1,
+      "text": "inSandbox claims a VM of that size, runs the harness, and releases the VM in a finally block."
+     },
+     {
+      "line": 3,
+      "text": "act holds the activities: the steps that do real work, such as posting to Jira and Slack."
+     },
+     {
+      "line": 4,
+      "text": "Waits for the Approve, Change or Stop signal. It reminds after a day and parks the ticket after three."
+     },
+     {
+      "line": 6,
+      "text": "Only an approved plan gets a full VM. The result of the build is the PR URL."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Walls: rules the infrastructure enforces",
+   "p": [
+    "A wall is a rule that holds even if the agent tries to break it, because infrastructure enforces it, not a prompt. We keep walls few and exact.",
+    "No keys in the VM. PHI (patient health information) never enters a prompt. Agents see fake seed data only. A ticket that looks like it holds real patient data is handed back.",
+    "Agents never merge, apply, destroy, sync or dispatch. Every PR needs exactly one approval, and never from the requester.",
+    "Agents cannot change the checks they are judged by: CI workflows, lint config and the plan's QA checks are locked. One fresh VM per run. A VM can only reach the internet through the allow-list proxy."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Exactly one approval, never by the requester. GitHub cannot know who asked for an agent's PR. So a required check reads the Requested-by line and fails if the requester approved alone."
+   }
+  },
+  {
+   "h": "Guidance: how the agent works",
+   "p": [
+    "Everything about how the agent works is guidance, not a wall. No time, turn or budget limit cuts a run in the middle, because a cut mid-thought throws the work away. We guide, we don't cage.",
+    "A progress watcher reads every tool call and spots loops. It answers with a ladder of steps. First a nudge, then a re-plan, then more thinking effort. Then a fresh session from the last checkpoint, and last a question to a person. Past its own estimate, Nova posts a short check-in and keeps going unless someone says stop.",
+    "A cost backstop sits far above a normal ticket. When a run passes it, the run pauses between turns and asks. For the first four weeks it only logs. The default model is Opus 5.5 at medium effort, one level higher when a step's checks fail."
+   ]
+  },
+  {
+   "h": "Nova, routines, Byte and the brain",
+   "p": [
+    "Nova turns a ticket into a PR. A routine is Nova with a different trigger and a written charter. One example is a fixer that wakes up when main goes red. Routines use the same harness, VMs and walls.",
+    "Byte already exists: it reviews PRs in fcp, and it will review Nova's drafts too. The R&D brain is a set of pages about our systems, plus a search tool the agents and people use. FCP Lab is the full fcp stack on one machine, so agents can test their changes for real."
+   ]
+  }
+ ],
+ "lab": {
+  "title": "Read the platform from its tickets",
+  "youNeed": [
+   "The course repo at ~/Projects/ai-agents-course",
+   "Node 24"
+  ],
+  "worked": [
+   {
+    "do": "cd ~/Projects/ai-agents-course && ls public/tickets",
+    "see": "g0.json  g1.json  g2.json  g3.json  g4.json\ng5.json  g6.json  g7.json  g8.json  index.json"
+   },
+   {
+    "do": "grep -o 'lite m8i[^)]*' public/tickets/g3.json | head -1",
+    "see": "lite m8i.xlarge, full m8i.2xlarge, wide m8i.4xlarge"
+   },
+   {
+    "do": "node -e 'const t = require(\"./public/tickets/g0.json\").find((x) => x.key === \"G0-13\"); console.log(t.why)'",
+    "see": "The sandbox VM must never hold the Anthropic key. Anthropic's hosting guide recommends exactly this: a proxy that injects the key."
+   },
+   {
+    "do": "node -e 'const t = require(\"./public/tickets/g0.json\").find((x) => x.key === \"G0-01\"); console.log(t.what)'",
+    "see": "Get Nir and Tal to sign off on the review rules: any engineer may review any area, the requester never approves their own agent's PR, and every PR needs exactly 1 approval. There is no CODEOWNERS file."
+   },
+   {
+    "do": "node -e 'const t = require(\"./public/tickets/g3.json\").find((x) => x.key === \"G3-19\"); console.log(t.how.find((h) => h.includes(\"maxTurns\")).slice(-44))'",
+    "see": "No maxTurns, no maxBudgetUsd, no taskBudget."
+   }
+  ],
+  "faded": "Find the ticket that says the broker never hands its GitHub tokens out. It is in g3.json, and its what field says so. Left to you: the node -e command that prints that ticket's key and what.",
+  "alone": "Close the lesson. On paper, draw the eight boxes of the picture and the seven arrows, each with a few words. Then write the ticket key next to each service: gateway, broker, orchestrator workflow, harness. Check your drawing against the picture and the Tickets this unlocks list.",
+  "done": "You can draw the picture from memory and point to the ticket that builds each service."
+ },
+ "quiz": [
+  {
+   "q": "Which service adds the Anthropic key to a model call?",
+   "options": [
+    {
+     "text": "The broker, because it holds all the keys",
+     "correct": false,
+     "why": "The broker holds GitHub, Jira and Slack credentials. The Anthropic key lives only in the gateway."
+    },
+    {
+     "text": "The LLM gateway, after it checks the run token",
+     "correct": true,
+     "why": "The VM sends a run token; the gateway swaps in the workload's key and counts the cost."
+    },
+    {
+     "text": "The harness in the VM, read from an environment variable",
+     "correct": false,
+     "why": "No keys in the VM. The harness only has the run token."
+    }
+   ]
+  },
+  {
+   "q": "Nova has worked for six hours, well past its own estimate. What happens?",
+   "options": [
+    {
+     "text": "The run is stopped at its time limit and the VM is destroyed",
+     "correct": false,
+     "why": "There is no time limit. A cut mid-thought throws the work away."
+    },
+    {
+     "text": "The gateway starts refusing its model calls",
+     "correct": false,
+     "why": "The gateway reports spend; it never refuses a call over budget."
+    },
+    {
+     "text": "Nova posts a short check-in and keeps going unless someone says stop",
+     "correct": true,
+     "why": "Time is measured, never limited. The watcher handles loops; the far backstop only pauses between turns."
+    }
+   ]
+  },
+  {
+   "q": "The requester approves Nova's PR and GitHub shows one approval. Can it merge?",
+   "options": [
+    {
+     "text": "No: a required check sees the approver is the requester, so a teammate must approve",
+     "correct": true,
+     "why": "Exactly one approval, never by the requester. The independent-approval check enforces it."
+    },
+    {
+     "text": "Yes: one approval is what the ruleset asks for",
+     "correct": false,
+     "why": "The ruleset counts approvals; it cannot know who asked for an agent's PR."
+    },
+    {
+     "text": "Yes, if Byte also approves the PR",
+     "correct": false,
+     "why": "Byte never approves, and approvals from apps never count."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p0-1: what are the three tabs of every lab, and what does each one leave to you?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "Nova",
+   "plain": "Our ticket-to-PR agent: it plans, builds and opens a PR for a Jira ticket assigned to it."
+  },
+  {
+   "term": "sandbox VM",
+   "plain": "The fresh EC2 machine a run works on; destroyed after the run, never reused."
+  },
+  {
+   "term": "warm pool",
+   "plain": "Stopped VMs that wait, already set up, so a run gets one in about a minute."
+  },
+  {
+   "term": "LLM gateway",
+   "plain": "The service that adds the Anthropic key to every model call and counts the cost."
+  },
+  {
+   "term": "broker",
+   "plain": "The service that holds GitHub, Jira and Slack credentials and makes those calls for a run."
+  },
+  {
+   "term": "orchestrator",
+   "plain": "The Temporal worker that runs our workflows, such as ticketToPr for one ticket."
+  },
+  {
+   "term": "guidance",
+   "plain": "Everything about how an agent works, such as the watcher and check-ins; it never cuts a run."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-24",
+   "why": "ticketToPr is the workflow in the picture: plan on lite, wait for approval, build on full, always release."
+  },
+  {
+   "key": "G3-19",
+   "why": "nova-worker is the harness inside the VM; it talks only to the gateway and the broker."
+  },
+  {
+   "key": "G0-13",
+   "why": "The gateway is why the VM never needs the Anthropic key."
+  },
+  {
+   "key": "G3-07",
+   "why": "The broker is why the VM never needs a GitHub token."
+  }
+ ],
+ "remember": "The VM does the work and holds no keys; four services outside it hold the keys and do the waiting."
+}

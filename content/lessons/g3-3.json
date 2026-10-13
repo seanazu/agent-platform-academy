@@ -1,0 +1,490 @@
+{
+ "id": "g3-3",
+ "title": "Temporal and the services on inf",
+ "minutes": 45,
+ "youNeed": [
+  "p5-2",
+  "p5-4",
+  "p7-1"
+ ],
+ "bridge": "Giving agents their own Temporal is like giving a feature its own database. Same engine, separate data and settings. Except some settings are fixed forever at the first install. And the services that hold credentials must run on inf, outside every sandbox, reached through one narrow door.",
+ "intro": "The agent services do not run in the sandbox account. They run on inf-rhinohealth, our tools cluster, next to n8n and Vault. This lesson deploys a Temporal for agents, then the orchestrator worker, the broker and the Slack app. Last, it opens one PrivateLink path from the sandboxes to exactly three ports.",
+ "picture": {
+  "caption": "Sandboxes reach three ports on inf through PrivateLink. Only the orchestrator worker reaches Temporal and the broker's internal port.",
+  "nodes": [
+   {
+    "id": "vm",
+    "label": "sandbox VM (ai-agents account)",
+    "kind": "machine"
+   },
+   {
+    "id": "endpoint",
+    "label": "interface endpoint in the sandbox VPC",
+    "kind": "cloud"
+   },
+   {
+    "id": "nlb",
+    "label": "internal NLB on inf: 443, 8443, 4318",
+    "kind": "service"
+   },
+   {
+    "id": "broker",
+    "label": "broker pods (sandbox port)",
+    "kind": "service"
+   },
+   {
+    "id": "gateway",
+    "label": "LLM gateway",
+    "kind": "service"
+   },
+   {
+    "id": "otel",
+    "label": "OTel collector",
+    "kind": "service"
+   },
+   {
+    "id": "worker",
+    "label": "orchestrator-worker pods",
+    "kind": "service"
+   },
+   {
+    "id": "temporal",
+    "label": "Temporal ai-agents + its own RDS",
+    "kind": "service"
+   }
+  ],
+  "steps": [
+   {
+    "from": "vm",
+    "to": "endpoint",
+    "text": "calls broker.ai-agents.example.com; the private zone points it at the endpoint"
+   },
+   {
+    "from": "endpoint",
+    "to": "nlb",
+    "text": "PrivateLink carries the call to inf without peering the two VPCs"
+   },
+   {
+    "from": "nlb",
+    "to": "broker",
+    "text": "port 443 goes to the broker's sandbox port, never its internal port"
+   },
+   {
+    "from": "nlb",
+    "to": "gateway",
+    "text": "port 8443 goes to the LLM gateway"
+   },
+   {
+    "from": "nlb",
+    "to": "otel",
+    "text": "port 4318 goes to the OTel collector (OTLP over HTTP)"
+   },
+   {
+    "from": "worker",
+    "to": "temporal",
+    "text": "only orchestrator-worker pods reach port 7233 (a NetworkPolicy)"
+   },
+   {
+    "from": "worker",
+    "to": "broker",
+    "text": "only the worker reaches the broker's internal port, to open and close run scopes"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Why its own Temporal, on inf",
+   "p": [
+    "Temporal runs the long parts of every agent run: wait for an approval, ask and wait, retry, resume. Waiting costs nothing and survives restarts (lesson p7-1). The product already has a Temporal per environment. Agents must not share it: a busy Nova must never slow a customer's job.",
+    "So G3-06 runs a small Temporal of its own on inf-rhinohealth. It has its own RDS Postgres database, its own Vault secret and its own Temporal namespace, ai-agents. A Temporal namespace is a separate space for workflows inside one Temporal server, with its own retention.",
+    "It follows the n8n pattern from lesson p5-2. A file multi_tenant/accounts/infrastructure/ai-agents/ai-agents.hcl holds the shared names: Kubernetes namespace, Temporal namespace, Vault paths and hostnames. Four units sit under ai-agents/temporal/: secrets, sg, rds and repository.",
+    "secrets generates the DB password into kvv2 infrastructure/ai-agents/temporal, like modules/n8n-secrets. sg lets Postgres in from the inf VPC only. rds uses terraform-aws-modules/rds 6.12.0: db.t4g.small, deletion protection, 14-day backups, Postgres 17."
+   ],
+   "callout": {
+    "kind": "gotcha",
+    "text": "Postgres 17 is what product Temporal uses today. n8n runs 18.4. Use 18 only if Andy confirms Temporal 1.31 is supported on it."
+   }
+  },
+  {
+   "h": "The module, part 1: namespace and DB password",
+   "p": [
+    "The repository unit runs a new module, modules/ai-agents-temporal. Part 1 creates the Kubernetes namespace and asks External Secrets to copy the DB password from Vault into it (lesson p5-3)."
+   ],
+   "because": "We create the password Secret before the chart, because Temporal's pods crash on start if their database password is missing.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/ai-agents-temporal/main.tf (part 1 of 2)",
+    "text": "resource \"kubernetes_namespace_v1\" \"this\" {\n  metadata { name = var.namespace } # \"ai-agents\"\n}\n\n# DB password from Vault (kvv2 infrastructure/ai-agents/temporal), synced by External Secrets.\nresource \"kubectl_manifest\" \"temporal_db_secret\" {\n  yaml_body = yamlencode({\n    apiVersion = \"external-secrets.io/v1\"\n    kind       = \"ExternalSecret\"\n    metadata   = { name = \"temporal-db\", namespace = kubernetes_namespace_v1.this.metadata[0].name }\n    spec = {\n      refreshInterval = \"5m\"\n      secretStoreRef  = { name = \"vault-store\", kind = \"ClusterSecretStore\" }\n      target          = { name = \"temporal-db\", creationPolicy = \"Owner\" }\n      data            = [{ secretKey = \"password\", remoteRef = { key = var.vault_path, property = \"DB_PASSWORD\" } }]\n    }\n  })\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "A Kubernetes namespace, a folder for pods and secrets. var.namespace is ai-agents."
+     },
+     {
+      "line": 6,
+      "text": "kubectl_manifest applies any Kubernetes YAML. Here it is an ExternalSecret, which the External Secrets operator reads."
+     },
+     {
+      "line": 7,
+      "text": "yamlencode turns the HCL map into YAML, so Terraform checks the structure for us."
+     },
+     {
+      "line": 12,
+      "text": "Every 5 minutes the operator reads Vault again, so a rotated password arrives without a redeploy."
+     },
+     {
+      "line": 13,
+      "text": "vault-store is the ClusterSecretStore on inf that reads kvv2. Lesson p5-3 explains why it is too wide; the threat model (G3-12) revisits it."
+     },
+     {
+      "line": 14,
+      "text": "The operator creates a Kubernetes Secret called temporal-db and owns it: delete the ExternalSecret and the Secret goes too."
+     },
+     {
+      "line": 15,
+      "text": "One key: password, filled from the DB_PASSWORD property at var.vault_path."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The module, part 2: the Helm release",
+   "p": [
+    "Part 2 installs the upstream Temporal chart, the same chart and version product Temporal uses. The values file starts from gitops/cloud/temporal/values.yaml. It keeps fullnameOverride temporal, the system worker on, and maxConns 6 and 2 for the two database pools."
+   ],
+   "because": "We pass the shard count and namespace through a template, because these two values must be visible in review.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/ai-agents-temporal/main.tf (part 2 of 2)",
+    "text": "resource \"helm_release\" \"temporal\" {\n  name        = \"temporal\"\n  namespace   = kubernetes_namespace_v1.this.metadata[0].name\n  repository  = \"https://go.temporal.io/helm-charts\"\n  chart       = \"temporal\"\n  version     = \"1.5.0\" # the same chart as product Temporal (gitops/cloud/temporal)\n  max_history = 10\n\n  values = [templatefile(\"${path.module}/templates/temporal_values.yml.tpl\", {\n    db_endpoint        = var.db_endpoint\n    num_history_shards = 128 # cannot change after the first install\n    temporal_namespace = \"ai-agents\" # retention 30d\n  })]\n\n  depends_on = [kubectl_manifest.temporal_db_secret]\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "A helm_release is a chart installed by Terraform, so plan shows every change before it happens."
+     },
+     {
+      "line": 4,
+      "text": "The official Temporal chart repository."
+     },
+     {
+      "line": 6,
+      "text": "Chart 1.5.0, the one gitops/cloud/temporal wraps for product Temporal. One version to learn."
+     },
+     {
+      "line": 7,
+      "text": "Helm keeps the last 10 releases, enough to roll back, without growing forever."
+     },
+     {
+      "line": 9,
+      "text": "templatefile fills placeholders in the values template with the three values below."
+     },
+     {
+      "line": 11,
+      "text": "History shards split Temporal's data. The number is fixed at the first install and can never change. 128 is plenty for us; product uses 512."
+     },
+     {
+      "line": 12,
+      "text": "The Temporal namespace ai-agents, created with 30-day retention: closed workflows are kept 30 days, then deleted."
+     },
+     {
+      "line": 15,
+      "text": "Install the chart only after the ExternalSecret exists."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "numHistoryShards cannot be changed later. Changing it means a new cluster and moving every workflow. Check the value in the plan before anyone applies."
+   }
+  },
+  {
+   "h": "Search attributes, the UI and who connects",
+   "p": [
+    "A search attribute is an indexed field on a workflow. With it you can list 'every run for RH-1234' or 'every running Nova run'. A post-install Job creates three, all of type Keyword: Agent, JiraKey and RunKind. It copies gitops/cloud/temporal/templates/search-attributes-init-job.yaml.",
+    "The Web UI gets an envoy-internal HTTPRoute at temporal-ai-agents.example.com. envoy-internal is the gateway only VPN and Teleport users reach, like n8n's UI. The Temporal frontend Service stays ClusterIP: an address inside the cluster only.",
+    "A NetworkPolicy lets only pods in the ai-agents namespace reach port 7233 (lesson p5-4). A VMServiceScrape, like gitops/cloud/temporal/templates/vmservicescrape.yaml, sends Temporal's metrics to VictoriaMetrics. Plan locally, paste it into the PR with Andy as reviewer, and a person applies."
+   ]
+  },
+  {
+   "h": "Three services, one module",
+   "p": [
+    "G3-17 deploys the services that hold credentials: the orchestrator worker, the broker and the Slack app. G0-15 already runs the LLM gateway with a shared module, modules/ai-agents-service. It is a local chart with a Deployment, a Service, an ExternalSecret and a VMServiceScrape.",
+    "Each service gets a unit next to G0-15's llm-gateway/: multi_tenant/accounts/infrastructure/ai-agents/{orchestrator-worker,broker,slack-app}/. Replicas are fixed: orchestrator-worker 2, broker 2, slack-app 1. KEDA, which scales pods by load, is off on inf.",
+    "Images come from inf ECR (ai-agents-*), pinned by digest. Pods run as non-root with a read-only root filesystem and all Linux capabilities dropped. They get no service-account token unless IRSA needs one.",
+    "Secrets come through ExternalSecrets from vault-store: infrastructure/ai-agents/{broker,slack-app,orchestrator,jira-nova}. They hold the GitHub App key and the Slack and Jira tokens. They also hold the gateway's token-signing key and the broker's DB user."
+   ]
+  },
+  {
+   "h": "IRSA: the worker's hands in the other account",
+   "p": [
+    "The orchestrator worker runs on inf but must start, stop and tag VMs in the ai-agents account. It does this with IRSA (IAM Roles for Service Accounts). A pod's Kubernetes service account maps to an IAM role, and the pod receives short-lived credentials for it. There is no static key anywhere.",
+    "The worker assumes ai-agents-orchestrator in the ai-agents account. It may start, stop, terminate and tag instances tagged ai-agents:managed=true. It may call SetDesiredCapacity and DetachInstances on the sandbox ASGs, and ssm:SendCommand with AWS-RunShellScript on tagged instances.",
+    "The broker's role may put and get objects under rhino-ai-agents-runs/runs/*, so it can presign URLs (lesson g3-4). NetworkPolicies let only orchestrator-worker reach the broker's internal port and Temporal. Vector is the log shipper that runs in every cluster: it collects pod logs and sends them on to VictoriaLogs. Every pod carries the Vector annotation logs.rhinofcp.com/processing.enabled, so its logs are shipped."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "Why not an access key in Vault? A key works for anyone who copies it, forever. IRSA credentials expire within hours and work only from that pod's service account."
+   }
+  },
+  {
+   "h": "PrivateLink, part 1: one NLB, three ports",
+   "p": [
+    "The sandbox VPC is never peered with inf. So how does nova-worker reach the broker and the gateway? Through PrivateLink. inf publishes a load balancer as an endpoint service, and the sandbox VPC gets an endpoint to it (lesson p5-4). Traffic flows one way, to the listed ports only.",
+    "The NLB's targets are pods. A TargetGroupBinding is a Kubernetes object from the AWS Load Balancer Controller. It keeps a target group's pod IPs current as pods come and go."
+   ],
+   "because": "We put exactly three listeners on the load balancer, because a sandbox reaches only what this NLB forwards.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/multi_tenant/accounts/infrastructure/ai-agents/sandbox-privatelink/main.tf (part 1 of 2)",
+    "text": "# Sandboxes reach exactly three things on inf: the broker's sandbox port, the LLM gateway and the\n# OTel collector. Not envoy-internal (that would expose every internal tool) and not Temporal.\nlocals {\n  sandbox_ports = { broker = 443, gateway = 8443, otel = 4318 }\n}\n\nresource \"aws_lb\" \"sandbox_facing\" {\n  name               = \"ai-agents-sandbox-facing\"\n  internal           = true\n  load_balancer_type = \"network\"\n  subnets            = var.inf_private_subnets\n  tags               = var.tags\n}\n\nresource \"aws_lb_listener\" \"this\" {\n  for_each          = local.sandbox_ports\n  load_balancer_arn = aws_lb.sandbox_facing.arn\n  port              = each.value\n  protocol          = \"TLS\"\n  certificate_arn   = var.acm_certificate_arn # *.ai-agents.example.com\n  default_action {\n    type             = \"forward\"\n    target_group_arn = aws_lb_target_group.this[each.key].arn # pods bound with TargetGroupBinding\n  }\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The rule in two lines. envoy-internal would expose every internal tool; Temporal is for the worker only."
+     },
+     {
+      "line": 4,
+      "text": "Three names, three ports: the broker's sandbox port on 443, the gateway on 8443, the collector's OTLP/HTTP port on 4318."
+     },
+     {
+      "line": 9,
+      "text": "internal = true: the NLB has no public address."
+     },
+     {
+      "line": 10,
+      "text": "A network load balancer, which works on TCP and is what PrivateLink requires."
+     },
+     {
+      "line": 11,
+      "text": "It sits in inf's private subnets."
+     },
+     {
+      "line": 16,
+      "text": "One listener per entry in sandbox_ports."
+     },
+     {
+      "line": 19,
+      "text": "TLS ends on the NLB, with an ACM certificate for *.ai-agents.example.com."
+     },
+     {
+      "line": 23,
+      "text": "Each listener forwards to its own target group, kept in sync with the pods by a TargetGroupBinding."
+     }
+    ]
+   }
+  },
+  {
+   "h": "PrivateLink, part 2: who may connect",
+   "p": [
+    "Part 2 publishes the NLB as an endpoint service and says which account may connect to it. The consumer side lives in the ai-agents account: an interface endpoint and three records in the private zone from lesson g3-2."
+   ],
+   "because": "We allow one account as principal, because an endpoint service open to the organization would let any account reach the broker.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/multi_tenant/accounts/infrastructure/ai-agents/sandbox-privatelink/main.tf (part 2 of 2)",
+    "text": "resource \"aws_vpc_endpoint_service\" \"sandbox_facing\" {\n  acceptance_required        = false\n  network_load_balancer_arns = [aws_lb.sandbox_facing.arn]\n  allowed_principals         = [\"arn:aws:iam::${var.ai_agents_account_id}:root\"] # nobody else\n  tags                       = var.tags\n}\n\n# The consumer side (aws_vpc_endpoint + private-zone records broker., gateway., otel.) lives in\n# terraform/accounts/ai-agents/aws/us-east-1/core-services/inf-services-endpoint/.",
+    "notes": [
+     {
+      "line": 1,
+      "text": "An endpoint service turns the NLB into something other VPCs can connect to."
+     },
+     {
+      "line": 2,
+      "text": "No manual approval step: the principal list below is the control."
+     },
+     {
+      "line": 4,
+      "text": "Only the ai-agents account may create an endpoint to it. Nobody else."
+     },
+     {
+      "line": 8,
+      "text": "The other half: aws_vpc_endpoint plus records broker., gateway. and otel. in ai-agents.example.com."
+     },
+     {
+      "line": 9,
+      "text": "That unit lives in the sandbox account's tree: core-services/inf-services-endpoint/."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "Sandboxes reach three ports and nothing else on inf. Never the broker's internal port, never envoy-internal, never Temporal. And because the collector is on the NLB, sandboxes need neither otel.example.com on the proxy list nor an ingest token."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Give a local Temporal the ai-agents namespace, retention and search attributes",
+  "youNeed": [
+   "temporal CLI (brew install temporal; temporal --version prints 1.x)",
+   "Two terminals",
+   "No cluster and no AWS. The dev server stands in for the Helm release; the commands match what the post-install Job runs"
+  ],
+  "worked": [
+   {
+    "do": "Terminal 1: temporal server start-dev --namespace ai-agents",
+    "see": "Temporal Server:      localhost:7233\nTemporal UI:          http://localhost:8233\nTemporal Metrics:     http://localhost:<port>/metrics"
+   },
+   {
+    "do": "Terminal 2: temporal --namespace ai-agents operator namespace describe | grep Retention",
+    "see": "  Config.WorkflowExecutionRetentionTtl  24h0m0s"
+   },
+   {
+    "do": "temporal --namespace ai-agents operator namespace update --retention 720h && temporal --namespace ai-agents operator namespace describe | grep Retention",
+    "see": "Namespace ai-agents update succeeded.\n  Config.WorkflowExecutionRetentionTtl  720h0m0s"
+   },
+   {
+    "do": "for n in Agent JiraKey RunKind; do temporal --namespace ai-agents operator search-attribute create --name $n --type Keyword; done",
+    "see": "Search attributes have been added\nSearch attributes have been added\nSearch attributes have been added"
+   },
+   {
+    "do": "temporal --namespace ai-agents operator search-attribute list | grep -E 'Agent|JiraKey|RunKind'",
+    "see": "  Agent                                 Keyword\n  JiraKey                               Keyword\n  RunKind                               Keyword"
+   },
+   {
+    "do": "temporal --namespace ai-agents workflow start --type ticketToPr --task-queue ai-agents-nova --workflow-id ticket-RH-1234 --input '{\"key\":\"RH-1234\",\"requester\":\"sean\"}' --search-attribute 'JiraKey=\"RH-1234\"' --search-attribute 'Agent=\"nova\"' --search-attribute 'RunKind=\"ticket\"'",
+    "see": "Running execution:\n  WorkflowId  ticket-RH-1234\n  Type        ticketToPr\n  Namespace   ai-agents\n  TaskQueue   ai-agents-nova\n(output trimmed)"
+   },
+   {
+    "do": "temporal --namespace ai-agents workflow list --query 'JiraKey=\"RH-1234\"'",
+    "see": "  Status     WorkflowId       Type       StartTime\n  Running  ticket-RH-1234  ticketToPr  2 seconds ago"
+   },
+   {
+    "do": "temporal --namespace ai-agents workflow start --type ticketToPr --task-queue ai-agents-nova --workflow-id ticket-RH-9 --search-attribute 'Ticket=\"RH-9\"'",
+    "see": "Error: failed starting workflow: Namespace ai-agents has no mapping defined for search attribute Ticket"
+   }
+  ],
+  "faded": "Find runs by more than one field. Start a second workflow, ticket-RH-1300, with Agent=\"nova\" and RunKind=\"ticket\", and a third, ci-fix-1, with Agent=\"cifix\" and RunKind=\"routine\". Nobody runs a worker, so all three stay Running. The last step is yours. Write one --query that lists only the Nova ticket runs. Say how many rows you expect before you run it.",
+  "alone": "Make a second namespace for drills: temporal operator namespace create --namespace ai-agents-drills --retention 72h. Add one Keyword search attribute, DrillId, to it only. Start a workflow there with DrillId=\"vm-dies\" and find it with a query. Then show that the same --search-attribute fails in ai-agents, and explain why the attributes are per namespace.",
+  "done": "describe shows 720h0m0s for ai-agents, the JiraKey query lists ticket-RH-1234, and an unknown attribute is refused."
+ },
+ "quiz": [
+  {
+   "q": "Six months in, Temporal for agents is busy. Can we raise numHistoryShards from 128 to 512?",
+   "options": [
+    {
+     "text": "Yes: change the value in the template and apply; the chart rebalances.",
+     "correct": false,
+     "why": "The shard count is fixed at the first install. The chart cannot rebalance existing data."
+    },
+    {
+     "text": "No: it is fixed at the first install. More shards means a new cluster and moving the workflows.",
+     "correct": true,
+     "why": "That is why the module comments it and the plan is checked before apply."
+    },
+    {
+     "text": "Yes, but only after a Postgres upgrade to 18.",
+     "correct": false,
+     "why": "The database version has nothing to do with it. The number is part of how Temporal stores history."
+    }
+   ]
+  },
+  {
+   "q": "nova-worker in a sandbox tries to call the Temporal frontend on port 7233. What stops it?",
+   "options": [
+    {
+     "text": "The Squid allow-list, which does not list Temporal.",
+     "correct": false,
+     "why": "Squid filters internet names. Port 7233 is a ClusterIP inside inf, and no proxy rule makes that reachable."
+    },
+    {
+     "text": "Only the NetworkPolicy on the ai-agents namespace.",
+     "correct": false,
+     "why": "It would refuse it too, but the traffic never reaches the cluster. There is no path at all."
+    },
+    {
+     "text": "There is no route: the VPCs are not peered, and the PrivateLink NLB forwards only 443, 8443 and 4318.",
+     "correct": true,
+     "why": "A sandbox reaches inf only through the NLB, and Temporal is not behind it."
+    }
+   ]
+  },
+  {
+   "q": "Why does the orchestrator worker use IRSA instead of an AWS access key stored in Vault?",
+   "options": [
+    {
+     "text": "IRSA gives the pod short-lived credentials for one narrow role, with no static key to copy.",
+     "correct": true,
+     "why": "A leaked key works for anyone until someone rotates it. IRSA credentials expire and are tied to the pod's service account."
+    },
+    {
+     "text": "Vault cannot store AWS keys.",
+     "correct": false,
+     "why": "Vault stores any secret. The problem is that a static key exists at all."
+    },
+    {
+     "text": "IRSA makes EC2 calls faster.",
+     "correct": false,
+     "why": "Speed is the same. The difference is who can use the credentials, and for how long."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From g3-2: which three interface endpoints does the SSM agent need, and why does the S3 endpoint list two buckets?",
+  "From p5-4: with no NetworkPolicy at all, which pods can reach a pod?"
+ ],
+ "videos": [
+  {
+   "title": "Temporal in 7 Minutes - the TL;DR Intro",
+   "url": "https://www.youtube.com/watch?v=2HjnQlnA5eY",
+   "channel": "Temporal",
+   "minutes": 7,
+   "why": "Official short intro to workflows, activities and durability."
+  }
+ ],
+ "words": [
+  {
+   "term": "Temporal namespace",
+   "plain": "A separate space for workflows inside one Temporal server, with its own retention and search attributes."
+  },
+  {
+   "term": "history shards",
+   "plain": "The pieces Temporal splits its data into. The number is fixed when the cluster is first installed."
+  },
+  {
+   "term": "search attribute",
+   "plain": "An indexed field on a workflow, such as JiraKey, used to list and find runs."
+  },
+  {
+   "term": "IRSA",
+   "plain": "IAM Roles for Service Accounts: a pod gets short-lived AWS credentials for one role, with no static key."
+  },
+  {
+   "term": "TargetGroupBinding",
+   "plain": "A Kubernetes object that keeps a load balancer's target group pointed at the current pod IPs."
+  },
+  {
+   "term": "envoy-internal",
+   "plain": "The gateway on inf that only VPN and Teleport users reach. Internal tools like n8n's UI sit behind it."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-06",
+   "why": "This lesson explained the n8n-style units, the module line by line, the fixed shard count, search attributes and who may connect.",
+   "walk": [
+    "Add multi_tenant/accounts/infrastructure/ai-agents/ai-agents.hcl with the namespace ai-agents, the Temporal namespace ai-agents, the Vault paths and the hostnames, following n8n.hcl.",
+    "Add ai-agents/temporal/secrets (a module like modules/n8n-secrets writing kvv2 infrastructure/ai-agents/temporal) and sg (Postgres from the inf VPC only).",
+    "Add ai-agents/temporal/rds with tfr:///terraform-aws-modules/rds/aws 6.12.0: db.t4g.small, deletion_protection, 14-day backups, Postgres 17 unless Andy confirms 18.",
+    "Write modules/ai-agents-temporal (code above) and templates/temporal_values.yml.tpl from gitops/cloud/temporal/values.yaml. Keep fullnameOverride temporal, the system worker and maxConns 6 and 2. Set 128 shards and namespace ai-agents with 30-day retention. Add the unit ai-agents/temporal/repository.",
+    "Add a post-install Job that creates the Keyword search attributes Agent, JiraKey and RunKind, like search-attributes-init-job.yaml.",
+    "Add the envoy-internal HTTPRoute temporal-ai-agents.example.com, a NetworkPolicy that lets only the ai-agents namespace reach 7233, and a VMServiceScrape.",
+    "Plan locally over VPN and paste it into the PR with Andy as reviewer. A person applies."
+   ]
+  },
+  {
+   "key": "G3-17",
+   "why": "This lesson explained the three service units, their secrets and IRSA roles, and the PrivateLink unit line by line.",
+   "walk": [
+    "Add units orchestrator-worker, broker and slack-app under multi_tenant/accounts/infrastructure/ai-agents/ with G0-15's modules/ai-agents-service. Replicas 2, 2 and 1.",
+    "Pin images from inf ECR ai-agents-* by digest. Run pods non-root with a read-only root filesystem, all capabilities dropped, and no service-account token unless IRSA needs it.",
+    "Add ExternalSecrets from vault-store for infrastructure/ai-agents/{broker,slack-app,orchestrator,jira-nova}, the gateway's token-signing key for the orchestrator, and a broker DB user on the ai-agents RDS.",
+    "Add IRSA roles. ai-agents-orchestrator in the ai-agents account gets tag-scoped EC2 actions, SetDesiredCapacity and DetachInstances on the sandbox ASGs, and ssm:SendCommand with AWS-RunShellScript. The broker gets put and get under rhino-ai-agents-runs/runs/*.",
+    "Add the unit ai-agents/sandbox-privatelink (code above) with one target group per port, TargetGroupBindings to the pods, and the ACM certificate for *.ai-agents.example.com.",
+    "Add terraform/accounts/ai-agents/aws/us-east-1/core-services/inf-services-endpoint/: the interface endpoint plus records broker., gateway. and otel. in the private zone.",
+    "Add the NetworkPolicies (only orchestrator-worker reaches the broker's internal port and Temporal) and the Vector annotation on every pod. Plan, paste, and a person applies."
+   ]
+  }
+ ],
+ "remember": "Credentials live on inf, in pods sandboxes cannot reach; sandboxes see exactly three ports through PrivateLink."
+}

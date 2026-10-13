@@ -1,0 +1,455 @@
+{
+ "id": "p3-4",
+ "title": "Warm pools and Spot",
+ "minutes": 50,
+ "youNeed": [
+  "p3-3"
+ ],
+ "bridge": "A warm pool is like keeping browser tabs open but asleep: waking one is fast, and a sleeping tab costs almost nothing. Except a used VM never goes back to the pool; it is thrown away. Spot is like a standby airline seat: much cheaper, but AWS can take it back with two minutes' warning.",
+ "intro": "A run should get its VM in about a minute, and a VM waiting on a person should cost cents. This lesson shows the AWS pieces behind that. Auto Scaling groups keep warm pools of stopped VMs. A lifecycle hook finishes setup before a VM sleeps. Spot groups run cheap work that can retry.",
+ "picture": {
+  "caption": "Warm VMs are prepared once and stopped; a claim wakes one and takes it out of the group for good.",
+  "nodes": [
+   {
+    "id": "asg",
+    "label": "ASG ai-agents-sandbox-full (desired 0)",
+    "kind": "service"
+   },
+   {
+    "id": "pool",
+    "label": "warm pool: 2 stopped VMs",
+    "kind": "machine"
+   },
+   {
+    "id": "hook",
+    "label": "lifecycle hook finish-setup",
+    "kind": "check"
+   },
+   {
+    "id": "act",
+    "label": "acquireSandbox activity",
+    "kind": "service"
+   },
+   {
+    "id": "vm",
+    "label": "claimed VM (detached, tagged)",
+    "kind": "machine"
+   },
+   {
+    "id": "spot",
+    "label": "Spot group: 2-minute warning",
+    "kind": "cloud"
+   }
+  ],
+  "steps": [
+   {
+    "from": "asg",
+    "to": "pool",
+    "text": "launches VMs for the pool from the launch template"
+   },
+   {
+    "from": "pool",
+    "to": "hook",
+    "text": "each new VM waits in the hook while sandbox-warm starts FCP Lab once"
+   },
+   {
+    "from": "hook",
+    "to": "pool",
+    "text": "CONTINUE: the VM is stopped and kept, costing only its disk"
+   },
+   {
+    "from": "act",
+    "to": "asg",
+    "text": "raises desired capacity by 1"
+   },
+   {
+    "from": "asg",
+    "to": "vm",
+    "text": "a warm VM starts in about a minute, turns InService, and is detached"
+   },
+   {
+    "from": "spot",
+    "to": "vm",
+    "text": "routines only: AWS may reclaim a Spot VM; spot-watch sees the notice and the run checkpoints"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start from the numbers",
+   "p": [
+    "A fresh VM must boot, pull Docker images and start FCP Lab before a run can begin. That takes many minutes. A VM that did all that once and was then stopped wakes in about a minute.",
+    "A stopped VM costs only its disk, about $8 to $10 a month (G3-15). A running full VM costs about $0.42 an hour; parked, about $0.01 (G3-20). So we keep a few VMs stopped and ready: 2 lite, 2 full and 0 wide to start."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "Warm pools turn a slow, identical start into work done once, before anyone is waiting. The run then spends its time on the ticket."
+   }
+  },
+  {
+   "h": "Auto Scaling group: a count AWS keeps true",
+   "p": [
+    "An Auto Scaling group (ASG) keeps a number of VMs running from one launch template, in the subnets you give it. That number is the desired capacity. Raise it and AWS starts a VM; lower it and AWS removes one.",
+    "Our groups have min 0, max 3 and desired 0 (G3-15). Nothing is in service until a run claims a VM. The max only covers claims in flight, because claimed VMs leave the group."
+   ],
+   "because": "We create the group with desired 0 because the steady state is 'all VMs warm and stopped', not 'some running'.",
+   "code": {
+    "lang": "bash",
+    "file": "~/academy/aws (moto running, source moto.env)",
+    "text": "aws ec2 create-launch-template --launch-template-name lab-full \\\n  --launch-template-data '{\"ImageId\":\"ami-03cf127a\",\"InstanceType\":\"m8i.2xlarge\"}'\nSUB=$(aws ec2 describe-subnets --query 'Subnets[0].SubnetId' --output text)\naws autoscaling create-auto-scaling-group --auto-scaling-group-name ai-agents-sandbox-full \\\n  --launch-template 'LaunchTemplateName=lab-full,Version=$Latest' \\\n  --min-size 0 --max-size 3 --desired-capacity 0 --vpc-zone-identifier $SUB",
+    "notes": [
+     {
+      "line": 2,
+      "text": "A small template for the lab. The real ones are the p3-3 templates."
+     },
+     {
+      "line": 3,
+      "text": "Any subnet works in moto. In the account, the group spans the three sandbox subnets."
+     },
+     {
+      "line": 5,
+      "text": "$Latest: new VMs use the newest template version. Single quotes stop the shell expanding $Latest."
+     },
+     {
+      "line": 6,
+      "text": "min 0, max 3, desired 0, as in G3-15."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The warm pool",
+   "p": [
+    "A warm pool is a set of prepared VMs kept next to the group, outside its desired capacity. With pool state Stopped, they are shut down and cost only disk.",
+    "A pool VM moves through states: Warmed:Pending, then Warmed:Pending:Wait while a hook runs, then Warmed:Stopped. On a scale-out it becomes Pending, then InService. G3-15 sets reuse_on_scale_in to false: a VM that served a run is never put back."
+   ],
+   "because": "We forbid reuse because a used VM may hold a run's leftovers, and one fresh VM per run is a wall.",
+   "code": {
+    "lang": "bash",
+    "file": "~/academy/aws (moto running)",
+    "text": "aws autoscaling put-warm-pool --auto-scaling-group-name ai-agents-sandbox-full \\\n  --pool-state Stopped --min-size 2 --max-group-prepared-capacity 2 \\\n  --instance-reuse-policy ReuseOnScaleIn=false\naws autoscaling describe-warm-pool --auto-scaling-group-name ai-agents-sandbox-full",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Stopped VMs, at least 2. max-group-prepared-capacity caps the pool plus the group at 2."
+     },
+     {
+      "line": 3,
+      "text": "Used VMs are terminated on scale-in, never returned to the pool."
+     },
+     {
+      "line": 4,
+      "text": "On AWS, Instances lists the pool VMs with their LifecycleState. moto stores the settings but starts no VMs."
+     }
+    ]
+   },
+   "see": "{\n    \"Instances\": [],\n    \"WarmPoolConfiguration\": {\n        \"MaxGroupPreparedCapacity\": 2,\n        \"MinSize\": 2,\n        \"PoolState\": \"Stopped\",\n        \"InstanceReusePolicy\": { \"ReuseOnScaleIn\": false }\n    }\n}"
+  },
+  {
+   "h": "The lifecycle hook: finish setup, then sleep",
+   "p": [
+    "A lifecycle hook pauses a VM at a transition until someone says 'continue'. G3-15 adds one on launch: heartbeat 1800 seconds, default ABANDON. If the VM does not finish within 30 minutes, AWS throws it away instead of keeping a half-ready VM.",
+    "The image has a sandbox-warm systemd unit (p3-5) that runs at boot as root. It asks IMDS where this VM is going. For Warmed:Stopped it starts FCP Lab once, to pull images and warm the disk, stops it, and completes the hook. For InService it completes at once."
+   ],
+   "because": "We let the VM finish setup before it sleeps, because work done in the pool is work no run waits for.",
+   "code": {
+    "lang": "bash",
+    "file": "sandbox-warm (sketch; a systemd unit in the image role, G3-15)",
+    "text": "#!/bin/bash\nset -euo pipefail\nimds() {  # IMDSv2 read, as in p3-3\n  local t; t=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H \"X-aws-ec2-metadata-token-ttl-seconds: 60\")\n  curl -s -H \"X-aws-ec2-metadata-token: $t\" \"http://169.254.169.254/latest/meta-data/$1\"\n}\nid=$(imds instance-id)\ntarget=$(imds autoscaling/target-lifecycle-state)   # Warmed:Stopped or InService\ngroup=$(cat /etc/ai-agent-sandbox/asg-name)         # how the VM learns its group: settle in G3-15\nif [ \"$target\" = \"Warmed:Stopped\" ]; then\n  sudo -iu agent lab start sandbox && sudo -iu agent lab stop sandbox   # pull images, warm the disk\nfi\naws autoscaling complete-lifecycle-action --lifecycle-hook-name finish-setup \\\n  --auto-scaling-group-name \"$group\" --instance-id \"$id\" --lifecycle-action-result CONTINUE",
+    "notes": [
+     {
+      "line": 8,
+      "text": "The VM's destination. Only root can read it, because of the p3-3 host rules."
+     },
+     {
+      "line": 9,
+      "text": "The group name is not in IMDS (metadata tags are off). The ticket does not say how the VM learns it."
+     },
+     {
+      "line": 11,
+      "text": "Check the lab command with Nave: G3-16 uses lab start, G3-14 uses lab up."
+     },
+     {
+      "line": 13,
+      "text": "Uses the role's one extra permission (p3-1) through the autoscaling endpoint (p3-2)."
+     },
+     {
+      "line": 14,
+      "text": "CONTINUE moves the VM on: into the pool (stopped) or into service."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Claiming a VM: scale out, then detach",
+   "p": [
+    "To claim a VM, the acquireSandbox activity (G3-18) raises desired capacity by 1. AWS wakes a warm VM, which turns InService. The activity then detaches it with ShouldDecrementDesiredCapacity, which puts the count back to 0.",
+    "After that the VM is no longer in the group. The ASG will not replace or terminate it; Temporal owns its life. The activity tags it with the run ID and a lease, and keeps renewing the lease while the run lives (p3-7)."
+   ],
+   "because": "We detach claimed VMs because an ASG that still counts them might replace or remove them in the middle of a run.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/activities/sandbox.ts (the three AWS calls, G3-18)",
+    "text": "await asg.send(new SetDesiredCapacityCommand({\n  AutoScalingGroupName: group,\n  DesiredCapacity: (await desired(group)) + 1, // wake one warm VM\n  HonorCooldown: false,\n}));\n// ... wait until a new instance in the group is InService, heartbeating to Temporal ...\nawait asg.send(new DetachInstancesCommand({\n  AutoScalingGroupName: group,\n  InstanceIds: [instanceId],\n  ShouldDecrementDesiredCapacity: true, // the group goes back to 0; the pool refills\n}));\nawait ec2.send(new CreateTagsCommand({ Resources: [instanceId], Tags: [\n  { Key: \"ai-agents:run-id\", Value: req.runId },\n  { Key: \"ai-agents:lease-until\", Value: leaseUntil({ hours: 2 }) }, // renewed while the run lives\n] }));",
+    "notes": [
+     {
+      "line": 3,
+      "text": "One more than now. Two claims at once each add one."
+     },
+     {
+      "line": 4,
+      "text": "Do not wait for a cooldown period between changes."
+     },
+     {
+      "line": 7,
+      "text": "Detach takes the VM out of the group. If two claims race for one VM, the loser's detach fails and it takes the next."
+     },
+     {
+      "line": 10,
+      "text": "Without the decrement, the group would start another VM to get back to 1."
+     },
+     {
+      "line": 12,
+      "text": "From here on the tags are how everyone, including the sweeper, knows whose VM this is."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Spot: cheap, with a two-minute warning",
+   "p": [
+    "Spot VMs use AWS's spare capacity, about 56% cheaper (G3-15). AWS may take one back at any time, with a notice two minutes before. G3-15 adds Spot groups for lite and full, with no warm pool.",
+    "A mixed instances policy lets the group pick from several types of the same size, so it finds spare capacity more often. Nova and the bug fixers stay on on-demand groups. They wait on people, and losing a VM mid-conversation costs more than the discount."
+   ],
+   "because": "We allow three instance families because a Spot group that accepts only one type often finds none.",
+   "code": {
+    "lang": "json",
+    "file": "~/academy/aws/spot.json",
+    "text": "{\n  \"LaunchTemplate\": {\n    \"LaunchTemplateSpecification\": { \"LaunchTemplateName\": \"lab-full\", \"Version\": \"$Latest\" },\n    \"Overrides\": [\n      { \"InstanceType\": \"m8i.2xlarge\" },\n      { \"InstanceType\": \"m7i.2xlarge\" },\n      { \"InstanceType\": \"m6i.2xlarge\" }\n    ]\n  },\n  \"InstancesDistribution\": {\n    \"OnDemandBaseCapacity\": 0,\n    \"OnDemandPercentageAboveBaseCapacity\": 0,\n    \"SpotAllocationStrategy\": \"price-capacity-optimized\"\n  }\n}",
+    "notes": [
+     {
+      "line": 5,
+      "text": "Same size (8 vCPU, 32 GiB), three generations. Any of them can run a full sandbox."
+     },
+     {
+      "line": 12,
+      "text": "No on-demand VMs at all in this group: 0% above a base of 0."
+     },
+     {
+      "line": 13,
+      "text": "Pick the pools with spare capacity first, then the cheapest among them."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Watching for the warning",
+   "p": [
+    "The Spot notice appears in IMDS at /latest/meta-data/spot/instance-action. Before a notice it answers 404. G3-08 adds spot-watch, a root timer that checks every 5 seconds and writes /run/nova/preempt once.",
+    "The harness sees the file, checkpoints (pushes the branch and saves the session) and exits with 'preempted'. The workflow then retries the step on a fresh VM from the same group (G3-20). Two minutes is enough for a checkpoint, not for finishing the work."
+   ],
+   "because": "We poll from a tiny root script because only root may reach IMDS, and the harness runs as agent.",
+   "code": {
+    "lang": "bash",
+    "file": "spot-watch.sh (G3-08; IMDS and OUT can be changed for the lab)",
+    "text": "#!/bin/sh\n# spot-watch: a systemd timer runs this every 5 s as root (G3-08). It writes the notice once.\nIMDS=${IMDS:-http://169.254.169.254}\nOUT=${OUT:-/run/nova/preempt}\n[ -e \"$OUT\" ] && exit 0\ntoken=$(curl -s -X PUT \"$IMDS/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 60\")\nnotice=$(curl -s -f -H \"X-aws-ec2-metadata-token: $token\" \"$IMDS/latest/meta-data/spot/instance-action\") || exit 0\nmkdir -p \"$(dirname \"$OUT\")\"\necho \"$notice\" > \"$OUT\"",
+    "notes": [
+     {
+      "line": 3,
+      "text": "The real address by default. The lab points it at a fake server on your laptop."
+     },
+     {
+      "line": 5,
+      "text": "Already warned: nothing to do. The harness reads this file."
+     },
+     {
+      "line": 7,
+      "text": "-f makes curl fail on 404, so 'no notice yet' exits quietly."
+     },
+     {
+      "line": 9,
+      "text": "The notice is JSON: the action (terminate or stop) and the time it happens."
+     }
+    ]
+   }
+  }
+ ],
+ "lab": {
+  "title": "A warm pool on a fake AWS, and a Spot warning on your laptop",
+  "youNeed": [
+   "moto and moto.env from p3-1",
+   "python3 (comes with macOS) for a fake metadata server"
+  ],
+  "worked": [
+   {
+    "do": "cd ~/academy/aws && source moto.env && curl -s -X POST localhost:5055/moto-api/reset. Then run the block from section 2.",
+    "see": "{\"status\": \"ok\"}\n(the launch template JSON, then nothing: create-auto-scaling-group prints no output on success)"
+   },
+   {
+    "do": "Run the block from section 3",
+    "see": "\"PoolState\": \"Stopped\" and \"ReuseOnScaleIn\": false in the output"
+   },
+   {
+    "do": "aws autoscaling put-lifecycle-hook --auto-scaling-group-name ai-agents-sandbox-full --lifecycle-hook-name finish-setup --lifecycle-transition autoscaling:EC2_INSTANCE_LAUNCHING --heartbeat-timeout 1800 --default-result ABANDON && aws autoscaling describe-lifecycle-hooks --auto-scaling-group-name ai-agents-sandbox-full --query 'LifecycleHooks[].[LifecycleHookName,HeartbeatTimeout,DefaultResult]' --output text",
+    "see": "finish-setup\t1800\tABANDON"
+   },
+   {
+    "do": "aws autoscaling set-desired-capacity --auto-scaling-group-name ai-agents-sandbox-full --desired-capacity 1 && aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ai-agents-sandbox-full --query 'AutoScalingGroups[0].Instances[].[InstanceId,LifecycleState]' --output text",
+    "see": "i-ee589756f7c477f66\tInService"
+   },
+   {
+    "do": "ID=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ai-agents-sandbox-full --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text) && aws autoscaling detach-instances --auto-scaling-group-name ai-agents-sandbox-full --instance-ids $ID --should-decrement-desired-capacity --query 'Activities[0].StatusCode' --output text",
+    "see": "InProgress"
+   },
+   {
+    "do": "aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ai-agents-sandbox-full --query 'AutoScalingGroups[0].[DesiredCapacity,length(Instances)]' --output text && aws ec2 create-tags --resources $ID --tags Key=ai-agents:run-id,Value=run-42 && aws ec2 describe-instances --instance-ids $ID --query 'Reservations[0].Instances[0].State.Name' --output text",
+    "see": "0\t0\nrunning\n(the group is empty again; the VM still runs, now owned by run-42)"
+   },
+   {
+    "do": "mkdir -p ~/academy/spot && cd ~/academy/spot. Save spot-watch.sh (section 7). mkdir -p imds/latest/meta-data/spot && (cd imds && python3 -m http.server 8169 --bind 127.0.0.1 >/dev/null 2>&1 &)",
+    "see": "(no output; a fake metadata server now runs on port 8169)"
+   },
+   {
+    "do": "IMDS=http://127.0.0.1:8169 OUT=./run/preempt sh spot-watch.sh; echo \"exit $?\"; ls run",
+    "see": "exit 0\nls: run: No such file or directory\n(no notice yet: 404, quiet exit. The fake server refuses the token PUT; the real IMDS does not.)"
+   },
+   {
+    "do": "echo '{\"action\": \"terminate\", \"time\": \"2026-10-13T15:02:00Z\"}' > imds/latest/meta-data/spot/instance-action && IMDS=http://127.0.0.1:8169 OUT=./run/preempt sh spot-watch.sh && cat run/preempt",
+    "see": "{\"action\": \"terminate\", \"time\": \"2026-10-13T15:02:00Z\"}"
+   }
+  ],
+  "faded": "Make the Spot group. Save spot.json (section 6) and create ai-agents-sandbox-full-spot with --mixed-instances-policy file://spot.json instead of --launch-template, with min 0, max 3, desired 0. Left to you: one describe-auto-scaling-groups query that prints OnDemandPercentageAboveBaseCapacity and the three override types.",
+  "alone": "Write claim.sh <run-id> that does what acquireSandbox does with the CLI. Remember the group's InService IDs, raise desired by 1, and find the new ID. Detach it with decrement. Tag it with ai-agents:run-id and a lease two hours ahead (date -u -v+2H +%Y-%m-%dT%H:%M:%SZ on macOS). Run it for run-1 and run-2, then check that both VMs are tagged and the group is back to 0.",
+  "done": "The group holds 0 VMs after a claim and the claimed VM runs with its run-id tag. spot-watch writes the notice only once the fake IMDS has one."
+ },
+ "quiz": [
+  {
+   "q": "Why does the warm pool set reuse_on_scale_in to false?",
+   "options": [
+    {
+     "text": "Stopped VMs that were used cost more than new ones",
+     "correct": false,
+     "why": "Price is the same. The reason is what a used VM may still hold."
+    },
+    {
+     "text": "A used VM may hold a run's leftovers, so it is never put back for the next run",
+     "correct": true,
+     "why": "One fresh VM per run is a wall; reuse would break it."
+    },
+    {
+     "text": "AWS requires it for pools in the Stopped state",
+     "correct": false,
+     "why": "It is a choice. AWS allows reuse; we turn it off."
+    }
+   ]
+  },
+  {
+   "q": "Why is a claimed VM detached from its group?",
+   "options": [
+    {
+     "text": "Detached VMs are billed at a lower rate",
+     "correct": false,
+     "why": "Billing does not change."
+    },
+    {
+     "text": "So the warm pool shrinks for good",
+     "correct": false,
+     "why": "The pool refills to its min size; detaching does not shrink it."
+    },
+    {
+     "text": "So the ASG never replaces or terminates it; Temporal owns its life from then on",
+     "correct": true,
+     "why": "And with the decrement, the group's desired capacity goes back to 0."
+    }
+   ]
+  },
+  {
+   "q": "Which work runs on the Spot groups?",
+   "options": [
+    {
+     "text": "Routines that can retry, such as CI fixers; never Nova, which waits on people",
+     "correct": true,
+     "why": "A lost Spot VM costs a retry. For a run waiting on a person, that is too disruptive."
+    },
+    {
+     "text": "Everything, since Spot is about 56% cheaper",
+     "correct": false,
+     "why": "Nova and bug fixers stay on on-demand groups on purpose."
+    },
+    {
+     "text": "Only wide VMs, because they cost the most",
+     "correct": false,
+     "why": "G3-15 makes Spot groups for lite and full, by kind of work, not by size."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p3-3: which address does sandbox-warm read its target state from, and why can the agent user not read it?"
+ ],
+ "videos": [
+  {
+   "title": "AWS EC2 Auto Scaling - How it Works",
+   "url": "https://www.youtube.com/watch?v=rcWgcFMlwFw",
+   "channel": "Digital Cloud Training",
+   "minutes": 8,
+   "why": "Short, clear overview of Auto Scaling groups and scaling policies."
+  },
+  {
+   "title": "Amazon/AWS EC2 Pricing Simply Explained | On-Demand, Spot, Reserved, Savings Plans",
+   "url": "https://www.youtube.com/watch?v=-t148tYgnJU",
+   "channel": "Tiny Technical Tutorials",
+   "minutes": 9,
+   "why": "Explains Spot instances and interruptions next to the other pricing models."
+  }
+ ],
+ "words": [
+  {
+   "term": "Auto Scaling group (ASG)",
+   "plain": "A group that keeps a count of VMs running from one launch template in given subnets."
+  },
+  {
+   "term": "desired capacity",
+   "plain": "The count an ASG keeps true; raise it to start a VM, lower it to remove one."
+  },
+  {
+   "term": "warm pool",
+   "plain": "Prepared VMs kept next to an ASG, ours stopped, ready to join it in about a minute."
+  },
+  {
+   "term": "lifecycle hook",
+   "plain": "A pause at a VM's transition until someone completes it, or a timeout applies the default result."
+  },
+  {
+   "term": "detach",
+   "plain": "Take a VM out of its ASG so the group no longer counts, replaces or removes it."
+  },
+  {
+   "term": "Spot instance",
+   "plain": "A VM on AWS's spare capacity, much cheaper, that AWS may take back."
+  },
+  {
+   "term": "interruption notice",
+   "plain": "The two-minute warning a Spot VM gets in IMDS at spot/instance-action."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-15",
+   "why": "One ASG per size with a stopped warm pool, the finish-setup hook, no reuse, and Spot groups for routines."
+  },
+  {
+   "key": "G3-18",
+   "why": "acquireSandbox raises desired by one, waits for InService, detaches with decrement and tags the VM."
+  },
+  {
+   "key": "G3-20",
+   "why": "On a Spot notice the harness checkpoints and exits preempted; the workflow retries on a fresh VM."
+  },
+  {
+   "key": "G3-08",
+   "why": "The image's spot-watch timer polls the notice every 5 seconds and writes /run/nova/preempt."
+  }
+ ],
+ "remember": "Keep VMs stopped and ready, claim one by scaling out and detaching it, and never put it back. Spot is for retryable work only."
+}

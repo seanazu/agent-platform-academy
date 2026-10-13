@@ -1,0 +1,380 @@
+{
+ "id": "p10-5",
+ "title": "Backend breaking-change checks",
+ "minutes": 50,
+ "youNeed": [
+  "p10-3"
+ ],
+ "bridge": "A breaking-change check is like tsc complaining when you remove an exported type that other files import. It runs as a required check on the PR. Except: the importers live outside the repo (a published SDK, on-prem clients that upgrade later, old pods during a rollout). No compiler sees them, so the check must compare the PR against its merge base on main.",
+ "intro": "Agents will change serializers, migrations and protos. Each one is a contract with something that is not in the PR. G7 adds one check per contract. oasdiff checks the OpenAPI schema, two linters check migrations, and buf checks the gRPC protos. A smoke test covers the published SDK, and a nightly mutation report measures test strength. This lesson shows what each tool compares and what its output means.",
+ "picture": {
+  "caption": "CI exports the contract from the merge base and from the PR, and a tool compares the two. A person, never an agent, records a deliberate break.",
+  "nodes": [
+   {
+    "id": "base",
+    "label": "merge base with main (worktree)",
+    "kind": "file"
+   },
+   {
+    "id": "head",
+    "label": "the PR's commit",
+    "kind": "file"
+   },
+   {
+    "id": "export",
+    "label": "export step (schema, SQL, protos)",
+    "kind": "service"
+   },
+   {
+    "id": "tool",
+    "label": "oasdiff / linter / buf",
+    "kind": "check"
+   },
+   {
+    "id": "person",
+    "label": "a person",
+    "kind": "person"
+   },
+   {
+    "id": "ignore",
+    "label": "openapi-breaking-ignore.txt (protected)",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "export",
+    "to": "base",
+    "text": "runs this commit's export script against the merge base tree"
+   },
+   {
+    "from": "export",
+    "to": "head",
+    "text": "runs the same script against the PR's tree"
+   },
+   {
+    "from": "tool",
+    "to": "head",
+    "text": "compares base to head and fails the job on an error-level break"
+   },
+   {
+    "from": "person",
+    "to": "ignore",
+    "text": "for a deliberate break, adds one line with the ticket key; agents may not edit this file"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Who is on the other side of the contract",
+   "p": [
+    "The cloud API has three readers that are not in the PR. They are the published rhino-health SDK on PyPI (customers keep old versions for months), the frontend, and the MCP server.",
+    "The gRPC protos are read by on-prem clients installed at customers, which upgrade later than the cloud. A migration runs while yesterday's pods are still serving requests. A test suite that passes no matter what the code does is a contract with nobody, which is its own problem.",
+    "Each check answers one question: would this change break a reader we cannot see? The tools differ, the shape is the same: get the old version, get the new version, compare."
+   ]
+  },
+  {
+   "h": "Everything starts at the merge base",
+   "p": [
+    "The merge base is the last commit the PR branch and main have in common. git merge-base HEAD origin/main prints it. Comparing against the merge base, not against main's tip, means the check only sees what this PR changed. CI checkouts are shallow by default, with one commit, so every job that needs the merge base sets fetch-depth: 0.",
+    "To run a script against the old code, G7-11 adds a git worktree. That is a second checkout of the merge base in a temp folder. The export script from this commit runs against both trees through PYTHONPATH. So the very first run already has a base to compare with."
+   ],
+   "because": "Every breaking-change check compares two versions. The base has to come from git in a way that shows only this PR's changes.",
+   "code": {
+    "lang": "bash",
+    "file": ".github/workflows/cloud-ci.yml (G7-11, the export step)",
+    "text": "git worktree add \"$RUNNER_TEMP/base\" \"$(git merge-base HEAD origin/main)\"\n# This commit's export script runs against both trees, so the first run already has a base.\nPYTHONPATH=\"$RUNNER_TEMP/base/cloud:$RUNNER_TEMP/base/common\" python cloud/rhinoCloud/scripts/export_openapi.py > \"$RUNNER_TEMP/base.yaml\"\nPYTHONPATH=\"$PWD/cloud:$PWD/common\" python cloud/rhinoCloud/scripts/export_openapi.py > \"$RUNNER_TEMP/head.yaml\"",
+    "notes": [
+     {
+      "line": 1,
+      "text": "A worktree is a second working copy sharing the same .git. The merge base is checked out there, read-only for our purpose."
+     },
+     {
+      "line": 3,
+      "text": "PYTHONPATH points imports at the old tree, so rhinoCloud.* resolves to the base's code while the script file is the new one."
+     },
+     {
+      "line": 4,
+      "text": "The same script, pointed at this commit. Two YAML files, ready for oasdiff."
+     }
+    ]
+   }
+  },
+  {
+   "h": "oasdiff on the OpenAPI schema",
+   "p": [
+    "OpenAPI is a YAML document that lists every endpoint, its parameters, request body and responses. fcp does not write it by hand: drf-spectacular generates it from the serializers, views and urls.py, and serves it at /docs/v2/openapi/. The export script calls the same generator and prints the YAML.",
+    "oasdiff breaking base.yaml head.yaml lists the changes that would break a client. Examples: a removed endpoint, a removed response property, a parameter that became required, a changed type.",
+    "Each has a level: error, warning or info. With --fail-on ERR the command exits non-zero on an error-level change and CI fails. --format githubactions turns the list into annotations on the PR.",
+    "A deliberate break is allowed, but only by a person. They add a line with the ticket key to cloud/rhinoCloud/openapi-breaking-ignore.txt, which oasdiff reads through --err-ignore. That file is a protected path, so an agent cannot silence the check it is judged by."
+   ],
+   "because": "The schema is generated, so this check sees every API change an agent makes, without anyone remembering to look.",
+   "code": {
+    "lang": "bash",
+    "file": "lab5 (oasdiff in Docker, the same image the CI step runs)",
+    "text": "docker run --rm -v \"$PWD:/work\" tufin/oasdiff \\\n  breaking /work/base.yaml /work/head.yaml \\\n  --fail-on ERR",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The folder with the two YAML files is mounted at /work. CI pins the image by digest; the lab uses the tag."
+     },
+     {
+      "line": 2,
+      "text": "breaking compares the old schema (base) with the new one (head) and lists only the changes that break clients."
+     },
+     {
+      "line": 3,
+      "text": "--fail-on ERR makes the command exit with an error on a breaking change, so the CI step fails."
+     }
+    ]
+   },
+   "see": "1 changes: 1 error, 0 warning, 0 info\nerror\t[request-parameter-became-required] at /h.yaml\n\tin API GET /api/notes/\n\t\tthe `query` request parameter `project` became required\n$ echo $?\n1",
+   "ifInstead": "If instead you see No breaking changes to report, but the specs are different, the change is not breaking by oasdiff's rules. A new optional response property is an example. Run oasdiff diff to see the structural change."
+  },
+  {
+   "h": "Two linters for migrations",
+   "p": [
+    "A migration can look harmless in a diff and still break production in two ways. First, during a deploy old pods keep running while the migration has already run. Dropping a column the old code still reads fails every request on those pods. django-migration-linter checks the migrations added since a commit for this class of change: manage.py lintmigrations --git-commit-id <merge base>.",
+    "Second, Postgres locks. ALTER TABLE takes an ACCESS EXCLUSIVE lock. On a big table, a rewrite or a NOT NULL column without a default blocks reads and writes for the whole operation. Squawk reads SQL and warns about that.",
+    "Django can print a migration's SQL with manage.py sqlmigrate <app> <name>. G7-15 feeds that SQL to Squawk, a migration linter, with a .squawk.toml at the repo root. The file sets the Postgres version and assume_in_transaction = true, because Django wraps migrations in a transaction. It also lists excluded rules, each with a reason.",
+    "G7-15 starts both advisory for two weeks (continue-on-error), reviews the findings with the BE guild, then makes them blocking. Exceptions are per migration, with a comment, added by a person."
+   ],
+   "because": "Agents will write migrations, and a column drop or a table rewrite is invisible in review until it hits a live database.",
+   "see": "$ uv run python manage.py lintmigrations notes\n(notes, 0001_initial)... OK\n(notes, 0002_remove_body)... ERR\n\tDROPPING columns (table: notes_note, column: body)\n*** Summary ***\nValid migrations: 1/2\nErroneous migrations: 1/2",
+   "callout": {
+    "kind": "tip",
+    "text": "Squawk's message for ADD COLUMN ... NOT NULL is Missing `set lock_timeout` before potentially slow ACCESS EXCLUSIVE lock operations. A lock timeout makes the migration fail fast instead of queueing every request behind it."
+   }
+  },
+  {
+   "h": "buf breaking for the gRPC protos",
+   "p": [
+    "The cloud and the on-prem client talk over gRPC, and the contract is common/fcp_common/rhinoAgentRpc/*.proto. buf is a tool for proto files. buf breaking compares a folder of protos with an older version and reports changes that break compatibility. buf.yaml names the module root and the rule set.",
+    "G7-19 picks the PACKAGE rules, not WIRE. WIRE only asks whether old bytes still parse, and it allows deleting or renaming an RPC.",
+    "fcp's proxy carries the RPC by method name in AgentRpcRequest.method_name. So a renamed RPC still parses on the wire, and still breaks every older client. The --against argument points at git: .git#ref=<merge base>,subdir=common.",
+    "When a field is removed on purpose, its number and name must be reserved in the message. Then nobody reuses them for something else. The protos have no reserved entries today; the ticket adds a note to the README."
+   ],
+   "because": "On-prem clients upgrade later than the cloud, so a proto change that is safe for the cloud can still break customers.",
+   "code": {
+    "lang": "yaml",
+    "file": "common/buf.yaml (G7-19)",
+    "text": "version: v2\nmodules:\n  - path: .\nbreaking:\n  use:\n    - PACKAGE\n  except:\n    - FIELD_SAME_JSON_NAME",
+    "notes": [
+     {
+      "line": 3,
+      "text": "The module root is common/, because make protoc runs with --proto_path=common; buf must see the same paths as the generated _pb2 files."
+     },
+     {
+      "line": 6,
+      "text": "PACKAGE: deleting or renaming an RPC, message or field is a break. WIRE would allow the rename that breaks method-name dispatch."
+     },
+     {
+      "line": 8,
+      "text": "The JSON mapping is unused between cloud and client (binary gRPC only), so this rule is switched off. Confirm with the BE guild."
+     }
+    ]
+   },
+   "see": "$ docker run --rm -v \"$PWD:/workspace\" -w /workspace bufbuild/buf breaking . --against \".git#ref=HEAD\"\nnotes/v1/notes.proto:4:1:Previously present field \"3\" with name \"body\" on message \"Note\" was deleted.\n$ echo $?\n100"
+  },
+  {
+   "h": "Smoke-test the published SDK",
+   "p": [
+    "The SDK in the repo is not what customers run; the wheel on PyPI is. G7-21 adds a small suite that installs the latest released rhino-health. It runs a few real calls over HTTP against this commit's API: log in, create a project, find it by name. The version comes from the PyPI JSON API; uv run --with rhino-health==$SDK_VERSION installs it for that run only, outside every dependency group.",
+    "Over HTTP means pytest-django's live_server fixture: a real server thread on a random port, over the same test database. That needs the transaction=True flavour of django_db, because a second thread cannot see rows inside the test's uncommitted transaction."
+   ],
+   "because": "A cloud change can pass every in-repo test and still break the SDK version a customer installed last month.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/sdk_smoke/test_published_sdk.py (G7-21, shortened)",
+    "text": "import pytest\n\nrh = pytest.importorskip(\"rhino_health\")  # in no uv group on purpose: CI installs the released wheel\n\npytestmark = [pytest.mark.sdk_smoke, pytest.mark.django_db(transaction=True)]  # live_server needs committed rows\n\n\n@pytest.fixture\ndef sdk(live_server, builder):\n    site = builder.site()  # a fake workgroup and user, created through the API\n    session = rh.login(username=site.email, password=site.password, rhino_api_url=f\"{live_server.url}/api/\")\n    return session, site",
+    "notes": [
+     {
+      "line": 3,
+      "text": "importorskip: if the package is not installed, the whole file is skipped instead of failing. Locally it skips; in CI the wheel is there."
+     },
+     {
+      "line": 5,
+      "text": "Two markers on the file. transaction=True commits rows so the server thread can read them."
+     },
+     {
+      "line": 9,
+      "text": "live_server from pytest-django: a URL like http://localhost:54321. builder from G7-06 creates the site through the API."
+     },
+     {
+      "line": 11,
+      "text": "The published SDK logs in over real HTTP. If this commit renamed the login field, this line fails."
+     }
+    ]
+   }
+  },
+  {
+   "h": "A nightly mutation report on test strength",
+   "p": [
+    "A mutation tool changes the code on purpose: flips a comparison, removes a line, changes a constant. Each change is a mutant.",
+    "The tests run; if they still pass, the mutant survived, and that part of the code is not really tested. G7-35 runs mutmut nightly on the cloud files that agent PRs changed the day before, at most 10 files. It is judged by the API layer only, because rhinoCore/tests are not pytest.",
+    "It is advisory and never a required check. The report (killed, survived, timed out per file, plus the survivors' diffs) goes to the job summary and an artifact. The weekly review reads it, and the G5 coverage-gap routine turns survivors into test proposals. The frontend already has the same idea in test:unit:mutation with Stryker."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Agents never change the checks they are judged by. The ignore file, .squawk.toml, buf.yaml and the CI workflow files are protected paths. A person records a deliberate break, with the ticket key."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Run oasdiff, buf breaking, Squawk and the migration linter",
+  "youNeed": [
+   "Docker Desktop running",
+   "uv",
+   "the lab3 Django project from p10-3"
+  ],
+  "worked": [
+   {
+    "do": "mkdir lab5 && cd lab5. Create base.yaml: an OpenAPI 3.0.3 document with one path /api/notes/, a GET with an optional query parameter project and a 200 response whose schema is an array of objects with id (integer) and title (string).",
+    "see": "One file, about 20 lines."
+   },
+   {
+    "do": "sed 's/          schema: { type: string }/          required: true\\n          schema: { type: string }/' base.yaml > head.yaml && diff base.yaml head.yaml",
+    "see": "8a9\n>           required: true"
+   },
+   {
+    "do": "docker run --rm -v \"$PWD:/work\" tufin/oasdiff breaking /work/base.yaml /work/head.yaml --fail-on ERR; echo exit $?",
+    "see": "1 changes: 1 error, 0 warning, 0 info\nerror\t[request-parameter-became-required] at /work/head.yaml\n\tin API GET /api/notes/\n\t\tthe `query` request parameter `project` became required\nexit 1"
+   },
+   {
+    "do": "mkdir -p proto/notes/v1 && cd proto. Create buf.yaml from the block above (without the except). Create notes/v1/notes.proto: package notes.v1, a message Note with id = 1, title = 2, body = 3, and a service Notes with one rpc. Then: git init -q && git add -A && git commit -qm base",
+    "see": "A commit holding the base version of the proto."
+   },
+   {
+    "do": "Delete the body = 3 line from notes.proto, then: docker run --rm -v \"$PWD:/workspace\" -w /workspace bufbuild/buf breaking . --against \".git#ref=HEAD\"; echo exit $?",
+    "see": "notes/v1/notes.proto:4:1:Previously present field \"3\" with name \"body\" on message \"Note\" was deleted.\nexit 100"
+   },
+   {
+    "do": "cd .. && printf 'ALTER TABLE \"notes_note\" ADD COLUMN \"owner_id\" integer NOT NULL;\\n' > 0002.sql && uvx --from squawk-cli squawk 0002.sql",
+    "see": "warning[require-lock-timeout]: Missing `set lock_timeout` before potentially slow ACCESS EXCLUSIVE lock operations\n ╭▸ 0002.sql:1:1\nwarning[require-statement-timeout]: Missing `set statement_timeout` before potentially slow operations"
+   },
+   {
+    "do": "cd ../lab3 && uv add --dev django-migration-linter, add 'django_migration_linter' to INSTALLED_APPS, create notes/migrations/0002_remove_body.py with a RemoveField(model_name=\"note\", name=\"body\") operation, then: uv run python manage.py lintmigrations notes",
+    "see": "(notes, 0001_initial)... OK\n(notes, 0002_remove_body)... ERR\n\tDROPPING columns (table: notes_note, column: body)\nValid migrations: 1/2\nErroneous migrations: 1/2"
+   }
+  ],
+  "faded": "In head.yaml, put required: true back to optional and instead change the type of id in the response from integer to string. Run oasdiff breaking again and read which rule fires and at which level. Then run it with --fail-on ERR and check the exit code. Reading the rule name and deciding whether --fail-on ERR would block it is the step left for you.",
+  "alone": "In lab3, delete 0002_remove_body.py. Add a field owner = models.CharField(max_length=80) to Note with no default. Run makemigrations and answer its prompt with a one-off default. Run sqlmigrate notes 0002 into a file and feed that SQL to Squawk. Then run lintmigrations. Write down in one line which tool said what, and why neither of them looked at the other's problem.",
+  "done": "oasdiff exits 1 on the required parameter, and buf exits 100 on the deleted field. Squawk warns about the lock, and lintmigrations marks the column drop as ERR."
+ },
+ "quiz": [
+  {
+   "q": "Why does the OpenAPI check export the schema from a git worktree of the merge base? Why not download it from the deployed dev environment?",
+   "options": [
+    {
+     "text": "Because the dev environment has no OpenAPI endpoint.",
+     "correct": false,
+     "why": "It does, at /docs/v2/openapi/; that is not the reason."
+    },
+    {
+     "text": "The merge base is exactly what this PR started from, so the diff shows only this PR's changes. And the same export script works on both trees from the first run.",
+     "correct": true,
+     "why": "Dev may be ahead or behind main; the merge base is the honest base."
+    },
+    {
+     "text": "Because oasdiff cannot read URLs.",
+     "correct": false,
+     "why": "oasdiff reads files and URLs; the choice is about what to compare."
+    }
+   ]
+  },
+  {
+   "q": "Which breaking rule set does G7-19 choose for buf, and why?",
+   "options": [
+    {
+     "text": "WIRE, because only the bytes on the wire matter between cloud and client.",
+     "correct": false,
+     "why": "WIRE allows renaming an RPC, and fcp dispatches by method name, so a rename breaks old clients."
+    },
+    {
+     "text": "PACKAGE, because deleting or renaming an RPC breaks the method-name dispatch even when the bytes still parse.",
+     "correct": true,
+     "why": "The proxy carries the RPC as a string in AgentRpcRequest.method_name."
+    },
+    {
+     "text": "FILE, because each proto file is versioned separately.",
+     "correct": false,
+     "why": "FILE is stricter about file layout, which is not the problem here."
+    }
+   ]
+  },
+  {
+   "q": "The nightly mutation report shows 12 surviving mutants in a file an agent PR changed. What does that mean and who acts?",
+   "options": [
+    {
+     "text": "The PR is reverted automatically.",
+     "correct": false,
+     "why": "The report is advisory and never a required check."
+    },
+    {
+     "text": "The tests on that file do not notice 12 code changes, so they are weak there. The weekly review reads it, and the coverage-gap routine proposes tests.",
+     "correct": true,
+     "why": "Survivors show where tests pass no matter what the code does."
+    },
+    {
+     "text": "The code has 12 bugs.",
+     "correct": false,
+     "why": "A mutant is a deliberate change made by the tool, not a bug in the code."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p10-3: what does makemigrations --check --dry-run catch, and which of this lesson's tools catches what it misses?",
+  "From p10-2: which pytest-django fixture does the SDK smoke test need, and why transaction=True?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "merge base",
+   "plain": "The last commit a branch shares with main; comparing against it shows only this PR's changes."
+  },
+  {
+   "term": "OpenAPI schema",
+   "plain": "A YAML description of every endpoint, generated by drf-spectacular from serializers, views and urls."
+  },
+  {
+   "term": "breaking change",
+   "plain": "A change that makes an existing reader of a contract fail: a removed field, a parameter that became required, a renamed RPC."
+  },
+  {
+   "term": "migration linter",
+   "plain": "django-migration-linter: checks new migrations for changes that break code still running during a deploy."
+  },
+  {
+   "term": "Squawk",
+   "plain": "A linter for Postgres SQL that warns about locks and table rewrites; fed with manage.py sqlmigrate output."
+  },
+  {
+   "term": "buf breaking",
+   "plain": "Compares proto files with an older version and reports incompatible changes under a chosen rule set."
+  },
+  {
+   "term": "mutant",
+   "plain": "A deliberate small change to the code made by a mutation tool. A test suite should fail on it; one that passes has a gap."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G7-11",
+   "why": "The oasdiff job is the worktree export plus the breaking command and the protected ignore file from this lesson."
+  },
+  {
+   "key": "G7-15",
+   "why": "The migration step is lintmigrations against the merge base plus Squawk on sqlmigrate output, both shown in the lab."
+  },
+  {
+   "key": "G7-19",
+   "why": "buf.yaml with PACKAGE rules and --against the merge base is the proto check explained here."
+  },
+  {
+   "key": "G7-21",
+   "why": "The SDK smoke suite needs importorskip, live_server and transactional django_db from this lesson."
+  }
+ ],
+ "remember": "Every breaking-change check is old version, new version, compare. The base comes from git's merge base, and only a person records a deliberate break."
+}

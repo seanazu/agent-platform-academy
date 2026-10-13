@@ -1,0 +1,609 @@
+{
+ "id": "g1-4",
+ "title": "Step tracing and quality numbers",
+ "minutes": 50,
+ "youNeed": [
+  "g1-2",
+  "p8-1",
+  "p7-3"
+ ],
+ "bridge": "A step tag is like the data-testid you put on a React element so Playwright can find it. Except the tag rides on the agent's environment, not on the DOM. Every metric, log and model call of that step carries the same five tags, and one session is one step.",
+ "intro": "A Nova run has nine steps, and each step spends tokens and can let a problem through. This lesson tags every signal with its step and labels failed runs the same way every week. Then it turns run records into one number per gate.",
+ "picture": {
+  "caption": "One env per step tags every signal; the weekly review labels failures; the nightly job turns records into gate numbers.",
+  "nodes": [
+   {
+    "id": "harness",
+    "label": "nova-worker (harness)",
+    "kind": "agent"
+   },
+   {
+    "id": "session",
+    "label": "Agent SDK session for one step",
+    "kind": "agent"
+   },
+   {
+    "id": "collector",
+    "label": "OTel Collector",
+    "kind": "service"
+   },
+   {
+    "id": "gateway",
+    "label": "LLM gateway",
+    "kind": "service"
+   },
+   {
+    "id": "reviewer",
+    "label": "you, in the weekly run review",
+    "kind": "person"
+   },
+   {
+    "id": "bucket",
+    "label": "rhino-ai-agents-eval-results (S3)",
+    "kind": "cloud"
+   },
+   {
+    "id": "nightly",
+    "label": "nightly metrics job",
+    "kind": "service"
+   },
+   {
+    "id": "grafana",
+    "label": "Grafana",
+    "kind": "service"
+   }
+  ],
+  "steps": [
+   {
+    "from": "harness",
+    "to": "session",
+    "text": "starts the build step with env: { ...process.env, ...stepEnv(run, \"build\") }"
+   },
+   {
+    "from": "session",
+    "to": "collector",
+    "text": "metrics and events carry agent, jira, run, step and harness.version"
+   },
+   {
+    "from": "session",
+    "to": "gateway",
+    "text": "every model call carries x-ai-agents-step and x-ai-agents-harness headers"
+   },
+   {
+    "from": "gateway",
+    "to": "grafana",
+    "text": "token and cost series now have a step label"
+   },
+   {
+    "from": "reviewer",
+    "to": "bucket",
+    "text": "label-run writes runs/<run>/label.json for a failed run"
+   },
+   {
+    "from": "nightly",
+    "to": "bucket",
+    "text": "reads labels and run JSON with a read-only role"
+   },
+   {
+    "from": "nightly",
+    "to": "grafana",
+    "text": "writes delivery_* step-quality series and ai_agents_run_failures_total"
+   },
+   {
+    "from": "reviewer",
+    "to": "grafana",
+    "text": "reads 'Quality at every step' and the fast-approval list in the review"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "A $4.10 run with no step on it",
+   "p": [
+    "Open the operations dashboard from lesson g1-3 and pick one Nova run. The gateway says the run cost $4.10 and used 310,000 tokens. It cannot say which step spent them, because today every call looks the same.",
+    "A Nova run has nine steps: ticket, plan, plan_ok, vm, build, pr, byte, approve and learn. A step is one stage of the run, and each stage is its own Agent SDK session. Every metric, log, model call and Temporal record of that session should carry the same tags. The tags are agent, jira, run, step and harness.version.",
+    "The tags travel as resource attributes. A resource attribute is a key=value pair that OpenTelemetry attaches to every signal a process sends (lesson p6-1). Claude Code reads them from the OTEL_RESOURCE_ATTRIBUTES variable. We set that variable once per session, and nothing inside the agent has to know.",
+    "The harness version is the fifth tag. It is the version field of harness/package.json and it changes on every harness release. With it, evals and live runs can be split by harness version, so a regression points at a release."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "When a run goes wrong we need two answers: which step spent the tokens, and which step should have caught the problem. Both need every signal tagged the same way."
+   }
+  },
+  {
+   "h": "telemetry.ts: one env per step",
+   "p": [
+    "This file lives in the harness workspace, ai-agents/harness/src/telemetry.ts. The harness itself is G3's; this file is the one piece G1 adds to it. It exports the nine steps, the harness version and one function, stepEnv.",
+    "The three blank lines of the ticket's sketch are dropped so it fits one block. Nothing else is removed."
+   ],
+   "because": "Because each step is its own session, the harness builds one environment per step, and the tags ride on it.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/telemetry.ts",
+    "text": "// ai-agents/harness/src/telemetry.ts  (the harness itself is G3's)\nimport { readFileSync } from \"node:fs\";\n// harness/package.json is one level above both src/ and dist/; its version changes on every harness release\nconst pkg = JSON.parse(readFileSync(new URL(\"../package.json\", import.meta.url), \"utf8\")) as { version: string };\nexport const HARNESS_VERSION = pkg.version;\nexport const STEPS = [\"ticket\", \"plan\", \"plan_ok\", \"vm\", \"build\", \"pr\", \"byte\", \"approve\", \"learn\"] as const;\nexport type Step = (typeof STEPS)[number];\nexport interface RunTags { agent: string; jira: string; id: string }\n/** Env for one Agent SDK session. Its OTel data and its gateway calls carry the same tags. */\nexport function stepEnv(run: RunTags, step: Step): Record<string, string> {\n  if (!STEPS.includes(step)) throw new Error(`unknown step ${step}`);\n  const tags = { agent: run.agent, jira: run.jira, run: run.id, step, \"harness.version\": HARNESS_VERSION };\n  return {\n    OTEL_RESOURCE_ATTRIBUTES: Object.entries(tags).map(([k, v]) => `${k}=${v}`).join(\",\"),\n    // agent, jira and run reach the gateway inside the run token; step and version ride on headers\n    ANTHROPIC_CUSTOM_HEADERS: `x-ai-agents-step: ${step}\\nx-ai-agents-harness: ${HARNESS_VERSION}`,\n  };\n}\n// In a step (no maxTurns, no maxBudgetUsd, no taskBudget: the far-away backstop acts between turns, in the harness).\n// options.env replaces the session's whole environment, so spread process.env (gateway URL and run token) first:\n//   const options: Options = { model: route.model, effort: route.effort, env: { ...process.env, ...stepEnv(run, \"build\") } };\n//   for await (const message of query({ prompt: task, options })) { ... }\n// The Temporal workflow also sets search attributes Step and HarnessVersion for the same run\n// (upsertSearchAttributes with typed keys from defineSearchAttributeKey).",
+    "notes": [
+     {
+      "line": 2,
+      "text": "readFileSync from node:fs reads the package file once, when the module loads."
+     },
+     {
+      "line": 4,
+      "text": "new URL(\"../package.json\", import.meta.url) resolves relative to this file, so src/ and dist/ both find harness/package.json. The cast tells TypeScript the shape."
+     },
+     {
+      "line": 5,
+      "text": "HARNESS_VERSION is exported so label-run.ts and the workflow use the same value."
+     },
+     {
+      "line": 6,
+      "text": "STEPS is the list of nine steps in run order. 'as const' makes it a readonly tuple, so TypeScript knows the exact strings."
+     },
+     {
+      "line": 7,
+      "text": "Step is the union of those nine strings. A typo like \"bulid\" fails at compile time."
+     },
+     {
+      "line": 8,
+      "text": "RunTags is what the harness knows about the run: the agent name, the Jira key and the run id."
+     },
+     {
+      "line": 10,
+      "text": "stepEnv returns a plain Record<string, string>, because environment variables are always strings."
+     },
+     {
+      "line": 11,
+      "text": "The runtime check matters when the step comes from JSON or a flag, where TypeScript cannot help."
+     },
+     {
+      "line": 12,
+      "text": "The five tags in one object. \"harness.version\" needs quotes because of the dot."
+     },
+     {
+      "line": 14,
+      "text": "The tags become one string: agent=nova,jira=RH-1234,run=r-42,step=build,harness.version=0.4.1. Claude Code attaches it to every metric and event."
+     },
+     {
+      "line": 15,
+      "text": "The gateway already knows agent, jira and run: they sit inside the run token from G0-13. Only step and version travel as headers."
+     },
+     {
+      "line": 16,
+      "text": "ANTHROPIC_CUSTOM_HEADERS adds headers to every model call. A newline separates the two headers; the gateway reads x-ai-agents-step."
+     },
+     {
+      "line": 19,
+      "text": "A wall: no maxTurns, no maxBudgetUsd, no taskBudget. The backstop lives in the harness and acts between turns, never in the middle of work."
+     },
+     {
+      "line": 20,
+      "text": "options.env replaces the session's whole environment. Spread process.env first, or the gateway URL and run token are gone."
+     },
+     {
+      "line": 21,
+      "text": "How a step uses it: model and effort from the routing table, env from process.env plus stepEnv(run, \"build\")."
+     },
+     {
+      "line": 23,
+      "text": "The Temporal workflow sets the same step and version as search attributes, so the Temporal UI filters the same way Grafana does."
+     }
+    ]
+   },
+   "ifInstead": "If instead a step's session cannot reach the gateway (connection refused to api.anthropic.com), you passed env without ...process.env, so ANTHROPIC_BASE_URL is gone."
+  },
+  {
+   "h": "Temporal search attributes and the dogfood check",
+   "p": [
+    "A search attribute is a typed, indexed field on a Temporal workflow (lesson p7-3). You can filter the Temporal UI by it, the way you filter Grafana by a label. The workflow sets two: Step and HarnessVersion.",
+    "In the workflow, define the keys once with defineSearchAttributeKey and set them with upsertSearchAttributes each time the step changes. Check the docs for both functions in @temporalio/workflow; the names are typed, so a wrong type fails at compile time.",
+    "The gateway already reads the x-ai-agents-step header. Your task is to check that its token and cost series carry a step label, in vmui, before you trust a dashboard. Then run one dogfood ticket end to end and add up cost by step in Grafana. The sum must equal the run's gateway total; if it does not, one step runs without stepEnv."
+   ],
+   "callout": {
+    "kind": "gotcha",
+    "text": "The version comes from harness/package.json. The release workflow bundles the harness into one file, so check that ../package.json still resolves in the VM. If not, inline the version at build time."
+   }
+  },
+  {
+   "h": "label-run.ts part 1: the flags",
+   "p": [
+    "The second ticket is a small command for the weekly run review. A run label is a JSON file with three facts. It says where a failed run failed, which step should have caught it, and a cause. The cause is one of the five eval cause labels plus model and unknown.",
+    "You run it from an ai-agents checkout: npx tsx harness/src/label-run.ts <run-id> --failed-at build --should-have-caught plan --cause missing_context. The first half of the file reads and checks the flags."
+   ],
+   "because": "Because a failure labelled the same way every week can become a check or a skill line, the label has fixed values.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/label-run.ts",
+    "text": "// ai-agents/harness/src/label-run.ts  (npx tsx harness/src/label-run.ts <run-id> --failed-at ... --cause ...)\n// Weekly run review: label a failed run with where it failed and which step should have caught it.\nimport { parseArgs } from \"node:util\";\nimport { PutObjectCommand, S3Client } from \"@aws-sdk/client-s3\";\nimport { STEPS } from \"./telemetry.js\";\n\nconst CAUSES = [\"too_many_tools\", \"bad_handoff\", \"contradicting_prompt\", \"missing_context\",\n  \"flaky_environment\", \"model\", \"unknown\"] as const;\n\nconst { values: a, positionals: [runId] } = parseArgs({\n  allowPositionals: true,\n  options: {\n    \"failed-at\": { type: \"string\" },\n    \"should-have-caught\": { type: \"string\" },\n    cause: { type: \"string\" },\n    note: { type: \"string\", default: \"\" }, // one line; no PHI, no secrets, no customer names\n  },\n});",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The usage line, so the next person sees how to run it without opening the code."
+     },
+     {
+      "line": 3,
+      "text": "parseArgs is Node's own flag parser from node:util. No library to install."
+     },
+     {
+      "line": 4,
+      "text": "The S3 client and the put command from AWS SDK v3, the same package the nightly job uses."
+     },
+     {
+      "line": 5,
+      "text": "STEPS comes from telemetry.ts, so this file and the tags can never disagree about the nine names."
+     },
+     {
+      "line": 7,
+      "text": "CAUSES: the five eval causes from results.py plus model and unknown. 'as const' keeps the exact strings."
+     },
+     {
+      "line": 10,
+      "text": "Destructure the parsed flags as a, and the first positional argument as runId."
+     },
+     {
+      "line": 11,
+      "text": "allowPositionals lets the run id come without a flag name."
+     },
+     {
+      "line": 13,
+      "text": "Three string flags. parseArgs rejects a flag it does not know, with a clear error."
+     },
+     {
+      "line": 16,
+      "text": "note defaults to an empty string. One line, no PHI, no secrets, no customer names: the file lands in a bucket many people read."
+     }
+    ]
+   }
+  },
+  {
+   "h": "label-run.ts part 2: write label.json",
+   "p": [
+    "The second half checks each value against its list, builds the label and writes it to the eval results bucket under runs/<run>/label.json. The nightly job counts labels into ai_agents_run_failures_total with failed_at, should_have_caught and cause labels, and the operations dashboard gets a panel for it."
+   ],
+   "because": "Because the JSON keys are the contract the nightly job reads, the file builds them in one place and refuses other values.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/label-run.ts",
+    "text": "const oneOf = (flag: string, value: string | undefined, allowed: readonly string[]): string => {\n  if (!value || !allowed.includes(value)) throw new Error(`--${flag} must be one of: ${allowed.join(\", \")}`);\n  return value;\n};\nif (!runId) throw new Error(\"usage: label-run <run-id> --failed-at <step> --should-have-caught <step> --cause <cause>\");\n\nconst label = { // the JSON keys are what the nightly job and the dashboards read\n  run: runId, failed_at: oneOf(\"failed-at\", a[\"failed-at\"], STEPS),\n  should_have_caught: oneOf(\"should-have-caught\", a[\"should-have-caught\"], STEPS),\n  cause: oneOf(\"cause\", a.cause, CAUSES), note: a.note, labelled_at: new Date().toISOString(),\n};\nawait new S3Client({}).send(new PutObjectCommand({\n  Bucket: \"rhino-ai-agents-eval-results\", Key: `runs/${runId}/label.json`,\n  Body: JSON.stringify(label), ContentType: \"application/json\",\n}));\nconsole.log(`${runId}: failed at ${label.failed_at}, should have been caught at ${label.should_have_caught}`);",
+    "notes": [
+     {
+      "line": 1,
+      "text": "oneOf is a small validator. readonly string[] accepts the 'as const' tuples STEPS and CAUSES."
+     },
+     {
+      "line": 2,
+      "text": "The error lists the allowed values, so the message teaches the vocabulary instead of hiding it."
+     },
+     {
+      "line": 5,
+      "text": "No run id means the usage line is thrown, and the process exits with code 1."
+     },
+     {
+      "line": 7,
+      "text": "The label object. The keys are snake_case on purpose: they become label names in Prometheus series."
+     },
+     {
+      "line": 8,
+      "text": "run and failed_at; a[\"failed-at\"] needs brackets because of the hyphen."
+     },
+     {
+      "line": 10,
+      "text": "cause, note and labelled_at, an ISO timestamp so a month's labels can be counted."
+     },
+     {
+      "line": 12,
+      "text": "S3Client({}) takes region and credentials from the environment: your AWS profile on a laptop, never a key in code."
+     },
+     {
+      "line": 13,
+      "text": "One key per run in the eval results bucket from G1-08, next to the eval JSON files."
+     },
+     {
+      "line": 14,
+      "text": "ContentType application/json lets a browser or the console show the file as JSON."
+     },
+     {
+      "line": 16,
+      "text": "One line of confirmation, in the same words the review thread uses."
+     }
+    ]
+   },
+   "see": "r-42: failed at build, should have been caught at plan",
+   "ifInstead": "If instead you see '--cause must be one of: too_many_tools, ...', the value is not in the list. Pick one of the seven, never a free text."
+  },
+  {
+   "h": "quality.ts part 1: ready and plan adherence",
+   "p": [
+    "The third ticket adds step-quality numbers to the nightly job from lesson g1-2. Each step has one gate and one number, and the number shows which gate is weak before the end result does. A gate is the check a step must pass: the readiness check, plan approval, green CI, Byte, approval.",
+    "The job reads run records from Temporal and the run JSON in S3, and Byte's findings from G2's live metrics. It writes per agent and week: delivery_ready_first_try_ratio, delivery_plan_unplanned_files, delivery_plan_items_not_done, delivery_first_pass_green_ratio and delivery_caught_before_pr_ratio.",
+    "Lines 1 to 17 of the sketch are below. The blank line 18 is dropped between the two parts; nothing else is removed."
+   ],
+   "because": "Because each step has one gate and one number, we compute the number from run records, and never from a person.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/quality.ts",
+    "text": "// ai-agents/metrics/src/quality.ts\n// Step-quality numbers per agent and week, from run records. A gate's number, not a person's.\nimport type { Approval, ByteFinding, CheckRun, RunRecord } from \"./types.js\";\n\n/** Tickets that passed the readiness check without being sent back / tickets assigned to Nova. */\nexport function readyOnFirstTry(runs: RunRecord[]): number | null {\n  const assigned = runs.filter((r) => r.agent === \"nova\");\n  return assigned.length ? assigned.filter((r) => r.readiness.sent_back === 0).length / assigned.length : null;\n}\n\nexport function planAdherence(run: RunRecord, changedFiles: string[]) {\n  const planned = new Set(run.plan.files);\n  return {\n    unplanned_files: new Set(changedFiles.filter((f) => !planned.has(f))).size,\n    items_not_done: run.plan.items.filter((item) => !item.done).length,\n  };\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "A gate's number, not a person's: the rule for every function in this file."
+     },
+     {
+      "line": 3,
+      "text": "import type brings only types; the build erases it. The shapes live in metrics/src/types.ts."
+     },
+     {
+      "line": 6,
+      "text": "readyOnFirstTry returns number or null. null means no data, so a chart does not show a fake 0 (the rule from G1-07)."
+     },
+     {
+      "line": 7,
+      "text": "Only runs of the nova agent count: the readiness check is Nova's gate."
+     },
+     {
+      "line": 8,
+      "text": "The share of tickets with sent_back equal to 0: they passed the readiness check without going back to the requester."
+     },
+     {
+      "line": 11,
+      "text": "planAdherence takes one run and the files its PR changed. The approved plan lives in run.plan."
+     },
+     {
+      "line": 12,
+      "text": "A Set of the planned files, for fast lookups."
+     },
+     {
+      "line": 14,
+      "text": "unplanned_files: changed files the plan did not name. The Set removes duplicates."
+     },
+     {
+      "line": 15,
+      "text": "items_not_done: plan items without done, so a plan that was approved but not finished shows."
+     }
+    ]
+   }
+  },
+  {
+   "h": "quality.ts part 2: green, caught and fast",
+   "p": [
+    "The second half covers three gates: CI on the first push, Byte before the PR, and the approval itself. First-pass green means the required checks on the PR's first pushed commit were all green. Caught before the PR is the share of important problems the self-review fixed before Byte saw them.",
+    "Fast approvals are a list, not a score. Plan or PR approvals given under 60 seconds after the request are posted as run links to the weekly review thread. They flag the run, never rank a person."
+   ],
+   "because": "Because a right answer reached the long way still matters, the gates after the build get their own numbers.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/quality.ts",
+    "text": "/** The required checks on the PR's first pushed commit were all green. */\nexport function firstPassGreen(checkRuns: CheckRun[], required: Set<string>): boolean {\n  const first = checkRuns.reduce((a, b) => (b.started_at < a.started_at ? b : a)); // ISO strings compare by time\n  return checkRuns.filter((c) => c.head_sha === first.head_sha && required.has(c.name)).every((c) => c.conclusion === \"success\");\n}\n\nexport function caughtBeforePr(run: RunRecord, byteFindings: ByteFinding[]): number | null {\n  const fixed = run.self_review.important_fixed; // from the self-review receipt in the PR\n  const left = byteFindings.filter((f) => (f.severity === \"HIGH\" || f.severity === \"MED\") && f.new).length;\n  return fixed + left ? fixed / (fixed + left) : null;\n}\n\n/** Plan or PR approvals given under 60 s after the request: run links for the weekly review. */\nexport function fastApprovals(approvals: Approval[], seconds = 60): string[] {\n  return approvals.filter((a) => Date.parse(a.approved_at) - Date.parse(a.requested_at) < seconds * 1000).map((a) => a.run_url);\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "required holds the names of the required checks from the ruleset (lesson g0-1), so optional jobs do not count."
+     },
+     {
+      "line": 3,
+      "text": "reduce finds the earliest check run. ISO timestamps compare as strings in time order, as in lesson g1-2."
+     },
+     {
+      "line": 4,
+      "text": "Keep only runs on that first commit's sha and in the required set; every one must have conclusion success."
+     },
+     {
+      "line": 7,
+      "text": "caughtBeforePr also returns number or null."
+     },
+     {
+      "line": 8,
+      "text": "important_fixed comes from the self-review receipt Nova writes into the PR (G4)."
+     },
+     {
+      "line": 9,
+      "text": "left counts Byte findings that are HIGH or MED and new, so a finding Byte repeats is not counted twice."
+     },
+     {
+      "line": 10,
+      "text": "fixed divided by fixed plus left. When both are 0 there is nothing to measure, so null."
+     },
+     {
+      "line": 14,
+      "text": "fastApprovals takes the threshold as a parameter, default 60 seconds."
+     },
+     {
+      "line": 15,
+      "text": "Date.parse both timestamps, subtract, compare with seconds * 1000. The result is run URLs, never names."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The weekly run review",
+   "p": [
+    "The label command and the fast-approval list meet in one 30-minute meeting each week. You open five traces: two at random and the three worst. For each failed or rejected run you run label-run with the three flags. A label seen twice in a month gets a ticket. That is how a repeated problem becomes a check, a lint rule or a skill line.",
+    "The delivery-impact dashboard from lesson g1-3 gets a 'Quality at every step' row with the five ratios. The operations dashboard gets the failure panel. Both show agents and steps, never a person."
+   ],
+   "callout": {
+    "kind": "tip",
+    "text": "Before you label, read the step tags on the trace. The step where cost jumps is often one step after the step that should have caught the problem."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Test stepEnv and quality.ts, write a label to LocalStack",
+  "youNeed": [
+   "Node 24",
+   "Docker Desktop",
+   "the aws CLI (brew install awscli)",
+   "jq"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/lab/g1-4/src ~/lab/g1-4/test && cd ~/lab/g1-4 && npm init -y >/dev/null && npm pkg set type=module version=0.4.1 && npm pkg get type version",
+    "see": "{\n  \"type\": \"module\",\n  \"version\": \"0.4.1\"\n}"
+   },
+   {
+    "do": "npm i -D typescript tsx @types/node && npm i @aws-sdk/client-s3   # the current versions",
+    "see": "found 0 vulnerabilities"
+   },
+   {
+    "do": "Create src/telemetry.ts with the 24-line block from the lesson. The lab's package.json is one level above src/, so ../package.json resolves to it. Then: node --import tsx -e 'import(\"./src/telemetry.ts\").then((m) => console.log(m.HARNESS_VERSION))'",
+    "see": "0.4.1"
+   },
+   {
+    "do": "Create test/telemetry.test.ts:\nimport { test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { HARNESS_VERSION, stepEnv } from \"../src/telemetry.js\";\nconst run = { agent: \"nova\", jira: \"RH-1234\", id: \"r-42\" };\ntest(\"resource attributes carry the five tags\", () => {\n  assert.equal(stepEnv(run, \"build\").OTEL_RESOURCE_ATTRIBUTES, \"agent=nova,jira=RH-1234,run=r-42,step=build,harness.version=0.4.1\");\n});\ntest(\"headers carry step and version\", () => {\n  assert.equal(stepEnv(run, \"build\").ANTHROPIC_CUSTOM_HEADERS, `x-ai-agents-step: build\\nx-ai-agents-harness: ${HARNESS_VERSION}`);\n});\ntest(\"unknown step throws\", () => {\n  assert.throws(() => stepEnv(run, \"deploy\" as never), /unknown step deploy/);\n});",
+    "see": "(no output yet; the next step runs it)"
+   },
+   {
+    "do": "node --import tsx --test test/*.test.ts",
+    "see": "✔ resource attributes carry the five tags\n✔ headers carry step and version\n✔ unknown step throws\nℹ tests 3\nℹ pass 3\nℹ fail 0"
+   },
+   {
+    "do": "Create src/types.ts, the lab's stub (the real file is metrics/src/types.ts):\nexport interface RunRecord { agent: string; readiness: { sent_back: number }; plan: { files: string[]; items: { done: boolean }[] }; self_review: { important_fixed: number } }\nexport interface CheckRun { name: string; head_sha: string; started_at: string; conclusion: string }\nexport interface ByteFinding { severity: string; new: boolean }\nexport interface Approval { requested_at: string; approved_at: string; run_url: string }\nThen create src/quality.ts from the two blocks (part 1, a blank line, part 2).",
+    "see": "(no output; ls src shows quality.ts telemetry.ts types.ts)"
+   },
+   {
+    "do": "Create test/quality.test.ts with four fixtures. runs: one nova run with sent_back 0, one nova run with sent_back 1, one cifix run; assert readyOnFirstTry(runs) equals 0.5. A run with plan.files [\"a.ts\"], items [{done: true}, {done: false}] and changedFiles [\"a.ts\", \"b.ts\", \"b.ts\"]. Assert planAdherence gives unplanned_files 1 and items_not_done 1. Check runs on sha \"111\" started 2026-10-01T10:00:00Z: lint success, test failure. Check runs on sha \"222\" started later: both success. Assert firstPassGreen(checkRuns, new Set([\"lint\", \"test\"])) is false. A run with important_fixed 2 and findings [HIGH new, MED not new, LOW new]; assert caughtBeforePr equals 2 / 3. Then: node --import tsx --test test/*.test.ts",
+    "see": "ℹ tests 7\nℹ pass 7\nℹ fail 0"
+   },
+   {
+    "do": "docker run --rm -d --name localstack -p 4566:4566 localstack/localstack && export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://s3.localhost.localstack.cloud:4566 && aws s3 mb s3://rhino-ai-agents-eval-results",
+    "see": "make_bucket: rhino-ai-agents-eval-results"
+   },
+   {
+    "do": "Create src/label-run.ts from the two blocks (part 1 then part 2, no gap). Then: npx tsx src/label-run.ts r-42 --failed-at build --should-have-caught plan --cause missing_context",
+    "see": "r-42: failed at build, should have been caught at plan"
+   },
+   {
+    "do": "aws s3 cp s3://rhino-ai-agents-eval-results/runs/r-42/label.json - | jq '.failed_at, .cause'",
+    "see": "\"build\"\n\"missing_context\""
+   }
+  ],
+  "faded": "Add test/fast-approvals.test.ts with two approvals: one answered 20 seconds after its request, one answered 300 seconds after, each with its own run_url. The last step is left to you. Write the assert that fastApprovals(approvals) returns exactly one URL, the 20-second one, and run the tests.",
+  "alone": "Write two tests for the caughtBeforePr edge cases with no help. A run with important_fixed 0 and no Byte findings must return null. A run with important_fixed 0 and one new HIGH finding must return 0. Decide first what each case means for the dashboard, then make both tests pass.",
+  "done": "node --import tsx --test test/*.test.ts prints fail 0 with at least 10 tests, and aws s3 ls shows runs/r-42/label.json in LocalStack."
+ },
+ "quiz": [
+  {
+   "q": "Why does the harness spread process.env before stepEnv(run, step) in options.env?",
+   "options": [
+    {
+     "text": "Because options.env replaces the whole environment, and the gateway URL and run token would be lost.",
+     "correct": true,
+     "why": "The SDK's env option replaces, it does not merge; without the spread the session has no ANTHROPIC_BASE_URL."
+    },
+    {
+     "text": "So the agent can read HARNESS_VERSION from its shell.",
+     "correct": false,
+     "why": "The version travels as a resource attribute and a header; the agent never needs it as a variable."
+    },
+    {
+     "text": "Because the SDK refuses an env without PATH.",
+     "correct": false,
+     "why": "The SDK does not check PATH; the real loss is the gateway URL and the run token."
+    }
+   ]
+  },
+  {
+   "q": "How do agent, jira and run reach the gateway?",
+   "options": [
+    {
+     "text": "In the x-ai-agents-step header, next to the step.",
+     "correct": false,
+     "why": "That header carries only the step; x-ai-agents-harness carries the version."
+    },
+    {
+     "text": "Inside the run token the gateway minted for the run.",
+     "correct": true,
+     "why": "The token from G0-13 already names agent, ticket and run; only step and version ride on headers."
+    },
+    {
+     "text": "In the first line of the prompt.",
+     "correct": false,
+     "why": "Tags never go into prompts; the model would see and could change them."
+    }
+   ]
+  },
+  {
+   "q": "What does fastApprovals produce?",
+   "options": [
+    {
+     "text": "A score per approver on the delivery dashboard.",
+     "correct": false,
+     "why": "No number is ever per person; that is the rule for every metric in this course."
+    },
+    {
+     "text": "A ratio written as delivery_fast_approval_ratio per team.",
+     "correct": false,
+     "why": "It is a list, not a score; a ratio would turn it into a ranking."
+    },
+    {
+     "text": "Run links for approvals under 60 seconds, posted to the weekly review thread.",
+     "correct": true,
+     "why": "They flag the run so the review looks at it; they never rank a person."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "In lesson g1-2, why does pullRequests query one week at a time, and what carries the next page?",
+  "In lesson p8-1, what ends an agent session, and which three options does the harness never set?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "step",
+   "plain": "One of the nine stages of a Nova run; each stage is its own Agent SDK session."
+  },
+  {
+   "term": "resource attribute",
+   "plain": "A key=value tag OpenTelemetry attaches to every signal a process sends, set with OTEL_RESOURCE_ATTRIBUTES."
+  },
+  {
+   "term": "search attribute",
+   "plain": "A typed, indexed field on a Temporal workflow that the Temporal UI can filter by."
+  },
+  {
+   "term": "run label",
+   "plain": "A JSON file that says where a failed run failed, which step should have caught it, and a cause."
+  },
+  {
+   "term": "gate",
+   "plain": "The check a step must pass, such as the readiness check, plan approval, green CI or Byte."
+  },
+  {
+   "term": "first-pass green",
+   "plain": "All required checks were green on the PR's first pushed commit."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G1-14",
+   "why": "stepEnv and the five tags are the whole ticket; the rest is wiring the same tags into Temporal.",
+   "walk": [
+    "Add ai-agents/harness/src/telemetry.ts (code above). Each step is its own session; pass env: { ...process.env, ...stepEnv(run, step) } as options.env to query().",
+    "In vmui, check the gateway's token and cost series carry a step label; the gateway already reads x-ai-agents-step.",
+    "In the Temporal workflow, define Step and HarnessVersion with defineSearchAttributeKey and set them with upsertSearchAttributes when the step changes.",
+    "Keep harness.version equal to harness/package.json's version; bump it on every harness release so evals and live runs split by it.",
+    "Run one dogfood ticket end to end and check in Grafana that cost by step adds up to the run's gateway total."
+   ]
+  },
+  {
+   "key": "G1-15",
+   "why": "The label command reuses STEPS from telemetry.ts and writes to the eval results bucket from G1-08.",
+   "walk": [
+    "Add ai-agents/harness/src/label-run.ts (code above); run it from an ai-agents checkout with npx tsx harness/src/label-run.ts <run-id> --failed-at ... --should-have-caught ... --cause ...",
+    "Keep the nine steps from the quality table and the seven causes: the five eval causes plus model and unknown.",
+    "In the nightly job, count the labels into ai_agents_run_failures_total{failed_at, should_have_caught, cause} and add a panel to ai-agents-operations.json.",
+    "Use it in the weekly 30-minute run review of 5 traces (2 at random, the 3 worst). A label seen twice in a month gets a ticket."
+   ]
+  },
+  {
+   "key": "G1-16",
+   "why": "The five functions in quality.ts turn run records into one number per gate for the nightly job.",
+   "walk": [
+    "Add ai-agents/metrics/src/quality.ts (code above) and the Approval, ByteFinding, CheckRun and RunRecord types in metrics/src/types.ts.",
+    "Read run records from Temporal and the run JSON in S3; read Byte's findings from G2's live metrics.",
+    "Write per agent and week: delivery_ready_first_try_ratio, delivery_plan_unplanned_files, delivery_plan_items_not_done, delivery_first_pass_green_ratio, delivery_caught_before_pr_ratio.",
+    "Post the fastApprovals run links to the weekly review thread; never write them as a series.",
+    "Add a 'Quality at every step' row to delivery-impact.json from lesson g1-3."
+   ]
+  }
+ ],
+ "remember": "One session is one step: tag it once, label its failures the same way every week, and give every gate one number."
+}

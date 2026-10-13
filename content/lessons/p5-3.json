@@ -1,0 +1,439 @@
+{
+ "id": "p5-3",
+ "title": "Secrets: Vault and ExternalSecrets",
+ "minutes": 55,
+ "youNeed": [
+  "p5-2",
+  "p1-4"
+ ],
+ "bridge": "Vault plus External Secrets is like a .env file that an operator copies into each pod for you. Except the value can change in Vault and the pod's copy follows within minutes, with no redeploy. And a Kubernetes Secret is only base64, not encryption, so who may read it matters more than where it sits.",
+ "intro": "The agents never hold keys, so the keys must live somewhere else: Vault. The gateway reads the Anthropic keys, the broker reads the GitHub App key, Temporal reads its database password. All of them get the value through an ExternalSecret. This lesson follows a key from `vault kv put` on a laptop to an environment variable in a pod. It also shows the two access gaps G0 found.",
+ "picture": {
+  "caption": "A person writes a key once; External Secrets copies it into the one namespace that needs it.",
+  "nodes": [
+   {
+    "id": "admin",
+    "label": "DevOps on VPN: vault kv put",
+    "kind": "person"
+   },
+   {
+    "id": "vault",
+    "label": "Vault kvv2: infrastructure/ai-agents/temporal",
+    "kind": "service"
+   },
+   {
+    "id": "store",
+    "label": "ClusterSecretStore vault-store",
+    "kind": "service"
+   },
+   {
+    "id": "es",
+    "label": "ExternalSecret temporal-db (ns ai-agents)",
+    "kind": "file"
+   },
+   {
+    "id": "secret",
+    "label": "Secret temporal-db",
+    "kind": "file"
+   },
+   {
+    "id": "pod",
+    "label": "temporal-history pod",
+    "kind": "machine"
+   },
+   {
+    "id": "gha",
+    "label": "any GitHub Actions job (role gha-runners)",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "admin",
+    "to": "vault",
+    "text": "writes DB_PASSWORD from stdin; nothing in shell history or a ticket"
+   },
+   {
+    "from": "es",
+    "to": "store",
+    "text": "asks every 5 minutes: give me DB_PASSWORD at that path"
+   },
+   {
+    "from": "store",
+    "to": "vault",
+    "text": "logs in with its AppRole and reads kvv2"
+   },
+   {
+    "from": "store",
+    "to": "secret",
+    "text": "writes key password into Secret temporal-db"
+   },
+   {
+    "from": "secret",
+    "to": "pod",
+    "text": "the pod reads it as an env var at start"
+   },
+   {
+    "from": "admin",
+    "to": "vault",
+    "text": "rotates the value; the Secret follows at the next refresh"
+   },
+   {
+    "from": "gha",
+    "to": "vault",
+    "text": "today: any org repo's job can log in as admin (the gap G0-11 closes)"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start from one key on a laptop",
+   "p": [
+    "In p1-4 you learned that a secret never goes in code. Where does it go instead? Into Vault, our secret store at vault.example.com, which runs on inf. Vault keeps key-value pairs under paths, with versions and an access log.",
+    "The mount we use is called kvv2 (key-value, version 2). A path like infrastructure/ai-agents/anthropic holds a small map: one field per workload. G0-07 writes the Anthropic keys with the script below. Read how it never lets the key touch the screen or the shell history."
+   ],
+   "because": "A key typed on a command line lands in shell history and `ps` output. Reading it from stdin keeps it out of both.",
+   "code": {
+    "lang": "bash",
+    "file": "run once by a DevOps admin on VPN (G0-07, shortened)",
+    "text": "export VAULT_ADDR=https://vault.example.com\nvault login -method=oidc role=terraform\n\nSECRET=infrastructure/ai-agents/anthropic   # same layout as infrastructure/n8n\nfor workload in nova routines brain-bot; do  # the workload names the gateway looks up\n  read -r -s -p \"Anthropic API key for ${workload}: \" key; echo\n  # \"=-\" reads the value from stdin, so the key never shows in the process list or shell history\n  printf '%s' \"$key\" | vault kv patch -mount=kvv2 \"$SECRET\" \"${workload}=-\"\n  unset key\ndone\n\nvault kv metadata put -mount=kvv2 \\\n  -custom-metadata=owner=platform \\\n  -custom-metadata=reader=llm-gateway \\\n  -custom-metadata=rotate_every=90d \\\n  \"$SECRET\"",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Log in with Google through OIDC. The person's identity goes in the audit log, not a shared token."
+     },
+     {
+      "line": 5,
+      "text": "One key per workload. Revoking nova's key stops Nova and nothing else: each agent has its own kill switch."
+     },
+     {
+      "line": 6,
+      "text": "read -s hides the typing. The value lives only in the shell variable for a moment."
+     },
+     {
+      "line": 8,
+      "text": "patch adds one field to the existing map; put would replace the whole map. The =- means 'value from stdin'."
+     },
+     {
+      "line": 12,
+      "text": "Metadata says who owns it, who reads it, and when to rotate. The 90-day reminder comes from here."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "No keys in the VM, and no key in Jira, Slack, a file or a PR. Keys go into Vault from stdin; only the LLM gateway ever reads the Anthropic keys."
+   }
+  },
+  {
+   "h": "Paths: one folder per tool",
+   "p": [
+    "n8n set the layout: everything an inf tool needs sits under infrastructure/<tool>. The agent platform follows it under infrastructure/ai-agents/. The paths are anthropic (the three API keys), gateway (the token-signing key) and temporal (the DB password). Then broker (the GitHub App key and a DB user), slack-app, orchestrator and jira-nova.",
+    "Each path has versions. `vault kv get -mount=kvv2 infrastructure/ai-agents/temporal` shows the latest; `-version=2` shows an older one. Rotation is a new version. The old one stays readable until it is destroyed, which gives you a way back if a rotation breaks something.",
+    "The secrets unit of a Terraform folder (p5-2) can write a path too. For Temporal it generates the DB password straight into Vault, so no person ever sees it."
+   ]
+  },
+  {
+   "h": "From Vault to a pod: ExternalSecret",
+   "p": [
+    "Pods cannot talk to Vault themselves; they would need a Vault login, which is another secret. Instead the External Secrets operator runs in the cluster.",
+    "An operator is a program in the cluster that watches objects of one kind and acts on them. This one logs in to Vault with its own AppRole and copies values into ordinary Kubernetes Secrets. An AppRole is a Vault login for a machine: a role ID plus a secret ID instead of a password.",
+    "Two objects do the work. A ClusterSecretStore named vault-store says how to reach Vault and how to log in; DevOps created it once, for the whole cluster. An ExternalSecret, one per Secret you want, says which path and which field to copy, into which Secret, how often.",
+    "The chart then mounts the Secret the normal way: as an environment variable, or as a file. Temporal's chart reads `existingSecret: temporal-db` (p5-2) and sets the password env var from it."
+   ],
+   "because": "The ExternalSecret is the only place that names a Vault path. So one object shows a reviewer exactly which secret a pod gets.",
+   "code": {
+    "lang": "yaml",
+    "file": "what kubectl_manifest.temporal_db_secret renders (G3-06)",
+    "text": "apiVersion: external-secrets.io/v1\nkind: ExternalSecret\nmetadata:\n  name: temporal-db\n  namespace: ai-agents\nspec:\n  refreshInterval: 5m\n  secretStoreRef:\n    name: vault-store\n    kind: ClusterSecretStore\n  target:\n    name: temporal-db\n    creationPolicy: Owner\n  data:\n    - secretKey: password\n      remoteRef:\n        key: infrastructure/ai-agents/temporal\n        property: DB_PASSWORD",
+    "notes": [
+     {
+      "line": 7,
+      "text": "Every 5 minutes the operator reads Vault again. A rotated value reaches the Secret without a deploy."
+     },
+     {
+      "line": 9,
+      "text": "The cluster-wide store. It decides what this ExternalSecret may read (next section)."
+     },
+     {
+      "line": 12,
+      "text": "The Kubernetes Secret that will exist in the same namespace. The chart refers to this name."
+     },
+     {
+      "line": 13,
+      "text": "Owner: the operator creates and deletes the Secret; nobody edits it by hand."
+     },
+     {
+      "line": 17,
+      "text": "The Vault path, without the mount name. The store knows the mount is kvv2."
+     },
+     {
+      "line": 18,
+      "text": "One field of the map becomes one key of the Secret. Copy only what the pod needs."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "A Kubernetes Secret is base64, not encrypted: `kubectl get secret -o jsonpath | base64 -d` prints the value. Anyone who can read Secrets in a namespace can read every secret in it. Keep the namespace small and the readers few."
+   }
+  },
+  {
+   "h": "Gap 1: vault-store can read everything",
+   "p": [
+    "Here is the catch G0-07 asks you to write down for the threat model (G3-12). The ClusterSecretStore vault-store logs in with an AppRole that can read all of kvv2. So any ExternalSecret, in any namespace on inf, can ask for infrastructure/ai-agents/anthropic and get the Anthropic keys into its own Secret.",
+    "The fix is a dedicated store for the ai-agents namespace. It gets its own AppRole with a policy that reads infrastructure/ai-agents/* only, and the ExternalSecrets in ai-agents name that store. The LLM gateway's unit should point at it, so the keys can only land next to the gateway.",
+    "Until that lands, the wall is people: only DevOps can create ExternalSecrets on inf, and they go through a Terraform PR. Write that down as 'guidance, not a wall' in the threat model, with an owner."
+   ]
+  },
+  {
+   "h": "Gap 2: the gha-runners role is too wide",
+   "p": [
+    "GitHub Actions jobs can log in to Vault without a stored secret. The job gets an OIDC token from GitHub (p2-3) that says which repo and workflow it runs in. Vault's JWT auth checks that token against a role and hands out a Vault token with a policy.",
+    "Today the role gha-runners accepts any token whose subject matches repo:RhinoHealth/* and gives it the admin policy. Think of a job in the public agent-skills repo, or in a new agent workflow. It is one `id-token: write` away from every secret in Vault. G0-11 narrows it to the 13 workflow files that use it today."
+   ],
+   "because": "Binding the role to exact workflow files changes 'any job in the org' into 'these jobs'. Adding a job then takes a reviewed PR.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/vault/auth_backends.tf (G0-11, part 1: the list)",
+    "text": "# Before: sub = \"repo:RhinoHealth/*\" gave admin to any job in any org repo, the public agent-skills repo included.\n# Now: only the 13 workflow files that log in with this role today. A new caller needs a reviewed change here.\n# Refs stay open (@*) because the fcp I&T workflows run on every branch push.\nlocals {\n  gha_runner_workflows = [\n    \"RhinoHealth/fcp/.github/workflows/_cloud-int-tests-reusable-*.yml@*\",\n    \"RhinoHealth/fcp/.github/workflows/_client-int-tests-reusable-*.yml@*\",\n    \"RhinoHealth/fcp/.github/workflows/_frontend-int-tests-reusable-*.yml@*\",\n    \"RhinoHealth/infrastructure/.github/workflows/ansible-molecule-test.yml@*\",\n    \"RhinoHealth/infrastructure/.github/workflows/ansible-molecule-test-everything.yml@*\",\n    \"RhinoHealth/infrastructure/.github/workflows/ansible-run-playbook.yml@*\",\n    \"RhinoHealth/infrastructure/.github/workflows/backup-rhino-client-db.yml@*\",\n    \"RhinoHealth/infrastructure/.github/workflows/scheduled-fleedm-enrollment-secrets-rotator.yml@*\",\n    \"RhinoHealth/gitops/.github/workflows/_update-rhino-client-version-batch.yml@*\",\n    \"RhinoHealth/gitops/.github/workflows/update-rhino-client-version-staging.yml@*\",\n  ]\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The old claim. A glob on the repo name matches every repo the org will ever create."
+     },
+     {
+      "line": 3,
+      "text": "The @* at the end is the git ref. fcp's integration tests run on every branch, so the ref cannot be pinned to main."
+     },
+     {
+      "line": 6,
+      "text": "A reusable workflow matches whoever calls it, because job_workflow_ref names the file the job runs in."
+     },
+     {
+      "line": 9,
+      "text": "The list came from `gh search code gha-runners --owner RhinoHealth`. Search first, then bind."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The role itself, and what stays open",
+   "p": [
+    "The second half is the role resource. Only the bound claim changes in this step; the admin policy stays. The follow-up for DevOps is one role per workflow group with a least-privilege policy, about one more day.",
+    "After apply, a person reruns one job per repo: an fcp I&T job, an infrastructure molecule test, a gitops staging update. Then they confirm a job from any other repo is refused. This must land before any agent pushes a branch, because cloud-ci, client-ci and sdk-ci run on push and log in to Vault."
+   ],
+   "because": "Changing only the claim keeps the diff small and the plan readable; the policy change is a separate, reviewable step.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/vault/auth_backends.tf (G0-11, part 2: the role)",
+    "text": "resource \"vault_jwt_auth_backend_role\" \"gha_runners\" {\n  backend   = vault_jwt_auth_backend.github_actions.path\n  role_name = \"gha-runners\"\n  role_type = \"jwt\"\n\n  user_claim        = \"sub\"\n  bound_audiences   = [\"https://github.com/RhinoHealth\"]\n  bound_claims_type = \"glob\"\n  bound_claims = {\n    # job_workflow_ref is the file the job runs in, so reusable workflows match whoever calls them.\n    job_workflow_ref = join(\",\", local.gha_runner_workflows) # comma-separated = \"any of these\"\n  }\n\n  token_policies = [\"admin\"] # unchanged in this step; least-privilege policies are the follow-up\n  token_ttl      = 3600\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The JWT auth mount that trusts GitHub's OIDC issuer. The role sits inside it."
+     },
+     {
+      "line": 7,
+      "text": "The audience GitHub puts in the token when Vault asks for it. A token for another audience is refused."
+     },
+     {
+      "line": 11,
+      "text": "Vault treats a comma-separated glob value as 'any of these'. join() builds it from the list above."
+     },
+     {
+      "line": 14,
+      "text": "Still admin. Honest and visible: the ticket says the narrow policies are a follow-up, not done here."
+     },
+     {
+      "line": 15,
+      "text": "One hour. A CI job that needs longer re-logs in; a leaked token dies on its own."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The rules in one place",
+   "p": [
+    "Keys enter Vault from stdin, on VPN, by a person, with metadata that names the owner, the reader and the rotation period. They leave Vault only through an ExternalSecret into the one namespace that needs them, copying only the fields that pod needs.",
+    "Access is a wall only when the store and the roles are narrow. Two items are open today: the all-of-kvv2 store (threat model, G3-12) and the too-wide gha-runners role (G0-11, must land before agents push). Everything else is guidance, written down with an owner."
+   ]
+  }
+ ],
+ "lab": {
+  "title": "A password that travels from Vault into a pod and rotates",
+  "youNeed": [
+   "the kind cluster from p5-1 (context kind-academy)",
+   "helm",
+   "kubectl"
+  ],
+  "worked": [
+   {
+    "do": "helm repo add hashicorp https://helm.releases.hashicorp.com && helm install vault hashicorp/vault -n vault --create-namespace --set server.dev.enabled=true --set injector.enabled=false",
+    "see": "NAME: vault\nNAMESPACE: vault\nSTATUS: deployed"
+   },
+   {
+    "do": "kubectl -n vault wait pod/vault-0 --for=condition=Ready --timeout=120s",
+    "see": "pod/vault-0 condition met"
+   },
+   {
+    "do": "printf '%s' 'lab-only-v1' | kubectl -n vault exec -i vault-0 -- vault kv put -mount=secret infrastructure/ai-agents/temporal DB_PASSWORD=-",
+    "see": "======= Secret Path =======\nsecret/data/infrastructure/ai-agents/temporal\n\n======= Metadata =======\nversion            1"
+   },
+   {
+    "do": "helm repo add external-secrets https://charts.external-secrets.io && helm install external-secrets external-secrets/external-secrets -n external-secrets --create-namespace --wait",
+    "see": "NAME: external-secrets\nSTATUS: deployed"
+   },
+   {
+    "do": "kubectl -n external-secrets create secret generic vault-token --from-literal=token=root",
+    "see": "secret/vault-token created"
+   },
+   {
+    "do": "Apply a ClusterSecretStore named vault-store: apiVersion external-secrets.io/v1, spec.provider.vault with server http://vault.vault.svc:8200, path secret, version v2, and auth.tokenSecretRef {name: vault-token, key: token, namespace: external-secrets}. Then: kubectl get clustersecretstore vault-store",
+    "see": "NAME          AGE   STATUS   CAPABILITIES   READY\nvault-store   5s    Valid    ReadWrite      True"
+   },
+   {
+    "do": "Apply the ExternalSecret from section 3 into namespace ai-agents, with refreshInterval 10s instead of 5m. Then: kubectl -n ai-agents get externalsecret temporal-db",
+    "see": "NAME          STORE         REFRESH INTERVAL   STATUS         READY\ntemporal-db   vault-store   10s                SecretSynced   True"
+   },
+   {
+    "do": "kubectl -n ai-agents get secret temporal-db -o jsonpath='{.data.password}' | base64 -d; echo",
+    "see": "lab-only-v1"
+   },
+   {
+    "do": "printf '%s' 'lab-only-v2' | kubectl -n vault exec -i vault-0 -- vault kv put -mount=secret infrastructure/ai-agents/temporal DB_PASSWORD=- >/dev/null; sleep 15; kubectl -n ai-agents get secret temporal-db -o jsonpath='{.data.password}' | base64 -d; echo",
+    "see": "lab-only-v2"
+   }
+  ],
+  "faded": "Add a second field to the same Vault path with `vault kv patch -mount=secret infrastructure/ai-agents/temporal DB_USER=temporal`. Extend the ExternalSecret's data list so the Secret also gets key user from property DB_USER. The check is yours: write the kubectl command that prints the user, and say what version `vault kv get` now shows.",
+  "alone": "Show gap 1 on your own cluster. Create a namespace called intruder. In it, create an ExternalSecret that copies DB_PASSWORD from the same Vault path into a Secret called stolen, through the same vault-store. Confirm it syncs. Then write three lines: what a dedicated store for ai-agents needs so the intruder's ExternalSecret fails. Name a Vault policy, an AppRole and a SecretStore in the namespace. Delete the intruder namespace when done.",
+  "done": "A Secret in ai-agents showed lab-only-v1, then lab-only-v2 after you rotated the value in Vault, without touching the Secret or any pod."
+ },
+ "quiz": [
+  {
+   "q": "A teammate asks you to post the new Slack bot token in the Jira ticket so DevOps can add it. What do you do?",
+   "options": [
+    {
+     "text": "Post it; the ticket is internal",
+     "correct": false,
+     "why": "Jira text is read by people, agents and search. A key there is a leak with a timestamp."
+    },
+    {
+     "text": "DM it on Slack instead",
+     "correct": false,
+     "why": "Slack is also a text store that agents read. Same problem, different app."
+    },
+    {
+     "text": "Ask DevOps to write it into Vault at infrastructure/ai-agents/slack-app from stdin, and reference the path in the ticket",
+     "correct": true,
+     "why": "The path is not secret; the value is. The vault kv put =- pattern keeps it off screens and history."
+    }
+   ]
+  },
+  {
+   "q": "Why can an ExternalSecret in any namespace on inf read the Anthropic keys today?",
+   "options": [
+    {
+     "text": "Because Kubernetes Secrets are only base64",
+     "correct": false,
+     "why": "That is a different gap: it is about reading a Secret that already exists, not about creating one from Vault."
+    },
+    {
+     "text": "Because the ClusterSecretStore vault-store logs in with an AppRole that reads all of kvv2",
+     "correct": true,
+     "why": "The store, not the ExternalSecret, decides what may be read. A store for ai-agents only is the fix."
+    },
+    {
+     "text": "Because the gha-runners role has the admin policy",
+     "correct": false,
+     "why": "That is gap 2, about GitHub Actions jobs. It does not involve ExternalSecrets."
+    }
+   ]
+  },
+  {
+   "q": "G0-11 binds the gha-runners role by job_workflow_ref instead of repo. Why that claim?",
+   "options": [
+    {
+     "text": "Because it names the workflow file, so a reusable workflow matches whoever calls it and nothing else",
+     "correct": true,
+     "why": "The fcp I&T workflows are reusable; the claim follows the file that runs, not the repo that triggers."
+    },
+    {
+     "text": "Because the repo claim is not available in GitHub's OIDC token",
+     "correct": false,
+     "why": "It is available; it is what the old role used. It was too wide, not missing."
+    },
+    {
+     "text": "Because it lets the role drop the admin policy",
+     "correct": false,
+     "why": "The policy is unchanged in this step. Narrower policies are the follow-up ticket."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p5-2: which object must exist before the Temporal helm_release, and which Terraform argument enforces that order?",
+  "From p2-3: what is in a GitHub Actions OIDC token, and why does a trust policy need to pin repo and branch?"
+ ],
+ "videos": [
+  {
+   "title": "HashiCorp Vault Tutorial for Beginners - What, Why and How",
+   "url": "https://www.youtube.com/watch?v=klyAhaklGNU",
+   "channel": "TechWorld with Nana",
+   "minutes": 29,
+   "why": "Recent, beginner-level Vault concepts with a demo."
+  },
+  {
+   "title": "HashiCorp Vault + Kubernetes: Create External Secrets",
+   "url": "https://www.youtube.com/watch?v=CF6ARIXdA4A",
+   "channel": "Rayan Slim",
+   "minutes": 25,
+   "why": "Installs External Secrets Operator and pulls Vault secrets into pods."
+  }
+ ],
+ "words": [
+  {
+   "term": "Vault",
+   "plain": "Our secret store at vault.example.com: values under paths, with versions and an audit log."
+  },
+  {
+   "term": "kvv2",
+   "plain": "The Vault mount we use: a key-value store where each path holds a map and keeps old versions."
+  },
+  {
+   "term": "ExternalSecret",
+   "plain": "An object that tells the External Secrets operator to copy a field from a Vault path into a Kubernetes Secret."
+  },
+  {
+   "term": "ClusterSecretStore",
+   "plain": "The cluster-wide object that says how to log in to Vault; vault-store is ours and reads all of kvv2 today."
+  },
+  {
+   "term": "AppRole",
+   "plain": "A Vault login for a machine or service: a role ID and a secret ID instead of a person's account."
+  },
+  {
+   "term": "JWT auth",
+   "plain": "Vault's way to accept a signed token from GitHub Actions and map it to a role and a policy."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G0-07",
+   "why": "Writes the Anthropic keys into Vault with the stdin pattern and metadata, and notes the vault-store gap for the threat model."
+  },
+  {
+   "key": "G0-11",
+   "why": "Narrows the gha-runners JWT role to the 13 workflow files; it must land before any agent pushes a branch."
+  },
+  {
+   "key": "G3-06",
+   "why": "Temporal's DB password travels exactly this path: secrets unit, kvv2 path, ExternalSecret, Secret temporal-db."
+  },
+  {
+   "key": "G3-17",
+   "why": "The broker, Slack app and orchestrator each get an ExternalSecret from their infrastructure/ai-agents/* path."
+  }
+ ],
+ "remember": "Keys go into Vault from stdin and leave only through a narrow ExternalSecret. A store or role that can read everything is a gap with an owner, not a wall."
+}

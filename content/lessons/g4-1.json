@@ -1,0 +1,569 @@
+{
+ "id": "g4-1",
+ "title": "Hand-off: poll, commands, readiness and status",
+ "minutes": 50,
+ "youNeed": [
+  "g3-12",
+  "g3-10",
+  "p9-2"
+ ],
+ "bridge": "Handing a ticket to Nova is like assigning it to a colleague in Jira. Except: nobody pushes a notification to Nova. A 1-minute poll finds the ticket, and the person who assigned it becomes the requester, who may never approve the PR.",
+ "intro": "This lesson builds the front door of Nova. People assign a ticket, type @Nova in a comment, or run /nova in Slack. The orchestrator turns that into one run per ticket. It checks the ticket is doable before any VM starts, and shows its state in one Jira comment.",
+ "picture": {
+  "caption": "From a Jira assignment to a running workflow, with no public webhook and no VM yet.",
+  "nodes": [
+   {
+    "id": "req",
+    "label": "requester",
+    "kind": "person"
+   },
+   {
+    "id": "jira",
+    "label": "Jira (RH project)",
+    "kind": "service"
+   },
+   {
+    "id": "poll",
+    "label": "poll-jira-nova schedule",
+    "kind": "service"
+   },
+   {
+    "id": "wf",
+    "label": "ticketToPr workflow",
+    "kind": "service"
+   },
+   {
+    "id": "ready",
+    "label": "checkReadiness activity",
+    "kind": "check"
+   },
+   {
+    "id": "status",
+    "label": "one status comment",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "req",
+    "to": "jira",
+    "text": "assigns RH-1234 to Nova (or /nova in Slack sets a property and assigns)"
+   },
+   {
+    "from": "poll",
+    "to": "jira",
+    "text": "every minute runs the JQL as Nova and reads the changelog for the requester"
+   },
+   {
+    "from": "poll",
+    "to": "wf",
+    "text": "startRun nova:RH-1234; a second poll joins the open run"
+   },
+   {
+    "from": "wf",
+    "to": "ready",
+    "text": "one Sonnet call on the ticket text: ready, ask or hand_back"
+   },
+   {
+    "from": "wf",
+    "to": "status",
+    "text": "setStatus creates the comment, then edits it at every state change"
+   },
+   {
+    "from": "req",
+    "to": "jira",
+    "text": "@Nova stop, or unassigning Nova, sends the stop signal"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start from a real hand-off",
+   "p": [
+    "Open any RH ticket in Jira and change the assignee to Nova. Nothing visible happens for up to a minute. Then one comment appears: \"Nova: Checking. Reading the ticket.\" The Nova state field on the ticket says Checking.",
+    "Behind that minute is a Temporal schedule (lesson g3-12). It runs a JQL query as the Nova service account, finds your ticket, and starts the ticketToPr workflow from lesson g3-10. No webhook is involved, so there is no new public URL to protect.",
+    "A service account is a Jira user that belongs to a program, not a person. Nova needs one so tickets can be assigned to it, and so Jira records who did the assigning. That record is how we know the requester."
+   ]
+  },
+  {
+   "h": "Who handed it over: requesterOf",
+   "p": [
+    "The requester is the person who handed the ticket to Nova. We need that name in two places. Questions go to that person, and the PR's Requested-by line names them, so they can never approve it.",
+    "Jira keeps a changelog per issue: a list of every field change with its author. We read it and keep the last change that set the assignee to Nova. A ticket started from Slack carries an issue property instead, a small hidden key-value pair on the issue."
+   ],
+   "because": "We take the requester from Jira's own record of the assignment, so nobody can claim they did not ask for the run.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/triggers/nova.ts (part 1)",
+    "text": "import type { Handoff } from \"@rhinohealth/ai-agents-shared\";\nimport { jira } from \"../jira.js\";\nimport { ticketToPr } from \"../workflows/ticket-to-pr.js\";\nimport { QUERIES } from \"./schedules.js\";\n\n// Runs as the Nova service account, so currentUser() is Nova.\nconst NOVA_JQL = \"project = RH AND assignee = currentUser() AND statusCategory != Done ORDER BY updated ASC\";\n\n/** Who handed the ticket to Nova: the property /nova sets in Slack, else the latest assignee change to Nova. */\nexport async function requesterOf(key: string): Promise<string | undefined> {\n  const fromSlack = await jira.issueProperty<string>(key, \"nova.requester\");\n  if (fromSlack) return fromSlack;\n  const history = await jira.changelog(key);  // oldest first\n  const toNova = history.filter((h) => h.items.some((i) => i.field === \"assignee\" && i.to === jira.me));\n  return toNova.at(-1)?.author.accountId;\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Handoff is the shared type { key, requester, drill? }: what starts every Nova run (lesson g3-10)."
+     },
+     {
+      "line": 2,
+      "text": "G3-28's Jira client. Its token comes from the ExternalSecret on the orchestrator pods, never from a VM."
+     },
+     {
+      "line": 4,
+      "text": "QUERIES is G3-28's registry of Jira queries. Adding an entry is all it takes to get a schedule."
+     },
+     {
+      "line": 7,
+      "text": "The JQL runs as Nova, so currentUser() means Nova. Done tickets are skipped; oldest update first."
+     },
+     {
+      "line": 11,
+      "text": "A ticket started with /nova in Slack carries the property nova.requester (G4-05). It wins."
+     },
+     {
+      "line": 13,
+      "text": "The changelog comes back oldest first, so the last matching entry is the latest assignment."
+     },
+     {
+      "line": 14,
+      "text": "Keep only changes where the assignee field moved to Nova's own accountId (jira.me)."
+     },
+     {
+      "line": 15,
+      "text": "The author of that entry is the requester. undefined means we found no assignment to Nova."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The registry entry: one poll, one run",
+   "p": [
+    "G3-28's registry turns an entry into a schedule named poll-jira-nova. Each tick runs the JQL and calls toStart for every match. toStart returns the workflow function and its input, or undefined to skip.",
+    "Two small changes to G3-28 are needed: toStart becomes async, because requesterOf calls Jira, and undefined must be allowed. Then startRun from G3-25 starts nova:RH-1234 on the ai-agents-nova queue with USE_EXISTING, so a second poll joins the open run."
+   ],
+   "because": "One registry entry gives us the schedule, the kill switch and one run per ticket, so we write no second poller.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/triggers/nova.ts (part 2)",
+    "text": "// ensureSchedules (G3-28) makes this the poll-jira-nova schedule: every minute, overlap SKIP.\n// startMatches hands each match to startRun (G3-25): queue ai-agents-nova, ID nova:<key>, USE_EXISTING.\nQUERIES.set(\"nova\", {\n  name: \"nova\", agent: \"nova\", jql: NOVA_JQL, every: \"1 minute\",\n  toStart: async (issue) => {  // async, and undefined skips a match: two small changes to G3-28's toStart\n    const requester = await requesterOf(issue.key);\n    if (!requester) return undefined;  // no assignment to Nova found: log it, don't start a run without an owner\n    const handoff: Handoff = { key: issue.key, requester };\n    return [ticketToPr, handoff];  // a second poll joins the open run\n  },\n});",
+    "notes": [
+     {
+      "line": 3,
+      "text": "The map key and name are \"nova\". ensureSchedules builds the schedule id poll-jira-nova from it."
+     },
+     {
+      "line": 4,
+      "text": "agent \"nova\" picks the task queue ai-agents-nova and the Agent search attribute. every: \"1 minute\" is the poll interval."
+     },
+     {
+      "line": 5,
+      "text": "toStart is async now. It is called once per matching issue, every minute."
+     },
+     {
+      "line": 7,
+      "text": "No requester means no owner. We skip the match and log it instead of starting a run nobody asked for."
+     },
+     {
+      "line": 8,
+      "text": "The Handoff is the workflow input: the key and the requester's Jira accountId."
+     },
+     {
+      "line": 9,
+      "text": "Returning the workflow function and its input lets startMatches call startRun with workflow ID nova:<key>."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Commands in comments: @Nova start, answer, stop",
+   "p": [
+    "People already write in Jira comments, so Nova reads them. A comment that mentions Nova and starts with a command word is a command. Any other reply to Nova counts as an answer to its open question.",
+    "Jira stores comment bodies as ADF, Atlassian Document Format: a JSON tree of nodes with a type, optional text and children. A mention is a node of type \"mention\" whose attrs.id is the account id. We flatten the tree and look for that node."
+   ],
+   "because": "We parse the comment's structure, not raw text, so a mention inside a quote or a code block cannot fool us.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/commands.ts",
+    "text": "// ai-agents/orchestrator/src/commands.ts: parse \"@Nova <command> [text]\" from a Jira comment (ADF body).\nexport const COMMANDS = [\"start\", \"answer\", \"retry\", \"stop\", \"approve\", \"change\"] as const;  // approve/change: G4-14\nexport type Command = (typeof COMMANDS)[number];\nexport interface NovaCommand {\n  command: Command;\n  text: string;  // the rest of the comment, e.g. an answer or a plan change\n  author: string;  // Jira accountId of the person who wrote it\n}\ninterface AdfNode { type: string; text?: string; attrs?: { id?: string }; content?: AdfNode[] }\ninterface JiraComment { author: { accountId: string }; body: AdfNode }\nconst flatten = (node: AdfNode): AdfNode[] => [node, ...(node.content ?? []).flatMap(flatten)];\nconst isCommand = (word: string): word is Command => (COMMANDS as readonly string[]).includes(word);\nexport function parseCommand(comment: JiraComment, novaAccountId: string): NovaCommand | undefined {\n  const author = comment.author.accountId;\n  if (author === novaAccountId) return undefined;  // never react to Nova's own comments\n  const nodes = flatten(comment.body);\n  const at = nodes.findIndex((n) => n.type === \"mention\" && n.attrs?.id === novaAccountId);\n  if (at === -1) return undefined;\n  const rest = nodes.slice(at + 1).filter((n) => n.type === \"text\").map((n) => n.text ?? \"\").join(\" \").trim();\n  const [word = \"\", ...words] = rest.split(\" \");\n  const command = word.toLowerCase();\n  if (isCommand(command)) return { command, text: words.join(\" \").trim(), author };\n  return { command: \"answer\", text: rest, author };  // a plain reply to Nova counts as an answer\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The six command words. approve and change belong to plan approval (lesson g4-2)."
+     },
+     {
+      "line": 9,
+      "text": "The small part of ADF we need: type, text, attrs.id for mentions, and content for children."
+     },
+     {
+      "line": 11,
+      "text": "flatten turns the tree into one list, depth first. A mention anywhere in the comment is found."
+     },
+     {
+      "line": 12,
+      "text": "A type guard: TypeScript narrows word to Command after it returns true."
+     },
+     {
+      "line": 15,
+      "text": "Nova's own status comments mention nobody, but this guard makes sure Nova never reacts to itself."
+     },
+     {
+      "line": 17,
+      "text": "Find the first mention of Nova. at is its index in the flat list."
+     },
+     {
+      "line": 19,
+      "text": "Everything after the mention that is text, joined with spaces. ADF splits text into pieces at formatting changes."
+     },
+     {
+      "line": 21,
+      "text": "Commands are case-insensitive: \"@Nova STOP\" works."
+     },
+     {
+      "line": 23,
+      "text": "No command word at the start means the person is answering a question."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Stop and assign-back: a person always owns the ticket",
+   "p": [
+    "The poller also watches tickets with an open run. It finds them with a Temporal visibility query: WorkflowType = 'ticketToPr' AND ExecutionStatus = 'Running'. New comments on those tickets go through parseCommand, and each command becomes a signal to the workflow.",
+    "Stop has a second trigger. If someone other than Nova changes the assignee away from Nova, that is a stop. G3's stop keeps the branch and the notes and destroys the VM. Nova's own assign-back must not count as a stop, so the author of the change is checked.",
+    "Assign-back is the rule that a person always owns the ticket. Nova gives the ticket back when the PR is marked ready (lesson g4-6), or when the run stops or hands back. The plan said \"when the PR opens\"; we use \"ready\", because that is when people are first pinged.",
+    "In Slack, /nova RH-1234 maps the Slack user to a Jira accountId through config/people.yaml. It sets the issue property nova.requester and assigns the ticket to Nova. The poller does the rest, so Slack and Jira hand-offs look the same."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "The requester is recorded by Jira's own changelog or by /nova, never typed by the agent. The PR's Requested-by line comes from this value, and the G0 check refuses an approval from that person."
+   }
+  },
+  {
+   "h": "Readiness: the shape of the answer",
+   "p": [
+    "Before any VM starts, one cheap model call reads the ticket text and says whether Nova can do it well. This is the cheapest place to stop a bad run: asking now costs cents, finding out on a VM costs an hour.",
+    "The answer has a fixed shape, a zod schema. Structured output means the model must return JSON that matches the schema, so the workflow can branch on verdict without parsing prose. PILOT_EXCLUDED lists areas people chose to keep out of the pilot. It is a choice, not a wall: Nova stops and asks when an edit lands there."
+   ],
+   "because": "A fixed schema lets the workflow branch on the verdict, and lets us compare the model's labels with 30 hand-labelled tickets.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/activities/readiness.ts (part 1)",
+    "text": "import { readFile } from \"node:fs/promises\";\nimport { query } from \"@anthropic-ai/claude-agent-sdk\";\nimport { JiraClient } from \"@rhinohealth/ai-agents-shared\";\nimport { z } from \"zod\";\nexport const PILOT_EXCLUDED = {  // a choice by people while we learn, not a wall: Nova stops and asks\n  migration: [\"cloud/rhinoCloud/rhinoCore/migrations/**\", \"client/rhinoOnPrem/*/migrations/**\"],\n  auth: [\"cloud/rhinoCloud/rhinoDjango/login/**\", \"frontend/src/app/(auth)/**\", \"frontend/src/app/api/auth/**\"],\n  grpc_contract: [\"common/fcp_common/rhinoAgentRpc/**\"],\n  infra: [\".github/workflows/**\", \"**/docker-compose*.yml\"],\n};\nexport const Readiness = z.object({\n  verdict: z.enum([\"ready\", \"ask\", \"hand_back\"]), reason: z.string(),\n  kind: z.enum([\"fe_bug\", \"be_bug\", \"add_tests\", \"small_feature\", \"dependency_bump\", \"docs\", \"other\"]),\n  size: z.enum([\"small\", \"bigger\", \"fuzzy\"]),  // bigger: grill; fuzzy: grill + 2-3 plans\n  how_to_check: z.string(),  // empty = Nova sees no way to check it\n  questions: z.array(z.string()).max(5),\n  out_of_scope: z.array(z.enum([\"migration\", \"auth\", \"grpc_contract\", \"infra\"])),  // the keys of PILOT_EXCLUDED\n});\nexport type Readiness = z.infer<typeof Readiness>;",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The activity runs on the orchestrator pod, so it imports the SDK root. Only the bundled harness uses /core."
+     },
+     {
+      "line": 5,
+      "text": "Four groups of paths: migrations, auth, the gRPC contract and infra. The model flags them from the ticket text."
+     },
+     {
+      "line": 11,
+      "text": "verdict is the branch: ready, ask (post questions) or hand_back (give the ticket back with a reason)."
+     },
+     {
+      "line": 13,
+      "text": "kind feeds the checking guide and the bench scores. The values match TICKET-BENCH's kinds (lesson g4-7)."
+     },
+     {
+      "line": 14,
+      "text": "size decides the grill: bigger tickets get questions first, fuzzy ones also get 2 to 3 plans and a judge."
+     },
+     {
+      "line": 16,
+      "text": "At most 5 questions. Each one should be specific enough to answer in one line."
+     },
+     {
+      "line": 19,
+      "text": "z.infer gives us the TypeScript type from the schema, so there is one definition."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Readiness: one cheap call, no VM",
+   "p": [
+    "checkReadiness is a Temporal activity: plain async code that may call the network. It uses the Agent SDK's query() with no tools and no repo. The model is Sonnet 5.5 at low effort, per the routing table (lesson g3-14).",
+    "The ticket text is the summary, the description, the comments and linked issue titles. Never attachments or images. Pilot tickets use fake data. If the text looks like real patient or customer data, the verdict is hand_back and nothing goes further."
+   ],
+   "because": "We spend one Sonnet call to avoid an hour of VM time on a ticket that cannot be done as written.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/activities/readiness.ts (part 2)",
+    "text": "export async function checkReadiness(key: string): Promise<Readiness> {\n  const ticket = await JiraClient.fromEnv().ticketText(key);  // summary, description, comments, link titles; no attachments\n  for await (const msg of query({ prompt: ticket, options: {\n    model: \"claude-sonnet-5-5\", effort: \"low\", tools: [], settingSources: [],  // routing table; no repo, no VM\n    systemPrompt: await readFile(new URL(\"../../prompts/readiness.md\", import.meta.url), \"utf8\"),\n    outputFormat: { type: \"json_schema\", schema: z.toJSONSchema(Readiness) },\n    env: { ...process.env, ANTHROPIC_AUTH_TOKEN: mintRunToken({ agent: \"nova\", jira: key, run: `readiness:${key}` }),\n      ANTHROPIC_CUSTOM_HEADERS: \"x-ai-agents-step: ticket\" },  // G0-13: the ticket rides in the run token\n  } })) {\n    if (msg.type === \"result\" && msg.subtype === \"success\") return Readiness.parse(msg.structured_output);\n  }\n  throw new Error(`readiness check for ${key} returned no result`);  // the activity fails and Temporal retries it\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Text only. ticketText never downloads attachments, so no screenshot or log reaches the prompt."
+     },
+     {
+      "line": 4,
+      "text": "tools: [] and settingSources: [] mean no tools, no CLAUDE.md, no skills. The model only reads and answers."
+     },
+     {
+      "line": 5,
+      "text": "The prompt lives in a markdown file next to the code: goals, reasons and 6 to 8 labelled examples."
+     },
+     {
+      "line": 6,
+      "text": "z.toJSONSchema turns the zod schema into JSON Schema, which outputFormat needs. zod 4 has this built in."
+     },
+     {
+      "line": 7,
+      "text": "env replaces process.env, so spread it. The run token carries agent, ticket and run for the gateway's spend tags (G0-13)."
+     },
+     {
+      "line": 8,
+      "text": "The step header tags this call as the \"ticket\" step for tracing (G1-14)."
+     },
+     {
+      "line": 10,
+      "text": "Readiness.parse checks the JSON once more and gives a typed value. A bad answer throws here."
+     },
+     {
+      "line": 12,
+      "text": "No result means the activity throws. Temporal retries it with the PEOPLE_APIS policy from G3-29."
+     }
+    ]
+   }
+  },
+  {
+   "h": "One status comment, edited in place",
+   "p": [
+    "People want to see where a ticket is without opening Slack. A new comment every few minutes would be noise. So each ticket gets one Nova comment, created once and edited at every state change. A Nova state field serves boards and filters.",
+    "A custom field is a field a Jira admin adds to the project. Ours is a single-select with 7 options. Its id looks like customfield_12345 and is not known until the admin creates it, so it lives in one file, jira-fields.ts.",
+    "Editing a comment can notify watchers. We pass notifyUsers only for the states that need a person: Awaiting approval, Needs info and PR open. Field edits notify watchers too. notifyUsers=false on issue edits needs admin rights, so ask the admin or accept one notification per state change."
+   ],
+   "because": "One comment edited in place gives people a live status without a stream of notifications.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/activities/status.ts",
+    "text": "import { JiraClient } from \"@rhinohealth/ai-agents-shared\";\nimport { NOVA_STATE_FIELD } from \"../jira-fields.js\";  // \"customfield_XXXXX\": id from the Jira admin; not known yet\nexport type NovaState = \"Checking\" | \"Planning\" | \"Awaiting approval\" | \"Working\" | \"PR open\" | \"Needs info\" | \"Stopped\";\nconst NOTIFY = new Set<NovaState>([\"Awaiting approval\", \"Needs info\", \"PR open\"]);  // only the states that need a person\nexport interface Status {\n  key: string;\n  state: NovaState;\n  doing: string;  // one plain line: \"Writing the QA checks as tests\"\n  links: Record<string, string>;  // plan, slack thread, trace\n  commentId?: string;  // kept in workflow state\n}\nfunction adf(s: Status) {\n  const text = `Nova: ${s.state}. ${s.doing}  ` + Object.entries(s.links).map(([k, v]) => `${k}: ${v}`).join(\" · \");\n  return { type: \"doc\", version: 1, content: [{ type: \"paragraph\", content: [{ type: \"text\", text }] }] };\n}\nexport async function setStatus(s: Status): Promise<string> {\n  const jira = JiraClient.fromEnv();\n  await jira.updateIssue(s.key, { [NOVA_STATE_FIELD]: { value: s.state } });\n  if (s.commentId === undefined) return jira.addComment(s.key, adf(s));  // returns the new comment id\n  await jira.editComment(s.key, s.commentId, adf(s), { notifyUsers: NOTIFY.has(s.state) });\n  return s.commentId;\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The custom field id comes from the Jira admin. Keep it in one file so the rest of the code never sees the number."
+     },
+     {
+      "line": 3,
+      "text": "The 7 states, in the order a run moves through them. Needs info and Stopped are side exits."
+     },
+     {
+      "line": 4,
+      "text": "Only these three states ping people. The others are silent edits."
+     },
+     {
+      "line": 10,
+      "text": "The comment id is returned to the workflow and stored in its state, so it survives restarts."
+     },
+     {
+      "line": 13,
+      "text": "One fixed line: the state, what Nova is doing, and links to the plan, the Slack thread and the trace."
+     },
+     {
+      "line": 14,
+      "text": "ADF again: a document with one paragraph with one text node. Jira's comment API needs this shape."
+     },
+     {
+      "line": 18,
+      "text": "The field is set on every call. Boards and the weekly review can count tickets per state."
+     },
+     {
+      "line": 19,
+      "text": "First call: create the comment and return its id. Later calls edit it with PUT .../comment/{id}."
+     },
+     {
+      "line": 20,
+      "text": "notifyUsers decides whether watchers get an email for this edit."
+     }
+    ]
+   }
+  }
+ ],
+ "lab": {
+  "title": "Parse @Nova commands on your laptop",
+  "youNeed": [
+   "Node 24",
+   "npm",
+   "a terminal"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/academy/g4-1 && cd ~/academy/g4-1 && npm init -y && npm pkg set type=module",
+    "see": "Wrote to ~/academy/g4-1/package.json. The second command prints nothing."
+   },
+   {
+    "do": "npm install --save-dev typescript@5.9.3 tsx@4.20.3 @types/node@24.12.2",
+    "see": "added 3 packages (or a few more) and no errors."
+   },
+   {
+    "do": "mkdir -p src test, then save the commands.ts block from this lesson as src/commands.ts",
+    "see": "src/commands.ts exists with parseCommand at the bottom."
+   },
+   {
+    "do": "Save this as test/commands.test.ts:\nimport { test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { parseCommand } from \"../src/commands.js\";\nconst NOVA = \"nova-account-id\";\nconst mention = { type: \"mention\", attrs: { id: NOVA } };\nconst comment = (author: string, ...content: object[]) =>\n  ({ author: { accountId: author }, body: { type: \"doc\", content: [{ type: \"paragraph\", content }] } });\ntest(\"@Nova stop is a stop command\", () => {\n  const c = comment(\"sean\", mention, { type: \"text\", text: \" stop\" });\n  assert.deepEqual(parseCommand(c, NOVA), { command: \"stop\", text: \"\", author: \"sean\" });\n});\ntest(\"a plain reply to Nova is an answer\", () => {\n  const c = comment(\"sean\", mention, { type: \"text\", text: \" the empty state says No projects yet\" });\n  assert.equal(parseCommand(c, NOVA)?.command, \"answer\");\n});\ntest(\"Nova's own comments are ignored\", () => {\n  assert.equal(parseCommand(comment(NOVA, mention, { type: \"text\", text: \" stop\" }), NOVA), undefined);\n});",
+    "see": "test/commands.test.ts exists. Note the import ends in .js; tsx maps it to the .ts file, like NodeNext does."
+   },
+   {
+    "do": "node --import tsx --test \"test/**/*.test.ts\"",
+    "see": "ℹ tests 3\nℹ pass 3\nℹ fail 0"
+   }
+  ],
+  "faded": "Add a fourth test: a comment \"@Nova change make the empty card blue\" from \"dana\". Build the comment with the same helper. The last line is left for you: assert.deepEqual against the NovaCommand you expect (command, text, author).",
+  "alone": "Write two more tests without help. One: a comment with no mention of Nova returns undefined. Two: \"@Nova STOP\" in capitals is still a stop command. Run the file and make all six pass.",
+  "done": "node --test prints pass 6, fail 0, and you can say which line of parseCommand made each test pass."
+ },
+ "quiz": [
+  {
+   "q": "A ticket was assigned to Nova in Jira. Who is the requester?",
+   "options": [
+    {
+     "text": "The ticket's reporter",
+     "correct": false,
+     "why": "The reporter wrote the ticket, maybe months ago. The hand-off is the assignment, not the creation."
+    },
+    {
+     "text": "The author of the latest changelog entry that set the assignee to Nova",
+     "correct": true,
+     "why": "requesterOf reads Jira's changelog and keeps the last change to Nova; Jira recorded who did it."
+    },
+    {
+     "text": "Whoever commented last on the ticket",
+     "correct": false,
+     "why": "Comments are commands or answers. The requester is fixed at hand-off so the approval wall holds."
+    }
+   ]
+  },
+  {
+   "q": "The poll runs again while RH-1234's run is still open. What happens?",
+   "options": [
+    {
+     "text": "A second run starts and both work on the ticket",
+     "correct": false,
+     "why": "startRun uses workflow ID nova:RH-1234 with USE_EXISTING, so there is one run per ticket."
+    },
+    {
+     "text": "The poll fails with a duplicate error",
+     "correct": false,
+     "why": "USE_EXISTING returns the open run's handle instead of throwing."
+    },
+    {
+     "text": "Nothing new: the second start joins the open run",
+     "correct": true,
+     "why": "That is the one-run-per-thing wall from G3-25. Repeats are no-ops."
+    }
+   ]
+  },
+  {
+   "q": "Where does the readiness check run?",
+   "options": [
+    {
+     "text": "On a lite VM, so it can read the code",
+     "correct": false,
+     "why": "No VM. It reads ticket text only; a VM costs an hour, this costs cents."
+    },
+    {
+     "text": "Inside Nova's main session as its first turn",
+     "correct": false,
+     "why": "It is its own query() with no tools and no repo, so its answer is not shaped by Nova's reasoning."
+    },
+    {
+     "text": "As an activity on the orchestrator pod, one Sonnet call with structured output",
+     "correct": true,
+     "why": "checkReadiness runs before any VM and returns a fixed JSON shape the workflow branches on."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From lesson g3-12: what does ensureSchedules do when a schedule with that id already exists?",
+  "From lesson g3-10: what is the workflow ID for a Nova run on RH-1234, and why does that ID matter?"
+ ],
+ "videos": [
+  {
+   "title": "Jira REST API 2024: A Complete Guide",
+   "url": "https://www.youtube.com/watch?v=2ahOpLVcYqQ",
+   "channel": "Rai Gurukul",
+   "minutes": 10,
+   "why": "API token, auth header and create/update issue calls, recent version."
+  }
+ ],
+ "words": [
+  {
+   "term": "service account",
+   "plain": "A Jira user that belongs to a program (Nova), so tickets can be assigned to it."
+  },
+  {
+   "term": "JQL",
+   "plain": "Jira Query Language: the search text that finds tickets, like SQL for issues."
+  },
+  {
+   "term": "changelog",
+   "plain": "Jira's per-issue list of every field change, with the author and time."
+  },
+  {
+   "term": "ADF",
+   "plain": "Atlassian Document Format: the JSON tree Jira uses for comment bodies."
+  },
+  {
+   "term": "issue property",
+   "plain": "A small hidden key-value pair stored on a Jira issue by an app."
+  },
+  {
+   "term": "structured output",
+   "plain": "Asking the model for JSON that matches a schema, so code can read the answer."
+  },
+  {
+   "term": "custom field",
+   "plain": "A field a Jira admin adds to a project, with an id like customfield_12345."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G4-04",
+   "why": "This lesson showed the poll entry, requesterOf and why assignment is the hand-off.",
+   "walk": [
+    "Ask a Jira site admin for the \"Nova\" service account (admin.atlassian.com, Directory, Service accounts). It needs Jira access, the RH role that makes it assignable, and a scoped API token.",
+    "DevOps puts the token in Vault (kvv2 infrastructure/ai-agents/jira-nova) and syncs it with an ExternalSecret into the orchestrator workers only. VMs never get it.",
+    "Create ai-agents/orchestrator/src/triggers/nova.ts with NOVA_JQL, requesterOf and the QUERIES.set entry (code above).",
+    "Check G3-28's JiraQuery type: toStart must be async and may return undefined. Change the type if it does not.",
+    "Start the worker. ensureSchedules creates poll-jira-nova (every 1 minute, overlap SKIP). Find it in the Temporal UI under Schedules.",
+    "Assign a scratch ticket to Nova and watch nova:RH-xxxx start once. Assign it again and see that no second run appears."
+   ]
+  },
+  {
+   "key": "G4-05",
+   "why": "This lesson explained parseCommand, the stop rule and assign-back.",
+   "walk": [
+    "Create ai-agents/orchestrator/src/commands.ts with parseCommand (code above) and orchestrator/test/commands.test.ts (the lab).",
+    "Extend the poller: list open runs with WorkflowType = 'ticketToPr' AND ExecutionStatus = 'Running'. Read new comments on those tickets and send each command as a signal.",
+    "In a scratch Jira project, test whether JQL can find @Nova mentions on tickets Nova does not own. If not, \"start\" works by assignment only.",
+    "In the G3 Slack app, make /nova RH-1234 map the Slack user with config/people.yaml. It sets the property nova.requester, then assigns the ticket to Nova.",
+    "Send the stop signal when the assignee moves away from Nova and the author of that change is not Nova.",
+    "Assign the ticket back to the requester (PUT /rest/api/3/issue/{key}/assignee). Do it when the PR is marked ready, or when the run stops or hands back."
+   ]
+  },
+  {
+   "key": "G4-06",
+   "why": "This lesson explained the Readiness schema, the no-VM call and PILOT_EXCLUDED.",
+   "walk": [
+    "Create ai-agents/orchestrator/src/activities/readiness.ts with PILOT_EXCLUDED, the Readiness schema and checkReadiness (code above). Export it from activities/index.ts.",
+    "Write ai-agents/orchestrator/prompts/readiness.md: goals, reasons, and 6 to 8 labelled examples. Examples: a clear FE bug, a fuzzy feature and a migration. Also a ticket with no way to check it, and a ticket that is two changes.",
+    "Make the verdict hand_back when the text looks like real patient or customer data. Nothing goes further in that case.",
+    "Pass only summary, description, comments and linked issue titles. Never attachments.",
+    "Label 30 past RH tickets by hand (ready, ask, hand_back) and compare with the model before turning it on."
+   ]
+  },
+  {
+   "key": "G4-11",
+   "why": "This lesson explained the single edited comment and the Nova state field.",
+   "walk": [
+    "Ask a Jira admin for a single-select custom field \"Nova state\" on the RH screens with the 7 options. Put its id in ai-agents/orchestrator/src/jira-fields.ts.",
+    "Create ai-agents/orchestrator/src/activities/status.ts with setStatus (code above).",
+    "Keep the returned commentId in ticketToPr's workflow state, so a restart edits the same comment.",
+    "Call setStatus at every state change in ticketToPr and post the same line in the ticket's Slack thread.",
+    "Ask the admin about notifyUsers=false on issue edits, or accept one notification per state change.",
+    "If Jira is down, post to Slack only, and the other way round (G3-39 outages)."
+   ]
+  }
+ ],
+ "remember": "Assignment is the hand-off. A poll finds it, the changelog names the requester, readiness runs before any VM, and one comment shows the state."
+}

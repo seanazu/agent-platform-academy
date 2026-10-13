@@ -1,0 +1,427 @@
+{
+ "id": "p8-1",
+ "title": "What an agent session is",
+ "minutes": 40,
+ "youNeed": [
+  "p0-2",
+  "p1-1",
+  "p1-7"
+ ],
+ "bridge": "query() is like a fetch() that returns an async iterator of events instead of one response. Except: it starts a whole Claude Code program on your machine. That program runs tools and many model turns before the final result arrives.",
+ "intro": "Nova, the routines, the judges and the QA agent are all the same thing underneath. Each is a session started with query() from the Claude Agent SDK. This lesson starts one session on your laptop and reads every message it sends back. It also shows where the cost and the session id live. Everything in Part 8 builds on this one loop.",
+ "picture": {
+  "caption": "One session: your script calls query(), the SDK starts the claude binary, and messages stream back until the result.",
+  "nodes": [
+   {
+    "id": "script",
+    "label": "your script (lab1-session.ts)",
+    "kind": "file"
+   },
+   {
+    "id": "sdk",
+    "label": "query() in the SDK",
+    "kind": "service"
+   },
+   {
+    "id": "claude",
+    "label": "claude binary (a subprocess)",
+    "kind": "machine"
+   },
+   {
+    "id": "api",
+    "label": "Anthropic API",
+    "kind": "cloud"
+   },
+   {
+    "id": "result",
+    "label": "result message",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "script",
+    "to": "sdk",
+    "text": "passes a prompt and an options object"
+   },
+   {
+    "from": "sdk",
+    "to": "claude",
+    "text": "starts the claude binary as a child process"
+   },
+   {
+    "from": "claude",
+    "to": "api",
+    "text": "sends the prompt (and tool results, turn after turn)"
+   },
+   {
+    "from": "api",
+    "to": "claude",
+    "text": "answers; the binary runs any tool the model asked for"
+   },
+   {
+    "from": "claude",
+    "to": "sdk",
+    "text": "streams messages: init, assistant, user, ..."
+   },
+   {
+    "from": "sdk",
+    "to": "result",
+    "text": "the last message is the result: cost, usage, session id"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start from a scratch project",
+   "p": [
+    "Make a new folder on your laptop, outside fcp. It needs Node 24 and nothing else. The SDK is an npm package, @anthropic-ai/claude-agent-sdk, and it brings its own copy of the claude binary.",
+    "The SDK talks to Claude with your own Claude Code login. No company key is needed for the labs. We also install zod, which the SDK lists as a peer dependency, and tsx so we can run TypeScript files directly."
+   ],
+   "because": "We install the SDK in a scratch folder because every lesson in this part runs real sessions. A scratch folder cannot touch fcp.",
+   "code": {
+    "lang": "bash",
+    "file": "~/sdk-lab (a new folder)",
+    "text": "mkdir ~/sdk-lab && cd ~/sdk-lab\nnpm init -y\nnpm pkg set type=module\nnpm install @anthropic-ai/claude-agent-sdk zod\nnpm install -D tsx typescript @types/node\nmkdir src",
+    "notes": [
+     {
+      "line": 3,
+      "text": "ESM modules, like Byte and ai-agents. Without this, top-level await in our scripts fails."
+     },
+     {
+      "line": 4,
+      "text": "The SDK (0.3.x) and zod 4, its peer dependency. The install also fetches the claude binary for your platform."
+     },
+     {
+      "line": 5,
+      "text": "tsx runs a .ts file with no build step. We run every lab with npx tsx src/<file>.ts."
+     }
+    ]
+   },
+   "see": "added 60 packages, and audited 61 packages in 8s\nfound 0 vulnerabilities",
+   "ifInstead": "If instead you see 'EBADENGINE' or a Node version warning, run node --version: it must print v24 or newer. Switch with nvm use 24."
+  },
+  {
+   "h": "The smallest session",
+   "p": [
+    "A session is one call to query(). You give it a prompt (text) and an options object. It returns an async iterator: an object that hands you values one at a time, waiting for each. You read it with for await, one message at a time.",
+    "Here we turn off every built-in tool and every settings file. The model can only answer. That keeps the first run small and predictable."
+   ],
+   "because": "We start with no tools and no settings because then the only moving parts are the prompt, the model and the messages.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/sdk-lab/src/lab1-session.ts (part 1)",
+    "text": "import { query } from \"@anthropic-ai/claude-agent-sdk\";\n\nconst session = query({\n  prompt: \"Reply with the single word: pong\",\n  options: {\n    model: \"claude-haiku-5-5\", // the cheapest model; enough for one word\n    effort: \"low\",\n    tools: [], // no built-in tools: the model can only answer\n    settingSources: [], // ignore every settings file on this laptop\n  },\n});",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The root entry of the package. A bundled app imports from /core instead; see below."
+     },
+     {
+      "line": 3,
+      "text": "query() does not wait. It returns at once; the work starts when you begin reading messages."
+     },
+     {
+      "line": 6,
+      "text": "A full model id, not an alias. An alias like 'haiku' means a different model on a different binary version."
+     },
+     {
+      "line": 7,
+      "text": "effort sets how much the model thinks before it answers: low, medium, high, xhigh or max. Lesson p8-8 explains it."
+     },
+     {
+      "line": 8,
+      "text": "tools: [] removes Read, Bash, Edit and the rest. Lesson p8-2 brings them back on purpose."
+     },
+     {
+      "line": 9,
+      "text": "settingSources: [] means no ~/.claude/settings.json, no .claude/ in the folder, no CLAUDE.md."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Read every message",
+   "p": [
+    "Each message has a type. The three you always see are system (subtype init), assistant and result. init tells you what the session is made of: model, tools, permission mode (who approves tool calls, lesson p8-2), binary version. assistant carries the model's reply as content blocks.",
+    "result is the last message of the turn. A turn is everything that happens between your prompt and the answer, including every tool call.",
+    "The union type is SDKMessage. TypeScript narrows it when you test msg.type, so inside each branch you get the right fields."
+   ],
+   "because": "We print every message because that is how you learn what a session really does before you trust it with a ticket.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/sdk-lab/src/lab1-session.ts (part 2)",
+    "text": "for await (const msg of session) {\n  if (msg.type === \"system\" && msg.subtype === \"init\") {\n    console.log(\"init\", msg.model, msg.claude_code_version, msg.permissionMode);\n  } else if (msg.type === \"assistant\") {\n    console.log(\"assistant\", JSON.stringify(msg.message.content));\n  } else if (msg.type === \"result\") {\n    console.log(\"result\", msg.subtype, msg.num_turns, \"turns, cost\", msg.total_cost_usd);\n    console.log(\"models used\", Object.keys(msg.modelUsage));\n    console.log(\"session_id\", msg.session_id);\n  }\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "for await reads one message at a time. The loop ends when the session ends."
+     },
+     {
+      "line": 2,
+      "text": "system messages have many subtypes. init is the first message of every session."
+     },
+     {
+      "line": 5,
+      "text": "content is an array of blocks: text, tool_use, thinking. For one word it is one text block."
+     },
+     {
+      "line": 7,
+      "text": "subtype is 'success' or an error subtype. num_turns counts model round trips in this turn."
+     },
+     {
+      "line": 9,
+      "text": "Keep session_id: it is what resume needs later (lesson p8-6)."
+     }
+    ]
+   },
+   "see": "init claude-haiku-5-5 2.1.296 default\nassistant [{\"type\":\"text\",\"text\":\"pong\"}]\nresult success 1 turns, cost 0.0007\nmodels used [ 'claude-haiku-5-5' ]\nsession_id 1b828585-1fbd-41af-8d8f-1956134e188d",
+   "ifInstead": "If instead the assistant text is an error, read it. 'Failed to authenticate: OAuth session expired and could not be refreshed' means your Claude Code login has expired. Run claude in a terminal and type /login. Finish in the browser, then run the script again."
+  },
+  {
+   "h": "The result message: cost and usage",
+   "p": [
+    "total_cost_usd is an estimate in dollars for this query() call. It is not a bill. The exact numbers come from the gateway in production; the SDK number is for a quick look.",
+    "modelUsage is the field to use for accounting. It is a map from model id to tokens and cost. It includes subagents (helper sessions, lesson p8-5) and workflow agents (lesson p8-7), not only the main loop. The older usage field counts the main loop only.",
+    "Watch one trap: subtype can be 'success' while is_error is true. That happens when the turn ended on an API error, such as the expired login above. The error text is then in result. Always check both."
+   ],
+   "callout": {
+    "kind": "gotcha",
+    "text": "Read the last result, do not add results up. In a session with streaming input, every result carries the running total so far."
+   }
+  },
+  {
+   "h": "Which claude runs: pathToClaudeCodeExecutable",
+   "p": [
+    "The SDK ships a claude binary and uses it by default. In the lab above it was version 2.1.296. Your terminal's claude may be another version. Each version resolves aliases and features differently: on one binary the alias haiku meant claude-haiku-5-5, on an older one it meant claude-haiku-4-5.",
+    "The harness never leaves this to chance. It passes pathToClaudeCodeExecutable: /usr/local/bin/claude, the binary that Packer baked into the sandbox image and that the nightly smoke test passed (G3-14). Same binary on every VM, every run."
+   ],
+   "because": "We pin the binary because a session's behaviour depends on it, and a silent change would break every eval comparison.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/session.ts (one option)",
+    "text": "const options: Options = {\n  // ...\n  pathToClaudeCodeExecutable: \"/usr/local/bin/claude\", // the pinned binary the nightly smoke test passed (G3-14)\n};",
+    "notes": [
+     {
+      "line": 3,
+      "text": "An absolute path. The SDK spawns exactly this file instead of its bundled copy."
+     },
+     {
+      "line": 1,
+      "text": "Options is the exported type of the options object. Import it with 'import type'."
+     },
+     {
+      "line": 2,
+      "text": "The rest of the harness options come in p8-2 (tools), p8-4 (hooks) and p8-8 (env)."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "On your laptop, try pathToClaudeCodeExecutable set to the path from 'which claude'. Compare the init line's version with the default run."
+   }
+  },
+  {
+   "h": "The /core entry for bundled apps",
+   "p": [
+    "The harness is bundled by esbuild into one file, nova-worker.mjs, so the VM has nothing to install. A bundled app must import the SDK from @anthropic-ai/claude-agent-sdk/core. It exports the same query(), tool() and createSdkMcpServer(), and takes zod from your bundle instead of inlining its own.",
+    "Never import both the root and /core in one process. They are two separate bundles, and you would get two copies of the SDK's state. The orchestrator, which runs on inf and is not bundled, uses the root entry."
+   ],
+   "because": "We import from /core in the harness because the bundle already carries zod. Two copies of the SDK in one process break session state.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/session.ts (imports)",
+    "text": "import {\n  createSdkMcpServer, type Options, type SessionStore,\n} from \"@anthropic-ai/claude-agent-sdk/core\";",
+    "notes": [
+     {
+      "line": 2,
+      "text": "type imports are erased at build time; verbatimModuleSyntax requires the 'type' keyword."
+     },
+     {
+      "line": 3,
+      "text": "/core: same names as the root entry, about a fifth of the code loaded eagerly, zod from your install."
+     },
+     {
+      "line": 3,
+      "text": "The orchestrator imports from the root entry. Never mix the two in one process."
+     }
+    ]
+   }
+  },
+  {
+   "h": "No limit cuts a run in the middle",
+   "p": [
+    "The options type has maxTurns, maxBudgetUsd and taskBudget. We never set them. A limit that fires mid-task throws away the work done so far and leaves a half-edited repo.",
+    "The platform guides instead. It uses a progress watcher, check-ins, and a far-away backstop (G3-37). The backstop acts only between turns, never in the middle of one. Lesson p8-8 adds a test that fails if a limit ever appears in the options."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "No maxTurns, no maxBudgetUsd, no taskBudget, no time limit. Guide, don't cage."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Run one session and read its result",
+  "youNeed": [
+   "Node 24 (node --version)",
+   "A Claude Code login (run claude, then /login if asked)",
+   "An empty folder outside fcp"
+  ],
+  "worked": [
+   {
+    "do": "mkdir ~/sdk-lab && cd ~/sdk-lab && npm init -y && npm pkg set type=module",
+    "see": "Wrote to /Users/you/sdk-lab/package.json"
+   },
+   {
+    "do": "npm install @anthropic-ai/claude-agent-sdk zod && npm install -D tsx typescript @types/node",
+    "see": "found 0 vulnerabilities"
+   },
+   {
+    "do": "node -e \"console.log(require('./node_modules/@anthropic-ai/claude-agent-sdk/package.json').version)\"",
+    "see": "0.3.296 (any 0.3.x is fine)"
+   },
+   {
+    "do": "mkdir src and create src/lab1-session.ts with part 1 and part 2 from above",
+    "see": "A 26-line file that starts with import { query }"
+   },
+   {
+    "do": "npx tsx src/lab1-session.ts",
+    "see": "init claude-haiku-5-5 2.1.296 default\nassistant [{\"type\":\"text\",\"text\":\"pong\"}]\nresult success 1 turns, cost 0.0007\nmodels used [ 'claude-haiku-5-5' ]\nsession_id <a uuid>"
+   },
+   {
+    "do": "Run it again and compare the two session_id lines",
+    "see": "Two different uuids: every query() call is a new session unless you resume."
+   }
+  ],
+  "faded": "Change the prompt to 'Reply with two words: ping pong' and add one console.log inside the result branch that prints msg.modelUsage[\"claude-haiku-5-5\"]?.outputTokens. Left to you: find the right field name in the ModelUsage type (open node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts and search for 'type ModelUsage').",
+  "alone": "Write src/alone1.ts: a session on claude-sonnet-5-5 at effort low, tools off, that asks for the capital of France. Print only two lines: the assistant text and total_cost_usd. Then add pathToClaudeCodeExecutable with the path from 'which claude' and check whether the init version changes.",
+  "done": "You can run a session and point at the init, assistant and result messages in the output. You can say what session_id and modelUsage are for."
+ },
+ "quiz": [
+  {
+   "q": "Where do you read how much a session cost, including its subagents?",
+   "options": [
+    {
+     "text": "Add up total_cost_usd from every result message",
+     "correct": false,
+     "why": "Each result carries the running total; adding them counts the same money twice."
+    },
+    {
+     "text": "modelUsage on the last result message",
+     "correct": true,
+     "why": "modelUsage lists every model call in the query pipeline, subagents and workflow agents included."
+    },
+    {
+     "text": "The usage field on the result",
+     "correct": false,
+     "why": "usage counts the main loop only; subagent calls are missing."
+    }
+   ]
+  },
+  {
+   "q": "A result has subtype 'success'. Is the turn fine?",
+   "options": [
+    {
+     "text": "Yes, success means the model answered",
+     "correct": false,
+     "why": "An API error can end a turn with subtype success and is_error true; the error text is in result."
+    },
+    {
+     "text": "Only if num_turns is 1",
+     "correct": false,
+     "why": "num_turns is how many model round trips happened; it says nothing about errors."
+    },
+    {
+     "text": "Only if is_error is also false",
+     "correct": true,
+     "why": "Check both: subtype for how the turn ended, is_error for whether it ended on an error."
+    }
+   ]
+  },
+  {
+   "q": "Why does the harness set pathToClaudeCodeExecutable?",
+   "options": [
+    {
+     "text": "So every VM runs the same pinned binary the nightly smoke test passed",
+     "correct": true,
+     "why": "A binary change alters alias resolution and features; pinning keeps runs and evals comparable."
+    },
+    {
+     "text": "Because the SDK has no binary of its own",
+     "correct": false,
+     "why": "The SDK bundles a binary; the harness overrides it on purpose."
+    },
+    {
+     "text": "To make the session faster",
+     "correct": false,
+     "why": "Speed is the same; the point is that the binary is known and tested."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p0-2: What does the LLM gateway add to every request, and why does that mean no key lives in the VM?",
+  "From p0-2: Name the three things a wall is enforced by, as opposed to guidance."
+ ],
+ "videos": [
+  {
+   "title": "You Can Build The Craziest Things with Claude's Agent SDK",
+   "url": "https://www.youtube.com/watch?v=ChaQ_tZDBFg",
+   "channel": "Traversy Media",
+   "minutes": 14,
+   "why": "Friendly first look at the Agent SDK from a well-known teacher."
+  },
+  {
+   "title": "Claude Agent SDK Tutorial – Build AI Agents with Claude Code",
+   "url": "https://www.youtube.com/watch?v=SM-Fy8e3nFk",
+   "channel": "ExamPro",
+   "minutes": 37,
+   "why": "Recent step-by-step build of an agent with the SDK."
+  }
+ ],
+ "words": [
+  {
+   "term": "session",
+   "plain": "One call to query(): a prompt, an options object, and the messages that come back until the result."
+  },
+  {
+   "term": "query()",
+   "plain": "The SDK function that starts a session and returns an async iterator of messages."
+  },
+  {
+   "term": "SDKMessage",
+   "plain": "The union type of every message a session can send; you test msg.type to narrow it."
+  },
+  {
+   "term": "result message",
+   "plain": "The last message of a turn: subtype, is_error, cost, modelUsage, permission denials and session_id."
+  },
+  {
+   "term": "modelUsage",
+   "plain": "A map from model id to tokens and cost for every model call in the session, subagents included."
+  },
+  {
+   "term": "claude binary",
+   "plain": "The Claude Code program the SDK starts as a child process; pathToClaudeCodeExecutable picks which one."
+  },
+  {
+   "term": "/core entry",
+   "plain": "The SDK import path for bundled apps: same functions, zod from your own bundle, never mixed with the root entry."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-19",
+   "why": "nova-worker is a query() session with options; this lesson is the loop it runs and the result it reads."
+  },
+  {
+   "key": "G4-06",
+   "why": "The readiness check is one cheap session with no tools; it reads the result message the way we did here."
+  },
+  {
+   "key": "G4-01",
+   "why": "The spike prints result.subtype, total_cost_usd and modelUsage to prove workflow agents are counted."
+  }
+ ],
+ "remember": "A session is one query() call: read its messages with for await, trust modelUsage on the last result, and pin the binary."
+}

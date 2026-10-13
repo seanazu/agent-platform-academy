@@ -1,0 +1,817 @@
+{
+ "id": "g0-5",
+ "title": "The LLM gateway",
+ "minutes": 55,
+ "youNeed": [
+  "g0-2",
+  "p1-3",
+  "p6-2"
+ ],
+ "bridge": "The gateway is like a backend-for-frontend that holds the API key your React app must never see. Except it never reads or changes the body: it streams the bytes through and only counts the usage numbers.",
+ "intro": "Every Claude call from an agent goes through one small service of ours. It checks a run token, adds the Anthropic key for that workload, streams the answer back, and counts tokens and dollars. This lesson builds it in TypeScript, meters it, and deploys it on inf-rhinohealth.",
+ "picture": {
+  "caption": "One call from a sandbox VM. The gateway swaps the run token for the workload's key, streams the answer back untouched, and only counts the usage.",
+  "nodes": [
+   {
+    "id": "vm",
+    "label": "sandbox VM: nova-worker",
+    "kind": "machine"
+   },
+   {
+    "id": "gw",
+    "label": "llm-gateway pod :8080",
+    "kind": "service"
+   },
+   {
+    "id": "keys",
+    "label": "Vault keys via ExternalSecret",
+    "kind": "file"
+   },
+   {
+    "id": "anthropic",
+    "label": "api.anthropic.com",
+    "kind": "cloud"
+   },
+   {
+    "id": "vm2",
+    "label": "VictoriaMetrics scrape :9090",
+    "kind": "service"
+   },
+   {
+    "id": "alert",
+    "label": "AIAgentDailySpendUnusual",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "vm",
+    "to": "gw",
+    "text": "POST /v1/messages with Authorization: Bearer <run token> and x-ai-agents-step"
+   },
+   {
+    "from": "gw",
+    "to": "gw",
+    "text": "verifies the HMAC signature, expiry and epoch; a bad token gets 401"
+   },
+   {
+    "from": "keys",
+    "to": "gw",
+    "text": "gives the key for the token's workload (nova, routines or brain-bot)"
+   },
+   {
+    "from": "gw",
+    "to": "anthropic",
+    "text": "forwards the same body and path with x-api-key added"
+   },
+   {
+    "from": "anthropic",
+    "to": "vm",
+    "text": "the SSE stream flows back through a tap that reads only the usage events"
+   },
+   {
+    "from": "gw",
+    "to": "vm2",
+    "text": "ai_agents_llm_tokens_total and ai_agents_llm_cost_usd_total are scraped every 30 seconds"
+   },
+   {
+    "from": "vm2",
+    "to": "alert",
+    "text": "a day above 2x the 14-day average posts to #ai-agents-alerts"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "What the VM is given instead of a key",
+   "p": [
+    "Look at the session options from lesson p8-1. In the VM, nova-worker starts a session with ANTHROPIC_BASE_URL=https://llm-gateway.example.com and ANTHROPIC_AUTH_TOKEN set to a run token. There is no ANTHROPIC_API_KEY anywhere on that machine.",
+    "The gateway is our service that adds the Anthropic key and meters spend. It is a reverse proxy: a server that receives a request, forwards it to another server, and returns the answer. Anthropic's hosting guide recommends exactly this shape, a proxy that injects the key.",
+    "A run token is a short signed string the orchestrator mints for one run. It names the agent, the Jira key, the run and an expiry, and it dies with the run. It is not an Anthropic key, so a leaked token leaks nothing that lasts."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "No keys in the VM. The three workload keys from lesson g0-2 are read by the gateway pod only, and the gateway never writes them anywhere."
+   }
+  },
+  {
+   "h": "The token, the epoch and the kill switch",
+   "p": [
+    "src/auth.ts signs tokens with createHmac(\"sha256\") and a signing key stored at kvv2 infrastructure/ai-agents/gateway. An HMAC is a hash of the token body mixed with a secret. Only a holder of the secret can make a valid signature. The check uses timingSafeEqual, which compares in constant time, so nobody can measure how many bytes matched.",
+    "Each token also carries an epoch: a number the gateway keeps per agent. Bump an agent's epoch and every live token of that agent stops working. A disabled_agents setting refuses an agent outright. Together they are the kill switch.",
+    "src/mint-token.ts mints a token for tests. In production the orchestrator mints one per run with the same signing key, which G3-17 gives it through Vault.",
+    "The block below is the lab's stub of auth.ts, not the real file. It shows the HMAC in 20 lines and leaves out the epoch and disabled_agents checks."
+   ],
+   "because": "We sign the token instead of storing it, because the gateway can then check it with one secret and no database.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/lab/g0-5/src/auth.ts (lab stub)",
+    "text": "import { createHmac, timingSafeEqual } from \"node:crypto\";\nexport type RunClaims = { agent: string; jira: string; run: string; exp: number; epoch: number };\nexport class RunTokenError extends Error {}\nconst SECRET = process.env.GATEWAY_SIGNING_KEY ?? \"lab-only-signing-key\";\nconst sign = (body: string) => createHmac(\"sha256\", SECRET).update(body).digest();\n\nexport const signRunToken = (claims: RunClaims): string => {\n  const body = Buffer.from(JSON.stringify(claims)).toString(\"base64url\");\n  return `${body}.${sign(body).toString(\"base64url\")}`;\n};\n\nexport const verifyRunToken = (header: string): RunClaims => {\n  const [body = \"\", sig = \"\"] = header.replace(/^Bearer /, \"\").split(\".\");\n  const want = sign(body);\n  const got = Buffer.from(sig, \"base64url\");\n  if (got.length !== want.length || !timingSafeEqual(got, want)) throw new RunTokenError(\"bad signature\");\n  const claims = JSON.parse(Buffer.from(body, \"base64url\").toString()) as RunClaims;\n  if (claims.exp < Date.now() / 1000) throw new RunTokenError(\"expired\");\n  return claims;\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "createHmac makes the signature; timingSafeEqual compares two buffers in constant time."
+     },
+     {
+      "line": 2,
+      "text": "The five claims every token carries. exp is a Unix time in seconds."
+     },
+     {
+      "line": 3,
+      "text": "server.ts turns a RunTokenError into a 401."
+     },
+     {
+      "line": 4,
+      "text": "The signing key from the environment. The real file reads it from the ExternalSecret mount."
+     },
+     {
+      "line": 5,
+      "text": "sign(body) is the HMAC-SHA256 of the body with the secret, as raw bytes."
+     },
+     {
+      "line": 8,
+      "text": "The claims become base64url JSON, the token body."
+     },
+     {
+      "line": 9,
+      "text": "The token is body, a dot, and the base64url signature of the body."
+     },
+     {
+      "line": 13,
+      "text": "Strip the Bearer prefix and split the token into body and signature."
+     },
+     {
+      "line": 16,
+      "text": "Compare lengths first, because timingSafeEqual throws on different lengths; a mismatch is a RunTokenError."
+     },
+     {
+      "line": 18,
+      "text": "An expired token is refused. The real file also checks the agent's epoch and the disabled_agents setting."
+     }
+    ]
+   }
+  },
+  {
+   "h": "server.ts, part 1: imports and waits",
+   "p": [
+    "The file is 35 lines, so we read it as two blocks. This block holds the imports and four constants. Nothing runs yet. Only the file-path comment line is dropped from the sketch.",
+    "Node's global fetch is built on undici. We import undici's Agent only to set waits: 10 seconds to connect, then 15 minutes between header bytes and between body bytes. Each wait restarts on every byte, so a stream can run for hours. There is no total limit, by design."
+   ],
+   "because": "We set per-wait limits and never a total, because no limit may cut a run in the middle.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/gateway/src/server.ts",
+    "text": "import { createServer } from \"node:http\";\nimport { Readable, Transform } from \"node:stream\";\nimport { buffer } from \"node:stream/consumers\";\nimport { pipeline } from \"node:stream/promises\";\nimport type { ReadableStream } from \"node:stream/web\";\nimport { Agent } from \"undici\"; // 7.x, the engine inside Node 24's fetch; used only for the waits below\nimport { RunTokenError, verifyRunToken } from \"./auth.js\"; // HMAC token from the orchestrator: agent, jira, run, exp, epoch\nimport { workloadKey } from \"./keys.js\"; // Anthropic key per workload, from the ExternalSecret mount\nimport { Meter } from \"./meter.js\"; // usage counting (next ticket)\n\nconst ROUTES = new Set([\"/v1/messages\", \"/v1/messages/count_tokens\"]);\nconst FORWARD = [\"anthropic-version\", \"anthropic-beta\", \"content-type\", \"accept\"];\nconst RETURN = [\"content-type\", \"request-id\", \"retry-after\", \"anthropic-ratelimit-requests-remaining\"];\nconst upstream = new Agent({ connect: { timeout: 10_000 }, headersTimeout: 900_000, bodyTimeout: 900_000 }); // per wait, never a total\n\n// Never refuses over budget: 429 and 529 pass through with retry-after, and the harness retries.",
+    "notes": [
+     {
+      "line": 1,
+      "text": "createServer from node:http. No web framework, like Byte's broker."
+     },
+     {
+      "line": 2,
+      "text": "Readable.fromWeb turns fetch's web stream into a Node stream; Transform is a pass-through we can tap."
+     },
+     {
+      "line": 3,
+      "text": "buffer reads the whole request body into one Buffer. There is no 1 MiB cap."
+     },
+     {
+      "line": 4,
+      "text": "pipeline connects streams, waits for the end, and passes errors on."
+     },
+     {
+      "line": 5,
+      "text": "Only a type. Line 15 of part 2 casts up.body to it, so tsc accepts Readable.fromWeb (the same cast as lesson p1-2)."
+     },
+     {
+      "line": 6,
+      "text": "undici's Agent, only to set the waits on line 14."
+     },
+     {
+      "line": 7,
+      "text": "verifyRunToken returns the claims (agent, jira, run, exp, epoch) or throws RunTokenError."
+     },
+     {
+      "line": 8,
+      "text": "workloadKey(agent) returns that workload's Anthropic key from the ExternalSecret mount."
+     },
+     {
+      "line": 9,
+      "text": "The Meter from the next two sections."
+     },
+     {
+      "line": 11,
+      "text": "Exactly two paths are forwarded. Everything else is 404."
+     },
+     {
+      "line": 12,
+      "text": "The only request headers passed upstream. authorization is not among them, so the run token never leaves."
+     },
+     {
+      "line": 13,
+      "text": "The only response headers passed back. retry-after lets the harness wait the right time."
+     },
+     {
+      "line": 14,
+      "text": "The waits in milliseconds: 10 s to connect, 900 s between bytes. Per wait, never a total."
+     },
+     {
+      "line": 16,
+      "text": "The rule in one line: over budget is not a reason to refuse. 429 and 529 pass through."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "On the laptop, npm's undici is a different copy from the one inside Node's global fetch. That fetch refuses an Agent from another copy and fails with 'fetch failed'. The lab imports fetch from undici too. The ticket should do the same, or pin undici to the version Node 24 bundles."
+   }
+  },
+  {
+   "h": "server.ts, part 2: one request end to end",
+   "p": [
+    "This block is the handler. Read it top to bottom as one request: health, route, token, forward, stream back.",
+    "The body goes through untouched. The only thing in the middle is a Transform called tap, which hands each chunk to the meter and passes it on. The meter reads usage numbers; it never keeps text."
+   ],
+   "because": "We stream through a pass-through rather than buffering, because the harness needs the first token at once.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/gateway/src/server.ts",
+    "text": "createServer(async (req, res) => {\n  const url = new URL(req.url ?? \"/\", \"http://gateway\");\n  if (req.method === \"GET\" && url.pathname === \"/health\") return void res.end(\"ok\");\n  if (req.method !== \"POST\" || !ROUTES.has(url.pathname)) return void res.writeHead(404).end();\n  try {\n    const claims = verifyRunToken(req.headers.authorization ?? \"\"); // RunTokenError if missing, expired or revoked\n    const headers = Object.fromEntries(FORWARD.flatMap((h) => (req.headers[h] ? [[h, String(req.headers[h])]] : [])));\n    const up = await fetch(`https://api.anthropic.com${url.pathname}${url.search}`, {\n      method: \"POST\", body: await buffer(req), dispatcher: upstream, // no 1 MiB cap here: Anthropic caps request size itself\n      headers: { ...headers, \"x-api-key\": workloadKey(claims.agent), \"accept-encoding\": \"identity\" }, // VM never sees the key\n    });\n    res.writeHead(up.status, Object.fromEntries(RETURN.flatMap((h) => { const v = up.headers.get(h); return v ? [[h, v]] : []; })));\n    const meter = new Meter(claims, String(req.headers[\"x-ai-agents-step\"] ?? \"unknown\"));\n    const tap = new Transform({ transform(chunk: Buffer, _enc, done) { meter.feed(chunk); done(null, chunk); } }); // usage only\n    await pipeline(up.body ? Readable.fromWeb(up.body as ReadableStream) : Readable.from([]), tap, res).finally(() => { meter.close(); });\n  } catch (error) {\n    if (!res.headersSent) res.writeHead(error instanceof RunTokenError ? 401 : 502).end();\n  }\n}).listen(8080); // access log (method, path, status, latency) only; no body is ever logged",
+    "notes": [
+     {
+      "line": 1,
+      "text": "One async handler for every request."
+     },
+     {
+      "line": 2,
+      "text": "Parse the path. The base URL is only there to parse; url.search keeps the query string for the forward."
+     },
+     {
+      "line": 3,
+      "text": "GET /health answers ok for the pod's readiness and liveness probes."
+     },
+     {
+      "line": 4,
+      "text": "Anything that is not a POST to one of the two routes is 404."
+     },
+     {
+      "line": 6,
+      "text": "Check the run token from the Authorization header. A missing, expired or revoked token throws RunTokenError."
+     },
+     {
+      "line": 7,
+      "text": "Collect the forwarded request headers that are present, as a plain object."
+     },
+     {
+      "line": 8,
+      "text": "fetch to api.anthropic.com with the same path and query string."
+     },
+     {
+      "line": 9,
+      "text": "The whole body, read with buffer, and the undici dispatcher with the long waits."
+     },
+     {
+      "line": 10,
+      "text": "x-api-key is the workload's key. accept-encoding: identity keeps the bytes plain, so the meter can read them."
+     },
+     {
+      "line": 12,
+      "text": "Write the upstream status and the allowed response headers back. 429 and 529 go through here with retry-after."
+     },
+     {
+      "line": 13,
+      "text": "A Meter for this call, tagged with the x-ai-agents-step header that G1-14 sets, or unknown."
+     },
+     {
+      "line": 14,
+      "text": "The tap: every chunk goes to meter.feed and then on to the client, unchanged."
+     },
+     {
+      "line": 15,
+      "text": "Pipe upstream body to tap to response. finally closes the meter, so counts are written even after an error. The cast to ReadableStream is needed: without it tsc fails with @types/node 24 and TypeScript 5.9."
+     },
+     {
+      "line": 17,
+      "text": "A bad token is 401; anything else is 502. Only if no headers were sent yet."
+     },
+     {
+      "line": 19,
+      "text": "Listen on 8080. The access log holds method, path, status and latency only; no body is ever logged."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "The G0-13 ticket sketch calls Readable.fromWeb(up.body) with no cast. With @types/node 24 and TypeScript 5.9 that fails tsc, because fetch's body type and Node's web stream type do not match. Cast it as above, with the type imported from node:stream/web (lesson p1-2)."
+   }
+  },
+  {
+   "h": "Rules the gateway keeps, and a fake upstream",
+   "p": [
+    "Three rules shape the rest of the ticket. First, never touch content: no body logging, and a node:test case in gateway/test/server.test.ts fails if any request text reaches the logs. Second, pass 429 and 529 through with retry-after; the harness waits and retries. Third, the gateway never refuses a call over budget.",
+    "The image is ai-agents-llm-gateway, built by ai-agents/.github/workflows/images.yml like Byte's Dockerfile. FROM node:24-bookworm-slim pinned by digest, npm ci --ignore-scripts, a tsc build, non-root user 10001 and CMD [\"node\", \"dist/server.js\"]. Port 8080 serves the API and 9090 serves metrics.",
+    "On the client side the harness sets ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN, plus ENABLE_TOOL_SEARCH=true and CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1. Both are off by default behind a gateway. Test with claude -p and with the Agent SDK, streaming and not.",
+    "To test on a laptop we need an upstream that costs nothing. The block below is the lab's fake Anthropic. It answers POST /v1/messages with three SSE events and the usage numbers the meter reads."
+   ],
+   "callout": {
+    "kind": "gotcha",
+    "text": "Request bodies are read whole with no 1 MiB cap, unlike Byte's broker. A long session sends several MB per call, and Anthropic caps the size itself."
+   },
+   "because": "We test against a fake upstream, because the lab must never spend money or hold a company key.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/lab/g0-5/lab/upstream.ts (lab file)",
+    "text": "import { createServer } from \"node:http\";\nconst start = '{\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}';\nconst delta = '{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":50}}';\ncreateServer((req, res) => {\n  if (req.method !== \"POST\" || req.url !== \"/v1/messages\") return void res.writeHead(404).end();\n  res.writeHead(200, { \"content-type\": \"text/event-stream\", \"request-id\": \"req_lab_1\" });\n  res.write(`event: message_start\\ndata: ${start}\\n\\n`);\n  res.write('event: content_block_delta\\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\\n\\n');\n  res.end(`event: message_delta\\ndata: ${delta}\\n\\n`);\n}).listen(8999, () => console.log(\"fake upstream on :8999\"));",
+    "notes": [
+     {
+      "line": 2,
+      "text": "message_start carries the model and the first usage: 1000 input tokens, 1 output token so far."
+     },
+     {
+      "line": 3,
+      "text": "message_delta carries the final output_tokens, a running total of 50."
+     },
+     {
+      "line": 5,
+      "text": "Only POST /v1/messages is answered; everything else is 404, like the gateway."
+     },
+     {
+      "line": 6,
+      "text": "The SSE content type and a request-id header, which the gateway passes back to the client."
+     },
+     {
+      "line": 7,
+      "text": "Each event is an event: line, a data: line and a blank line."
+     },
+     {
+      "line": 9,
+      "text": "res.end sends the last event and closes the stream, which makes the gateway call meter.close()."
+     },
+     {
+      "line": 10,
+      "text": "Port 8999. The gateway's lab copy reads it from UPSTREAM_URL."
+     }
+    ]
+   }
+  },
+  {
+   "h": "meter.ts, part 1: counters and the stream",
+   "p": [
+    "The meter answers two questions: how many tokens, and how many dollars, per agent, model, Jira key, run and step. It exports them as Prometheus counters, as in lesson p6-2: numbers that only go up, read by a scraper. The library is @prometheus-io/client, prom-client's new name with the same API.",
+    "A streamed response is SSE, server-sent events: plain text, a few lines per event, events separated by a blank line. Two events carry usage. In message_start the usage sits inside message; in message_delta the output_tokens is a running total. A non-streaming call returns one JSON object instead.",
+    "This block is 17 lines: the counters, the fields and feed(). The library does not add _total to names, so the names carry it."
+   ],
+   "because": "We read usage from the response rather than counting tokens ourselves, because Anthropic's numbers are the ones on the invoice.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/gateway/src/meter.ts",
+    "text": "import { createServer } from \"node:http\";\nimport { Counter, register } from \"@prometheus-io/client\"; // prom-client's new name (same API)\nimport type { RunClaims } from \"./auth.js\";\nimport { pricePerMtok } from \"./prices.js\"; // gateway/prices.yaml: $ per million tokens by model and token type\nconst TOKENS = new Counter({ name: \"ai_agents_llm_tokens_total\", help: \"Tokens through the gateway\", labelNames: [\"agent\", \"model\", \"type\", \"step\"] });\nconst COST = new Counter({ name: \"ai_agents_llm_cost_usd_total\", help: \"Estimated cost in USD\", labelNames: [\"agent\", \"model\", \"jira\", \"run\", \"step\"] });\ntype Usage = { model?: string; usage?: Record<string, unknown>; message?: Usage };\nexport class Meter { // reads only the usage numbers of a Messages response; text is never kept or logged\n  #model = \"unknown\"; #usage: Record<string, number> = {}; #buf = \"\"; #utf8 = new TextDecoder();\n  constructor(readonly claims: RunClaims, readonly step: string) {}\n  feed(chunk: Buffer): void {\n    const events = (this.#buf + this.#utf8.decode(chunk, { stream: true })).split(\"\\n\\n\"); // an SSE event ends with a blank line\n    this.#buf = events.pop() ?? \"\";\n    for (const line of events.flatMap((event) => event.split(\"\\n\"))) {\n      if (line.startsWith(\"data: \") && line.includes('\"usage\"')) this.#take(JSON.parse(line.slice(6)) as Usage);\n    }\n  }",
+    "notes": [
+     {
+      "line": 1,
+      "text": "createServer again, for the metrics port at the end of part 2."
+     },
+     {
+      "line": 2,
+      "text": "Counter and the default register from @prometheus-io/client."
+     },
+     {
+      "line": 3,
+      "text": "RunClaims is the type of the verified token: agent, jira, run, exp, epoch."
+     },
+     {
+      "line": 4,
+      "text": "pricePerMtok(model, type) reads prices.yaml: dollars per million tokens."
+     },
+     {
+      "line": 5,
+      "text": "Tokens by agent, model, token type and step. The name ends in _total because the library does not add it."
+     },
+     {
+      "line": 6,
+      "text": "Cost by agent, model, Jira key, run and step. The run label is fine at a few hundred runs a month."
+     },
+     {
+      "line": 7,
+      "text": "The three shapes in one type: message_start nests under message, the others do not."
+     },
+     {
+      "line": 8,
+      "text": "The class reads only usage numbers. Text is never kept or logged."
+     },
+     {
+      "line": 9,
+      "text": "Private fields: the model, the usage so far, a buffer for a half-received event, and a streaming UTF-8 decoder."
+     },
+     {
+      "line": 10,
+      "text": "The constructor takes the claims and the step name."
+     },
+     {
+      "line": 11,
+      "text": "feed is called by the tap in server.ts for every chunk."
+     },
+     {
+      "line": 12,
+      "text": "Join the leftover text and the new chunk, then split on blank lines: one piece per SSE event."
+     },
+     {
+      "line": 13,
+      "text": "The last piece may be half an event. Keep it for the next chunk."
+     },
+     {
+      "line": 15,
+      "text": "Only data: lines that mention usage are parsed. Every other line is dropped unread."
+     }
+    ]
+   }
+  },
+  {
+   "h": "meter.ts, part 2: prices and the metrics port",
+   "p": [
+    "#take merges the usage fields of one event into #usage, so message_delta's running total overwrites message_start's early number. close() runs once, when the stream ends, and turns the totals into counter increments.",
+    "Prices live in ai-agents/gateway/prices.yaml, loaded by src/prices.ts with the yaml package, in dollars per million tokens. Opus 5.5: input 4, output 20, cache write 5 for 5 minutes or 8 for 1 hour, cache read 0.20. Sonnet 5.5: 2, 10, 2.50 or 4, 0.10. Haiku 5.5: 0.10, 0.50, 0.125 or 0.20, 0.01, up to 100K-token prompts.",
+    "An unknown model still counts tokens and raises an alert; the call never fails. GET /v1/spend?run=… or ?jira=… answers from VictoriaMetrics through a fetch to vmselect at SPEND_QUERY_URL, so totals survive a restart. A 30-second scrape delay is fine for a backstop checked between turns."
+   ],
+   "because": "We split cache writes into 5-minute and 1-hour because they have different prices, and G1 reads them back as one cache_write type.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/gateway/src/meter.ts",
+    "text": "  #take(data: Usage): void {\n    const msg = data.message ?? data; // message_start nests it; message_delta and plain JSON don't\n    this.#model = msg.model ?? this.#model;\n    const usage = msg.usage ?? {};\n    for (const [k, v] of Object.entries(usage)) if (Number.isInteger(v)) this.#usage[k] = v as number;\n    const hour = (usage.cache_creation as { ephemeral_1h_input_tokens?: number } | undefined)?.ephemeral_1h_input_tokens;\n    if (Number.isInteger(hour)) this.#usage.cache_write_1h = hour as number; // 1-hour writes cost more than 5-minute ones\n  }\n  close(): void {\n    if (this.#buf.trim().startsWith(\"{\")) this.#take(JSON.parse(this.#buf) as Usage); // a non-streaming call: one JSON object\n    const u = this.#usage, { agent, jira, run } = this.claims, labels = { agent, model: this.#model, step: this.step };\n    const hour = u.cache_write_1h ?? 0, writes = u.cache_creation_input_tokens ?? 0;\n    const parts = { input: u.input_tokens ?? 0, output: u.output_tokens ?? 0, cache_write_5m: writes - hour,\n      cache_write_1h: hour, cache_read: u.cache_read_input_tokens ?? 0 };\n    for (const [type, n] of Object.entries(parts)) TOKENS.inc({ ...labels, type: type.replace(/_(5m|1h)$/, \"\") }, n); // G1 reads type=\"cache_write\"\n    const cost = Object.entries(parts).reduce((sum, [type, n]) => sum + n * pricePerMtok(this.#model, type), 0) / 1_000_000;\n    COST.inc({ ...labels, jira, run }, cost);\n  }\n}\ncreateServer(async (_req, res) => res.writeHead(200, { \"Content-Type\": register.contentType }).end(await register.metrics()))\n  .listen(9090); // Prometheus metrics on :9090, apart from the API on :8080",
+    "notes": [
+     {
+      "line": 1,
+      "text": "#take gets one parsed event or body."
+     },
+     {
+      "line": 2,
+      "text": "message_start nests the message; message_delta and a plain JSON body do not."
+     },
+     {
+      "line": 3,
+      "text": "Keep the model from the event, or the one we already have."
+     },
+     {
+      "line": 5,
+      "text": "Copy every integer field: input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens."
+     },
+     {
+      "line": 6,
+      "text": "1-hour cache writes sit deeper, in usage.cache_creation.ephemeral_1h_input_tokens."
+     },
+     {
+      "line": 7,
+      "text": "Store them under cache_write_1h; they cost more than 5-minute writes."
+     },
+     {
+      "line": 9,
+      "text": "close runs once, from the finally in server.ts."
+     },
+     {
+      "line": 10,
+      "text": "A non-streaming call: the whole JSON body is still in the buffer, so parse it now."
+     },
+     {
+      "line": 11,
+      "text": "The labels shared by both counters, from the claims and the step."
+     },
+     {
+      "line": 13,
+      "text": "5-minute writes are all cache writes minus the 1-hour ones. The other parts are copied as they are."
+     },
+     {
+      "line": 15,
+      "text": "One increment per token type. The suffix is stripped, so G1 sees type=cache_write for both."
+     },
+     {
+      "line": 16,
+      "text": "Cost is the sum of count times price, divided by one million."
+     },
+     {
+      "line": 17,
+      "text": "The cost increment carries jira and run too, so the weekly review can sum per ticket."
+     },
+     {
+      "line": 20,
+      "text": "A second node:http server answers every request with the metrics text in Prometheus format."
+     },
+     {
+      "line": 21,
+      "text": "Port 9090, apart from the API on 8080, so the scraper never touches the API port."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The Terragrunt unit, part 1: module and inputs",
+   "p": [
+    "The gateway runs on inf-rhinohealth as a Terraform helm_release unit, like n8n in lesson p4-2. A unit is one folder with one terragrunt.hcl that points at a module and gives it inputs. This one is infrastructure/multi_tenant/accounts/infrastructure/ai-agents/llm-gateway/terragrunt.hcl.",
+    "The module is new in this ticket: modules/ai-agents-service, a small local chart shaped like modules/goalert/chart. It holds a Deployment, a Service, an HTTPRoute, an ExternalSecret from vault-store and a VMServiceScrape. A VMServiceScrape tells VictoriaMetrics which port to scrape. G3's broker, workers and Slack app reuse it.",
+    "Pods keep the image's command, run as user 10001 with a read-only root filesystem, and probe GET /health. First, DevOps adds the ECR repo ai-agents-llm-gateway with tags_immutability_enabled = true to multi_tenant/accounts/infrastructure/artifacts/artifacts.hcl. The ai-agents repo's images.yml builds and pushes the image."
+   ],
+   "because": "We deploy through a unit and a shared module, because the next four services need the same shape.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/multi_tenant/accounts/infrastructure/ai-agents/llm-gateway/terragrunt.hcl",
+    "text": "include \"root\" {\n  path   = find_in_parent_folders(\"root.hcl\")\n  expose = true\n}\n\nterraform {\n  # New module (this ticket): a local chart shaped like modules/goalert/chart; G3's services reuse it.\n  source = \"../../../../../modules/ai-agents-service//\"\n}\n\ninputs = {\n  name         = \"llm-gateway\"\n  namespace    = \"ai-agents\"\n  image        = \"123456789012.dkr.ecr.us-east-1.amazonaws.com/ai-agents-llm-gateway:0.1.0\" # CMD: node dist/server.js\n  replicas     = 2\n  port         = 8080\n  metrics_port = 9090\n  health_path  = \"/health\" # readiness and liveness; user 10001, read-only root filesystem",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Include the shared root.hcl found in a parent folder: remote state, providers and tags."
+     },
+     {
+      "line": 3,
+      "text": "expose = true lets this file read include.root.locals, used for the metrics namespace in part 2."
+     },
+     {
+      "line": 8,
+      "text": "The module path in the old tree, five folders up. The double slash marks where the module root starts."
+     },
+     {
+      "line": 11,
+      "text": "Every input becomes a value for the chart."
+     },
+     {
+      "line": 12,
+      "text": "Name and namespace: llm-gateway in the ai-agents namespace."
+     },
+     {
+      "line": 14,
+      "text": "The image from inf ECR at a tag. CMD node dist/server.js comes from the image itself."
+     },
+     {
+      "line": 15,
+      "text": "Two replicas, fixed. KEDA is off on inf."
+     },
+     {
+      "line": 16,
+      "text": "8080 is the API port the Service exposes."
+     },
+     {
+      "line": 17,
+      "text": "9090 is the port the VMServiceScrape reads."
+     },
+     {
+      "line": 18,
+      "text": "GET /health for readiness and liveness; user 10001 and a read-only root filesystem come from the module."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The Terragrunt unit, part 2, and the alert",
+   "p": [
+    "The second half wires secrets, one env var and the route. The ExternalSecret reads two Vault paths through the existing ClusterSecretStore vault-store: the three workload keys and the token-signing key. An HTTPRoute is the Envoy Gateway resource that gives the service a hostname. envoy-internal means VPN, Teleport and in-cluster callers only.",
+    "The route's request timeout is 0s. n8n sets 300s; a stream with 64K to 128K output tokens runs for many minutes and would be cut. How sandbox VMs reach the gateway without VPC peering is a G3 decision, and the comment in the file says so.",
+    "Then the alert. Add victoria-metrics/alerting/templates/alert_rules/ai-agents.yml with AIAgentDailySpendUnusual: sum by (agent) (increase(ai_agents_llm_cost_usd_total[1d])) above 2x its 14-day average. Route service.name=ai-agents to a new Slack receiver for #ai-agents-alerts. A person runs plan and apply. The smoke test is claude -p 'say ok' through the gateway from a pod, then its cost series in Grafana."
+   ],
+   "because": "We set the route timeout to zero, because a long stream must not be cut by the thing in front of it.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/multi_tenant/accounts/infrastructure/ai-agents/llm-gateway/terragrunt.hcl",
+    "text": "  # ExternalSecrets through the existing ClusterSecretStore vault-store\n  vault_secret_paths = [\"infrastructure/ai-agents/anthropic\", \"infrastructure/ai-agents/gateway\"]\n\n  env = {\n    SPEND_QUERY_URL = \"http://vmselect-rhino-metrics.${include.root.locals.metrics_namespace}:8481/select/0/prometheus\"\n  }\n\n  route = {\n    parent_ref      = \"envoy-internal\" # VPN, Teleport and in-cluster callers only in v0\n    hostname        = \"llm-gateway.example.com\"\n    request_timeout = \"0s\"             # no route timeout: streams with 64K-128K output run for many minutes\n  }\n  # Decide with G3: how sandbox VMs in the ai-agents account reach this without VPC peering\n  # (a PrivateLink endpoint service, or envoy-external + WAF behind the egress proxy).\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The ClusterSecretStore vault-store already exists on inf; the module makes one ExternalSecret from it."
+     },
+     {
+      "line": 2,
+      "text": "Two kvv2 paths: anthropic holds the three workload keys from G0-07, gateway holds the token-signing key."
+     },
+     {
+      "line": 5,
+      "text": "SPEND_QUERY_URL points /v1/spend at vmselect in the metrics namespace, read from the root locals."
+     },
+     {
+      "line": 8,
+      "text": "The route block becomes the HTTPRoute."
+     },
+     {
+      "line": 9,
+      "text": "envoy-internal: reachable from VPN, Teleport and inside the cluster only, in v0."
+     },
+     {
+      "line": 10,
+      "text": "The hostname is the harness's ANTHROPIC_BASE_URL."
+     },
+     {
+      "line": 11,
+      "text": "0s means no route timeout. n8n's 300s would cut a long stream."
+     },
+     {
+      "line": 13,
+      "text": "The open decision for G3: PrivateLink, or envoy-external with the WAF behind the egress proxy."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "why",
+    "text": "The alert does not stop anything. Someone hears about a runaway day before the invoice; the harness backstop in G3 stays in shadow mode for 4 weeks."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Run the gateway against a fake Anthropic",
+  "youNeed": [
+   "Node 24",
+   "npm",
+   "curl",
+   "terragrunt (brew install terragrunt) for the last step",
+   "the code blocks from this lesson: auth.ts stub, server.ts parts 1 and 2, meter.ts parts 1 and 2, upstream.ts"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/lab/g0-5/src ~/lab/g0-5/lab && cd ~/lab/g0-5 && npm init -y && npm pkg set type=module && npm i -D typescript tsx @types/node && npm i undici @prometheus-io/client  (the current versions)",
+    "see": "added <n> packages, and audited <n> packages in 4s\n\nfound 0 vulnerabilities"
+   },
+   {
+    "do": "Create src/auth.ts with the lab stub from the token section.",
+    "see": "ls src\nauth.ts"
+   },
+   {
+    "do": "echo 'export const workloadKey = (_agent: string): string => \"sk-ant-lab-fake\";' > src/keys.ts && echo 'export const pricePerMtok = (_model: string, type: string): number => ({ input: 4, output: 20, cache_write_5m: 5, cache_write_1h: 8, cache_read: 0.2 })[type] ?? 0;' > src/prices.ts   (lab stubs: the real keys.ts reads the secret mount, the real prices.ts loads prices.yaml)",
+    "see": "ls src\nauth.ts  keys.ts  prices.ts"
+   },
+   {
+    "do": "Create src/meter.ts: part 1, then part 2, unchanged. Create src/server.ts: part 1, then part 2, with two lab-only changes. Change the undici import to import { Agent, fetch } from \"undici\". On the fetch line, replace https://api.anthropic.com with ${process.env.UPSTREAM_URL ?? \"https://api.anthropic.com\"}.",
+    "see": "wc -l src/server.ts src/meter.ts\n  34 src/server.ts\n  38 src/meter.ts"
+   },
+   {
+    "do": "printf '%s\\n' 'import { signRunToken } from \"./auth.js\";' 'console.log(signRunToken({ agent: \"nova\", jira: \"RH-1\", run: \"lab-1\", exp: Math.floor(Date.now() / 1000) + 3600, epoch: 1 }));' > src/mint-token.ts && node --import tsx src/mint-token.ts",
+    "see": "eyJhZ2VudCI6Im5vdmEiLCJqaXJhIj...<two base64url parts joined by a dot>"
+   },
+   {
+    "do": "Create lab/upstream.ts from the fake-upstream block. In terminal 1: node --import tsx lab/upstream.ts",
+    "see": "fake upstream on :8999"
+   },
+   {
+    "do": "In terminal 2: UPSTREAM_URL=http://localhost:8999 node --import tsx src/server.ts",
+    "see": "(no output: the gateway listens on 8080 and 9090)"
+   },
+   {
+    "do": "In terminal 3: TOKEN=$(node --import tsx src/mint-token.ts) && curl -s localhost:8080/health && echo && curl -sN localhost:8080/v1/messages -H \"authorization: Bearer $TOKEN\" -H \"x-ai-agents-step: lab\" -H \"content-type: application/json\" -d '{\"model\":\"claude-opus-5-5\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'",
+    "see": "ok\nevent: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":50}}"
+   },
+   {
+    "do": "curl -s localhost:9090/metrics | grep -E '^ai_agents_llm_(tokens|cost)'",
+    "see": "ai_agents_llm_tokens_total{agent=\"nova\",model=\"claude-opus-5-5\",step=\"lab\",type=\"input\"} 1000\nai_agents_llm_tokens_total{agent=\"nova\",model=\"claude-opus-5-5\",step=\"lab\",type=\"output\"} 50\nai_agents_llm_tokens_total{agent=\"nova\",model=\"claude-opus-5-5\",step=\"lab\",type=\"cache_write\"} 0\nai_agents_llm_tokens_total{agent=\"nova\",model=\"claude-opus-5-5\",step=\"lab\",type=\"cache_read\"} 0\nai_agents_llm_cost_usd_total{agent=\"nova\",model=\"claude-opus-5-5\",step=\"lab\",jira=\"RH-1\",run=\"lab-1\"} 0.005"
+   },
+   {
+    "do": "Check the cost by hand: 1000 input tokens at $4 per million, plus 50 output tokens at $20 per million.",
+    "see": "0.004 + 0.001 = 0.005"
+   },
+   {
+    "do": "Reading step for the unit: copy the two HCL blocks into infra/llm-gateway/terragrunt.hcl and run terragrunt hcl format --check infra/llm-gateway/terragrunt.hcl. Then open modules/goalert/chart in the infrastructure repo and find the Deployment, Service and ExternalSecret templates the new module copies.",
+    "see": "(no output and exit code 0: the file is formatted)"
+   }
+  ],
+  "faded": "The 401 case. Mint a token, change its last character, and send the same curl with -o /dev/null -w '%{http_code}'. The gateway should answer 401, and the series on :9090 should keep their values. The curl command and the second metrics check are left to you.",
+  "alone": "The count_tokens route. Teach lab/upstream.ts to answer POST /v1/messages/count_tokens with one JSON object, {\"input_tokens\":12}, not a stream. Send it through the gateway with the token and the header x-ai-agents-step: count, and see the JSON come back. Then read the metrics: new series appear for step=\"count\" with model=\"unknown\", 0 tokens and 0 cost. Explain why from #take: the response has no usage key and no model.",
+  "done": "You can show the three SSE events coming back through :8080 and the five ai_agents_llm series on :9090 with cost 0.005. A bad token gets 401, and a count_tokens call adds series with 0 tokens."
+ },
+ "quiz": [
+  {
+   "q": "A run has spent past its far-away backstop. What does the gateway do with the next call?",
+   "options": [
+    {
+     "text": "Returns 429 with retry-after so the harness slows down.",
+     "correct": false,
+     "why": "429 only passes through from Anthropic. The gateway never makes its own refusal over budget."
+    },
+    {
+     "text": "Serves it and counts it; the harness decides between turns, in shadow mode for 4 weeks.",
+     "correct": true,
+     "why": "The gateway reports and never refuses. No limit cuts a run in the middle."
+    },
+    {
+     "text": "Bumps the agent's epoch so the token dies.",
+     "correct": false,
+     "why": "The epoch is the kill switch for a misbehaving agent, not a budget tool."
+    }
+   ]
+  },
+  {
+   "q": "Where does the Anthropic key live while a run is going?",
+   "options": [
+    {
+     "text": "In the VM, as ANTHROPIC_API_KEY in the harness environment.",
+     "correct": false,
+     "why": "No keys in the VM. The VM only holds ANTHROPIC_AUTH_TOKEN, the run token."
+    },
+    {
+     "text": "Inside the run token, encrypted with the signing key.",
+     "correct": false,
+     "why": "The token carries agent, jira, run, exp and epoch. The gateway looks the key up by agent."
+    },
+    {
+     "text": "In the gateway pod, mounted from Vault through an ExternalSecret.",
+     "correct": true,
+     "why": "vault_secret_paths lists infrastructure/ai-agents/anthropic; workloadKey reads the mount."
+    }
+   ]
+  },
+  {
+   "q": "Why is request_timeout set to 0s on the gateway's HTTPRoute?",
+   "options": [
+    {
+     "text": "A stream with 64K to 128K output tokens runs for many minutes; n8n's 300s would cut it.",
+     "correct": true,
+     "why": "A long stream must not be cut by the thing in front of it. The undici waits are per byte, never a total."
+    },
+    {
+     "text": "0s means use the Envoy default, which is enough.",
+     "correct": false,
+     "why": "0s turns the route timeout off. The default would still cut long streams."
+    },
+    {
+     "text": "The health probes fail with any timeout set.",
+     "correct": false,
+     "why": "GET /health answers at once; the probes are not the reason."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "In lesson g0-2, which Vault path holds the three Anthropic keys, and which custom-metadata field says when to rotate them?",
+  "In lesson p6-2, what is a Prometheus counter, and why do you query rates on the server instead of in code?"
+ ],
+ "videos": [
+  {
+   "title": "Node.js Ultimate Beginner's Guide in 7 Easy Steps",
+   "url": "https://www.youtube.com/watch?v=ENrzD9HAZK4",
+   "channel": "Fireship",
+   "minutes": 16,
+   "why": "Fast tour of Node runtime, modules, http server and npm for browser-only devs."
+  }
+ ],
+ "words": [
+  {
+   "term": "reverse proxy",
+   "plain": "A server that receives a request, forwards it to another server, and returns the answer."
+  },
+  {
+   "term": "run token",
+   "plain": "A short HMAC-signed string minted per run that names the agent, Jira key, run, expiry and epoch; not an Anthropic key."
+  },
+  {
+   "term": "epoch",
+   "plain": "A per-agent number inside every token; bumping it kills all live tokens of that agent."
+  },
+  {
+   "term": "SSE",
+   "plain": "Server-sent events: a streamed text response of small events separated by blank lines."
+  },
+  {
+   "term": "usage",
+   "plain": "The token counts Anthropic puts in message_start, message_delta or the JSON body; the only thing the meter reads."
+  },
+  {
+   "term": "HTTPRoute",
+   "plain": "The Envoy Gateway resource that gives a service a hostname and a request timeout."
+  },
+  {
+   "term": "unit",
+   "plain": "One Terragrunt folder with one terragrunt.hcl that points at a module and gives it inputs."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G0-13",
+   "why": "This lesson read server.ts line by line and showed why the VM holds a run token, not a key.",
+   "walk": [
+    "Create ai-agents/gateway/ in RhinoHealth/ai-agents: package.json named @rhinohealth/ai-agents-gateway, src/server.ts from the two blocks above, node:http and global fetch, no web framework.",
+    "Import fetch from undici next to Agent, or pin undici to the version Node 24 bundles. The global fetch refuses an Agent from a different undici copy; the lab shows it.",
+    "Add src/auth.ts: createHmac(\"sha256\") signing and a timingSafeEqual check; claims agent, jira, run, exp and epoch; the signing key from kvv2 infrastructure/ai-agents/gateway. Add src/mint-token.ts for tests.",
+    "Add src/keys.ts: workloadKey(agent) reads the key from the ExternalSecret mount. Add the disabled_agents setting and the per-agent epoch, so one bump kills all live tokens.",
+    "Routes: POST /v1/messages and /v1/messages/count_tokens, plus GET /health; anything else is 404. The query string passes through. Bodies are read whole with no 1 MiB cap.",
+    "Write gateway/test/server.test.ts with a case that fails if any request text reaches the logs. The access log holds method, path, status and latency only.",
+    "Add the image to ai-agents/.github/workflows/images.yml: node:24-bookworm-slim by digest, npm ci --ignore-scripts, tsc, user 10001, CMD [\"node\", \"dist/server.js\"], ports 8080 and 9090.",
+    "Test with claude -p and the Agent SDK, streaming and not, with ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, ENABLE_TOOL_SEARCH=true and CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1. Check that 429 and 529 pass through with retry-after."
+   ]
+  },
+  {
+   "key": "G0-14",
+   "why": "This lesson read meter.ts line by line: both usage shapes, the price table and the two counters.",
+   "walk": [
+    "Add src/meter.ts from the two blocks above. Usage comes from the JSON body of a non-streaming call, and from the message_start and message_delta events. In message_delta, output_tokens is a running total.",
+    "Add ai-agents/gateway/prices.yaml and src/prices.ts, loaded with yaml, with the Opus, Sonnet and Haiku 5.5 prices from the lesson. Split 1-hour writes with usage.cache_creation. An unknown model counts tokens and raises an alert; the call never fails.",
+    "Export ai_agents_llm_tokens_total{agent,model,type,step} and ai_agents_llm_cost_usd_total{agent,model,jira,run,step} with @prometheus-io/client on :9090; the names carry _total themselves.",
+    "Add GET /v1/spend?run=… or ?jira=…: a fetch to vmselect at SPEND_QUERY_URL returns the total from VictoriaMetrics, so it survives restarts.",
+    "Leave the backstop decision in the harness (G3), in shadow mode for 4 weeks. The gateway reports; it never refuses."
+   ]
+  },
+  {
+   "key": "G0-15",
+   "why": "This lesson read the Terragrunt unit and showed why the route timeout is 0s and what the alert watches.",
+   "walk": [
+    "Add the ECR repo ai-agents-llm-gateway with tags_immutability_enabled = true to multi_tenant/accounts/infrastructure/artifacts/artifacts.hcl; images.yml in the ai-agents repo builds and pushes it.",
+    "Create modules/ai-agents-service: a local chart shaped like modules/goalert/chart with Deployment, Service, HTTPRoute, ExternalSecret from vault-store and VMServiceScrape. Pods run as user 10001 with a read-only root filesystem and probe GET /health.",
+    "Add the unit multi_tenant/accounts/infrastructure/ai-agents/llm-gateway/terragrunt.hcl from the two blocks above, with request_timeout = \"0s\" on the route.",
+    "Add victoria-metrics/alerting/templates/alert_rules/ai-agents.yml with AIAgentDailySpendUnusual, a day above 2x the 14-day average per agent. Route service.name=ai-agents to a new Slack receiver for #ai-agents-alerts.",
+    "A person runs terragrunt plan and apply over VPN. Smoke test: claude -p 'say ok' through the gateway from a pod in the cluster, then find its cost series in Grafana."
+   ]
+  }
+ ],
+ "remember": "The gateway swaps a short-lived run token for the workload's key, streams bytes through untouched, counts usage, and never refuses a call."
+}

@@ -1,0 +1,553 @@
+{
+ "id": "g6-5",
+ "title": "BRAIN-QA and ingest",
+ "minutes": 50,
+ "youNeed": [
+  "g6-4",
+  "p12-3",
+  "g5-1"
+ ],
+ "bridge": "BRAIN-QA is like a Playwright regression suite for the brain. Fixed questions with expected answers run on every change, so a regression shows up as a red check. Except: the questions must stay hidden from the thing under test. So they live in a restricted repo the brain can never index.",
+ "intro": "A brain that answers wrong with confidence is worse than none. This lesson builds the fixed test set of 60 real questions. Then the runner that scores retrieval on every PR and judged answers nightly. Then the weekly ingest that keeps pages current with merged work. The ingest is a routine: Nova's harness with a different trigger, so it keeps the same walls.",
+ "picture": {
+  "caption": "Questions stay in a restricted repo; the runner scores retrieval on every PR and answers nightly; ingest runs on Mondays.",
+  "nodes": [
+   {
+    "id": "golden",
+    "label": "brain-qa/cases/*.yaml (restricted repo)",
+    "kind": "file"
+   },
+   {
+    "id": "runner",
+    "label": "evals/brain_qa.py",
+    "kind": "check"
+   },
+   {
+    "id": "search",
+    "label": "kb search (the same ranking)",
+    "kind": "service"
+   },
+   {
+    "id": "judge",
+    "label": "Judge: Sonnet 5.5, PASS/FAIL per point",
+    "kind": "agent"
+   },
+   {
+    "id": "collect",
+    "label": "kb ingest-collect -> work.json",
+    "kind": "service"
+   },
+   {
+    "id": "routine",
+    "label": "kb-ingest routine (lite VM)",
+    "kind": "agent"
+   },
+   {
+    "id": "owner",
+    "label": "Page owner approves the PR",
+    "kind": "person"
+   }
+  ],
+  "steps": [
+   {
+    "from": "runner",
+    "to": "golden",
+    "text": "reads the cases with the rhino-kb App; prints only ids and totals"
+   },
+   {
+    "from": "runner",
+    "to": "search",
+    "text": "retrieval mode on every rnd-kb PR: is a source page in the top 5? Below 85% fails"
+   },
+   {
+    "from": "runner",
+    "to": "judge",
+    "text": "answers mode nightly: each answer point PASS or FAIL; target 80% correct"
+   },
+   {
+    "from": "routine",
+    "to": "collect",
+    "text": "Monday 06:41: setup runs kb ingest-collect --since last_run"
+   },
+   {
+    "from": "collect",
+    "to": "routine",
+    "text": "work.json: merged PRs and closed epics per page, plus unmatched changes"
+   },
+   {
+    "from": "routine",
+    "to": "owner",
+    "text": "edits only pages with news; one PR per owner; confidence at most med"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start from one question (G6-17)",
+   "p": [
+    "A BRAIN-QA case is one question someone really asked in Slack. It names the page or pages that answer it, and the points a correct answer must contain. Sixty of them, spread over cloud, client, frontend, CI and QA, product, decisions and runbooks. About six have no page yet: the right answer there is \"I don't know\" plus where to ask.",
+    "The cases live under brain-qa/ in the restricted golden-set repo from G1 and G4, which agents and the bot cannot read. Never in rnd-kb: if the brain could see the questions, the test would measure memory, not knowledge."
+   ],
+   "because": "We write answer points, not a full expected answer. The judge can check three facts reliably, but cannot compare two paragraphs reliably.",
+   "code": {
+    "lang": "yaml",
+    "file": "<restricted golden-set repo>/brain-qa/cases/bq-017.yaml",
+    "text": "# <restricted golden-set repo>/brain-qa/cases/bq-017.yaml: repo name comes from G1/G4; agents and the bot can't read it\nid: bq-017\nquestion: \"When I change a proto in fcp_common, what do I need to do so old on-prem clients keep working?\"\nasked_in: public # public = close to the original words; private = rewritten as a summary (DATA-SCOPE.md)\nsource_pages: # any of these in the top 5 of `kb search` counts as a retrieval hit\n  - engineering/cloud-client-compatibility.md\n  - engineering/code-run-path.md\nanswer_points: # the judge checks each point; all must be there for \"correct\"\n  - \"Protos live in common/fcp_common/rhinoAgentRpc/ and the generated _pb2 files are committed (make protoc)\"\n  - \"Add new fields instead of renaming or removing old ones, because clients installed at customers still use them\"\n  - \"Cites at least one page as rnd-kb/<path>@<sha>\"\nexpect: answer # answer | not_in_kb (then the right reply is \"I don't know\" plus where to ask)\ntags: [be, cross-tier, protos]\nadded: 2026-11-10",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The repo name comes from G1/G4. The comment states the one rule: agents and the bot cannot read it."
+     },
+     {
+      "line": 3,
+      "text": "The question in close to the original words; a private-channel question is rewritten as a summary."
+     },
+     {
+      "line": 4,
+      "text": "asked_in records which it was, so a reviewer knows whether the wording is original."
+     },
+     {
+      "line": 5,
+      "text": "source_pages: any of these in the top 5 of kb search counts as a retrieval hit."
+     },
+     {
+      "line": 8,
+      "text": "answer_points: the judge checks each one; all must be present for 'correct'."
+     },
+     {
+      "line": 11,
+      "text": "One point is the citation itself: the answer must cite a page as rnd-kb/<path>@<sha>."
+     },
+     {
+      "line": 12,
+      "text": "expect: answer, or not_in_kb for the six questions the brain cannot answer yet."
+     },
+     {
+      "line": 13,
+      "text": "tags let the nightly report scores per area."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The runner: retrieval on every PR (G6-18)",
+   "p": [
+    "evals/brain_qa.py in rnd-kb-tooling has two modes. --mode retrieval makes no model calls. For each answerable case it runs the same search() the kb CLI uses. Then it checks whether a source page is in the top 5.",
+    "It runs as a step in kb-lint's CI and reads the golden set with the rhino-kb App. It prints only case ids and totals, because CI logs are visible.",
+    "The targets: the right page in the top 5 for at least 85% of questions. And a correct answer for at least 80%. Retrieval below 85% fails the PR, so an edit that hides an answer is caught at once."
+   ],
+   "because": "We import the CLI's own search() instead of calling kb search as a process. The score must measure exactly the ranking people and agents get.",
+   "code": {
+    "lang": "python",
+    "file": "rnd-kb-tooling/evals/brain_qa.py",
+    "text": "# rnd-kb-tooling/evals/brain_qa.py: sketch; prints ids and totals only, never question text (CI logs are visible)\nimport json\nimport subprocess\nfrom pathlib import Path\n\nfrom kb_tools.search import search  # the same ranking `kb search` uses\nfrom kb_tools.text import normalise, word_runs  # small helpers, omitted here\n\n\ndef retrieval(cases: list[dict], kb_dir: str) -> float:\n    answerable = [c for c in cases if c[\"expect\"] == \"answer\"]\n    hits = 0\n    for case in answerable:\n        top5 = [hit.path for hit in search(kb_dir, case[\"question\"], limit=5)]\n        hits += any(page in top5 for page in case[\"source_pages\"])\n    return hits / len(answerable)\n\n\ndef leaked(cases: list[dict], kb_dir: str) -> list[str]:\n    pages = \" \".join(normalise(p.read_text()) for p in Path(kb_dir).rglob(\"*.md\"))\n    return [c[\"id\"] for c in cases if any(run in pages for run in word_runs(c[\"question\"], 8))]",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The rule in the first line: ids and totals only, never question text, because CI logs are visible."
+     },
+     {
+      "line": 6,
+      "text": "search() from kb_tools.search: the same BM25 ranking as the CLI."
+     },
+     {
+      "line": 7,
+      "text": "normalise() lowercases and strips punctuation; word_runs() yields every run of n words. Both are small helpers."
+     },
+     {
+      "line": 10,
+      "text": "retrieval() returns a fraction between 0 and 1."
+     },
+     {
+      "line": 11,
+      "text": "Only cases with expect: answer count; not_in_kb cases have no source page."
+     },
+     {
+      "line": 14,
+      "text": "top5: the paths of the first five hits for this question."
+     },
+     {
+      "line": 15,
+      "text": "A hit when any source page is in the top 5. any() of a generator reads well here."
+     },
+     {
+      "line": 19,
+      "text": "leaked(): the leak check. Join every page's normalised text into one string."
+     },
+     {
+      "line": 21,
+      "text": "A case leaks when any 8-word run of its question appears in a page. The question text itself never prints; only the id."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Answers nightly, through the gateway",
+   "p": [
+    "--mode answers runs nightly on the agents' runner set, through the LLM gateway with the evals key. The runner holds no Anthropic key. Until the bot ships, answers come from claude -p with the kb plugin on Sonnet 5.5 at low effort. After G6-21 the runner calls the bot's answer() instead, so the score measures what Slack users get.",
+    "The judge is Sonnet 5.5 at medium effort with PASS/FAIL per answer point. Before trusting it, check it against Shai's own labels on 10 answers. Results go to the G1 eval store as JSON; the two numbers go to the check summary."
+   ],
+   "because": "We ask through the real kb plugin, not a bare model call. The thing under test is the brain plus the skill, not the model.",
+   "code": {
+    "lang": "python",
+    "file": "rnd-kb-tooling/evals/brain_qa.py",
+    "text": "def ask(question: str) -> str:\n    # until the bot ships; then: from bot.app import answer\n    out = subprocess.run(\n        [\"claude\", \"-p\", question, \"--plugin-dir\", \"plugin\", \"--model\", \"claude-sonnet-5-5\",\n         \"--effort\", \"low\", \"--output-format\", \"json\"],\n        capture_output=True, text=True, check=True,\n    )\n    return json.loads(out.stdout)[\"result\"]",
+    "notes": [
+     {
+      "line": 1,
+      "text": "ask() returns the answer text for one question."
+     },
+     {
+      "line": 2,
+      "text": "The comment marks the swap: after the bot ships, import answer from bot.app instead."
+     },
+     {
+      "line": 4,
+      "text": "claude -p runs one non-interactive session; --plugin-dir plugin loads the kb plugin from this repo."
+     },
+     {
+      "line": 5,
+      "text": "Sonnet 5.5 at low effort: cheap, and the same settings the bot will use."
+     },
+     {
+      "line": 6,
+      "text": "capture_output and check=True: a failing claude run raises instead of scoring an empty answer."
+     },
+     {
+      "line": 8,
+      "text": "--output-format json wraps the answer in JSON; the answer text is in result."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "No maxTurns, no budget cap on the answer run. A limit that cuts an answer in the middle would score the limit, not the brain. Cost is reported and charted instead."
+   }
+  },
+  {
+   "h": "kb ingest-collect: this week's news per page (G6-19)",
+   "p": [
+    "The weekly ingest should spend model time only on pages with real news. So a plain script does the finding. It lists fcp PRs merged and Jira epics closed since the last run. It groups them by the page whose applies_to or sources they touch. Changes with no page go to an unmatched list, which becomes candidates for new pages that an owner decides on.",
+    "The script keeps no state. --since comes from the routine, because the Temporal schedule knows the last run."
+   ],
+   "because": "We shell out to gh api instead of writing a GitHub client. gh already handles auth, pagination and JSON filtering with --jq.",
+   "code": {
+    "lang": "python",
+    "file": "rnd-kb-tooling/src/kb_tools/ingest_collect.py",
+    "text": "# rnd-kb-tooling/src/kb_tools/ingest_collect.py: finds this week's news per page; no model calls\nimport fnmatch\nimport json\nimport subprocess\nfrom collections import defaultdict\n\n\ndef gh(*args: str) -> list[str]:\n    return subprocess.run([\"gh\", \"api\", *args], capture_output=True, text=True, check=True).stdout.splitlines()\n\n\ndef merged_prs(since: str) -> list[dict]:\n    query = f\"repo:RhinoHealth/fcp is:pr is:merged merged:>={since}\"\n    lines = gh(\"-X\", \"GET\", \"search/issues\", \"-f\", f\"q={query}\", \"--paginate\",\n               \"--jq\", \".items[] | {number, title, url: .html_url}\")\n    return [json.loads(line) for line in lines]",
+    "notes": [
+     {
+      "line": 1,
+      "text": "No model calls in this file. It is a plain script that runs the same way every week."
+     },
+     {
+      "line": 2,
+      "text": "fnmatch matches file paths against applies_to globs, like the kb touched command in g6-4."
+     },
+     {
+      "line": 8,
+      "text": "gh(): run gh api with the given arguments and return the output lines."
+     },
+     {
+      "line": 12,
+      "text": "merged_prs(): the GitHub search query for fcp PRs merged on or after since."
+     },
+     {
+      "line": 14,
+      "text": "--paginate follows every page of results; --jq keeps number, title and URL per PR."
+     },
+     {
+      "line": 16,
+      "text": "One JSON object per line becomes a list of dicts."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Grouping by page",
+   "p": [
+    "collect() takes the index (from index.json), the since date and the epics. The epics come from a read-only JQL query: project = RH AND issuetype = Epic AND status changed to Done after since. It returns work.json's content: pages with their PRs and epics, and the unmatched list.",
+    "DATA-SCOPE.md applies here too: keep titles and links, not comment threads, and filter deny-list terms."
+   ],
+   "because": "We match PRs by their changed files against applies_to, the same link the PR comment uses. So both tools agree on which page a change belongs to.",
+   "code": {
+    "lang": "python",
+    "file": "rnd-kb-tooling/src/kb_tools/ingest_collect.py",
+    "text": "def collect(index: list[dict], since: str, epics: list[dict]) -> dict:\n    work, unmatched = defaultdict(lambda: {\"prs\": [], \"epics\": []}), []\n    for pr in merged_prs(since):\n        files = gh(f\"repos/RhinoHealth/fcp/pulls/{pr['number']}/files\", \"--paginate\", \"--jq\", \".[].filename\")\n        pages = [p[\"path\"] for p in index\n                 if any(g.startswith(\"fcp:\") and fnmatch.filter(files, g[4:]) for g in p[\"applies_to\"])]\n        for path in pages:\n            work[path][\"prs\"].append(pr)\n        if not pages:\n            unmatched.append(pr)\n    for epic in epics:  # from read-only JQL: epics moved to Done since `since`\n        pages = [p[\"path\"] for p in index if epic[\"key\"] in p[\"sources\"]]\n        for path in pages:\n            work[path][\"epics\"].append(epic)\n        if not pages:\n            unmatched.append(epic)\n    return {\"pages\": work, \"unmatched\": unmatched}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "work: page path to {prs, epics}; a defaultdict with a lambda builds the two empty lists on first use."
+     },
+     {
+      "line": 3,
+      "text": "For each merged PR, fetch its files with the pulls API."
+     },
+     {
+      "line": 5,
+      "text": "A page matches when any of its fcp: globs matches any changed file. g[4:] strips the 'fcp:' prefix."
+     },
+     {
+      "line": 7,
+      "text": "Append the PR under every matching page."
+     },
+     {
+      "line": 10,
+      "text": "No page matched: the PR goes to unmatched, a candidate for a new page."
+     },
+     {
+      "line": 11,
+      "text": "Epics match by key: a page whose sources list the epic gets it."
+     },
+     {
+      "line": 17,
+      "text": "The return value is written as work.json for the routine."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The ingest as a routine (G6-20)",
+   "p": [
+    "The ingest is not a new workflow. It is a charter for G5's routineRun workflow (lesson g5-1): data only, in G5-06's format, next to the other charters in ai-agents/routines/charters/. routineRun (TypeScript, in ai-agents/orchestrator/) loads it and claims a lite VM. It runs the setup command and lets the agent work with the kb and pr-story skills.",
+    "The walls are the same as Nova's. No keys in the VM, and the broker may push only to RhinoHealth/rnd-kb on branches kb-ingest/<week>/<owner>. fcp and Jira are read-only, and a person (the page owner) approves every PR. The routine never sets confidence above med and never touches DATA-SCOPE.md, OWNERS.yml, templates or .github/.",
+    "It starts in shadow for two weeks. Proposed diffs go to the run's S3 artifacts, and Shai compares them with what an owner would write."
+   ],
+   "because": "We ship the ingest as a charter instead of code. Then every routine shares one tested workflow, one trust ladder and one set of noise rules.",
+   "code": {
+    "lang": "yaml",
+    "file": "ai-agents/routines/charters/kb-ingest.yaml",
+    "text": "# ai-agents/routines/charters/kb-ingest.yaml: data only, in G5-06's charter format. G5's routineRun workflow\n# (TypeScript, ai-agents/orchestrator/) loads it; repo, read_only and setup are G5-06's optional keys.\nname: kb-ingest\nowner: shai                           # the routine's owner never approves its PRs; page owners do\nstage: shadow                         # shadow -> drafts to owners -> normal (G5 trust ladder)\ntrigger:\n  kind: schedule                      # a Temporal schedule in G5-13's list, Monday, odd minute\n  cron: \"41 6 * * 1\"\nrun_id: \"sched:kb-ingest\"             # G5-13's schedule ID: one run a week; overlap SKIP never stacks a second\nvm: { size: lite }\nmodel: { name: claude-opus-5-5, effort: medium } # the routing table's default\nrepo: RhinoHealth/rnd-kb\nallowed_paths: [\"engineering/**\", \"product/**\", \"decisions/**\", \"runbooks/**\", \"index.md\", \"index.json\"]\ndenied_paths: [\"DATA-SCOPE.md\", \"OWNERS.yml\", \"templates/**\", \".github/**\"]\nread_only: [\"RhinoHealth/fcp\", \"jira:project=RH\"]\nskills: [kb, pr-story]\nsetup: \"kb ingest-collect --since {last_run} > work.json\" # the Python kb CLI (G6-10), baked into the agent image\ndone:\n  - each changed page cites the PR or epic that changed it and passes kb lint\n  - confidence stays at most med\n  - one PR per page owner, with that owner as reviewer; unmatched changes are listed in the PR, not written up",
+    "notes": [
+     {
+      "line": 3,
+      "text": "name: the routine. Its task queue and schedule ID are derived from it."
+     },
+     {
+      "line": 4,
+      "text": "owner: Shai, who never approves its PRs; page owners do."
+     },
+     {
+      "line": 5,
+      "text": "stage: shadow first, then drafts to owners, then normal (the G5 trust ladder)."
+     },
+     {
+      "line": 7,
+      "text": "A Temporal schedule, Monday 06:41 UTC, in G5-13's list."
+     },
+     {
+      "line": 9,
+      "text": "run_id sched:kb-ingest: one run a week; overlap policy SKIP never stacks a second run."
+     },
+     {
+      "line": 10,
+      "text": "A lite VM: the ingest edits markdown, not Django."
+     },
+     {
+      "line": 11,
+      "text": "Opus 5.5 at medium effort: the routing table's default."
+     },
+     {
+      "line": 13,
+      "text": "allowed_paths: the four page folders and the two index files. Nothing else may change."
+     },
+     {
+      "line": 14,
+      "text": "denied_paths: the scope, the owners, the templates and the workflows are off limits."
+     },
+     {
+      "line": 15,
+      "text": "read_only: fcp and the RH Jira project. The broker enforces it."
+     },
+     {
+      "line": 17,
+      "text": "setup: the Python kb CLI, baked into the agent image, writes work.json before the agent starts."
+     },
+     {
+      "line": 18,
+      "text": "done: what a finished run looks like, as guidance for the agent and the judge."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "G5's noise rules apply: one open ingest PR per owner, closed after 7 idle days. Without that, owners who are away collect a stack of stale PRs. Also, this charter has no team or queue, and the Charter schema lets that pass. Agree a queue with the G5-06 owner, or kb-ingest has no slot line."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Score retrieval and catch a leak",
+  "youNeed": [
+   "Python 3.13 and uv",
+   "the ~/labs/touched folder from g6-4 (or any folder)"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/labs/brainqa/cases ~/labs/brainqa/kb/engineering ~/labs/brainqa/kb/runbooks && cd ~/labs/brainqa",
+    "see": "Two folders: cases (the golden set) and kb (the pages)."
+   },
+   {
+    "do": "Write three cases as in the G6-17 block but shorter: cases/bq-001.yaml (question about changing a proto so old clients keep working; source_pages [engineering/code-run-path.md]; expect answer), cases/bq-002.yaml (why are my integration tests waiting for the QA lock; source runbooks/integration-test-lock.md; expect answer) and cases/bq-003.yaml (the holiday on-call rota; source_pages []; expect not_in_kb).",
+    "see": "Three YAML files with id, question, source_pages and expect."
+   },
+   {
+    "do": "Write three pages in kb/: engineering/code-run-path.md (one line: protos live in common/fcp_common/rhinoAgentRpc; add fields, never rename or remove them, because old on-prem clients keep using them), runbooks/integration-test-lock.md (one lock per component per cloud) and engineering/ci-map.md (CI runs on push; frontend on pull_request). Each starts with a title in frontmatter.",
+    "see": "Three short pages."
+   },
+   {
+    "do": "Create brain_qa.py with retrieval() and leaked() copied from the G6-18 block, plus these stand-ins above them:\n\nimport re, sys\nfrom pathlib import Path\nimport yaml\nWORD = re.compile(r\"[a-z0-9_]+\")\n\ndef normalise(text):\n    return \" \".join(WORD.findall(text.lower()))\n\ndef word_runs(text, n):\n    words = normalise(text).split()\n    return [\" \".join(words[i:i + n]) for i in range(len(words) - n + 1)]\n\ndef search(kb_dir, question, limit=5):\n    q = set(normalise(question).split())\n    scored = [(len(q & set(normalise(p.read_text()).split())), str(p.relative_to(kb_dir))) for p in Path(kb_dir).rglob(\"*.md\")]\n    return [path for score, path in sorted(scored, reverse=True)[:limit] if score]\n\nand at the end:\n\nif __name__ == \"__main__\":\n    cases = [yaml.safe_load(p.read_text()) for p in sorted(Path(sys.argv[1]).glob(\"*.yaml\"))]\n    print(f\"cases: {len(cases)}  retrieval: {retrieval(cases, sys.argv[2]):.0%}  leaked: {leaked(cases, sys.argv[2]) or 'none'}\")\n\n(in retrieval() and leaked(), hit.path becomes the path string the stand-in returns)",
+    "see": "A script of about 45 lines. The word-overlap search stands in for BM25; the scoring code is the ticket's."
+   },
+   {
+    "do": "uv run --with pyyaml python brain_qa.py cases kb",
+    "see": "cases: 3  retrieval: 100%  leaked: none"
+   },
+   {
+    "do": "Paste the exact text of the bq-001 question at the end of kb/engineering/ci-map.md, then run the same command.",
+    "see": "cases: 3  retrieval: 100%  leaked: ['bq-001']"
+   }
+  ],
+  "faded": "Make retrieval fail: rename kb/runbooks/integration-test-lock.md to kb/runbooks/qa-lock.md without changing the case. Predict the retrieval number before you run it, then run it. Then add the `--mode retrieval` exit rule from the ticket: exit 1 when retrieval is below 0.85.",
+  "alone": "Write collect() from the G6-19 block against fake data instead of gh. Use three PR dicts with a files list each, an index of two pages with applies_to globs, and one epic. Print work.json with json.dumps(indent=2) and check it by eye. A PR touching .github/workflows lands under the CI page, and a PR touching README.md lands in unmatched.",
+  "done": "Your runner prints 100% on the clean KB, names bq-001 as leaked after the paste, and exits 1 after the rename. Your collect() groups PRs by page."
+ },
+ "quiz": [
+  {
+   "q": "Why do the BRAIN-QA cases live in a restricted repo instead of rnd-kb?",
+   "options": [
+    {
+     "text": "Because YAML files are not allowed in rnd-kb.",
+     "correct": false,
+     "why": "seed-plan.yml and OWNERS.yml are YAML in rnd-kb; the format is not the issue."
+    },
+    {
+     "text": "So the brain and the bot can never index the questions; otherwise the test would measure memory, not knowledge.",
+     "correct": true,
+     "why": "G6-17 and the leak check in G6-18 exist for exactly this reason."
+    },
+    {
+     "text": "Because the questions contain customer names.",
+     "correct": false,
+     "why": "Names and customer identifiers are removed from the cases."
+    }
+   ]
+  },
+  {
+   "q": "The ingest routine finds a page with news and the facts are clearly right. What confidence may it set?",
+   "options": [
+    {
+     "text": "high, since the PR it cites is merged.",
+     "correct": false,
+     "why": "Only an owner sets high; the charter says confidence stays at most med."
+    },
+    {
+     "text": "At most med; the page owner raises it when they approve the PR.",
+     "correct": true,
+     "why": "That is the rule in G6-20's charter and in the done list."
+    },
+    {
+     "text": "It leaves confidence alone and only adds the source.",
+     "correct": false,
+     "why": "It may edit bodies and sources and set up to med; leaving it is allowed but not required."
+    }
+   ]
+  },
+  {
+   "q": "Retrieval mode runs on every rnd-kb PR. How many model calls does it make?",
+   "options": [
+    {
+     "text": "One per case, to Sonnet 5.5 at low effort.",
+     "correct": false,
+     "why": "That is answers mode, which runs nightly."
+    },
+    {
+     "text": "None; it runs the kb search ranking and checks the top 5.",
+     "correct": true,
+     "why": "G6-18: --mode retrieval makes no model calls, so it is cheap enough for every PR."
+    },
+    {
+     "text": "One per PR, to the judge.",
+     "correct": false,
+     "why": "The judge only scores answers, nightly."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From g6-4: what does kb search print for each hit, and why does that format matter for BRAIN-QA?",
+  "From g5-1: which keys does a routine charter need, and who approves a routine's PRs?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "golden set",
+   "plain": "A fixed list of test cases with known right answers, kept where the thing under test cannot read it."
+  },
+  {
+   "term": "retrieval",
+   "plain": "The first half of answering: finding the right page. Scored as 'a source page is in the top 5'."
+  },
+  {
+   "term": "judge",
+   "plain": "A model that marks each answer point PASS or FAIL; checked against a person's labels before it is trusted."
+  },
+  {
+   "term": "leak check",
+   "plain": "A test that no question text appears in a page, done by searching for 8-word runs of each question."
+  },
+  {
+   "term": "ingest",
+   "plain": "The weekly routine that updates pages with merged PRs and closed epics and opens one PR per owner."
+  },
+  {
+   "term": "charter",
+   "plain": "The YAML file that describes a routine (trigger, VM, paths, skills, done) for G5's routineRun workflow."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G6-17",
+   "why": "This lesson walked through a case file and explained where the cases live and why.",
+   "walk": [
+    "Search public engineering channels for questions from the last 6 months ('how does', 'why do we', 'where is'). Rewrite private-channel questions as summaries.",
+    "For each case record source_pages and 2 to 4 answer_points; remove names and anything that identifies a customer.",
+    "Include about 6 not_in_kb cases whose right answer is 'I don't know' plus where to ask.",
+    "Spread the 60 cases over cloud, client, frontend, CI and QA, product, decisions and runbooks; tag each.",
+    "Commit them under brain-qa/cases/ in the restricted golden-set repo. Never in rnd-kb."
+   ]
+  },
+  {
+   "key": "G6-18",
+   "why": "This lesson walked through brain_qa.py and you wrote retrieval() and leaked() in the lab.",
+   "walk": [
+    "Add rnd-kb-tooling/evals/brain_qa.py with --mode retrieval (no model calls; a step in kb-lint's CI; ids and totals only) and --mode answers (nightly).",
+    "Answers go through claude -p with the kb plugin (Sonnet 5.5, low) until the bot ships, then through bot.app.answer(). The judge runs on Sonnet 5.5 at medium, PASS/FAIL per point. Check it first against Shai's labels on 10 answers.",
+    "Add the leak check. Fail when an 8-word run of a question appears in a page. Also fail when the golden-set repo is in any search or bot source list.",
+    "Write results JSON to the G1 eval store and the two numbers to the check summary; retrieval below 85% fails the PR.",
+    "Run the nightly on the agents' runner set through the LLM gateway with the evals key; the runner holds no Anthropic key."
+   ]
+  },
+  {
+   "key": "G6-19",
+   "why": "This lesson walked through ingest_collect.py and you wrote collect() against fake data.",
+   "walk": [
+    "Add src/kb_tools/ingest_collect.py from the two blocks above behind kb ingest-collect --since <date>.",
+    "GitHub: search merged fcp PRs since the date, fetch each PR's files, match them to pages by applies_to from index.json.",
+    "Jira: read-only JQL for RH epics moved to Done since the date; match by key against pages' sources.",
+    "Write work.json: per page the PRs and epics with title and URL, plus the unmatched list. Keep titles and links only, and filter deny-list terms."
+   ]
+  },
+  {
+   "key": "G6-20",
+   "why": "This lesson walked through the kb-ingest charter and explained why it is data, not code.",
+   "walk": [
+    "Write ai-agents/routines/charters/kb-ingest.yaml from the block above, in G5-06's format.",
+    "Add kb-ingest to G5-13's schedule list in ai-agents/orchestrator/src/triggers/schedules.ts (Monday 06:41 UTC, overlap SKIP).",
+    "Ask Platform for the broker scope: push to RhinoHealth/rnd-kb on kb-ingest/<week>/<owner> branches; fcp and Jira read-only.",
+    "Run in shadow for 2 weeks. Compare the proposed diffs in the run's S3 artifacts with what an owner would write. Then move to drafts to owners.",
+    "Confirm G5's noise rules apply: one open ingest PR per owner, closed after 7 idle days."
+   ]
+  }
+ ],
+ "remember": "Hidden questions, a score on every PR, and a weekly routine that proposes but never approves. That is how the brain stays right over time."
+}

@@ -1,0 +1,447 @@
+{
+ "id": "p1-7",
+ "title": "One file to ship: bundling with esbuild",
+ "minutes": 40,
+ "youNeed": [
+  "p1-6"
+ ],
+ "bridge": "esbuild is like Vite's production build, for a Node program: it follows every import and writes one file. Except: the file runs on a VM with no node_modules beside it. Everything must be inside, and a CommonJS dependency may need a small banner to find require.",
+ "intro": "The harness, nova-worker, runs inside every sandbox VM, and nothing is installed there at run time. So it ships as one bundled file in a release tarball, which the Packer image unpacks. This lesson bundles a small CLI the same way and publishes it as a GitHub release.",
+ "picture": {
+  "caption": "From source to a file on every VM: bundle, pack, release, bake into the image.",
+  "nodes": [
+   {
+    "id": "src",
+    "label": "harness/src/main.ts + imports",
+    "kind": "file"
+   },
+   {
+    "id": "esbuild",
+    "label": "esbuild --bundle",
+    "kind": "service"
+   },
+   {
+    "id": "mjs",
+    "label": "nova-worker.mjs (#!/usr/bin/env node)",
+    "kind": "file"
+   },
+   {
+    "id": "tgz",
+    "label": "ai-agents-harness-<version>.tgz",
+    "kind": "file"
+   },
+   {
+    "id": "release",
+    "label": "GitHub release",
+    "kind": "cloud"
+   },
+   {
+    "id": "vm",
+    "label": "image: /usr/local/bin/nova-worker",
+    "kind": "machine"
+   }
+  ],
+  "steps": [
+   {
+    "from": "src",
+    "to": "esbuild",
+    "text": "follows every import: our packages, zod, the Agent SDK's /core entry"
+   },
+   {
+    "from": "esbuild",
+    "to": "mjs",
+    "text": "writes one ESM file with a shebang on top"
+   },
+   {
+    "from": "mjs",
+    "to": "tgz",
+    "text": "tar packs it with workflows/, prompts/ and protected-paths.yaml"
+   },
+   {
+    "from": "tgz",
+    "to": "release",
+    "text": "release-harness.yml attaches it to the tag's release"
+   },
+   {
+    "from": "release",
+    "to": "vm",
+    "text": "Packer downloads and unpacks it; nothing to npm install on the VM"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Why one file",
+   "p": [
+    "A service runs in a Docker image with its node_modules (lesson p1-8). The harness is different. It runs on the VM itself, next to fcp's own tools, and the VM cannot reach the npm registry. A bundle needs nothing but Node 24.",
+    "One file is also one version. The same nova-worker.mjs runs in the VM and in the bench, so a bench score describes exactly what ships."
+   ],
+   "because": "We give the harness a small CLI with subcommands, so the VM, the bench and people all start it one way.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/cli.ts",
+    "text": "import { readFile } from \"node:fs/promises\";\nimport { RunScope } from \"@lab/shared/schemas\";\n\nconst [command, file] = process.argv.slice(2);\nif (command !== \"check\" || !file) {\n  console.error(\"usage: lab-worker check <scope.json>\");\n  process.exit(2);\n}\nconst result = RunScope.safeParse(JSON.parse(await readFile(file, \"utf8\")));\nconsole.log(result.success ? `ok: ${result.data.repo} ${result.data.branch}` : `bad scope: ${result.error.issues.length} problem(s)`);\nprocess.exitCode = result.success ? 0 : 1;",
+    "notes": [
+     {
+      "line": 4,
+      "text": "argv[0] is node and argv[1] the script; the arguments start at 2."
+     },
+     {
+      "line": 7,
+      "text": "Exit code 2 is the usual answer to wrong usage."
+     },
+     {
+      "line": 9,
+      "text": "The schema from p1-5. zod goes into the bundle with it."
+     },
+     {
+      "line": 11,
+      "text": "Sets the exit code but lets Node finish writing output first."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The esbuild command",
+   "p": [
+    "esbuild starts at one file, follows every import, and writes the result. Each flag below matters.",
+    "The ai-agents release job runs the same command on harness/src/main.ts, with --outfile=dist/harness/nova-worker.mjs."
+   ],
+   "because": "We name every flag because each one changes what the file can do on the VM.",
+   "code": {
+    "lang": "bash",
+    "file": "terminal, in ~/p1-lab",
+    "text": "npx esbuild svc/src/cli.ts \\\n  --bundle \\\n  --platform=node \\\n  --format=esm \\\n  --target=node24 \\\n  --banner:js='#!/usr/bin/env node' \\\n  --outfile=dist/lab-worker.mjs",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Pull every import into the file: @lab/shared, zod, anything else."
+     },
+     {
+      "line": 3,
+      "text": "Leave node: built-ins as imports, since Node provides them."
+     },
+     {
+      "line": 4,
+      "text": "Write an ES module. The .mjs ending tells Node so, with no package.json needed."
+     },
+     {
+      "line": 5,
+      "text": "Write syntax Node 24 runs as it is."
+     },
+     {
+      "line": 6,
+      "text": "Put this text on line 1: the shebang that lets the OS run the file with node."
+     },
+     {
+      "line": 7,
+      "text": "One file. dist/ is in .gitignore."
+     }
+    ]
+   },
+   "see": "  dist/lab-worker.mjs  738.8kb\n\n⚡ Done in 61ms"
+  },
+  {
+   "h": "The shebang and running it",
+   "p": [
+    "#!/usr/bin/env node on line 1 is a shebang: it tells the OS which program runs this file. Make the file executable with chmod +x and you can run it like any command.",
+    "Packer links /usr/local/bin/nova-worker to the bundled file, so on a VM you type nova-worker run /run/nova/task.json."
+   ],
+   "because": "We run the bundle from an empty folder, because only that proves nothing is missing from it.",
+   "code": {
+    "lang": "bash",
+    "file": "terminal, in ~/p1-lab",
+    "text": "head -1 dist/lab-worker.mjs\nchmod +x dist/lab-worker.mjs\n./dist/lab-worker.mjs check runs/scope.json\nmkdir -p ~/p1-empty && cp dist/lab-worker.mjs runs/scope.json ~/p1-empty/\ncd ~/p1-empty && ./lab-worker.mjs check scope.json; ./lab-worker.mjs; echo \"exit $?\"",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Shows the banner esbuild added."
+     },
+     {
+      "line": 2,
+      "text": "Executable. Packer does the same with chmod 0755."
+     },
+     {
+      "line": 4,
+      "text": "No node_modules and no package.json here. If the bundle missed an import, this fails."
+     },
+     {
+      "line": 5,
+      "text": "Without arguments the CLI prints its usage and exits 2."
+     }
+    ]
+   },
+   "see": "#!/usr/bin/env node\nok: RhinoHealth/fcp nova/RH-1234\nok: RhinoHealth/fcp nova/RH-1234\nusage: lab-worker check <scope.json>\nexit 2"
+  },
+  {
+   "h": "When a dependency needs require",
+   "p": [
+    "Some packages on npm are CommonJS: they call require(\"fs\") inside. In an ESM bundle there is no require, so esbuild leaves a stub that throws when it runs. You see it only when you run the file, not when you build it.",
+    "The fix is a second banner line that creates require from import.meta.url. We hit this with the yaml package, and the harness reads YAML, so test the bundle by running it."
+   ],
+   "because": "We add createRequire to the banner because the error only shows up at run time, on the VM.",
+   "code": {
+    "lang": "bash",
+    "file": "terminal, in ~/p1-lab",
+    "text": "echo 'import YAML from \"yaml\"; console.log(YAML.stringify({ a: 1 }).trim());' > svc/src/y.ts\nnpx esbuild svc/src/y.ts --bundle --platform=node --format=esm --outfile=dist/y.mjs\nnode dist/y.mjs     # Error: Dynamic require of \"process\" is not supported\nnpx esbuild svc/src/y.ts --bundle --platform=node --format=esm --outfile=dist/y.mjs \\\n  --banner:js='import { createRequire } from \"node:module\"; const require = createRequire(import.meta.url);'\nnode dist/y.mjs     # a: 1",
+    "notes": [
+     {
+      "line": 1,
+      "text": "yaml is used by charters and the protected-paths file. Install it first: npm install -w svc yaml@2.8.1."
+     },
+     {
+      "line": 3,
+      "text": "The bundle builds fine and fails only when it runs."
+     },
+     {
+      "line": 5,
+      "text": "Makes a real require for this file, so CommonJS code inside the bundle can load Node built-ins."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "In the release job the shebang and the createRequire line go in one banner, shebang first. The shebang must be the very first line of the file."
+   }
+  },
+  {
+   "h": "Bundling the Agent SDK: the /core entry",
+   "p": [
+    "The harness imports the Agent SDK from @anthropic-ai/claude-agent-sdk/core, the SDK's documented entry for bundled apps. It exports the same names, and takes zod from your bundle instead of carrying its own copy. Never import both entries in one process.",
+    "The harness also passes pathToClaudeCodeExecutable: /usr/local/bin/claude, the pinned Claude Code in the image. So the SDK's own binary is not needed, and the SDK runs the binary the nightly smoke test passed. Lesson p8-1 explains the rest."
+   ],
+   "because": "We use /core and a fixed binary path because the bundle carries the code, and the image carries the tested binary.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/session.ts (G3-19, the lines that matter here)",
+    "text": "import { createSdkMcpServer, type Options, type SessionStore } from \"@anthropic-ai/claude-agent-sdk/core\";\n\n// inside buildOptions(...):\npathToClaudeCodeExecutable: \"/usr/local/bin/claude\", // the pinned binary the nightly smoke test passed (G3-14)",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The entry for bundled apps. Never import the root entry in the same process."
+     },
+     {
+      "line": 1,
+      "text": "Type-only names, written with type because of verbatimModuleSyntax."
+     },
+     {
+      "line": 4,
+      "text": "Claude Code installed by Packer with npm install -g, pinned and never self-updating."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Publishing it as a release",
+   "p": [
+    "A GitHub release is a tag plus files attached to it, called assets. release-harness.yml bundles the harness, packs nova-worker.mjs with workflows/, prompts/ and settings/protected-paths.yaml into ai-agents-harness-<version>.tgz, and attaches it.",
+    "The nightly Packer build downloads that asset with a short-lived token, unpacks it into /opt/ai-agents/harness and links /usr/local/bin/nova-worker. Nothing else is installed. In the lab you do the same with your own scratch repo and gh."
+   ],
+   "because": "We ship through a release because a release asset is versioned, cannot change silently, and needs nothing to install.",
+   "code": {
+    "lang": "bash",
+    "file": "terminal, in ~/p1-lab",
+    "text": "tar -czf dist/lab-worker-v0.1.0.tgz -C dist lab-worker.mjs\ngh repo create p1-lab --private --source=. --push\ngh release create v0.1.0 dist/lab-worker-v0.1.0.tgz --title v0.1.0 --notes \"lab bundle\"\ngh release download v0.1.0 --dir ~/p1-dl\ntar -xzf ~/p1-dl/lab-worker-v0.1.0.tgz -C ~/p1-dl && ~/p1-dl/lab-worker.mjs check runs/scope.json",
+    "notes": [
+     {
+      "line": 1,
+      "text": "-C dist packs the file without the dist/ prefix, like the real tarball's layout."
+     },
+     {
+      "line": 2,
+      "text": "A private scratch repo in your own account from this folder. Never a company repo."
+     },
+     {
+      "line": 3,
+      "text": "Makes the tag v0.1.0 on main and attaches the tarball as an asset."
+     },
+     {
+      "line": 4,
+      "text": "What Packer's build job does with its token: fetch the asset by tag."
+     },
+     {
+      "line": 5,
+      "text": "Unpack and run. tar keeps the executable bit from chmod +x."
+     }
+    ]
+   },
+   "see": "✓ Created repository <you>/p1-lab on github.com\n✓ Pushed commits to https://github.com/<you>/p1-lab.git\nhttps://github.com/<you>/p1-lab/releases/tag/v0.1.0\nok: RhinoHealth/fcp nova/RH-1234\n(output trimmed)",
+   "ifInstead": "If instead gh says the repo has no commits, run git log. The first step of p1-2 made the 'lab start' commit."
+  }
+ ],
+ "lab": {
+  "title": "Bundle, run anywhere, release",
+  "youNeed": [
+   "~/p1-lab from p1-6",
+   "gh CLI logged in to your own account"
+  ],
+  "worked": [
+   {
+    "do": "npm install -D esbuild@0.25.10",
+    "see": "added 2 packages, and audited <n> packages\nfound 0 vulnerabilities"
+   },
+   {
+    "do": "Create svc/src/cli.ts. Then: echo '{\"runId\":\"run-1\",\"agent\":\"nova\",\"repo\":\"RhinoHealth/fcp\",\"branch\":\"nova/RH-1234\",\"jiraKey\":\"RH-1234\",\"expiresAt\":\"2026-10-13T18:00:00Z\"}' > runs/scope.json",
+    "see": "(no output)"
+   },
+   {
+    "do": "npx esbuild svc/src/cli.ts --bundle --platform=node --format=esm --target=node24 --banner:js='#!/usr/bin/env node' --outfile=dist/lab-worker.mjs",
+    "see": "  dist/lab-worker.mjs  738.8kb\n\n⚡ Done in 61ms"
+   },
+   {
+    "do": "head -1 dist/lab-worker.mjs && chmod +x dist/lab-worker.mjs && ./dist/lab-worker.mjs check runs/scope.json",
+    "see": "#!/usr/bin/env node\nok: RhinoHealth/fcp nova/RH-1234"
+   },
+   {
+    "do": "mkdir -p ~/p1-empty && cp dist/lab-worker.mjs runs/scope.json ~/p1-empty/ && cd ~/p1-empty && ./lab-worker.mjs check scope.json; cd ~/p1-lab",
+    "see": "ok: RhinoHealth/fcp nova/RH-1234"
+   },
+   {
+    "do": "tar -czf dist/lab-worker-v0.1.0.tgz -C dist lab-worker.mjs && tar -tzf dist/lab-worker-v0.1.0.tgz",
+    "see": "lab-worker.mjs"
+   },
+   {
+    "do": "gh repo create p1-lab --private --source=. --push && gh release create v0.1.0 dist/lab-worker-v0.1.0.tgz --title v0.1.0 --notes 'lab bundle'",
+    "see": "✓ Created repository <you>/p1-lab on github.com\nhttps://github.com/<you>/p1-lab/releases/tag/v0.1.0\n(output trimmed)"
+   },
+   {
+    "do": "gh release download v0.1.0 --dir ~/p1-dl && tar -xzf ~/p1-dl/lab-worker-v0.1.0.tgz -C ~/p1-dl && ~/p1-dl/lab-worker.mjs check runs/scope.json",
+    "see": "ok: RhinoHealth/fcp nova/RH-1234"
+   }
+  ],
+  "faded": "Bundle the yaml example from 'When a dependency needs require'. First build it without the createRequire banner and see it fail when run. Left to you: one esbuild command with a two-line banner, shebang first and createRequire second. Then a run that prints a: 1.",
+  "alone": "Give the CLI a version subcommand. Declare declare const VERSION: string; in cli.ts, build with --define:VERSION='\"0.2.0\"', and make lab-worker version print 0.2.0. Then pack it as v0.2.0, release it, download it into a fresh folder and run it there.",
+  "done": "The bundle runs from an empty folder and from the downloaded release, and prints ok for the scope file."
+ },
+ "quiz": [
+  {
+   "q": "What does esbuild's --banner:js='#!/usr/bin/env node' add, and why does the harness need it?",
+   "options": [
+    {
+     "text": "A first line that lets the OS run the file with node, so /usr/local/bin/nova-worker works as a command",
+     "correct": true,
+     "why": "The shebang plus chmod makes the bundle a command; Packer links it into /usr/local/bin."
+    },
+    {
+     "text": "A comment that tells esbuild to target Node",
+     "correct": false,
+     "why": "--platform=node and --target do that; the banner is only text at the top."
+    },
+    {
+     "text": "An import of Node's built-in modules",
+     "correct": false,
+     "why": "Built-ins are imported where they are used; the banner adds none."
+    }
+   ]
+  },
+  {
+   "q": "The bundle builds, but running it prints: Dynamic require of \"fs\" is not supported. What is wrong?",
+   "options": [
+    {
+     "text": "esbuild could not find the fs package; install it",
+     "correct": false,
+     "why": "fs is built into Node; there is nothing to install."
+    },
+    {
+     "text": "A CommonJS dependency calls require inside an ESM bundle; add the createRequire banner",
+     "correct": true,
+     "why": "The banner gives the bundle a real require."
+    },
+    {
+     "text": "The file must be built with --platform=browser",
+     "correct": false,
+     "why": "That would break every Node built-in."
+    }
+   ]
+  },
+  {
+   "q": "Why does the harness pass pathToClaudeCodeExecutable: /usr/local/bin/claude?",
+   "options": [
+    {
+     "text": "So the SDK runs the pinned Claude Code that the nightly image smoke test passed",
+     "correct": true,
+     "why": "A bundle has no SDK binary, and the image's pinned one is known to work."
+    },
+    {
+     "text": "Because the VM has no PATH variable",
+     "correct": false,
+     "why": "PATH exists; the point is a fixed, tested binary."
+    },
+    {
+     "text": "So Claude Code can update itself during a run",
+     "correct": false,
+     "why": "Updates are turned off in the image; the version only moves with a new image."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p1-6: which one command runs every test file under svc/test through tsx?",
+  "From p1-1: what does \"type\": \"module\" change, and why does a .mjs file not need it?"
+ ],
+ "videos": [
+  {
+   "title": "TypeScript, Node, esbuild, Commander... Let's build a CLI!",
+   "url": "https://www.youtube.com/watch?v=mSnDUMybZXk",
+   "channel": "Matt Pocock",
+   "minutes": 70,
+   "why": "Exactly the use case: bundling a Node CLI with esbuild, live and unscripted."
+  },
+  {
+   "title": "Intro to ESBUILD: The FAST JavaScript BUNDLER",
+   "url": "https://www.youtube.com/watch?v=xRiC8YLGhGQ",
+   "channel": "Nono Martínez Alonso",
+   "minutes": 5,
+   "why": "Five-minute primer on what esbuild does and its basic CLI flags."
+  }
+ ],
+ "words": [
+  {
+   "term": "bundle",
+   "plain": "One file that holds a program and every package it imports."
+  },
+  {
+   "term": "esbuild",
+   "plain": "A fast bundler; it follows imports from one entry file and writes one output file."
+  },
+  {
+   "term": "shebang",
+   "plain": "A first line like #!/usr/bin/env node that tells the OS which program runs the file."
+  },
+  {
+   "term": "banner",
+   "plain": "Text esbuild puts at the top of the output; we use it for the shebang and createRequire."
+  },
+  {
+   "term": "createRequire",
+   "plain": "Makes a require function inside an ES module, for CommonJS code in a bundle."
+  },
+  {
+   "term": "release asset",
+   "plain": "A file attached to a GitHub release tag, downloaded by version."
+  },
+  {
+   "term": "/core entry",
+   "plain": "@anthropic-ai/claude-agent-sdk/core, the SDK's entry for bundled apps."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-01",
+   "why": "release-harness.yml bundles harness/ with esbuild into nova-worker.mjs and attaches the tarball to a release."
+  },
+  {
+   "key": "G3-14",
+   "why": "Packer downloads the release asset, unpacks it to /opt/ai-agents/harness and links /usr/local/bin/nova-worker."
+  },
+  {
+   "key": "G3-19",
+   "why": "The harness imports the SDK from /core and passes pathToClaudeCodeExecutable."
+  },
+  {
+   "key": "G4-03",
+   "why": "The bench's Nova adapter runs the same tarball inside the task container."
+  }
+ ],
+ "remember": "Bundle into one ESM file with a shebang, prove it in an empty folder, ship it as a release asset."
+}

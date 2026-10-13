@@ -1,0 +1,405 @@
+{
+ "id": "p2-6",
+ "title": "Renovate",
+ "minutes": 40,
+ "youNeed": [
+  "p2-1",
+  "p2-4"
+ ],
+ "bridge": "Renovate is like npm update run by a bot that opens the PRs for you. A config file says what to update, when, and who reviews. Except: it covers npm, Python, Dockerfiles and GitHub Actions at once. It waits for a release to age, and it rebases its own PRs every day.",
+ "intro": "fcp bumps dependencies with a weekly workflow that opens one PR per app. G5-04 replaces it with Renovate: grouped PRs once a month and nothing younger than 7 days. The upgrade fixers repair only what breaks. This lesson reads the config and the self-hosted workflow.",
+ "picture": {
+  "caption": "A daily cron runs Renovate on our runners with an App token. It reads renovate.json5 and opens grouped PRs on the 1st. CI runs, and a person (or an upgrade fixer first) handles them.",
+  "nodes": [
+   {
+    "id": "cron",
+    "label": "renovate.yml, cron 41 1 * * *",
+    "kind": "file"
+   },
+   {
+    "id": "runner",
+    "label": "fcp-runner-set",
+    "kind": "machine"
+   },
+   {
+    "id": "renovate",
+    "label": "Renovate (renovatebot/github-action)",
+    "kind": "service"
+   },
+   {
+    "id": "config",
+    "label": "renovate.json5",
+    "kind": "file"
+   },
+   {
+    "id": "pr",
+    "label": "renovate/* PRs, grouped",
+    "kind": "check"
+   },
+   {
+    "id": "fixer",
+    "label": "upgrade fixer (G5-23/24) or a person",
+    "kind": "agent"
+   }
+  ],
+  "steps": [
+   {
+    "from": "cron",
+    "to": "runner",
+    "text": "runs every day; new PRs appear only on the 1st, the schedule in the config"
+   },
+   {
+    "from": "runner",
+    "to": "renovate",
+    "text": "mints a one-hour token with create-github-app-token and starts Renovate"
+   },
+   {
+    "from": "renovate",
+    "to": "config",
+    "text": "reads managers, groups, minimumReleaseAge and reviewers"
+   },
+   {
+    "from": "renovate",
+    "to": "pr",
+    "text": "opens or rebases one PR per group; CI runs on push or on the PR"
+   },
+   {
+    "from": "pr",
+    "to": "fixer",
+    "text": "a red PR wakes the upgrade fixer through G5-12; green ones go to the reviewers"
+   },
+   {
+    "from": "fixer",
+    "to": "pr",
+    "text": "pushes a fix; a person merges, never the bot"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "What runs today, and why it goes",
+   "p": [
+    "Open fcp/.github/workflows/weekly-dependency-upgrades.yml. Every Saturday at 03:17 UTC it bumps gRPC first.",
+    "Then it runs a matrix over client, cloud, mcp-server, connect-api, frontend and sdk. Each runs make upgrade-deps or npm update and opens a PR per app with github-script. It is 300 lines of shell and YAML that only fcp has.",
+    "The cost is noise: six PRs a week, some red, each needing a person. Renovate does the same job as configuration.",
+    "It knows the ecosystems and groups updates. It waits for releases to settle, and rebases its PRs when main moves. G5-04 deletes the old workflow in the same PR, with no shim."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "Why monthly and 7 days old? Fewer, larger PRs are reviewed better than many small ones. And a release that broke people gets pulled or patched within a week."
+   }
+  },
+  {
+   "h": "renovate.json5: the top-level rules",
+   "p": [
+    "The config lives at the repo root as renovate.json5. JSON5 is JSON that allows comments and unquoted keys, so the file can explain itself. The first half sets the pace and the scope; packageRules below it set groups and reviewers."
+   ],
+   "because": "We set the pace in one place so every ecosystem follows the same rhythm. Reviewers then learn when to expect dependency PRs.",
+   "code": {
+    "lang": "json5",
+    "file": "fcp/renovate.json5 (from G5-04, part 1)",
+    "text": "// renovate.json5 (fcp root). Replaces .github/workflows/weekly-dependency-upgrades.yml.\n{\n  $schema: \"https://docs.renovatebot.com/renovate-schema.json\",\n  extends: [\"config:recommended\"],\n  timezone: \"Asia/Jerusalem\",\n  schedule: [\"* 2-6 1 * *\"],               // monthly: new PRs only on the 1st\n  minimumReleaseAge: \"7 days\",\n  internalChecksFilter: \"strict\",          // no branch at all until the release is 7 days old\n  rangeStrategy: \"update-lockfile\",        // like `uv lock --upgrade` / `npm update`: stay inside our ranges\n  lockFileMaintenance: { enabled: true },  // monthly refresh of transitive dependencies\n  labels: [\"dependencies\"],\n  prConcurrentLimit: 10,\n  enabledManagers: [\"npm\", \"pep621\", \"pip-compile\", \"dockerfile\", \"github-actions\"],\n  ignorePaths: [\"**/node_modules/**\", \"ohif/**\", \"cloud/rhinoCloud/rhino-containers/**\", \"cloud/rhinoCloud/rhinoCore/integration-tests/**\"],\n  \"pip-compile\": { managerFilePatterns: [\"/^sdk/requirements\\\\.txt$/\", \"/^cloud/mcp-server/requirements/.+\\\\.txt$/\"] },",
+    "notes": [
+     {
+      "line": 4,
+      "text": "config:recommended is Renovate's base preset: sensible defaults such as pinning Dockerfile digests."
+     },
+     {
+      "line": 6,
+      "text": "A cron-like schedule in the timezone above: hours 2 to 6 on day 1 of every month. Renovate still runs daily to rebase."
+     },
+     {
+      "line": 7,
+      "text": "A version younger than 7 days is not offered. Combined with line 8, no branch is even created before then."
+     },
+     {
+      "line": 9,
+      "text": "update-lockfile keeps package.json ranges as they are and moves the lockfile, exactly what the old workflow did."
+     },
+     {
+      "line": 13,
+      "text": "A manager is one ecosystem reader. pep621 reads pyproject.toml (uv), pip-compile the requirements files, github-actions the uses: lines."
+     },
+     {
+      "line": 14,
+      "text": "ohif and rhino-containers stay out until the BE guild says otherwise; integration-tests requirements are regenerated by a task instead."
+     }
+    ]
+   }
+  },
+  {
+   "h": "packageRules: groups, reviewers and post-upgrade tasks",
+   "p": [
+    "A packageRule matches some updates (by path, manager, package name or update type) and changes how they are handled. The first rules keep today's ownership: frontend to frontend-guild, cloud, client and sdk to backend-guild, mcp-server and connect-api to their owners.",
+    "groupName puts every matching update into one PR. matchUpdateTypes major with groupName null does the opposite: each major gets its own PR, so an upgrade fixer can take one alone."
+   ],
+   "because": "We group by app and reviewer. That is the unit a guild can review and a fixer can repair in one run.",
+   "code": {
+    "lang": "json5",
+    "file": "fcp/renovate.json5 (part 2, packageRules)",
+    "text": "  packageRules: [\n    { matchFileNames: [\"frontend/**\"], groupName: \"frontend npm\", reviewers: [\"team:frontend-guild\"] },\n    { matchFileNames: [\"cloud/rhinoCloud/**\"], groupName: \"cloud python\", reviewers: [\"team:backend-guild\"],\n      postUpgradeTasks: { executionMode: \"branch\", commands: [\"make -C cloud/rhinoCloud update-deps\"], fileFilters: [\"cloud/rhinoCloud/**\"] } },\n    { matchFileNames: [\"client/**\"], groupName: \"client python\", reviewers: [\"team:backend-guild\"] },\n    { matchFileNames: [\"sdk/**\"], groupName: \"sdk python\", reviewers: [\"team:backend-guild\"] },\n    { matchFileNames: [\"cloud/mcp-server/**\"], groupName: \"mcp-server\", reviewers: [\"yaniv-rhino\"] },\n    { matchFileNames: [\"cloud/connect-api/**\"], groupName: \"connect-api python\", reviewers: [\"richard-engineering\"] },\n    { matchUpdateTypes: [\"major\"], groupName: null },   // one PR per major, so a fixer can take it alone\n    { matchManagers: [\"github-actions\"], groupName: \"github actions\" },\n    { matchManagers: [\"dockerfile\"], groupName: \"base images\" },\n    { matchPackageNames: [\"RhinoHealth/byte\"], enabled: false },   // Byte's own fleet sync pins it\n  ],\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Every npm update under frontend/ lands in one PR titled after the group, reviewed by the guild team."
+     },
+     {
+      "line": 4,
+      "text": "After updating, run make update-deps on the branch so integration-tests/requirements.txt stays in step. Only files under the filter are committed."
+     },
+     {
+      "line": 9,
+      "text": "Rules apply in order; a later rule overrides. Majors leave their group here, and the gRPC rule (next block) puts them back."
+     },
+     {
+      "line": 10,
+      "text": "uses: lines pinned by SHA get updated with the SHA and the version comment, the way p2-2 pinned them."
+     },
+     {
+      "line": 12,
+      "text": "byte-review.yml's pin is moved by Byte's fleet-sync script, so Renovate must not touch it."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The gRPC rule: things that must move together",
+   "p": [
+    "The one special case from the old workflow survives as one rule. grpcio, grpcio-tools, protobuf and friends must be the same version in client and cloud, because both use the generated stubs in common/fcp_common/rhinoAgentRpc. The rule groups them, majors included, and regenerates the stubs on the branch."
+   ],
+   "because": "We regenerate the stubs inside Renovate's branch because CI finds a stub mismatch only after the PR exists. Doing it here makes the PR green or red on its own merits.",
+   "code": {
+    "lang": "json5",
+    "file": "fcp/renovate.json5 (the gRPC packageRule)",
+    "text": "    { matchPackageNames: [\"grpcio\", \"grpcio-tools\", \"grpcio-status\", \"grpcio-health-checking\", \"protobuf\"],\n      groupName: \"grpc stack\", reviewers: [\"team:backend-guild\"],   // client + cloud + stubs move together, majors too\n      postUpgradeTasks: { executionMode: \"branch\", fileFilters: [\"common/fcp_common/rhinoAgentRpc/**\", \"cloud/rhinoCloud/**\"],\n        commands: [\"cd cloud/rhinoCloud && uv sync --frozen --no-install-project --only-group grpc-stub-gen && uv run --no-sync make -C ../../common/fcp_common/rhinoAgentRpc protoc\",\n                   \"make -C cloud/rhinoCloud update-deps\"] } },",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Match by package name across every file, so client and cloud lockfiles land in the same PR."
+     },
+     {
+      "line": 2,
+      "text": "This rule comes after the major rule, so it wins. A major gRPC bump still ships as one PR for the whole stack."
+     },
+     {
+      "line": 4,
+      "text": "The same two commands the old workflow ran: install the stub toolchain, then make protoc."
+     },
+     {
+      "line": 4,
+      "text": "Only commands listed in RENOVATE_ALLOWED_COMMANDS may run; anything else is refused by Renovate itself."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "The old workflow has a Python check: 'gRPC versions match across client and cloud'. It moves into cloud-ci's Lint job, so it guards Renovate and people alike."
+   }
+  },
+  {
+   "h": "Self-hosting: the workflow that runs it",
+   "p": [
+    "Mend's hosted Renovate app cannot run postUpgradeTasks, so we run Renovate ourselves on fcp-runner-set. The workflow is small. It mints a token with the rhino-actions-pr-creator App (the same one the old workflow used).",
+    "Then it runs the renovatebot/github-action pinned by SHA. It runs daily at 01:41 UTC to rebase. New PRs still appear only on the 1st because of the schedule in the config.",
+    "The sketch below is written from G5-04's steps. Input names of renovatebot/github-action change between versions: check its README for the current ones before you copy this."
+   ],
+   "because": "We run Renovate on our own runners because the gRPC stub regeneration needs uv and make on the branch. Only a self-hosted run can do that.",
+   "code": {
+    "lang": "yaml",
+    "file": "fcp/.github/workflows/renovate.yml (sketch from G5-04; check renovatebot/github-action's README for input names)",
+    "text": "name: Renovate\non:\n  schedule:\n    - cron: '41 1 * * *'   # daily: rebases open PRs; new PRs only on the 1st (schedule in renovate.json5)\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  renovate:\n    runs-on: fcp-runner-set\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          persist-credentials: false\n      - id: app-token\n        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0\n        with:\n          app-id: ${{ secrets.RHINO_PR_CREATOR_APP_ID }}\n          private-key: ${{ secrets.RHINO_PR_CREATOR_PRIVATE_KEY }}\n      - uses: renovatebot/github-action@<sha>   # pin by SHA; check the README for the inputs below\n        with:\n          token: ${{ steps.app-token.outputs.token }}\n        env:\n          RENOVATE_REPOSITORIES: RhinoHealth/fcp\n          RENOVATE_ALLOWED_COMMANDS: '[\"make -C cloud/rhinoCloud update-deps\", \"cd cloud/rhinoCloud && uv sync --frozen --no-install-project --only-group grpc-stub-gen && uv run --no-sync make -C ../../common/fcp_common/rhinoAgentRpc protoc\"]'",
+    "notes": [
+     {
+      "line": 6,
+      "text": "The job's own token only reads. Writes happen with the App token, so PRs trigger normal CI (GITHUB_TOKEN's PRs would not)."
+     },
+     {
+      "line": 15,
+      "text": "The same App and secrets the weekly workflow used today; nothing new to create."
+     },
+     {
+      "line": 19,
+      "text": "Pin by SHA like every other action. The <sha> is left for you to resolve with gh api, as in p2-2."
+     },
+     {
+      "line": 23,
+      "text": "Which repos this run may touch. One line to add infrastructure or gitops later (G5-05)."
+     },
+     {
+      "line": 24,
+      "text": "The exact strings from postUpgradeTasks. A command not in this list is refused even if the config asks for it."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Dry run first, and what stays",
+   "p": [
+    "Before trusting the config, run it twice without side effects. In CI, RENOVATE_DRY_RUN=full logs every PR it would open. On a laptop, npx renovate --platform=local scans the current directory and prints what it would update, with no token and no branches. Validate the file itself with renovate-config-validator.",
+    ".github/dependabot.yml stays as it is: security alerts only, open-pull-requests-limit 0. Renovate's vulnerabilityAlerts opens security fixes at once, outside the monthly schedule. frontend-ci runs only on pull_request, so prCreation stays at its default: a PR must exist for frontend checks to run."
+   ],
+   "because": "We dry-run because a wrong ignorePaths or schedule shows up as a wall of PRs on the 1st. Reading the log costs five minutes.",
+   "code": {
+    "lang": "bash",
+    "file": "terminal, in any repo with a renovate.json5",
+    "text": "npx --package renovate@44.155.2 renovate-config-validator\nLOG_LEVEL=info npx --package renovate@44.155.2 renovate --platform=local\nnpx --package renovate@44.155.2 renovate --platform=local --dry-run=extract",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Checks the config against Renovate's schema and names unknown keys. The renovate package ships this second binary."
+     },
+     {
+      "line": 2,
+      "text": "The local platform looks up newer versions for every dependency it finds and logs them; it never creates a branch."
+     },
+     {
+      "line": 3,
+      "text": "extract stops before lookups: a fast way to see which files and managers Renovate recognised."
+     }
+    ]
+   },
+   "see": "INFO: Repository started\nINFO: Dependency extraction complete (packageFiles: npm: 1, github-actions: 2)\nINFO: Updates found: tsx 4.19.0 -> 4.23.15 (minor), actions/checkout v6 -> v7.0.1\nINFO: Repository finished",
+   "ifInstead": "If instead the validator says 'Invalid configuration option', the key is misspelled or belongs inside a packageRule; the message names the key."
+  }
+ ],
+ "lab": {
+  "title": "Configure Renovate and dry-run it on your scratch repo",
+  "youNeed": [
+   "actions-lab from p2-1",
+   "Node 24 and npm (the renovate package is large; the first npx takes a minute)"
+  ],
+  "worked": [
+   {
+    "do": "cd actions-lab && npm init -y && npm pkg set type=module && npm install tsx@4.19.0 && git add -A && git commit -m 'Add an old dependency'",
+    "see": "added N packages"
+   },
+   {
+    "do": "Create renovate.json5 with: $schema, extends config:recommended, timezone Asia/Jerusalem, schedule ['* 2-6 1 * *'], minimumReleaseAge '7 days', rangeStrategy 'update-lockfile', enabledManagers ['npm', 'github-actions'], and one packageRule { matchManagers: ['npm'], groupName: 'npm' }.",
+    "see": "(file saved)"
+   },
+   {
+    "do": "npx --package renovate@44.155.2 renovate-config-validator",
+    "see": "INFO: Validating renovate.json5\nINFO: Config validated successfully"
+   },
+   {
+    "do": "LOG_LEVEL=info npx --package renovate@44.155.2 renovate --platform=local 2>&1 | grep -E 'extraction|Updates|tsx|checkout'",
+    "see": "INFO: Dependency extraction complete (packageFiles: npm: 1, github-actions: 3)\n... tsx ... 4.19.0 -> 4.23.15"
+   },
+   {
+    "do": "Change the schedule to ['before 4am'] and run the validator again.",
+    "see": "INFO: Config validated successfully"
+   },
+   {
+    "do": "Add a wrong key, minimumReleaseAg: '7 days', and run the validator.",
+    "see": "ERROR: Invalid configuration option: minimumReleaseAg"
+   }
+  ],
+  "faded": "Add a packageRule that groups every github-actions update under groupName 'github actions'. Then run the local dry run and find the line that lists the actions/checkout update. Then unpin one uses: line in hello.yml to a plain tag (actions/checkout@v6) and run again: the update should still be found. The exact rule object is yours to write; its shape is in the lesson.",
+  "alone": "Write a packageRule that gives majors their own PR (groupName null). Write one that disables updates for a package named example/never, and run the validator. Explain in one line each why the order of the two rules matters or does not.",
+  "done": "The validator passes, and the local dry run lists the tsx update and the actions/checkout update. You can say which rule each update falls under."
+ },
+ "quiz": [
+  {
+   "q": "renovate.yml runs every day at 01:41, yet new PRs appear only on the 1st. Why?",
+   "options": [
+    {
+     "text": "Because the workflow's cron is wrong and should be monthly.",
+     "correct": false,
+     "why": "The daily run is wanted: it rebases open PRs when main moves and runs vulnerabilityAlerts."
+    },
+    {
+     "text": "Because the schedule in renovate.json5 allows new branches only on day 1, hours 2 to 6.",
+     "correct": true,
+     "why": "The workflow sets how often Renovate looks; the config sets when it may create PRs."
+    },
+    {
+     "text": "Because GitHub limits bots to one PR per month.",
+     "correct": false,
+     "why": "No such limit exists; prConcurrentLimit in the config is ours."
+    }
+   ]
+  },
+  {
+   "q": "Why must Renovate be self-hosted for fcp?",
+   "options": [
+    {
+     "text": "Because fcp is private.",
+     "correct": false,
+     "why": "Mend's hosted app works on private repos; that is not the blocker."
+    },
+    {
+     "text": "Because the gRPC stubs must be regenerated on the branch, and the hosted app cannot run postUpgradeTasks.",
+     "correct": true,
+     "why": "G5-04 says it in one line: self-hosting is required for postUpgradeTasks, which need uv and make on the runner."
+    },
+    {
+     "text": "Because self-hosted runs are free and the hosted app costs money.",
+     "correct": false,
+     "why": "Cost is not the reason given; the task runner is."
+    }
+   ]
+  },
+  {
+   "q": "A Renovate PR for 'frontend npm' turns red on CI. Who fixes it?",
+   "options": [
+    {
+     "text": "Renovate retries the update next month.",
+     "correct": false,
+     "why": "Renovate rebases but never fixes code; the red PR would sit there."
+    },
+    {
+     "text": "The frontend-guild reviewers, by hand, as today.",
+     "correct": false,
+     "why": "That is what G5 removes: people should see few dependency PRs, and green ones."
+    },
+    {
+     "text": "The upgrade fixer wakes through G5-12 on the red renovate/* branch, pushes a fix, and a person merges.",
+     "correct": true,
+     "why": "The trigger Action reports failed runs on renovate/* branches; the fixer repairs, never merges."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p2-4: which App token does the weekly upgrade workflow use today, and why not GITHUB_TOKEN?",
+  "From p2-2: what does Renovate change when it updates a uses: line pinned by SHA?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "manager",
+   "plain": "One ecosystem reader in Renovate: npm, pep621, pip-compile, dockerfile, github-actions."
+  },
+  {
+   "term": "packageRule",
+   "plain": "A rule that matches some updates (by path, manager, name or type) and sets their group, reviewers or tasks."
+  },
+  {
+   "term": "group",
+   "plain": "Updates that share a groupName go into one PR."
+  },
+  {
+   "term": "minimumReleaseAge",
+   "plain": "How old a version must be before Renovate offers it; 7 days for fcp."
+  },
+  {
+   "term": "postUpgradeTasks",
+   "plain": "Commands Renovate runs on the branch after updating, allowed only if listed in RENOVATE_ALLOWED_COMMANDS."
+  },
+  {
+   "term": "local platform",
+   "plain": "renovate --platform=local: a lookup-only dry run in the current directory with no token."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G5-04",
+   "why": "Writing renovate.json5, the self-hosted workflow and the dry run is exactly this lesson."
+  },
+  {
+   "key": "G5-12",
+   "why": "The trigger Action watches renovate/* branches, which exist only once Renovate runs."
+  }
+ ],
+ "remember": "Renovate is configuration, not shell. It has groups, a monthly schedule, 7-day-old releases and allowed post-upgrade commands. Do a dry run before the first real one."
+}

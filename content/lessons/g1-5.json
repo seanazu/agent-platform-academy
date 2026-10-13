@@ -1,0 +1,772 @@
+{
+ "id": "g1-5",
+ "title": "Evals store, the three lenses, surveys and model checks",
+ "minutes": 60,
+ "youNeed": [
+  "g1-3",
+  "p12-3",
+  "p3-6"
+ ],
+ "bridge": "The eval store is like the Playwright report folder CI keeps for every run. Except each case runs three times and the report is JSON in S3. The nightly job turns those files into Grafana lines, so a pass rate never appears without its spread.",
+ "intro": "Five eval suites, the DX lenses, two surveys and two sweeps all answer one question: is the change worth it? This lesson gives them one store, one set of team-level numbers and one rule for moving a setting.",
+ "picture": {
+  "caption": "Suites and sweeps write JSON to one bucket; the nightly job turns it into series; the survey runs beside the metrics.",
+  "nodes": [
+   {
+    "id": "sweep",
+    "label": "sweeps/*.yaml",
+    "kind": "file"
+   },
+   {
+    "id": "suite",
+    "label": "an eval suite on a wide VM",
+    "kind": "machine"
+   },
+   {
+    "id": "results",
+    "label": "evals/results.py",
+    "kind": "file"
+   },
+   {
+    "id": "bucket",
+    "label": "rhino-ai-agents-eval-results (S3)",
+    "kind": "cloud"
+   },
+   {
+    "id": "nightly",
+    "label": "nightly metrics job",
+    "kind": "service"
+   },
+   {
+    "id": "grafana",
+    "label": "Grafana",
+    "kind": "service"
+   },
+   {
+    "id": "shai",
+    "label": "Shai, with the survey CSVs",
+    "kind": "person"
+   },
+   {
+    "id": "compare",
+    "label": "metrics/src/survey-compare.ts",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "sweep",
+    "to": "suite",
+    "text": "lists the rows; each setting runs 3 times on wide VMs"
+   },
+   {
+    "from": "suite",
+    "to": "results",
+    "text": "calls record() with 3 runs per case and a cause for each failure"
+   },
+   {
+    "from": "results",
+    "to": "bucket",
+    "text": "put_object writes suite/version/split/started_at.json with the VM's instance role"
+   },
+   {
+    "from": "nightly",
+    "to": "bucket",
+    "text": "reads new files with a read-only role (GitHub OIDC)"
+   },
+   {
+    "from": "nightly",
+    "to": "grafana",
+    "text": "pushes ai_agents_eval_* and delivery_lens_* series, team level"
+   },
+   {
+    "from": "shai",
+    "to": "compare",
+    "text": "runs survey-compare.ts on october.csv and december.csv"
+   },
+   {
+    "from": "compare",
+    "to": "shai",
+    "text": "prints team medians with their IQR for the quarter report"
+   },
+   {
+    "from": "grafana",
+    "to": "shai",
+    "text": "a person reads the scoreboard and approves the one harness PR"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "One bucket, one file per eval run",
+   "p": [
+    "After G2 and G4 land, BYTE-GOLD and TICKET-BENCH both produce results. Without one format you compare two spreadsheets by hand. So every suite writes one JSON file per run to one bucket, rhino-ai-agents-eval-results, in the ai-agents AWS account. That bucket is the eval store.",
+    "The key says what the run was: suite/version/split/started_at.json, for example ticket-bench/0.4.1/dev/2026-11-03T02-20-00Z.json. A split is a named slice of a suite. dev is for daily work, smoke for a quick run, and holdout for the final check nobody tunes on. Run aws s3 ls on that prefix and you see one file per run.",
+    "DevOps creates the bucket as one Terragrunt unit, terraform/accounts/ai-agents/aws/us-east-1/evals/results-bucket/terragrunt.hcl, from tfr:///terraform-aws-modules/s3-bucket/aws 5.13.0 with KMS, versioning and no public access. KMS is AWS's key service; here it encrypts every stored object (lesson p3-6). A person runs apply. Sandbox VMs write with their instance role through the S3 VPC endpoint (lesson p3-6), so no key sits in the VM.",
+    "The nightly job from lesson g1-2 gets ai-agents/metrics/src/eval-results.ts with @aws-sdk/client-s3. It reads new files with a read-only role in the ai-agents account (GitHub OIDC). It pushes ai_agents_eval_pass_rate, _pass_rate_spread, _cost_per_case_usd and _median_turns with suite, version, split, model and effort labels."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "JSON in S3 plus Grafana is enough until Q1. Langfuse would need ClickHouse, and five suites from five goals need one format more than they need a product."
+   }
+  },
+  {
+   "h": "results.py: record one eval run",
+   "p": [
+    "This file stays Python, because Harbor and the suites that call it are Python (ts_platform.md). The four blank lines of the sketch are dropped so it fits one block; nothing else is removed.",
+    "Two rules are checked before anything is written. Every case runs 3 times, and every failed run carries a cause from a fixed list. The spread is the difference between the best and the worst of the three rounds. Small suites swing a lot, so the spread is always shown next to the pass rate."
+   ],
+   "because": "Because a change must be judged on quality, cost, steps and time together, one function scores all four into one file.",
+   "code": {
+    "lang": "python",
+    "file": "ai-agents/evals/results.py",
+    "text": "# ai-agents/evals/results.py  (every suite calls record(); Python, like Harbor and the suites around it)\n\"\"\"One JSON file per eval run. Quality, cost, steps, agents and time are scored together.\"\"\"\nimport json\nimport statistics\nimport boto3\nBUCKET = \"rhino-ai-agents-eval-results\"\nCAUSES = {\"too_many_tools\", \"bad_handoff\", \"contradicting_prompt\", \"missing_context\", \"flaky_environment\"}\ndef record(suite: str, version: str, setup: dict, cases: list[dict], started_at: str) -> str:\n    \"\"\"setup: {\"split\": \"dev\", \"model\": \"claude-opus-5-5\", \"effort\": \"medium\", \"harness\": \"0.4.1\"}\n    cases: [{\"id\": \"T-017\", \"runs\": [{\"pass\": True, \"cost_usd\": 1.9, \"turns\": 41, \"agents\": 3,\n                                       \"seconds\": 820, \"cause\": None}, ...]}]   # 3 runs per case\"\"\"\n    assert all(len(case[\"runs\"]) == 3 for case in cases), \"every case runs 3 times\"\n    runs = [run for case in cases for run in case[\"runs\"]]\n    assert all(run[\"cause\"] in CAUSES for run in runs if not run[\"pass\"]), \"label every failure\"\n    per_round = [statistics.mean(case[\"runs\"][i][\"pass\"] for case in cases) for i in range(3)]\n    summary = {\n        \"pass_rate\": statistics.mean(per_round),\n        \"pass_rate_spread\": max(per_round) - min(per_round),  # small suites swing a lot; always show it\n        \"cost_per_case_usd\": sum(run[\"cost_usd\"] for run in runs) / len(runs),\n        \"median_turns\": statistics.median(run[\"turns\"] for run in runs),\n    }\n    key = f\"{suite}/{version}/{setup['split']}/{started_at}.json\"\n    body = {\"suite\": suite, \"version\": version, \"setup\": setup, \"summary\": summary, \"cases\": cases}\n    boto3.client(\"s3\").put_object(Bucket=BUCKET, Key=key, Body=json.dumps(body).encode())\n    return key  # the nightly job turns new keys into ai_agents_eval_<summary field> series",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The docstring states the rule: quality, cost, steps, agents and time are scored together."
+     },
+     {
+      "line": 5,
+      "text": "boto3 is the AWS SDK for Python; it is the only dependency beyond the standard library."
+     },
+     {
+      "line": 6,
+      "text": "The bucket name, the same one label-run.ts writes to in lesson g1-4."
+     },
+     {
+      "line": 7,
+      "text": "The five cause labels. label-run.ts adds model and unknown; the eval set stays at five."
+     },
+     {
+      "line": 8,
+      "text": "record takes the suite name, the version under test, the setup, the cases and when the run started."
+     },
+     {
+      "line": 9,
+      "text": "setup names split, model, effort and harness version; they become the series labels."
+     },
+     {
+      "line": 12,
+      "text": "The first rule: every case has exactly 3 runs. An assert stops a bad file before it lands."
+     },
+     {
+      "line": 13,
+      "text": "Flatten all runs into one list for the cost and turn numbers."
+     },
+     {
+      "line": 14,
+      "text": "The second rule: a failed run without a known cause is refused."
+     },
+     {
+      "line": 15,
+      "text": "per_round: the pass rate of round 1, round 2 and round 3 across all cases. Python averages booleans as 0 and 1."
+     },
+     {
+      "line": 17,
+      "text": "pass_rate is the mean of the three rounds."
+     },
+     {
+      "line": 18,
+      "text": "pass_rate_spread is best round minus worst round. Always show it; a small suite swings a lot."
+     },
+     {
+      "line": 19,
+      "text": "Cost per case: total cost over all runs divided by the number of runs."
+     },
+     {
+      "line": 20,
+      "text": "Median turns: a right answer reached the long way still shows."
+     },
+     {
+      "line": 22,
+      "text": "The key is suite/version/split/started_at.json; the nightly job parses it."
+     },
+     {
+      "line": 24,
+      "text": "put_object with the default client: credentials come from the instance role, never from code."
+     },
+     {
+      "line": 25,
+      "text": "The key is returned so the suite can print or log where its run landed."
+     }
+    ]
+   },
+   "see": "ticket-bench/0.4.1/dev/2026-11-03T02-20-00Z.json",
+   "ifInstead": "If instead you see AssertionError: label every failure, one failed run has cause None; pick one of the five causes."
+  },
+  {
+   "h": "lenses.ts part 1: utilization and impact",
+   "p": [
+    "DX is a developer-experience research group. Its framework reads three lenses together: utilization, impact and cost. A lens is one group of numbers that answers one question. Any one lens alone misleads: usage can rise while impact falls, and impact can rise at a cost we do not want.",
+    "The nightly job computes the three lenses per team and week and writes delivery_lens_* series. Keys stay snake_case, because each key becomes a series name. Lines 1 to 23 of the sketch follow; the blank line 24 is dropped before part 2 and nothing else is removed."
+   ],
+   "because": "Because any one lens alone misleads, the three are computed for the same team and week and shown side by side.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/lenses.ts",
+    "text": "// ai-agents/metrics/src/lenses.ts\n// DX's three lenses for one team and week, side by side. Never a per-person number.\n// Keys stay snake_case: each one becomes a delivery_lens_<key> series.\nimport type { AgentRun, Gateway, Jira, Otel, PullRequest, Week } from \"./types.js\";\n\nexport const share = <T>(items: T[], predicate: (item: T) => boolean): number =>\n  items.length ? items.filter(predicate).length / items.length : 0;\n\nexport const utilization = async (week: Week, otel: Otel, prs: PullRequest[], jira: Jira) => ({\n  weekly_ai_users: await otel.distinct(\"user_hash\", week), // salted hash from the collector; no emails\n  pr_ai_share: share(prs, (pr) => pr.aiTrailer), // Co-Authored-By: Claude / \"Generated with Claude Code\"\n  tasks_to_agents: (await jira.count('assignee = \"Nova\"', week)) + (await jira.routineRuns(week)),\n});\n\nexport const impact = (_week: Week, prs: PullRequest[], failed: Set<number>, agentRuns: AgentRun[]) => {\n  const merged = prs.filter((pr) => pr.mergedAt);\n  return {\n    merged_prs: merged.length, // always shown next to change failure, never alone\n    change_fail_pct: 100 * share(merged, (pr) => failed.has(pr.number)),\n    // decide (Nir): proposal = the hours an engineer would need, stated in Nova's approved plan\n    human_equivalent_hours: agentRuns.filter((run) => run.merged).reduce((sum, run) => sum + run.humanHours, 0),\n  };\n};",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Never a per-person number: every function takes a team's data for one week."
+     },
+     {
+      "line": 4,
+      "text": "Types only, from metrics/src/types.ts; Otel, Gateway and Jira are small query clients the nightly job already has."
+     },
+     {
+      "line": 6,
+      "text": "share is a helper: the fraction of items that match a predicate, 0 for an empty list, so no division by zero."
+     },
+     {
+      "line": 9,
+      "text": "utilization is async because it queries the collector's metrics and Jira."
+     },
+     {
+      "line": 10,
+      "text": "Weekly AI users: distinct user_hash values. The collector made that salted hash in lesson g1-1; no email exists here."
+     },
+     {
+      "line": 11,
+      "text": "Share of PRs with AI help: the aiTrailer flag from lesson g1-2 (Co-Authored-By: Claude or 'Generated with Claude Code')."
+     },
+     {
+      "line": 12,
+      "text": "Tasks given to agents: Jira tickets assigned to Nova plus routine runs that week."
+     },
+     {
+      "line": 15,
+      "text": "impact takes merged PRs, the set of PR numbers that failed (G1-07's change failure) and the agent runs."
+     },
+     {
+      "line": 18,
+      "text": "merged_prs is always shown next to change_fail_pct, never alone; throughput alone rewards the wrong thing."
+     },
+     {
+      "line": 20,
+      "text": "A decision for Nir: human-equivalent hours are the hours an engineer would need, stated in Nova's approved plan."
+     },
+     {
+      "line": 21,
+      "text": "Sum humanHours over merged agent runs only; a run that was not merged did no work for the team."
+     }
+    ]
+   }
+  },
+  {
+   "h": "lenses.ts part 2: cost",
+   "p": [
+    "The cost lens adds people's spend and agents' spend, then divides by the team's engineers for an average. The last number is dollars per human-equivalent hour. A human-equivalent hour is one hour of work an engineer would have needed; the plan approver confirms or corrects Nova's estimate.",
+    "The plan wrote the rate as hours divided by cost. As a rate it is cost divided by hours, so the sketch shows dollars per hour. Confirm the wording with Nir before the dashboard goes out. The three lenses then get a 'Three lenses' row at the top of delivery-impact.json, side by side over the same weeks."
+   ],
+   "because": "Because impact can rise at a cost we do not want, the cost lens sits next to the other two.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/lenses.ts",
+    "text": "export const cost = async (week: Week, gateway: Gateway, otel: Otel, engineers: number, humanHours: number) => {\n  const agentsUsd = await gateway.totalUsd(week); // ai_agents_llm_cost_usd_total\n  const peopleUsd = await otel.costUsd(week); // claude_code_cost_usage_USD_total\n  return {\n    ai_spend_usd: agentsUsd + peopleUsd,\n    ai_spend_per_engineer_usd: (agentsUsd + peopleUsd) / Math.max(engineers, 1), // a team average\n    // The plan writes \"hours / cost\"; as a rate it is cost per hour. Confirm the wording with Nir.\n    agent_usd_per_human_hour: humanHours ? agentsUsd / humanHours : null,\n  };\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "cost takes the gateway client, the collector client, the team's engineer count and the humanHours from impact."
+     },
+     {
+      "line": 2,
+      "text": "Agent spend is the gateway's ai_agents_llm_cost_usd_total for the week."
+     },
+     {
+      "line": 3,
+      "text": "People's spend is claude_code_cost_usage_USD_total from Claude Code telemetry (lesson g1-1)."
+     },
+     {
+      "line": 5,
+      "text": "Total AI spend: both added."
+     },
+     {
+      "line": 6,
+      "text": "A team average per engineer. Math.max(engineers, 1) avoids dividing by zero for an empty team."
+     },
+     {
+      "line": 7,
+      "text": "The open wording question, kept in the code so nobody forgets to ask Nir."
+     },
+     {
+      "line": 8,
+      "text": "Dollars of agent spend per human-equivalent hour, or null when there were no hours, so the chart shows no data."
+     }
+    ]
+   }
+  },
+  {
+   "h": "questions.yaml: the October survey",
+   "p": [
+    "Delivery metrics show what changed, not where time goes or how it feels. METR found developers felt faster while being slower, so the survey asks about time lost too. The answers are read next to the metrics, never instead of them.",
+    "Shai builds a Google Form from this file and sends it in #engineering by 21 Oct with one line on why. One reminder goes out after 3 days. No emails are collected; team is the only grouping field. Teams with fewer than 5 answers fold into Other when we report. The CSV export goes to a restricted Drive folder, and the file stays unchanged for December."
+   ],
+   "because": "Because October and December must ask the same thing, the questions live in one file that nobody edits between the two runs.",
+   "code": {
+    "lang": "yaml",
+    "file": "ai-agents/metrics/survey/questions.yaml",
+    "text": "# ai-agents/metrics/survey/questions.yaml\n# Builds the October form and the December one. Don't edit the questions between the two runs.\ngroup_by: team        # FE, BE, DevOps, Data Science, Other. No names and no emails are collected.\nmin_group_size: 5     # smaller teams fold into Other when we report\nscales:\n  hours: [\"0\", \"under 1 h\", \"1-3 h\", \"3-6 h\", \"more than 6 h\"]\n  agree: [\"1 strongly disagree\", \"2\", \"3\", \"4\", \"5 strongly agree\"]\nquestions:\n  - { id: time_saved,       scale: hours, text: \"In a normal week, how much time do AI tools save you?\" }\n  - { id: lost_meetings,    scale: hours, text: \"In a normal week, how much time do you lose to meetings that didn't need you?\" }\n  - { id: lost_interrupts,  scale: hours, text: \"In a normal week, how much time do you lose to interruptions and switching tasks?\" }\n  - { id: lost_builds,      scale: hours, text: \"In a normal week, how much time do you lose waiting for builds, tests and CI?\" }\n  - { id: lost_review,      scale: hours, text: \"In a normal week, how much time do you lose waiting for code review?\" }\n  - { id: lost_setup,       scale: hours, text: \"In a normal week, how much time do you lose to a broken or slow dev setup?\" }\n  - { id: lost_finding,     scale: hours, text: \"In a normal week, how much time do you lose looking for information?\" }\n  - { id: confident_change, scale: agree, text: \"I feel confident changing code in a part of the product I don't know well.\" }\n  - { id: confident_ci,     scale: agree, text: \"When CI is green, I trust that my change works.\" }\n  - { id: biggest_drag,     scale: text,  text: \"What one thing slows you down the most?\" }",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The one rule for this file: do not edit the questions between the two runs."
+     },
+     {
+      "line": 3,
+      "text": "group_by: team. The five groups are FE, BE, DevOps, Data Science and Other. No names, no emails."
+     },
+     {
+      "line": 4,
+      "text": "min_group_size 5: survey-compare.ts reads the same number as MIN_GROUP."
+     },
+     {
+      "line": 6,
+      "text": "The hours scale has five bands; survey-compare.ts maps each band to a number."
+     },
+     {
+      "line": 7,
+      "text": "The agree scale is 1 to 5; the first digit of the answer is the number."
+     },
+     {
+      "line": 9,
+      "text": "time_saved is the one question about gain; the next six are about loss."
+     },
+     {
+      "line": 16,
+      "text": "Two confidence questions: changing unknown code, and trusting green CI."
+     },
+     {
+      "line": 18,
+      "text": "biggest_drag is free text; its scale is 'text', which the form builder treats as a long answer."
+     }
+    ]
+   }
+  },
+  {
+   "h": "survey-compare.ts part 1: load and fold",
+   "p": [
+    "In December Shai sends the same form and exports a second CSV. From an ai-agents checkout, after npm ci, you run npx tsx metrics/src/survey-compare.ts october.csv december.csv. The first half of the file loads one CSV into groups per team and folds small teams into Other.",
+    "Lines 1 to 21 of the sketch follow. The blank line 22 is dropped between the parts; nothing else is removed."
+   ],
+   "because": "Because a team with fewer than 5 answers could be recognised, the loader folds it into Other before anything is computed.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/survey-compare.ts",
+    "text": "// ai-agents/metrics/src/survey-compare.ts  (npx tsx metrics/src/survey-compare.ts october.csv december.csv)\n// October vs. December survey, team level only. Groups under 5 answers fold into 'Other'.\nimport { readFileSync } from \"node:fs\";\nimport { parse } from \"csv-parse/sync\"; // Google Forms answers can hold commas and quotes\nimport { median, quantile } from \"./stats.js\"; // quantile uses the same method as Python's statistics.quantiles\n\nconst MIN_GROUP = 5;\nconst HOURS: Record<string, number> = { \"0\": 0, \"under 1 h\": 0.5, \"1-3 h\": 2, \"3-6 h\": 4.5, \"more than 6 h\": 7 };\nconst QUESTIONS = [\"time_saved\", \"lost_builds\", \"lost_review\", \"lost_setup\", \"lost_finding\", \"confident_change\", \"confident_ci\"];\ntype Row = Record<string, string | undefined>;\n\nfunction load(path: string): Map<string, Row[]> {\n  const groups = new Map<string, Row[]>();\n  for (const row of parse<Row>(readFileSync(path, \"utf8\"), { columns: true })) {\n    const team = row.team ?? \"Other\";\n    groups.set(team, [...(groups.get(team) ?? []), row]);\n  }\n  const keep = new Map([...groups].filter(([team, rows]) => rows.length >= MIN_GROUP && team !== \"Other\"));\n  keep.set(\"Other\", [...groups].filter(([team]) => !keep.has(team)).flatMap(([, rows]) => rows));\n  return keep;\n}",
+    "notes": [
+     {
+      "line": 4,
+      "text": "csv-parse's sync parser: Google Forms answers can hold commas and quotes, so no hand-written split."
+     },
+     {
+      "line": 5,
+      "text": "median and quantile come from metrics/src/stats.ts, the same file G1-07's compute.ts uses."
+     },
+     {
+      "line": 7,
+      "text": "MIN_GROUP 5, the same number as min_group_size in questions.yaml."
+     },
+     {
+      "line": 8,
+      "text": "HOURS maps each hours band to a number in the middle of the band, so medians can be computed."
+     },
+     {
+      "line": 9,
+      "text": "The seven questions compared. The two agree questions are read by their first digit."
+     },
+     {
+      "line": 10,
+      "text": "A Row is one CSV line: column name to answer, possibly missing."
+     },
+     {
+      "line": 14,
+      "text": "columns: true turns the header line into object keys, so row.team works."
+     },
+     {
+      "line": 15,
+      "text": "A row without a team goes to Other."
+     },
+     {
+      "line": 18,
+      "text": "keep holds the teams with at least 5 answers, and never a team literally named Other."
+     },
+     {
+      "line": 19,
+      "text": "Every other row, from every small team, is folded into one Other group."
+     }
+    ]
+   }
+  },
+  {
+   "h": "survey-compare.ts part 2: medians with ranges",
+   "p": [
+    "The second half prints one line per question and team: the October median with its IQR next to the December one. The IQR is the interquartile range, the gap between the 25th and the 75th percentile. It shows how spread the answers are, so a moved median is read with its range.",
+    "Put the output next to the delivery-impact numbers in the quarter report, both directions, with ranges, and no per-person view."
+   ],
+   "because": "Because a median alone hides how much people disagree, every number is printed with its IQR and its count.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/survey-compare.ts",
+    "text": "function summary(rows: Row[], question: string): string {\n  const values = rows.flatMap((r) => { const a = r[question]; return a ? [HOURS[a] ?? Number(a[0])] : []; }); // agree: its digit\n  if (values.length < MIN_GROUP) return \"too few answers\";\n  const [mid, q1, q3] = [median(values), quantile(values, 0.25), quantile(values, 0.75)];\n  return `median ${mid.toFixed(1)} (IQR ${q1.toFixed(1)}-${q3.toFixed(1)}, n=${values.length})`;\n}\nconst [october, december] = [load(process.argv[2] ?? \"\"), load(process.argv[3] ?? \"\")];\nfor (const question of QUESTIONS) {\n  for (const team of [...october.keys()].filter((t) => december.has(t)).sort()) {\n    const oct = summary(october.get(team) ?? [], question), dec = summary(december.get(team) ?? [], question);\n    console.log(`${question.padEnd(17)} ${team.padEnd(12)} Oct ${oct.padEnd(34)} Dec ${dec}`);\n  }\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Turn each answer into a number: the HOURS band, or the first digit for an agree answer. Missing answers are skipped."
+     },
+     {
+      "line": 3,
+      "text": "Fewer than 5 numbers prints 'too few answers' instead of a misleading median."
+     },
+     {
+      "line": 4,
+      "text": "Median, 25th and 75th percentile from stats.ts."
+     },
+     {
+      "line": 5,
+      "text": "One readable string, with n so the reader knows how many answered."
+     },
+     {
+      "line": 7,
+      "text": "The two CSV paths come from the command line; a missing path becomes an empty string and fails on read."
+     },
+     {
+      "line": 9,
+      "text": "Only teams present in both months are printed, sorted. Other is always present."
+     },
+     {
+      "line": 11,
+      "text": "padEnd lines the columns up, so the console output can be pasted into the report."
+     }
+    ]
+   },
+   "see": "time_saved        FE           Oct median 2.0 (IQR 0.5-2.0, n=5)      Dec median 4.5 (IQR 2.0-4.5, n=5)\ntime_saved        Other        Oct too few answers                    Dec too few answers\nlost_builds       FE           Oct median 2.0 (IQR 2.0-4.5, n=5)      Dec median 0.5 (IQR 0.5-2.0, n=5)\nlost_builds       Other        Oct too few answers                    Dec too few answers\n(10 more lines: one FE line and one Other line for each of the other five questions)"
+  },
+  {
+   "h": "The effort sweep",
+   "p": [
+    "Most numbers in the routing table are Anthropic's, not ours. Effort is how much thinking a model does per message. The routing table in the harness picks model and effort per job. A sweep is a small eval run that tries each table row one level up and one level down. It runs before real pilot tickets.",
+    "The sweep runs on wide sandbox VMs and its results land in the eval store through record(). Each setting runs 3 times. A cheaper setting passes when its pass rate is within the current setting's spread. Effort changes per message, not per session, so the prompt cache stays warm. The table is updated in one harness PR that links the scoreboard, and a person approves it."
+   ],
+   "because": "Because a row that loses quality on our code must go one level up, every row is tried one step each way.",
+   "code": {
+    "lang": "yaml",
+    "file": "ai-agents/evals/sweeps/2026-w9-effort.yaml",
+    "text": "# ai-agents/evals/sweeps/2026-w9-effort.yaml\n# Confirms the routing table on our code before real pilot tickets. Results go to the eval store.\nvm_size: wide\nrepeats: 3                          # report the spread, never a single run\nsuites:\n  ticket-bench: { split: smoke }    # 15 tasks (G4)\n  byte-gold:    { split: dev }      # never the holdout (G2)\nrows:                               # the table's current setting first, then one level each side\n  - job: build_typical\n    suite: ticket-bench\n    settings: [opus-5-5/medium, opus-5-5/low, opus-5-5/high]\n  - job: build_hard\n    suite: ticket-bench\n    settings: [opus-5-5/high, opus-5-5/medium, opus-5-5/xhigh]\n  - job: review_logic_security\n    suite: byte-gold\n    settings: [opus-5-5/medium, opus-5-5/low, opus-5-5/high]\n  - job: review_conventions\n    suite: byte-gold\n    settings: [sonnet-5-5/low, sonnet-5-5/medium, opus-5-5/low]\neffort_changes: per message         # keeps the prompt cache warm\ndecision:\n  keep_cheaper_if: its pass_rate >= current pass_rate - current spread\n  if_a_row_loses_quality: move that row one level up\n  apply_as: one harness PR that links the scoreboard; a person approves it",
+    "notes": [
+     {
+      "line": 3,
+      "text": "Wide VMs: the sweep runs several cases at once."
+     },
+     {
+      "line": 4,
+      "text": "repeats 3, so the spread exists; a single run is never reported."
+     },
+     {
+      "line": 6,
+      "text": "TICKET-BENCH's smoke split, 15 tasks from G4."
+     },
+     {
+      "line": 7,
+      "text": "BYTE-GOLD's dev split from G2, never the holdout; the holdout is for the final check only."
+     },
+     {
+      "line": 8,
+      "text": "Each row lists the table's current setting first, then one level down and one level up."
+     },
+     {
+      "line": 11,
+      "text": "Settings are model/effort pairs, opus-5-5/medium for a typical build."
+     },
+     {
+      "line": 20,
+      "text": "Convention review tries the cheaper sonnet-5-5 at two efforts against opus-5-5/low."
+     },
+     {
+      "line": 21,
+      "text": "Effort per message keeps the prompt cache warm; a new session would pay for the cache again."
+     },
+     {
+      "line": 23,
+      "text": "The rule: keep the cheaper setting if its pass rate is at least the current one minus the current spread."
+     },
+     {
+      "line": 25,
+      "text": "The change is one PR with the scoreboard linked, approved by a person. Agents never apply it."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The new-model check",
+   "p": [
+    "Anthropic dropped a whole harness step when a newer model no longer needed it. A harness part is one piece of the harness that a flag can switch off. The six parts: self-review subagent, QA agent, scope judge, progress watcher nudges, plan grill and KB skill. Parts that stopped helping cost tokens and slow runs.",
+    "So every new model gets the same check. Run each suite on the new model with every part on, then with each part off alone. Run it once in W12 on the current model as the reference, so the next release has a baseline. A part goes only when removing it keeps the pass rate within the spread and lowers cost or time. That change goes into the monthly rule-diet PR, and a person approves it."
+   ],
+   "because": "Because a part that stopped helping still costs tokens, each part is switched off alone and judged against the same spread rule.",
+   "code": {
+    "lang": "yaml",
+    "file": "ai-agents/evals/sweeps/new-model.yaml",
+    "text": "# ai-agents/evals/sweeps/new-model.yaml\n# Run when a new model ships, and once in W12 on today's model as the reference.\nmodel_under_test: claude-opus-5-5         # replace with the new model's ID\nreference: { model: claude-opus-5-5, harness: current }\nrepeats: 3\nsuites: [ticket-bench/smoke, byte-gold/dev, routine-bench/weekly, skill-evals/nightly, brain-qa/nightly]\nharness_parts:                            # each one is switched off alone; all others stay on\n  - self_review_subagent\n  - qa_agent\n  - scope_judge\n  - progress_watcher_nudges\n  - plan_grill\n  - kb_skill\nruns:\n  - { name: full, model: \"{model_under_test}\", parts_off: [] }\n  - { name: without-each-part, model: \"{model_under_test}\", parts_off: each }\ndecision:\n  move_model_if: every suite's pass_rate >= reference pass_rate - spread, and cost per case doesn't rise\n  drop_part_if: pass_rate stays within the spread without it, and cost or time falls\n  apply_as: the monthly rule-diet PR; a person approves it",
+    "notes": [
+     {
+      "line": 3,
+      "text": "The model under test; replace it with the new model's ID when one ships."
+     },
+     {
+      "line": 4,
+      "text": "The reference: today's model with the current harness, the baseline every run is compared with."
+     },
+     {
+      "line": 6,
+      "text": "All five suites, each with its usual split."
+     },
+     {
+      "line": 7,
+      "text": "The parts that can be switched off. Each one goes off alone; all the others stay on."
+     },
+     {
+      "line": 15,
+      "text": "The full run: every part on."
+     },
+     {
+      "line": 16,
+      "text": "parts_off: each expands into one run per part."
+     },
+     {
+      "line": 18,
+      "text": "Move to the new model only if every suite holds within the spread and cost per case does not rise."
+     },
+     {
+      "line": 19,
+      "text": "Drop a part only if the pass rate holds without it and cost or time falls."
+     },
+     {
+      "line": 20,
+      "text": "The monthly rule-diet PR, approved by a person; the harness never changes its own parts."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "Agents never change the checks they are judged by. A sweep proposes; one PR carries the change; a person approves it."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Compare two survey CSVs and record an eval run into LocalStack",
+  "youNeed": [
+   "Node 24",
+   "Docker Desktop",
+   "Python 3.13 + uv",
+   "the aws CLI (brew install awscli)",
+   "jq"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/lab/g1-5/metrics/src && cd ~/lab/g1-5/metrics && npm init -y >/dev/null && npm pkg set type=module && npm i -D typescript tsx @types/node && npm i csv-parse && npm pkg get type",
+    "see": "\"module\""
+   },
+   {
+    "do": "Create src/stats.ts, the lab's stub (the real file is G1-07's metrics/src/stats.ts):\nexport const quantile = (xs: number[], p: number): number => {\n  const s = [...xs].sort((a, b) => a - b);\n  const pos = (s.length - 1) * p, lo = Math.floor(pos), hi = Math.ceil(pos);\n  return s[lo] + (s[hi] - s[lo]) * (pos - lo);\n};\nexport const median = (xs: number[]): number => quantile(xs, 0.5);\nThen create src/survey-compare.ts from the two blocks (part 1, a blank line, part 2) and run: ls src",
+    "see": "stats.ts\nsurvey-compare.ts"
+   },
+   {
+    "do": "Create october.csv with this header and these 7 rows:\nteam,time_saved,lost_builds,lost_review,lost_setup,lost_finding,confident_change,confident_ci\nFE,under 1 h,1-3 h,1-3 h,0,under 1 h,3,4\nFE,1-3 h,1-3 h,3-6 h,under 1 h,1-3 h,2,4\nFE,1-3 h,3-6 h,1-3 h,0,1-3 h,4,5\nFE,3-6 h,1-3 h,1-3 h,under 1 h,under 1 h,3,3\nFE,0,more than 6 h,3-6 h,1-3 h,1-3 h,2,4\nBE,1-3 h,1-3 h,1-3 h,0,0,3,4\nBE,under 1 h,0,1-3 h,0,under 1 h,4,5\nCreate december.csv with the same header and these rows:\nFE,1-3 h,under 1 h,1-3 h,0,under 1 h,4,4\nFE,3-6 h,1-3 h,1-3 h,0,under 1 h,3,5\nFE,3-6 h,under 1 h,under 1 h,under 1 h,1-3 h,4,4\nFE,more than 6 h,1-3 h,1-3 h,0,0,5,5\nFE,1-3 h,0,under 1 h,0,under 1 h,4,4\nBE,1-3 h,1-3 h,under 1 h,0,0,3,4\nBE,3-6 h,under 1 h,0,0,under 1 h,4,5\nThen: wc -l october.csv december.csv",
+    "see": "       8 october.csv\n       8 december.csv\n      16 total"
+   },
+   {
+    "do": "npx tsx src/survey-compare.ts october.csv december.csv",
+    "see": "time_saved        FE           Oct median 2.0 (IQR 0.5-2.0, n=5)      Dec median 4.5 (IQR 2.0-4.5, n=5)\ntime_saved        Other        Oct too few answers                    Dec too few answers\nlost_builds       FE           Oct median 2.0 (IQR 2.0-4.5, n=5)      Dec median 0.5 (IQR 0.5-2.0, n=5)\nlost_builds       Other        Oct too few answers                    Dec too few answers\n(10 more lines: one FE line and one Other line for each of the other five questions)"
+   },
+   {
+    "do": "docker run --rm -d --name localstack -p 4566:4566 localstack/localstack && export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:4566 && aws s3 mb s3://rhino-ai-agents-eval-results",
+    "see": "make_bucket: rhino-ai-agents-eval-results"
+   },
+   {
+    "do": "cd ~/lab/g1-5 && uv init evals && cd evals && uv add boto3",
+    "see": "Initialized project `evals` at `/Users/you/lab/g1-5/evals`\n + boto3==<the current version>\n(more + lines for botocore and the other dependencies)"
+   },
+   {
+    "do": "Create results.py from the 25-line block. Then create run.py:\nfrom results import record\nruns = [\n    {\"pass\": True, \"cost_usd\": 1.2, \"turns\": 30, \"agents\": 2, \"seconds\": 400, \"cause\": None},\n    {\"pass\": True, \"cost_usd\": 1.4, \"turns\": 35, \"agents\": 2, \"seconds\": 450, \"cause\": None},\n    {\"pass\": False, \"cost_usd\": 2.0, \"turns\": 60, \"agents\": 3, \"seconds\": 900, \"cause\": \"missing_context\"},\n]\nsetup = {\"split\": \"dev\", \"model\": \"claude-opus-5-5\", \"effort\": \"medium\", \"harness\": \"0.4.1\"}\nprint(record(\"ticket-bench\", \"0.4.1\", setup, [{\"id\": \"T-001\", \"runs\": runs}], \"2026-11-03T02-20-00Z\"))\nThen: uv run run.py",
+    "see": "ticket-bench/0.4.1/dev/2026-11-03T02-20-00Z.json"
+   },
+   {
+    "do": "aws s3 cp s3://rhino-ai-agents-eval-results/ticket-bench/0.4.1/dev/2026-11-03T02-20-00Z.json - | jq .summary",
+    "see": "{\n  \"pass_rate\": 0.6666666666666666,\n  \"pass_rate_spread\": 1,\n  \"cost_per_case_usd\": 1.5333333333333332,\n  \"median_turns\": 35\n}"
+   },
+   {
+    "do": "Reading step. In ~/lab/g1-5/evals, create sweeps/2026-w9-effort.yaml and sweeps/new-model.yaml from the two YAML blocks. Then count the effort runs: npx -y js-yaml sweeps/2026-w9-effort.yaml | jq '.repeats as $r | [.rows[].settings | length] | add * $r'",
+    "see": "36"
+   },
+   {
+    "do": "Reading step. Create ~/lab/g1-5/metrics/survey/questions.yaml from the block. Check that every id in QUESTIONS of survey-compare.ts exists in it: grep -c 'id:' ~/lab/g1-5/metrics/survey/questions.yaml",
+    "see": "10"
+   }
+  ],
+  "faded": "Add a third team, DS, to both CSVs: 5 DS rows in october.csv and 2 DS rows in december.csv. The last step is left to you. Before you run the compare, write down which lines you expect for DS and for Other. Then run it and explain where the DS answers went.",
+  "alone": "In a copy of 2026-w9-effort.yaml, write a new sweep row for a job called plan on suite ticket-bench. Put the current setting first and one level each side. Add a short note under decision saying what would make you keep the cheaper setting. Check with js-yaml and jq that rows now has 5 entries.",
+  "done": "survey-compare prints 14 lines (FE with medians, Other with 'too few answers'), and aws s3 ls shows the eval JSON under ticket-bench/0.4.1/dev/."
+ },
+ "quiz": [
+  {
+   "q": "When does a cheaper routing setting replace the current one after the effort sweep?",
+   "options": [
+    {
+     "text": "When its pass rate is higher than the current setting's pass rate.",
+     "correct": false,
+     "why": "Higher is not required; small suites swing, so a single higher number proves little."
+    },
+    {
+     "text": "When its pass rate is at least the current pass rate minus the current spread.",
+     "correct": true,
+     "why": "That is keep_cheaper_if: within the spread, the cheaper setting holds its slice and stays."
+    },
+    {
+     "text": "When it costs less, whatever the pass rate does.",
+     "correct": false,
+     "why": "Cost alone never decides; a row that loses quality moves one level up."
+    }
+   ]
+  },
+  {
+   "q": "A team sent 4 survey answers. What does the report do with them?",
+   "options": [
+    {
+     "text": "Drops them, because 4 is under min_group_size.",
+     "correct": false,
+     "why": "Dropping loses answers; the rule folds them instead."
+    },
+    {
+     "text": "Reports the team with a warning that n is small.",
+     "correct": false,
+     "why": "A team with 4 answers can be recognised; the report is team level only, with no small groups."
+    },
+    {
+     "text": "Folds them into Other together with every other team under 5.",
+     "correct": true,
+     "why": "load() keeps teams with at least 5 answers and sends every other row to Other."
+    }
+   ]
+  },
+  {
+   "q": "How does a suite running on a sandbox VM write its result file to the eval bucket?",
+   "options": [
+    {
+     "text": "With the VM's instance role, through the S3 VPC endpoint.",
+     "correct": true,
+     "why": "No key sits in the VM; the role is attached to the instance and the endpoint keeps the call inside AWS."
+    },
+    {
+     "text": "With an access key the harness reads from the run's environment.",
+     "correct": false,
+     "why": "No keys in the VM is a wall; a key in the environment would be readable by the agent."
+    },
+    {
+     "text": "Through the nightly job's read-only GitHub OIDC role.",
+     "correct": false,
+     "why": "That role only reads new files from CI; it cannot write, and the VM is not a GitHub job."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "In lesson g1-3, what does the eval scoreboard draw under each pass-rate line, and why does a change only count past it?",
+  "In lesson p3-6, how does a process on an EC2 instance write to a bucket without an access key?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "eval store",
+   "plain": "The S3 bucket rhino-ai-agents-eval-results, with one JSON file per eval run."
+  },
+  {
+   "term": "spread",
+   "plain": "The best round's pass rate minus the worst round's, over the three runs of a suite."
+  },
+  {
+   "term": "split",
+   "plain": "A named slice of a suite: dev for daily work, smoke for a quick run, holdout for the final check."
+  },
+  {
+   "term": "lens",
+   "plain": "One of DX's three groups of numbers, utilization, impact or cost, read together."
+  },
+  {
+   "term": "human-equivalent hour",
+   "plain": "One hour of work an engineer would have needed, stated in Nova's plan and confirmed by the approver."
+  },
+  {
+   "term": "IQR",
+   "plain": "The interquartile range: the gap between the 25th and the 75th percentile of the answers."
+  },
+  {
+   "term": "sweep",
+   "plain": "A small eval run that tries each routing-table row, or each harness part, one change at a time."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G1-08",
+   "why": "The eval store is the one place every suite, sweep and run label writes to, and the nightly job reads from.",
+   "walk": [
+    "In the infrastructure repo, add terraform/accounts/ai-agents/aws/us-east-1/evals/results-bucket/terragrunt.hcl from tfr:///terraform-aws-modules/s3-bucket/aws 5.13.0 with KMS, versioning and no public access; a person applies.",
+    "Add ai-agents/evals/results.py (code above); every suite calls record(). VMs write with their instance role through the S3 VPC endpoint.",
+    "Add ai-agents/metrics/src/eval-results.ts with @aws-sdk/client-s3. It reads new files with the read-only GitHub OIDC role. It pushes the four ai_agents_eval_* series with suite, version, split, model and effort labels.",
+    "Keep the schema rules: 3 runs per case; each run records pass, cost, turns, agents, seconds and a cause when it fails.",
+    "Check with aws s3 ls that the first BYTE-GOLD and TICKET-BENCH runs land as suite/version/split/started_at.json."
+   ]
+  },
+  {
+   "key": "G1-13",
+   "why": "The three lenses need the PR data, the collector's user_hash and the gateway series that earlier lessons built.",
+   "walk": [
+    "Add ai-agents/metrics/src/lenses.ts (code above) to the nightly job and write delivery_lens_* series per team and week.",
+    "Utilization: distinct user_hash from Claude Code metrics; aiTrailer PRs; Jira tickets assigned to Nova plus routine runs.",
+    "Decide human-equivalent hours with Nir: the proposal is the hours stated in Nova's plan, confirmed or corrected by the plan approver.",
+    "Show dollars per human-equivalent hour (cost divided by hours) and confirm the wording with Nir.",
+    "Add a 'Three lenses' row at the top of delivery-impact.json, the three side by side over the same weeks."
+   ]
+  },
+  {
+   "key": "G1-01",
+   "why": "The survey is the baseline for how time and confidence feel, read next to the metrics.",
+   "walk": [
+    "Build the Google Form from ai-agents/metrics/survey/questions.yaml (code above); collect no emails, team is the only grouping field.",
+    "Send it in #engineering by 21 Oct with one line on why; remind once after 3 days.",
+    "Report team level only; fold any team with fewer than 5 answers into Other.",
+    "Export the answers as CSV to a restricted Drive folder and keep questions.yaml unchanged for December."
+   ]
+  },
+  {
+   "key": "G1-18",
+   "why": "survey-compare.ts turns the two CSV exports into team medians with ranges.",
+   "walk": [
+    "Rebuild the form from the unchanged questions.yaml and send it by 10 Dec with the same wording.",
+    "From an ai-agents checkout after npm ci, run npx tsx metrics/src/survey-compare.ts october.csv december.csv (code above).",
+    "Put the output next to the delivery-impact numbers in the quarter report: both directions, with ranges, no per-person view."
+   ]
+  },
+  {
+   "key": "G1-17",
+   "why": "The sweep uses record(), the eval scoreboard and the spread rule from this lesson.",
+   "walk": [
+    "Add ai-agents/evals/sweeps/2026-w9-effort.yaml (code above) and run it on wide sandbox VMs; results land in the eval store.",
+    "Run each setting 3 times; a cheaper setting passes when its pass rate is within the current setting's spread.",
+    "Change effort per message, not per session, so the prompt cache stays warm.",
+    "Update the harness routing table in one PR that links the scoreboard; a person approves it."
+   ]
+  },
+  {
+   "key": "G1-19",
+   "why": "The new-model check is the same sweep shape with harness parts instead of effort levels.",
+   "walk": [
+    "Add ai-agents/evals/sweeps/new-model.yaml (code above) listing the harness parts that can be switched off.",
+    "Run it once in W12 on the current model as the reference, so the next model release has a baseline.",
+    "Drop a part only when removing it keeps the pass rate within the spread and lowers cost or time. Ship that in the monthly rule-diet PR."
+   ]
+  }
+ ],
+ "remember": "One file per eval run, three runs per case, and nothing moves unless it holds within the spread and a person approves."
+}

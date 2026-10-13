@@ -1,0 +1,417 @@
+{
+ "id": "p9-3",
+ "title": "Pull requests from an agent",
+ "minutes": 40,
+ "youNeed": [
+  "p2-5",
+  "p9-1",
+  "p9-2"
+ ],
+ "bridge": "An agent's PR is like a PR you open as a draft and only mark ready when CI is green. Except: the author is a bot, so the PR must name the person who asked in a Requested-by line. And the bot may open drafts and mark its own PR ready, but it can never approve or merge.",
+ "intro": "p2-5 taught the Octokit calls. This lesson is about the life of an agent's PR. Who opens it, what its title and last line say, and how required checks decide when it leaves draft. Then the one GraphQL call that marks it ready. People are pinged only when the PR is clean.",
+ "picture": {
+  "caption": "The harness asks, the broker writes with a one-repo token, and the ready gate pings people only when the PR is clean.",
+  "nodes": [
+   {
+    "id": "vm",
+    "label": "harness in the VM",
+    "kind": "agent"
+   },
+   {
+    "id": "broker",
+    "label": "broker (one-repo App token)",
+    "kind": "service"
+   },
+   {
+    "id": "pr",
+    "label": "draft PR: [FE] RH-1234 ... Requested-by: @dana-l",
+    "kind": "file"
+   },
+   {
+    "id": "gate",
+    "label": "readyGate activity",
+    "kind": "check"
+   },
+   {
+    "id": "people",
+    "label": "reviewer team + requester",
+    "kind": "person"
+   }
+  ],
+  "steps": [
+   {
+    "from": "vm",
+    "to": "broker",
+    "text": "asks to open a PR for branch nova/RH-1234; the VM holds no token"
+   },
+   {
+    "from": "broker",
+    "to": "pr",
+    "text": "pulls.create with draft: true and the Requested-by line last"
+   },
+   {
+    "from": "gate",
+    "to": "pr",
+    "text": "reads required checks (gh pr checks --required), QA results, judges and findings"
+   },
+   {
+    "from": "gate",
+    "to": "pr",
+    "text": "all clean: markPullRequestReadyForReview, then request the reviewer team"
+   },
+   {
+    "from": "pr",
+    "to": "people",
+    "text": "only now is anyone pinged; one approval from someone who is not Dana"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "The life of an agent PR",
+   "p": [
+    "Nova works on the branch nova/RH-1234 and pushes a checkpoint after each step that passes, with [skip ci] in the message. When the work is done, it asks the broker to open a draft PR. Byte reviews the draft, Nova fixes what Byte finds, and CI runs.",
+    "The PR stays a draft until everything is clean. Then the ready gate marks it ready and requests the reviewer team. The Jira ticket goes back to the requester, and Slack gets a post. A person reviews, one other person approves, and a person merges. The agent never does those last three."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "G4-27: people's attention is the scarcest part of this loop. Pinging them only for clean PRs keeps their trust in Nova."
+   }
+  },
+  {
+   "h": "Title, branch and the Requested-by line",
+   "p": [
+    "The title follows fcp's habit: [FE] RH-1234: what changes. The body uses the pr-story headings and keeps ### References with the Jira link, so add-jira-links finds it. The last line is always Requested-by: @<github login>.",
+    "That line matters because the PR's author is the bot rhino-ai-agents[bot]. GitHub stops authors approving their own PRs, but here the author is a bot. The independent-approval check (G0-09) reads the line and refuses an approval from that person. A PR without the line fails closed. For a routine, the line names the routine's owner."
+   ],
+   "because": "We build the line in one function because a missing or wrong login silently breaks the approval wall.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/github-pr.ts (sketch)",
+    "text": "// ai-agents/broker/src/github-pr.ts (sketch): what every agent PR looks like\nconst REQUESTED_BY = /^Requested-by:\\s*@?([A-Za-z0-9-]+)\\s*$/m; // the line G0-09's check reads\n\nexport const prTitle = (team: \"FE\" | \"BE\", key: string, summary: string) => `[${team}] ${key}: ${summary}`;\nexport const prBranch = (agent: string, key: string) => `${agent}/${key}`; // nova/RH-1234\n\nexport const withRequestedBy = (body: string, jiraAccountId: string): string => {\n  const person = people.byJiraId(jiraAccountId); // config/people.yaml: Jira accountId to GitHub login\n  if (!person) throw new Error(`no GitHub login for ${jiraAccountId}; add them to config/people.yaml`);\n  const line = `Requested-by: @${person.github}`;\n  if (!REQUESTED_BY.test(line)) throw new Error(`not a GitHub login: ${person.github}`);\n  return `${body.trimEnd()}\\n\\n${line}\\n`; // always the last line\n};",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The same pattern the approval check uses (G0-09). Test the line against it before writing."
+     },
+     {
+      "line": 4,
+      "text": "The team prefix and the Jira key, like every fcp PR title."
+     },
+     {
+      "line": 5,
+      "text": "The run's one branch. The broker's git proxy refuses pushes anywhere else."
+     },
+     {
+      "line": 8,
+      "text": "The requester is known by Jira accountId; GitHub needs the login. people.yaml maps them."
+     },
+     {
+      "line": 9,
+      "text": "No mapping: fail loudly. A PR with a guessed requester is worse than no PR."
+     },
+     {
+      "line": 12,
+      "text": "The last line of the body, after the pr-story sections and References."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The broker opens the draft",
+   "p": [
+    "The VM has no GitHub token. The harness asks the broker, and the broker's POST /v1/gh allow-list decides. It may create a draft PR, mark the run's own PR ready, view, diff, read checks and comment on its own PR. It may never merge, approve or change settings.",
+    "The broker mints a GitHub App token for one repo and one hour. It has contents and pull_requests write, and checks and actions read. Never workflows, so no agent push can change .github/workflows."
+   ],
+   "because": "We open the PR in the broker because the token never enters the VM, and the broker knows the run's branch.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/github-pr.ts (sketch)",
+    "text": "// ai-agents/broker/src/github-pr.ts (sketch): the broker opens the PR; the VM only asks\nexport const openDraftPr = async (scope: RunScope, title: string, body: string, requester: string) => {\n  const octokit = new Octokit({ auth: await mintToken(scope) }); // 1 hour, one repo, never leaves the broker\n  const [owner = \"\", repo = \"\"] = scope.repo.split(\"/\");\n  const { data: pr } = await octokit.rest.pulls.create({\n    owner, repo, base: \"main\",\n    head: scope.branch, // nova/RH-1234: the only branch this run may push\n    title, body: withRequestedBy(body, requester),\n    draft: true, // always a draft: nobody is pinged yet\n  });\n  await audit(scope, \"pr.create\", { number: pr.number }); // every write lands in the audit log\n  return { number: pr.number, url: pr.html_url, nodeId: pr.node_id };\n};",
+    "notes": [
+     {
+      "line": 3,
+      "text": "A fresh installation token for this run's repo. It is used here and never returned."
+     },
+     {
+      "line": 7,
+      "text": "head comes from the run's scope, not from the request, so a run cannot open a PR from another branch."
+     },
+     {
+      "line": 8,
+      "text": "The body gets the Requested-by line here, in one place."
+     },
+     {
+      "line": 9,
+      "text": "Always draft. Drafts do not request reviews or notify CODEOWNERS."
+     },
+     {
+      "line": 11,
+      "text": "Byte's broker pattern: every write and every refused write is audited."
+     },
+     {
+      "line": 12,
+      "text": "node_id is the PR's GraphQL ID. Keep it: marking ready needs it."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Reading checks: only the required ones",
+   "p": [
+    "A PR has many checks, and only the required ones block a merge. gh pr checks <n> --required --json name,bucket lists them. bucket groups each check's state into pass, fail, pending, skipping or cancel, so the code needs no table of conclusions.",
+    "The ready gate treats anything but pass and skipping as a blocker, a pending check included. Then it adds the other evidence: QA checks, the scope judge, the PR judge and important findings that are still open. If main fails the same check, Nova links main's failing run and flags it instead of looping."
+   ],
+   "because": "We gate on required checks, not all checks, because only those decide whether a person could merge.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/activities/ready-gate.ts",
+    "text": "// ai-agents/orchestrator/src/activities/ready-gate.ts (G4-27): draft to ready only when clean\nconst DONE = new Set([\"fixed\", \"answered\", \"with_a_person\"]);\n\nexport async function readyGate(pr: number, ev: GateEvidence): Promise<GateResult> {\n  const checks = await gh<{ name: string; bucket: string }[]>([\"pr\", \"checks\", String(pr), \"--required\", \"--json\", \"name,bucket\"]);\n  const blockers = checks.filter((c) => c.bucket !== \"pass\" && c.bucket !== \"skipping\")\n    .map((c) => `CI: ${c.name} is ${c.bucket}`);\n  blockers.push(...ev.qa_results.filter((q) => !q.passed).map((q) => `QA check ${q.id} failed`));\n  if (ev.scope_judge.verdict === \"veto\" && !ev.scope_judge.explained) blockers.push(\"scope judge veto not resolved\");\n  if (!ev.pr_judge.ready) blockers.push(\"PR judge: the description has open items\");\n  const open = ev.findings.filter((f) => f.severity === \"important\" && !DONE.has(f.state));\n  blockers.push(...open.map((f) => `open finding ${f.path}:${f.line}`));\n  if (blockers.length) return { ready: false, blockers }; // stays a draft; nobody is pinged\n  await gh([\"pr\", \"ready\", String(pr)]);\n  await gh([\"pr\", \"edit\", String(pr), \"--add-reviewer\", ev.reviewer_team]); // e.g. RhinoHealth/frontend-guild\n  return { ready: true, blockers: [] };\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Finding states that count as handled. Anything else that is important blocks."
+     },
+     {
+      "line": 5,
+      "text": "Through the broker: gh with --required and JSON output. One call, every required check."
+     },
+     {
+      "line": 6,
+      "text": "pass and skipping are fine; fail, pending and cancel block."
+     },
+     {
+      "line": 8,
+      "text": "Every QA check from the agreed plan must have passed."
+     },
+     {
+      "line": 13,
+      "text": "Any blocker: stay a draft, ping nobody, and return the reasons."
+     },
+     {
+      "line": 14,
+      "text": "Clean: leave draft. In the broker this is the GraphQL call below."
+     },
+     {
+      "line": 15,
+      "text": "Request the reviewer team by area: frontend-guild for frontend/**, backend-guild for cloud/** and client/**."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Marking ready is a GraphQL call",
+   "p": [
+    "The REST endpoint that updates a PR cannot take it out of draft. GitHub's GraphQL API has the mutation markPullRequestReadyForReview, and gh pr ready uses it. It takes the PR's node_id, which pulls.create returned.",
+    "The broker checks first that the PR belongs to this run. A run can mark only its own PR ready, never another one."
+   ],
+   "because": "We check the PR's owner first, so 'mark ready' can never ping people about someone else's PR.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/github-pr.ts (sketch)",
+    "text": "// ai-agents/broker/src/github-pr.ts (sketch): what `gh pr ready` does. REST cannot leave draft; GraphQL can.\nconst READY = `mutation($id: ID!) {\n  markPullRequestReadyForReview(input: { pullRequestId: $id }) { pullRequest { isDraft url } }\n}`;\n\nexport const markReady = async (scope: RunScope, pr: { number: number; nodeId: string }) => {\n  if (!(await isOwnPr(scope, pr.number))) throw new ScopeDenied(\"only the run's own PR\"); // G3-07\n  const octokit = new Octokit({ auth: await mintToken(scope) });\n  type Res = { markPullRequestReadyForReview: { pullRequest: { isDraft: boolean } } };\n  const res = await octokit.graphql<Res>(READY, { id: pr.nodeId }); // node_id from pulls.create\n  return !res.markPullRequestReadyForReview.pullRequest.isDraft; // true: people may now be pinged\n};",
+    "notes": [
+     {
+      "line": 2,
+      "text": "A GraphQL mutation with one variable, the PR's node ID."
+     },
+     {
+      "line": 3,
+      "text": "We ask for isDraft back, to confirm the change happened."
+     },
+     {
+      "line": 7,
+      "text": "The scope wall: only the run's own PR (G3-07)."
+     },
+     {
+      "line": 10,
+      "text": "octokit.graphql sends the query with variables. Errors throw like REST errors."
+     },
+     {
+      "line": 11,
+      "text": "false isDraft means ready. Then the workflow sets Nova state to PR open and assigns Jira back."
+     }
+    ]
+   }
+  },
+  {
+   "h": "What the bot never does",
+   "p": [
+    "Exactly one approval, from a person who is not the requester, is a GitHub wall. The ruleset requires it and G0-09's check enforces who. The rhino-ai-agents App has no permission to merge and no bypass. The agent also never edits the checks it is judged by: locked checks block that (G0-18).",
+    "After ready, people's review comments go back into Nova's fix-or-answer loop. If nobody reviews for 2 days, Nova reminds once (G3-38)."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "The requester never approves their own agent's PR, and exactly one approval is needed. Agents never merge."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Read a draft PR the way the ready gate does",
+  "youNeed": [
+   "Your scratch repo actions-lab from p2 (with a workflow that runs on pull_request)",
+   "gh CLI logged in",
+   "~/octo-lab from p2-5"
+  ],
+  "worked": [
+   {
+    "do": "cd ~/actions-lab && git switch -c nova/LAB-1 && echo lab >> README.md && git commit -am 'LAB-1: a lab change' && git push -u origin nova/LAB-1",
+    "see": "nova/LAB-1 -> nova/LAB-1"
+   },
+   {
+    "do": "gh pr create --draft --title '[FE] LAB-1: a lab change' --body $'### References\\n- LAB-1\\n\\nRequested-by: @<your login>'",
+    "see": "https://github.com/<you>/actions-lab/pull/<n>"
+   },
+   {
+    "do": "cd ~/octo-lab and create pr-lab.ts:\n// ~/octo-lab/pr-lab.ts: read-only. Reads a draft PR and prints what the ready gate would do.\nimport { execFileSync } from \"node:child_process\";\nimport { Octokit } from \"@octokit/rest\";\n\nconst owner = \"<you>\", repo = \"actions-lab\", n = Number(process.argv[2]);\nconst octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });\nconst { data: pr } = await octokit.rest.pulls.get({ owner, repo, pull_number: n });\nconst requester = /^Requested-by:\\s*@?([A-Za-z0-9-]+)\\s*$/m.exec(pr.body ?? \"\")?.[1];\nconsole.log(`#${n} draft=${pr.draft} node_id=${pr.node_id} requested-by=${requester ?? \"MISSING\"}`);\n\nconst out = execFileSync(\"gh\", [\"pr\", \"checks\", String(n), \"-R\", `${owner}/${repo}`, \"--json\", \"name,bucket\"], { encoding: \"utf8\" });\nconst blockers = (JSON.parse(out) as { name: string; bucket: string }[])\n  .filter((c) => c.bucket !== \"pass\" && c.bucket !== \"skipping\").map((c) => `${c.name} is ${c.bucket}`);\nif (!requester) blockers.push(\"no Requested-by line: the approval check would fail closed\");\nconsole.log(blockers.length ? `stays draft: ${blockers.join(\"; \")}` : `would send markPullRequestReadyForReview for ${pr.node_id}`);",
+    "see": "(no output)"
+   },
+   {
+    "do": "GITHUB_TOKEN=$(gh auth token) npx tsx pr-lab.ts <n> while the workflow still runs",
+    "see": "#<n> draft=true node_id=PR_kwDO... requested-by=<your login>\nstays draft: <job name> is pending"
+   },
+   {
+    "do": "Wait for the run to finish (gh pr checks <n> --watch), then run pr-lab.ts again",
+    "see": "would send markPullRequestReadyForReview for PR_kwDO..."
+   },
+   {
+    "do": "Mark it ready yourself: gh pr ready <n>. Run pr-lab.ts again.",
+    "see": "#<n> draft=false ..."
+   },
+   {
+    "do": "Put it back: gh pr ready <n> --undo",
+    "see": "Pull request #<n> is converted to \"draft\""
+   }
+  ],
+  "faded": "Edit the PR body on GitHub and delete the Requested-by line. Left to you: predict pr-lab.ts's output, run it, and say which wall that output protects.",
+  "alone": "Write withRequestedBy for the lab: a small people.json mapping a fake Jira accountId to your GitHub login. It must throw for an unknown accountId and put the line last. Test both cases with node:test, then print the body you would send.",
+  "done": "Your read-only script found the Requested-by line, kept a pending PR as a draft, and named the node_id it would mark ready."
+ },
+ "quiz": [
+  {
+   "q": "How does the broker take Nova's PR out of draft?",
+   "options": [
+    {
+     "text": "pulls.update with draft: false",
+     "correct": false,
+     "why": "REST cannot leave draft; that field is not accepted for this change."
+    },
+    {
+     "text": "Adding a ready-for-review label",
+     "correct": false,
+     "why": "Labels change nothing about the draft state."
+    },
+    {
+     "text": "The GraphQL mutation markPullRequestReadyForReview with the PR's node_id",
+     "correct": true,
+     "why": "That is what gh pr ready does too."
+    }
+   ]
+  },
+  {
+   "q": "A fe-ci-fixer routine opens a PR. Who goes on the Requested-by line?",
+   "options": [
+    {
+     "text": "The routine's owner from config/people.yaml",
+     "correct": true,
+     "why": "For routines the owner is the requester, so the owner cannot approve it."
+    },
+    {
+     "text": "rhino-ai-agents[bot], the author",
+     "correct": false,
+     "why": "The author is already excluded; the line must name a person."
+    },
+    {
+     "text": "The reviewer of the day",
+     "correct": false,
+     "why": "Then the person expected to review could never approve."
+    }
+   ]
+  },
+  {
+   "q": "A required check has bucket pending. What does the ready gate do?",
+   "options": [
+    {
+     "text": "Marks the PR ready; CI will finish soon",
+     "correct": false,
+     "why": "Pending blocks; people are pinged only for clean PRs."
+    },
+    {
+     "text": "Keeps the PR a draft, pings nobody, and returns the blocker",
+     "correct": true,
+     "why": "Only pass and skipping count as clean."
+    },
+    {
+     "text": "Re-runs the check until it passes",
+     "correct": false,
+     "why": "The gate reads checks; it never re-runs or changes them."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "In p9-2, where does requesterOf look first, and what does it read when that is empty?",
+  "In p2-5, why must a list call such as listReviews go through octokit.paginate?"
+ ],
+ "videos": [
+  {
+   "title": "How to use GitHub REST API for Beginners",
+   "url": "https://www.youtube.com/watch?v=OvfLavRD1Os",
+   "channel": "Andy's Tech Tutorials",
+   "minutes": 6,
+   "why": "Six-minute first call to the GitHub REST API with a token."
+  },
+  {
+   "title": "Open Source Friday with Octokit - GitHub's SDKs for JS, Ruby, .NET and more!",
+   "url": "https://www.youtube.com/watch?v=qP4h7GP5kfM",
+   "channel": "GitHub",
+   "minutes": 50,
+   "why": "GitHub's own session on Octokit.js, auth and pagination."
+  }
+ ],
+ "words": [
+  {
+   "term": "draft PR",
+   "plain": "A PR opened with draft: true; it requests no reviews and notifies nobody."
+  },
+  {
+   "term": "Requested-by line",
+   "plain": "The last line of an agent PR body, Requested-by: @login; that person can never approve it."
+  },
+  {
+   "term": "required check",
+   "plain": "A check the ruleset demands before merge; the ready gate reads only these."
+  },
+  {
+   "term": "bucket",
+   "plain": "gh pr checks' simple state per check: pass, fail, pending, skipping or cancel."
+  },
+  {
+   "term": "node_id",
+   "plain": "A PR's GraphQL ID, returned by pulls.create; GraphQL mutations need it."
+  },
+  {
+   "term": "ready gate",
+   "plain": "G4-27's activity that marks a PR ready only when checks, QA, judges and findings are clean."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G4-27",
+   "why": "readyGate reads required checks and evidence, and only then marks ready and requests reviewers."
+  },
+  {
+   "key": "G4-20",
+   "why": "The PR body uses the pr-story headings, keeps ### References, and always ends with Requested-by."
+  },
+  {
+   "key": "G0-09",
+   "why": "The independent-approval check reads the Requested-by line and fails closed without it."
+  },
+  {
+   "key": "G3-07",
+   "why": "The broker's POST /v1/gh allow-list opens drafts and marks only the run's own PR ready, with a one-repo token."
+  }
+ ],
+ "remember": "Agents open drafts through the broker, end the body with Requested-by, and leave draft only when every required check is clean."
+}

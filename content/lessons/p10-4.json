@@ -1,0 +1,444 @@
+{
+ "id": "p10-4",
+ "title": "Fakes, not mocks",
+ "minutes": 55,
+ "youNeed": [
+  "p10-2",
+  "p10-3"
+ ],
+ "bridge": "A fake is like MSW's in-memory request handlers instead of vi.fn(). It is a small, real implementation of the service that keeps state and answers like the real one. Except: a fake needs its own proof that it behaves like the real service. That proof is a contract suite: the same tests run against the fake and against the real thing.",
+ "intro": "fcp's cloud talks to three things a unit test cannot run. They are on-prem clients over gRPC, an object store (S3 or MinIO) and Celery workers. Today the tests mock them in about 100 places, and the mocks drift. G7 replaces them with three fakes, each pinned by a contract suite. This lesson shows how to write one and how to keep it honest.",
+ "picture": {
+  "caption": "The same contract tests run against the in-memory fake and against the real service. A difference fails the suite, so the fake is fixed.",
+  "nodes": [
+   {
+    "id": "test",
+    "label": "API test",
+    "kind": "check"
+   },
+   {
+    "id": "code",
+    "label": "cloud code (StorageService)",
+    "kind": "service"
+   },
+   {
+    "id": "fake",
+    "label": "InMemoryStore (fake)",
+    "kind": "service"
+   },
+   {
+    "id": "real",
+    "label": "MinIO in Docker (real)",
+    "kind": "cloud"
+   },
+   {
+    "id": "contract",
+    "label": "contract suite",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "test",
+    "to": "code",
+    "text": "calls the endpoint; the code wants to upload a file"
+   },
+   {
+    "from": "code",
+    "to": "fake",
+    "text": "a fixture swapped the real provider for the fake at the seam, so the bytes land in a dict"
+   },
+   {
+    "from": "contract",
+    "to": "fake",
+    "text": "the contract tests run against the fake: put, get, list, missing bucket"
+   },
+   {
+    "from": "contract",
+    "to": "real",
+    "text": "the same tests run against MinIO when MINIO_URL is set"
+   },
+   {
+    "from": "real",
+    "to": "fake",
+    "text": "every behaviour MinIO shows and the fake lacks becomes a failing test, then a fix in the fake"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Why mocks drift",
+   "p": [
+    "A mock is a stand-in that records calls and returns what the test told it to. vi.fn().mockResolvedValue(x) is a mock. It proves that the code called something. It proves nothing about whether the real service would accept those arguments or return that shape. When the real service changes, the mock keeps smiling.",
+    "rhinoCore/tests has 69 mock.patch calls on AgentRpcClient and 24 on StorageService. 11 test classes set CELERY_TASK_ALWAYS_EAGER, which runs Celery tasks inside the caller and skips the broker's serialization. G7-01 lists these numbers as the reason for the fakes.",
+    "A fake is different: it is a small real implementation. An in-memory store keeps the bytes in a dict and returns them on get.",
+    "A fake client serves the real gRPC service in-process. A fake queue records tasks and runs them when you ask. The code under test cannot tell the difference, and the test asserts on outcomes, not on calls."
+   ]
+  },
+  {
+   "h": "Write the fake behind the real interface",
+   "p": [
+    "Start from the interface the production code already uses. fcp's storage code calls a CloudStorageServiceProviderBase with methods like list_objects and upload_file; the AWS provider implements it with boto3. The fake implements the same methods with a dict. In the lab, the interface is a small ObjectStore class and the fake is InMemoryStore.",
+    "Two habits from the tickets: be loud about gaps, and keep the fake honest about errors. When a handler is missing, G7-04's fake returns an error that names the method. So a gap fails a test instead of silently passing. G7-05's fake lets a missing bucket raise, because MinIO does."
+   ],
+   "because": "The fake must sit behind the same interface as the real thing, or the production code would need a test-only branch.",
+   "code": {
+    "lang": "python",
+    "file": "lab4/store/memory.py",
+    "text": "from .base import ObjectStore\n\n\nclass InMemoryStore(ObjectStore):\n    \"\"\"S3-shaped store in a dict. Pinned by tests/test_store_contract.py, which also runs on MinIO.\"\"\"\n\n    def __init__(self) -> None:\n        self.buckets: dict[str, dict[str, bytes]] = {}\n\n    def create_bucket(self, bucket: str) -> None:\n        self.buckets.setdefault(bucket, {})\n\n    def put(self, bucket: str, key: str, data: bytes) -> None:\n        self.buckets[bucket][key] = data  # a missing bucket raises KeyError, like MinIO raises NoSuchBucket\n\n    def get(self, bucket: str, key: str) -> bytes:\n        return self.buckets[bucket][key]\n\n    def list_keys(self, bucket: str, prefix: str = \"\") -> list[str]:\n        return sorted(key for key in self.buckets[bucket] if key.startswith(prefix))",
+    "notes": [
+     {
+      "line": 4,
+      "text": "Subclassing the same base class the real store subclasses. The code under test only knows the base."
+     },
+     {
+      "line": 5,
+      "text": "The docstring names the contract suite. G7-05's fake does the same, so the next person knows what pins it."
+     },
+     {
+      "line": 8,
+      "text": "All the state: bucket name to (key to bytes). No network, no disk."
+     },
+     {
+      "line": 14,
+      "text": "Honest about errors: self.buckets[bucket] raises when the bucket is missing. The first version used setdefault here and the contract suite caught it."
+     },
+     {
+      "line": 20,
+      "text": "sorted, because S3 returns keys in order and the contract tests compare lists."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Swap it in at the seam",
+   "p": [
+    "A seam is the one place where production code creates or reaches the real service. You replace the real thing there, with monkeypatch, and nowhere else. G7-05: StorageService.__init__ builds AWSStorageServiceProvider() at call time, so the fixture patches storage_service.AWSStorageServiceProvider.",
+    "G7-07: Task.apply_async ends in app.send_task, so the fixture patches app.send_task. G7-04: AgentRpcClient reads two env vars for the proxy host and port every time it is created. So the fixture points them at the fake server.",
+    "Patch the attribute on the module that reads it, never the name a test imported. And write the seam down in the fake's docstring: G7-05 also has to patch requests.get for presigned URLs, and says so."
+   ],
+   "because": "Patching at the seam means production code does not change. The test still runs the real code on both sides of it.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/conftest.py (G7-05 fixture, sketch)",
+    "text": "import pytest\n\nfrom rhinoCloud.rhinoCore.services.cloud_services import storage_service\n\nfrom fakes.object_store import InMemoryStorageProvider\n\n\n@pytest.fixture\ndef object_store(monkeypatch):\n    store = InMemoryStorageProvider()\n    # StorageService.__init__ calls AWSStorageServiceProvider() when CLOUD_PROVIDER is AWS (the test env)\n    monkeypatch.setattr(storage_service, \"AWSStorageServiceProvider\", lambda: store)\n    return store",
+    "notes": [
+     {
+      "line": 3,
+      "text": "Import the module that holds the seam, not the class. The patch must land where production code looks it up."
+     },
+     {
+      "line": 12,
+      "text": "The seam: every StorageService created during this test gets the fake. monkeypatch undoes it after the test."
+     },
+     {
+      "line": 13,
+      "text": "Return the fake so the test can look inside it (store.buckets) when an outcome is not visible through the API."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The contract suite keeps the fake honest",
+   "p": [
+    "A contract suite is one set of tests with a parametrized fixture that yields the fake or the real service. Each test runs twice.",
+    "The real side runs only when the real service is reachable. In the lab, that is when MINIO_URL is set. In fcp, it runs under the contract marker in the CI job that has the MinIO and Redis services. It also runs against FCP Lab with --target lab (G7-26).",
+    "The suite does not need to be big. It pins the behaviours the code under test relies on. Examples: a missing bucket, list with a prefix, overwrite, delete, the error type for an offline agent, the order of drained tasks. When MinIO does something the fake does not, you add a test, watch the fake fail, and fix the fake."
+   ],
+   "because": "Without the real side, a fake is a mock with more lines; the contract suite is what makes it trustworthy.",
+   "code": {
+    "lang": "python",
+    "file": "lab4/tests/test_store_contract.py",
+    "text": "import os\nimport uuid\n\nimport pytest\n\nfrom store.memory import InMemoryStore\nfrom store.s3 import S3Store\n\nTARGETS = [\"memory\"] + ([\"minio\"] if os.environ.get(\"MINIO_URL\") else [])\n\n\n@pytest.fixture(params=TARGETS)\ndef store(request):\n    if request.param == \"memory\":\n        store = InMemoryStore()\n    else:\n        store = S3Store(os.environ[\"MINIO_URL\"], \"minioadmin\", \"minioadmin\")\n    store.create_bucket(\"lab\")\n    return store\n\n\ndef test_put_into_a_missing_bucket_raises(store):\n    with pytest.raises(Exception):\n        store.put(\"no-such-bucket\", f\"contract/{uuid.uuid4()}\", b\"x\")",
+    "notes": [
+     {
+      "line": 9,
+      "text": "The real target joins only when the environment says where it is. On a laptop without MinIO the suite still runs on the fake."
+     },
+     {
+      "line": 12,
+      "text": "params on a fixture: every test that asks for store runs once per param. pytest names them test_x[memory] and test_x[minio]."
+     },
+     {
+      "line": 18,
+      "text": "Setup that both sides need, done through the interface, so the test never touches boto3 directly."
+     },
+     {
+      "line": 22,
+      "text": "This test came from MinIO. The first fake created buckets on put; MinIO raised NoSuchBucket; the fake was wrong."
+     }
+    ]
+   },
+   "see": "$ MINIO_URL=http://localhost:9000 uv run pytest -v\ntests/test_store_contract.py::test_put_then_get_returns_the_same_bytes[memory] PASSED\ntests/test_store_contract.py::test_put_then_get_returns_the_same_bytes[minio] PASSED\n...\ntests/test_store_contract.py::test_put_into_a_missing_bucket_raises[minio] PASSED\n============================== 8 passed in 0.45s ===============================",
+   "ifInstead": "If instead the minio tests show ERROR with EndpointConnectionError, MinIO is not up on port 9000. Run docker ps and docker logs lab-minio."
+  },
+  {
+   "h": "FakeOnPremClient: a gRPC servicer in memory",
+   "p": [
+    "gRPC is a remote-call protocol. A .proto file defines services and messages, and a code generator writes the client and the server base class (the servicer). The bytes on the wire are protobuf. The cloud reaches every on-prem client through one proxy service, RhinoCloudInternalRpcProxy, and AgentRpcClient wraps the call.",
+    "G7-04's fake subclasses the real generated servicer and starts a real grpc.server on 127.0.0.1 inside the test process. Cloud code under test goes through the real AgentRpcClient, the real protobuf encoding and a real socket. It lands in a Python method that returns an in-memory answer. A mock would skip all of that, which is where the 69 mocks drift.",
+    "Two rules in that fake. Handlers run on a gRPC server thread outside the test's database transaction, so they never touch the database. And finishing a task is explicit: the test calls complete_task(), which runs the same handle_task_response function the production worker runs."
+   ],
+   "because": "The fake must serve the real wire format, or it proves nothing about the encoding and dispatch that the real client does.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/fakes/onprem_client.py (G7-04, the dispatch method)",
+    "text": "class FakeOnPremClient(RhinoCloudInternalRpcProxyServicer):\n    def __init__(self):\n        self.calls: list[tuple[str, str]] = []  # (rhino_agent_id, method_name)\n        self.offline_agents: set[str] = set()\n        self.scheduled: list[onprem.ScheduleTaskRequest] = []\n\n    def AgentRpc(self, request, context):  # runs on a gRPC server thread: never touch the database here\n        self.calls.append((request.rhino_agent_id, request.method_name))\n        if request.rhino_agent_id in self.offline_agents:\n            return AgentRpcResponse(error_message=\"agent not connected\", error_type=AgentRpcResponse.ErrorType.TIMEOUT)\n        handler = getattr(self, f\"_{request.method_name}\", None)\n        if handler is None:  # loud on purpose: add the method here and a case to the contract suite\n            return AgentRpcResponse(error_message=f\"FakeOnPremClient does not implement {request.method_name}\")\n        request_type = getattr(onprem, METHODS[request.method_name].input_type.name)\n        return AgentRpcResponse(response_data=handler(request_type.FromString(request.request_data)).SerializeToString())\n\n    def _HealthCheck(self, request):\n        return onprem.HealthCheckResponse(is_healthy=True)",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The real generated base class. add_RhinoCloudInternalRpcProxyServicer_to_server registers it on a grpc.server in the fixture."
+     },
+     {
+      "line": 4,
+      "text": "State the test can set: put an agent id here and the fake answers with the TIMEOUT error the real proxy returns."
+     },
+     {
+      "line": 7,
+      "text": "One entry point for every method: the proxy carries the method name and the encoded request."
+     },
+     {
+      "line": 11,
+      "text": "getattr looks up a method by name at run time: _HealthCheck for HealthCheck. Missing means a loud error, not a silent pass."
+     },
+     {
+      "line": 14,
+      "text": "The same descriptor lookup AgentRpcClient uses, so the fake decodes exactly what the real client encodes."
+     },
+     {
+      "line": 15,
+      "text": "Decode, call the handler, encode. The protobuf round-trip is real."
+     }
+    ]
+   }
+  },
+  {
+   "h": "FakeTaskQueue: record, then drain",
+   "p": [
+    "Celery is a background job queue, like BullMQ. A task is a plain function registered by import path. Code sends it with apply_async, and a broker (Redis in fcp) stores it serialized.",
+    "A worker process imports the same code and runs it. CELERY_TASK_ALWAYS_EAGER runs the task inside the caller at send time, skipping the broker and the serialization. Celery's own docs say it is not for testing.",
+    "G7-07's fake replaces app.send_task. send_task serializes the arguments with the app's real serializer (pickle in fcp) and deserializes them back. So an argument a broker could not carry fails in the test.",
+    "It records the task and returns an AsyncResult. Nothing runs until the test calls drain(). drain() runs the recorded tasks oldest first with Task.apply and re-raises a task's own error. It also follows Celery's chain option, which the vocabulary indexing flow uses."
+   ],
+   "because": "The order of tasks and the serialization are the two things eager mode hides, and both have bitten production.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/fakes/task_queue.py (G7-07, shortened)",
+    "text": "class FakeTaskQueue:\n    def __init__(self):\n        self.sent: list[SentTask] = []\n        self.ran: list[SentTask] = []\n\n    def send_task(self, name, args=None, kwargs=None, task_id=None, **options):  # replaces app.send_task\n        content_type, encoding, body = dumps((args or (), kwargs or {}), serializer=app.conf.task_serializer)\n        args, kwargs = loads(body, content_type, encoding, accept=app.conf.accept_content)\n        self.sent.append(SentTask(name, tuple(args), kwargs, options, task_id or str(uuid.uuid4())))\n        return app.AsyncResult(self.sent[-1].task_id)  # callers read .id; tests call drain(), never .get()\n\n    def drain(self) -> list[SentTask]:\n        while self.sent:\n            task = self.sent.pop(0)\n            result = app.tasks[task.name].apply(task.args, task.kwargs, task_id=task.task_id, headers=task.options.get(\"headers\"))\n            result.get(propagate=True)  # the task's own exception, raised in the test\n            if chain := list(task.options.get(\"chain\") or []):\n                next_sig = maybe_signature(chain.pop(), app=app)  # Celery keeps the rest of a chain reversed\n                next_sig.apply_async(() if next_sig.immutable else (result.result,), chain=chain or None)\n            self.ran.append(task)\n        return self.ran",
+    "notes": [
+     {
+      "line": 6,
+      "text": "The seam: monkeypatch.setattr(app, \"send_task\", queue.send_task). apply_async ends here, so RhinoTask's header injection still runs."
+     },
+     {
+      "line": 7,
+      "text": "kombu's dumps with the real serializer: the arguments go through pickle as they would on Redis."
+     },
+     {
+      "line": 10,
+      "text": "Production code often reads result.id; nobody waits on it. The test decides when things run."
+     },
+     {
+      "line": 14,
+      "text": "Oldest first. The order is the point; eager mode runs tasks in the middle of the caller."
+     },
+     {
+      "line": 15,
+      "text": "Task.apply runs the task function in this process, with the recorded headers, so the metadata context is restored."
+     },
+     {
+      "line": 17,
+      "text": "A chain is a list of tasks where each feeds the next. The walrus := assigns and tests in one line."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "Fake data only. Builders use Faker names and emails and generated passwords. Never copy rows from QA or prod into a test, and no PHI anywhere in the test layer."
+   }
+  },
+  {
+   "h": "Assert on what the caller sees",
+   "p": [
+    "With fakes in place, tests stop asserting that a mock was called with certain arguments. They assert on status codes, error text, fields and row counts, the things a UI or SDK user would see. G7-18 writes this rule down for the ported tests. It matches the frontend rule in G7-10: test ids, roles, visible text, never class names or internal state.",
+    "When an outcome is not visible through the API, look inside the fake. Use task_queue.sent for a queued chain (G7-27), and onprem_client.scheduled for a scheduled import task (G7-08). That is still an outcome, not a call count."
+   ]
+  }
+ ],
+ "lab": {
+  "title": "A fake object store with a contract suite against MinIO",
+  "youNeed": [
+   "uv",
+   "Docker Desktop running",
+   "the pytest words from p10-2"
+  ],
+  "worked": [
+   {
+    "do": "docker run -d --name lab-minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin public.ecr.aws/u7h0g2s9/rhinofcp/minio:2025.2.7",
+    "see": "A container id. This is the public MinIO image fcp's own CI test job uses; docker logs lab-minio ends with ** Starting MinIO **."
+   },
+   {
+    "do": "uv init --python 3.13 --bare lab4 && cd lab4 && uv add boto3 && uv add --dev pytest && mkdir store tests && touch store/__init__.py && printf '[pytest]\\npythonpath = .\\n' > pytest.ini",
+    "see": " + boto3==1.x\n + pytest==9.1.1"
+   },
+   {
+    "do": "Create store/base.py: an abstract ObjectStore with create_bucket, put, get and list_keys (use abc.ABC and @abstractmethod). Create store/memory.py from the code block above.",
+    "see": "Two files; nothing runs yet."
+   },
+   {
+    "do": "Create store/s3.py: S3Store(endpoint_url, access_key, secret_key) with a boto3 client (region_name=\"us-east-1\"); create_bucket catches self.s3.exceptions.BucketAlreadyOwnedByYou; put is put_object; get is get_object()[\"Body\"].read(); list_keys is list_objects_v2 with Prefix.",
+    "see": "The real side, about 25 lines."
+   },
+   {
+    "do": "Create tests/test_store_contract.py from the block above, plus tests for put-then-get, overwrite and list-with-prefix. Then: uv run pytest -q",
+    "see": "....                                                                     [100%]\n4 passed in 0.25s"
+   },
+   {
+    "do": "MINIO_URL=http://localhost:9000 uv run pytest -v",
+    "see": "test_put_then_get_returns_the_same_bytes[memory] PASSED\ntest_put_then_get_returns_the_same_bytes[minio] PASSED\n...\n============================== 8 passed in 0.45s ==============================="
+   },
+   {
+    "do": "Break the fake: in memory.py change put to self.buckets.setdefault(bucket, {})[key] = data. Run the suite with MINIO_URL again.",
+    "see": "FAILED tests/test_store_contract.py::test_put_into_a_missing_bucket_raises[memory]\n1 failed, 7 passed in 0.36s"
+   },
+   {
+    "do": "Undo the change. When you are done: docker rm -f lab-minio",
+    "see": "lab-minio"
+   }
+  ],
+  "faded": "Add delete(bucket, key) to the interface and to both stores (boto3: delete_object(Bucket=..., Key=...)). Add a contract test that puts a key and deletes it. It checks that get raises and that list_keys no longer shows it. The memory implementation is the step left for you; the suite tells you when it matches MinIO.",
+  "alone": "Put 1,100 keys under one prefix through the interface and assert that list_keys returns all 1,100, on both targets. One side will surprise you: find out which. Read the boto3 docs for list_objects_v2 (look for MaxKeys and ContinuationToken), and fix the store that is wrong. Write one sentence in the fake's docstring about what you learned.",
+  "done": "The contract suite passes on memory and on MinIO, and breaking the fake makes a memory test fail. Your 1,100-key test passes on both sides."
+ },
+ "quiz": [
+  {
+   "q": "A test patches rhinoCloud.rhinoCore.views.dataset.StorageService with a mock and asserts upload_file was called once. What does the test prove about production?",
+   "options": [
+    {
+     "text": "That the upload works end to end.",
+     "correct": false,
+     "why": "No bytes went anywhere; only a call was recorded."
+    },
+    {
+     "text": "That the view called upload_file. Nothing about whether the arguments would be accepted or what a user would see afterwards.",
+     "correct": true,
+     "why": "This is the drift problem: the real provider can change and the mock keeps passing."
+    },
+    {
+     "text": "That the presigned URL is valid.",
+     "correct": false,
+     "why": "A mock returns whatever the test said; it never generated a URL."
+    }
+   ]
+  },
+  {
+   "q": "Where does the object_store fixture patch, and why there?",
+   "options": [
+    {
+     "text": "On the test module, by importing AWSStorageServiceProvider and replacing the name.",
+     "correct": false,
+     "why": "The test's copy of the name is not what production code reads; the patch would do nothing."
+    },
+    {
+     "text": "On storage_service.AWSStorageServiceProvider, because StorageService.__init__ creates the provider there at call time.",
+     "correct": true,
+     "why": "Patch the seam where production creates the real thing, and production code stays unchanged."
+    },
+    {
+     "text": "On boto3.client, so every AWS call is faked.",
+     "correct": false,
+     "why": "Too low: the fake would then have to speak boto3's whole API instead of the small provider interface."
+    }
+   ]
+  },
+  {
+   "q": "Why does FakeTaskQueue serialize the arguments with kombu before recording them?",
+   "options": [
+    {
+     "text": "To make the fake slower, like a real broker.",
+     "correct": false,
+     "why": "Speed is not the point; faithfulness is."
+    },
+    {
+     "text": "So an argument the real broker could not carry fails in the test, not in production. Examples: an open connection, or a model instance that cannot pickle.",
+     "correct": true,
+     "why": "This is exactly what CELERY_TASK_ALWAYS_EAGER skips."
+    },
+    {
+     "text": "Because Celery refuses unserialized arguments in tests.",
+     "correct": false,
+     "why": "Celery does not check; the fake does, on purpose."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p10-2: what does a fixture with params do to the tests that ask for it?",
+  "From p10-3: why do rows created through the API prove more than rows created by a factory?"
+ ],
+ "videos": [
+  {
+   "title": "Unit Tests and Test Doubles like Mocks, Stubs & Fakes",
+   "url": "https://www.youtube.com/watch?v=NPp2pvhGbkM",
+   "channel": "The Theory Of Code",
+   "minutes": 18,
+   "why": "Patient explanation of each test double and when to use it."
+  },
+  {
+   "title": "Stubs vs Mocks vs Fake | In a nutshell",
+   "url": "https://www.youtube.com/watch?v=4AxXWjBSIdY",
+   "channel": "Keploy",
+   "minutes": 3,
+   "why": "Three-minute recap to keep the three terms straight."
+  }
+ ],
+ "words": [
+  {
+   "term": "mock",
+   "plain": "A stand-in that records calls and returns canned answers; it proves a call happened, not that the real service would accept it."
+  },
+  {
+   "term": "fake",
+   "plain": "A small real implementation of a service, usually in memory, behind the same interface as the real one."
+  },
+  {
+   "term": "seam",
+   "plain": "The one place where production code creates or reaches the real service; the fixture swaps the fake in there."
+  },
+  {
+   "term": "contract suite",
+   "plain": "One set of tests run against both the fake and the real service, so the two cannot drift apart."
+  },
+  {
+   "term": "gRPC servicer",
+   "plain": "The server-side base class generated from a .proto file; subclass it and implement the methods."
+  },
+  {
+   "term": "Celery task",
+   "plain": "A plain Python function registered by import path that a worker runs from a queue; sent with apply_async."
+  },
+  {
+   "term": "drain()",
+   "plain": "The fake queue's method that runs the recorded tasks oldest first, when the test decides."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G7-04",
+   "why": "FakeOnPremClient is the gRPC servicer fake with the loud-gap rule and the explicit complete_task shown here."
+  },
+  {
+   "key": "G7-05",
+   "why": "InMemoryStorageProvider and its MinIO contract suite are the lab in fcp's own interface."
+  },
+  {
+   "key": "G7-07",
+   "why": "FakeTaskQueue is the record-then-drain fake, pinned by a contract run on a real Celery worker."
+  },
+  {
+   "key": "G7-08",
+   "why": "The dataset builder uses onprem_client.scheduled and complete_task, so you need the fake's shape."
+  }
+ ],
+ "remember": "A fake is a small real thing behind the real interface, swapped in at the seam. A contract suite run against the real service keeps it honest."
+}

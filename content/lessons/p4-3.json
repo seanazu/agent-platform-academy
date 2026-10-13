@@ -1,0 +1,494 @@
+{
+  "id": "p4-3",
+  "title": "Writing HCL for our modules",
+  "minutes": 55,
+  "youNeed": [
+    "p4-2",
+    "p3-4"
+  ],
+  "bridge": "Reading an HCL module is like reading a React component. Variables are props, outputs are what it returns, and for_each is a map() that renders one resource per item. Except changing a key in that map is not a re-render. It destroys one real resource and creates another.",
+  "intro": "Three modules hold the sandbox infrastructure: aws-vpc-private (the network), aws-sandbox-pool (launch templates and warm pools) and aws-egress-proxy (Squid). This lesson reads them with the HCL features they use. Then it changes one safely and checks it with fmt, validate and a plan.",
+  "picture": {
+    "caption": "One sizes map flows through the pool module: a template and a group per key, and outputs keyed the same way.",
+    "nodes": [
+      {
+        "id": "unit",
+        "label": "sandboxes/terragrunt.hcl inputs",
+        "kind": "file"
+      },
+      {
+        "id": "vars",
+        "label": "variables.tf: sizes, warm_pool_size",
+        "kind": "file"
+      },
+      {
+        "id": "lt",
+        "label": "launch_templates.tf: for_each",
+        "kind": "file"
+      },
+      {
+        "id": "asg",
+        "label": "asg.tf: for_each",
+        "kind": "file"
+      },
+      {
+        "id": "outs",
+        "label": "outputs.tf",
+        "kind": "file"
+      },
+      {
+        "id": "check",
+        "label": "fmt, validate, plan",
+        "kind": "check"
+      }
+    ],
+    "steps": [
+      {
+        "from": "unit",
+        "to": "vars",
+        "text": "passes sizes = { lite, full, wide } and warm_pool_size"
+      },
+      {
+        "from": "vars",
+        "to": "lt",
+        "text": "one launch template per key"
+      },
+      {
+        "from": "lt",
+        "to": "asg",
+        "text": "each group points at the template with the same key"
+      },
+      {
+        "from": "asg",
+        "to": "outs",
+        "text": "IDs and names go out as maps keyed by size"
+      },
+      {
+        "from": "unit",
+        "to": "check",
+        "text": "you run fmt, validate and a plan before the PR"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "h": "The contract: variables",
+      "p": [
+        "Start reading a module at variables.tf: it is the module's props. Each variable has a type, and can have a validation that fails the plan with your message.",
+        "aws-sandbox-pool (G3-11, G3-15) takes a name prefix, the sizes map, the warm pool size per size, the subnets and the tags. The validation keeps warm pools within the group's max_size of 3."
+      ],
+      "because": "We validate inputs in the module so a wrong number fails at plan time with a clear message, not in AWS.",
+      "code": {
+        "lang": "hcl",
+        "file": "modules/aws-sandbox-pool/variables.tf (sketch)",
+        "text": "variable \"name_prefix\" {\n  type = string # \"ai-agents\", from account.hcl\n}\n\nvariable \"sizes\" {\n  type        = map(string)\n  description = \"One launch template and one ASG per key; the value is the instance type.\"\n}\n\nvariable \"warm_pool_size\" {\n  type = map(number) # { lite = 2, full = 2, wide = 0 }\n  validation {\n    condition     = alltrue([for n in values(var.warm_pool_size) : n >= 0 && n <= 3])\n    error_message = \"A warm pool holds 0 to 3 VMs (the group's max_size is 3).\"\n  }\n}\n\nvariable \"subnet_ids\" {\n  type = list(string)\n}\n\nvariable \"tags\" {\n  type = map(string)\n}",
+        "notes": [
+          {
+            "line": 2,
+            "text": "Types are checked before anything runs: string, number, bool, list(...), map(...), object({...})."
+          },
+          {
+            "line": 8,
+            "text": "A description shows up in docs and error messages. Write it for the next reader."
+          },
+          {
+            "line": 14,
+            "text": "alltrue over a for expression: every value between 0 and 3."
+          },
+          {
+            "line": 15,
+            "text": "The message the person sees when the plan fails. Say what is allowed."
+          }
+        ]
+      }
+    },
+    {
+      "h": "for_each and each.key",
+      "p": [
+        "G3-11's launch templates are one resource block with for_each = var.sizes. OpenTofu makes one template per key. Inside the block, each.key is the size and each.value is the instance type.",
+        "Other resources are referenced by type.name.attribute. Below, the template points at the instance profile and the security group. Part 2 points at the KMS key. All three live elsewhere in the module."
+      ],
+      "because": "We use for_each over the sizes map because one block keeps all three sizes under identical rules.",
+      "code": {
+        "lang": "hcl",
+        "file": "modules/aws-sandbox-pool/launch_templates.tf (part 1, G3-11)",
+        "text": "resource \"aws_launch_template\" \"sandbox\" {\n  for_each = var.sizes # { lite = \"m8i.xlarge\", full = \"m8i.2xlarge\", wide = \"m8i.4xlarge\" }\n\n  name          = \"${var.name_prefix}-sandbox-${each.key}\"\n  image_id      = \"resolve:ssm:/ai-agents/sandbox/ami-id\" # promoted by the nightly smoke test (G3-16)\n  instance_type = each.value\n\n  iam_instance_profile { name = aws_iam_instance_profile.sandbox.name } # SSM core only\n  vpc_security_group_ids = [aws_security_group.sandbox.id]              # no ingress at all\n  metadata_options {\n    http_endpoint               = \"enabled\"\n    http_tokens                 = \"required\"\n    http_put_response_hop_limit = 1 # containers on the docker bridge can't get a token\n    instance_metadata_tags      = \"disabled\"\n  }",
+        "notes": [
+          {
+            "line": 2,
+            "text": "One template per key: aws_launch_template.sandbox[\"lite\"], [\"full\"], [\"wide\"]."
+          },
+          {
+            "line": 4,
+            "text": "${...} inside a string: ai-agents-sandbox-lite and so on."
+          },
+          {
+            "line": 6,
+            "text": "each.value is the map's value for this key: the instance type."
+          },
+          {
+            "line": 8,
+            "text": "A nested block written on one line. The profile is another resource in this module."
+          },
+          {
+            "line": 10,
+            "text": "The metadata rules from p3-3, now in HCL. Note the snake_case names."
+          }
+        ]
+      }
+    },
+    {
+      "h": "dynamic blocks and merge()",
+      "p": [
+        "Some settings are nested blocks, not arguments, and a block cannot take a list. A dynamic block writes one block per item. Inside content, the iterator is named after the block: tag_specifications.value.",
+        "merge() combines maps, and later maps win. The account's tags come first, then the two tags the sweeper and the claim code rely on."
+      ],
+      "because": "We generate the tag blocks because the instance and its volume need the same tags, and a copy-pasted block drifts.",
+      "code": {
+        "lang": "hcl",
+        "file": "modules/aws-sandbox-pool/launch_templates.tf (part 2, G3-11)",
+        "text": "  block_device_mappings {\n    device_name = \"/dev/sda1\"\n    ebs {\n      volume_type                = \"gp3\"\n      volume_size                = 120\n      encrypted                  = true\n      kms_key_id                 = aws_kms_key.sandbox.arn\n      volume_initialization_rate = 300 # MiB/s; check aws provider 6.64.0 supports this argument\n    }\n  }\n\n  dynamic \"tag_specifications\" {\n    for_each = [\"instance\", \"volume\"]\n    content {\n      resource_type = tag_specifications.value\n      tags          = merge(var.tags, { \"ai-agents:managed\" = \"true\", \"ai-agents:size\" = each.key })\n    }\n  }\n}",
+        "notes": [
+          {
+            "line": 7,
+            "text": "References the module's own KMS key. Its key policy must allow the AutoScaling role (p3-3)."
+          },
+          {
+            "line": 8,
+            "text": "The ticket asks you to check this argument exists in the pinned provider. validate will tell you."
+          },
+          {
+            "line": 12,
+            "text": "dynamic \"<block name>\": one tag_specifications block per item of for_each."
+          },
+          {
+            "line": 15,
+            "text": "The iterator is named after the block. Here it is \"instance\", then \"volume\"."
+          },
+          {
+            "line": 16,
+            "text": "each.key still refers to the outer for_each: the size."
+          }
+        ]
+      }
+    },
+    {
+      "h": "The group: reference by the same key",
+      "p": [
+        "G3-15's groups use the same for_each. aws_launch_template.sandbox[each.key] picks the template with the same key, so lite's group always launches lite's template.",
+        "var.warm_pool_size[each.key] reads a map by key. If the map lacks a key that sizes has, the plan fails with an error. That is what you want: a missing pool size is a mistake."
+      ],
+      "because": "We key everything by size because then a size is added or removed in one map, and every piece follows.",
+      "code": {
+        "lang": "hcl",
+        "file": "modules/aws-sandbox-pool/asg.tf (G3-15)",
+        "text": "resource \"aws_autoscaling_group\" \"sandbox\" {\n  for_each = var.sizes\n\n  name                = \"${var.name_prefix}-sandbox-${each.key}\"\n  vpc_zone_identifier = var.subnet_ids\n  min_size            = 0\n  max_size            = 3 # only claims in flight live here; claimed VMs are detached\n  desired_capacity    = 0\n  launch_template {\n    id      = aws_launch_template.sandbox[each.key].id\n    version = \"$Latest\"\n  }\n  warm_pool {\n    pool_state                  = \"Stopped\" # a stopped VM costs only its disk\n    min_size                    = var.warm_pool_size[each.key]\n    max_group_prepared_capacity = var.warm_pool_size[each.key]\n    instance_reuse_policy { reuse_on_scale_in = false } # a used VM never goes back\n  }\n  initial_lifecycle_hook {\n    name                 = \"finish-setup\"\n    lifecycle_transition = \"autoscaling:EC2_INSTANCE_LAUNCHING\"\n    heartbeat_timeout    = 1800\n    default_result       = \"ABANDON\"\n  }\n}",
+        "notes": [
+          {
+            "line": 5,
+            "text": "The sandbox subnets from the vpc unit, through a dependency (p4-2)."
+          },
+          {
+            "line": 10,
+            "text": "Same key, so each group launches its own size's template."
+          },
+          {
+            "line": 11,
+            "text": "$Latest: a template change applies to the next VM without touching the group."
+          },
+          {
+            "line": 15,
+            "text": "A map read by key. lite and full get 2, wide gets 0 to start."
+          },
+          {
+            "line": 19,
+            "text": "The finish-setup hook from p3-4: 30 minutes, then ABANDON."
+          }
+        ]
+      }
+    },
+    {
+      "h": "Group tags and outputs",
+      "p": [
+        "An ASG takes tags as repeated tag blocks, each with propagate_at_launch, so VMs from the group get them too. A dynamic block over a merged map writes them.",
+        "Outputs return values to whoever calls the module. Here, maps keyed by size, written with for expressions over the resources. Other units read them through a dependency."
+      ],
+      "because": "We propagate the tags at launch because the sweeper finds warm VMs by ai-agents:managed and the ASG's own tag.",
+      "code": {
+        "lang": "hcl",
+        "file": "modules/aws-sandbox-pool/asg.tf (inside the group) and outputs.tf",
+        "text": "  # inside resource \"aws_autoscaling_group\" \"sandbox\", after initial_lifecycle_hook:\n  dynamic \"tag\" {\n    for_each = merge(var.tags, { \"ai-agents:managed\" = \"true\", \"ai-agents:size\" = each.key })\n    content {\n      key                 = tag.key\n      value               = tag.value\n      propagate_at_launch = true\n    }\n  }\n\n# outputs.tf\noutput \"launch_template_ids\" {\n  value = { for size, lt in aws_launch_template.sandbox : size => lt.id }\n}\n\noutput \"asg_names\" {\n  value = { for size, g in aws_autoscaling_group.sandbox : size => g.name }\n}",
+        "notes": [
+          {
+            "line": 3,
+            "text": "for_each over a map: the iterator's key and value are the tag's key and value."
+          },
+          {
+            "line": 7,
+            "text": "Copy this tag onto every VM the group launches."
+          },
+          {
+            "line": 13,
+            "text": "A for expression that builds a map: { lite = \"lt-...\", full = \"lt-...\", ... }."
+          },
+          {
+            "line": 17,
+            "text": "The claim code (G3-18) finds groups by name: ai-agents-sandbox-<size>."
+          }
+        ]
+      }
+    },
+    {
+      "h": "The other two modules",
+      "p": [
+        "aws-vpc-private (G3-03) wraps the registry module terraform-aws-modules/vpc/aws at version 6.5.1. Its inputs are what p3-2 built by hand: private_subnets from cidrsubnet, public_subnets = [], create_igw = false, enable_nat_gateway = false. Its own resources add the S3 endpoint with the bucket policy, written with jsonencode().",
+        "aws-egress-proxy (G3-09) is the one place with a way out. It cuts two /28s from the spare fourth /18 and adds an internet gateway. A route table sends 0.0.0.0/0 to it, and squid.conf comes from a template. Below is a sketch of those parts; p4-5 covers Squid itself."
+      ],
+      "because": "We build the config file with templatefile() because the allowed source ranges come from Terraform, not from a hand-edited file.",
+      "code": {
+        "lang": "hcl",
+        "file": "modules/aws-egress-proxy/network.tf (sketch for G3-09)",
+        "text": "locals {\n  proxy_subnets = [for i in range(2) : cidrsubnet(cidrsubnet(var.vpc_cidr, 2, 3), 10, i)] # two /28s\n  squid_conf = templatefile(\"${path.module}/templates/squid.conf.tpl\", {\n    sandbox_cidrs = join(\" \", var.sandbox_cidrs)\n  })\n}\n\nresource \"aws_subnet\" \"proxy\" {\n  count             = 2\n  vpc_id            = var.vpc_id\n  cidr_block        = local.proxy_subnets[count.index]\n  availability_zone = var.azs[count.index]\n  tags              = merge(var.tags, { Name = \"${var.name_prefix}-proxy-${count.index}\" })\n}\n\nresource \"aws_internet_gateway\" \"this\" { vpc_id = var.vpc_id }\n\nresource \"aws_route_table\" \"proxy\" {\n  vpc_id = var.vpc_id\n  route {\n    cidr_block = \"0.0.0.0/0\"\n    gateway_id = aws_internet_gateway.this.id # the only route out in the whole VPC\n  }\n}",
+        "notes": [
+          {
+            "line": 2,
+            "text": "The same expression you ran in tofu console in p3-2."
+          },
+          {
+            "line": 3,
+            "text": "templatefile() fills ${sandbox_cidrs} in the .tpl file. The result goes into the proxy VMs' user data, the script a VM runs at first boot."
+          },
+          {
+            "line": 9,
+            "text": "count makes N copies, numbered by count.index. for_each is better when items have names."
+          },
+          {
+            "line": 18,
+            "text": "Associate this table with the two proxy subnets only (aws_route_table_association, not shown)."
+          },
+          {
+            "line": 22,
+            "text": "The one route the sandbox subnets never get. G3-12 decides between this and Squid on inf."
+          }
+        ]
+      }
+    },
+    {
+      "h": "Changing a module safely",
+      "p": [
+        "Before a PR, run what CI runs: tofu fmt -check and terragrunt hcl format --check. Then tofu validate, which checks types and references with no cloud access. Then a plan, read line by line.",
+        "Renaming is the classic trap. Rename a resource label or a for_each key and the plan destroys the old resource and creates a new one. A moved block tells OpenTofu that the old address is the new one, so the plan has no changes. If the key is also part of a name, such as ai-agents-sandbox-${each.key}, the name changes and the resource is replaced anyway."
+      ],
+      "because": "We write a moved block whenever an address changes, because without it a rename destroys real VMs and groups.",
+      "code": {
+        "lang": "bash",
+        "file": "a module change, before the PR",
+        "text": "tofu fmt -check -recursive            # what terrugrunt-lint.yml runs\nterragrunt hcl format --check         # the same for terragrunt.hcl files\ntofu init -backend=false && tofu validate\n# renamed aws_launch_template.sandbox to .this? Add this, then plan shows no changes:\n# moved {\n#   from = aws_launch_template.sandbox\n#   to   = aws_launch_template.this\n# }",
+        "notes": [
+          {
+            "line": 1,
+            "text": "Exit code 3 and a list of files when formatting is off. Fix with tofu fmt."
+          },
+          {
+            "line": 3,
+            "text": "-backend=false: no state, no credentials. G7-17 runs exactly this in CI for every module."
+          },
+          {
+            "line": 5,
+            "text": "moved covers every instance of a for_each resource at once."
+          }
+        ]
+      },
+      "see": "Success! The configuration is valid.",
+      "ifInstead": "If instead validate says 'Unsupported argument' for volume_initialization_rate, the pinned provider does not support it. That is the check G3-11 asks for: remove the line and say so in the PR."
+    },
+    {
+      "h": "Pointing the AWS provider at moto",
+      "p": [
+        "For the lab we want real provider checks with no real AWS. The provider block below uses fake keys, skips the account lookups, and sends every call to moto. A plan of new resources makes no API calls, so moto only matters if someone runs apply by mistake.",
+        "The aws provider is a large download, a few hundred MB, the first time you run init."
+      ],
+      "because": "We send the provider to moto so that even a mistaken apply in the lab stays on your laptop.",
+      "code": {
+        "lang": "hcl",
+        "file": "~/academy/pool/providers.tf (lab only)",
+        "text": "terraform {\n  required_providers {\n    aws = { source = \"hashicorp/aws\", version = \"6.64.0\" } # the version common.hcl pins\n  }\n}\n\nprovider \"aws\" {\n  region                      = \"us-east-1\"\n  access_key                  = \"test\"\n  secret_key                  = \"test\"\n  skip_credentials_validation = true\n  skip_requesting_account_id  = true\n  skip_metadata_api_check     = true\n  endpoints {\n    autoscaling = \"http://localhost:5055\"\n    ec2         = \"http://localhost:5055\"\n    iam         = \"http://localhost:5055\"\n    kms         = \"http://localhost:5055\"\n    sts         = \"http://localhost:5055\"\n  }\n}",
+        "notes": [
+          {
+            "line": 3,
+            "text": "Same pin as the repo, so validate checks against the same schema DevOps uses."
+          },
+          {
+            "line": 9,
+            "text": "Fake keys. Never put real keys in a .tf file."
+          },
+          {
+            "line": 11,
+            "text": "Do not call STS to check the keys or to find the account ID."
+          },
+          {
+            "line": 14,
+            "text": "Every service this module uses goes to moto."
+          }
+        ]
+      }
+    }
+  ],
+  "lab": {
+    "title": "Validate and plan the sandbox pool",
+    "youNeed": [
+      "OpenTofu, and moto from p3-1 running",
+      "about 1 GB of free disk for the aws provider",
+      "the tf1 folder from p4-1, for the faded rung"
+    ],
+    "worked": [
+      {
+        "do": "mkdir -p ~/academy/pool && cd ~/academy/pool. Save providers.tf (section 8). tofu init",
+        "see": "- Installing hashicorp/aws v6.64.0...\n- Installed hashicorp/aws v6.64.0 (signed, key ID ...)\nOpenTofu has been successfully initialized!\n(from the docs; output trimmed)"
+      },
+      {
+        "do": "Save variables.tf (section 1), launch_templates.tf (sections 2 and 3, one file), asg.tf (section 4, with the tag block from section 5 before its last brace) and outputs.tf (section 5)",
+        "see": "(four files)"
+      },
+      {
+        "do": "stubs.tf for the lab: variable \"vpc_id\" (string); resource \"aws_kms_key\" \"sandbox\" {}; resource \"aws_security_group\" \"sandbox\" with name = \"sandbox\" and vpc_id = var.vpc_id; resource \"aws_iam_role\" \"sandbox\" with name = \"ai-agent-sandbox\" and assume_role_policy = file(\"${path.module}/trust.json\") (copy trust.json from p3-1); resource \"aws_iam_instance_profile\" \"sandbox\" with name = \"ai-agent-sandbox\" and role = aws_iam_role.sandbox.name",
+        "see": "(one file with five blocks, one argument per line)"
+      },
+      {
+        "do": "lab.auto.tfvars: name_prefix = \"ai-agents\", sizes = { lite = \"m8i.xlarge\", full = \"m8i.2xlarge\", wide = \"m8i.4xlarge\" }, warm_pool_size = { lite = 2, full = 2, wide = 0 }, subnet_ids = [\"subnet-a\", \"subnet-b\", \"subnet-c\"], vpc_id = \"vpc-lab\", tags = { project = \"rhinofcp\" } (one per line)",
+        "see": "(tofu loads *.auto.tfvars by itself)"
+      },
+      {
+        "do": "tofu fmt -check; echo \"fmt exit $?\"; tofu validate",
+        "see": "fmt exit 0\nSuccess! The configuration is valid."
+      },
+      {
+        "do": "tofu plan | grep -E '^  #|Plan:'",
+        "see": "  # aws_autoscaling_group.sandbox[\"full\"] will be created\n  # aws_autoscaling_group.sandbox[\"lite\"] will be created\n  # aws_autoscaling_group.sandbox[\"wide\"] will be created\n  # aws_iam_instance_profile.sandbox will be created\n  # aws_iam_role.sandbox will be created\n  # aws_kms_key.sandbox will be created\n  (... three launch templates and the security group ...)\nPlan: 10 to add, 0 to change, 0 to destroy."
+      },
+      {
+        "do": "Set wide = 5 in warm_pool_size and run tofu plan",
+        "see": "Error: Invalid value for variable\n  on variables.tf line 10:\n  10: variable \"warm_pool_size\" {\n    │ var.warm_pool_size is map of number with 3 elements\nA warm pool holds 0 to 3 VMs (the group's max_size is 3).\n(output trimmed)"
+      }
+    ],
+    "faded": "Practise moved where state exists. In ~/academy/tf1 from p4-1, apply the second version (lite and full). Rename the resource label launch_template to template, and fix the output's reference. tofu plan shows 2 to destroy and 2 to add. Left to you: write the moved block. The next plan should say 'has moved to' twice, then 'Plan: 0 to add, 0 to change, 0 to destroy.'",
+    "alone": "Add G3-15's Spot groups to the pool module. Write aws_autoscaling_group \"sandbox_spot\" with for_each = { for k, v in var.sizes : k => v if k != \"wide\" }. Give it no warm_pool and a mixed_instances_policy. It has 0% on-demand, price-capacity-optimized, and overrides m8i, m7i and m6i of the same size. Hint: replace(each.value, \"m8i\", \"m7i\"). Validate, then plan and check it adds exactly two groups.",
+    "done": "validate passes with the pinned provider and the plan adds 10 resources keyed by size. A bad warm pool size fails with your message. In tf1, a moved block turns a rename into no changes."
+  },
+  "quiz": [
+    {
+      "q": "You rename the for_each key \"wide\" to \"big\" in sizes. What does the plan do to wide's launch template and group?",
+      "options": [
+        {
+          "text": "Updates them in place with the new key",
+          "correct": false,
+          "why": "A for_each key is part of the address; a new address is a new resource."
+        },
+        {
+          "text": "Destroys and recreates them. A moved block fixes the addresses, but the names contain the key, so they are replaced anyway",
+          "correct": true,
+          "why": "name = \"...-${each.key}\" changes too, and a launch template's name cannot change in place."
+        },
+        {
+          "text": "Nothing, because the instance type did not change",
+          "correct": false,
+          "why": "The address and the name both changed."
+        }
+      ]
+    },
+    {
+      "q": "Inside dynamic \"tag_specifications\", what is tag_specifications.value?",
+      "options": [
+        {
+          "text": "The current item of the dynamic block's for_each: \"instance\", then \"volume\"",
+          "correct": true,
+          "why": "The iterator is named after the block."
+        },
+        {
+          "text": "The size key, like lite",
+          "correct": false,
+          "why": "That is each.key, from the resource's own for_each."
+        },
+        {
+          "text": "The merged tags map",
+          "correct": false,
+          "why": "The tags are an argument inside content; the iterator walks the list."
+        }
+      ]
+    },
+    {
+      "q": "Why does the pool module validate warm_pool_size?",
+      "options": [
+        {
+          "text": "Because AWS rejects any warm pool over 2",
+          "correct": false,
+          "why": "AWS allows larger pools. The limit is our max_size of 3."
+        },
+        {
+          "text": "So the PR reviewer does not have to read the plan",
+          "correct": false,
+          "why": "Validation catches one mistake early; reading the plan stays a person's job."
+        },
+        {
+          "text": "So a wrong number fails at plan time with a clear message instead of at apply time in AWS",
+          "correct": true,
+          "why": "Errors are cheapest before anything runs."
+        }
+      ]
+    }
+  ],
+  "recall": [
+    "From p4-2: what does mock_outputs_allowed_terraform_commands = [\"plan\", \"validate\"] protect against?",
+    "From p3-4: why does the warm pool set reuse_on_scale_in to false?"
+  ],
+  "videos": [],
+  "words": [
+    {
+      "term": "variable",
+      "plain": "A module input with a type and an optional validation; the module's props."
+    },
+    {
+      "term": "output",
+      "plain": "A value a module returns; other units read it through a dependency."
+    },
+    {
+      "term": "for_each",
+      "plain": "Makes one copy of a resource per map key or set item; each.key and each.value inside."
+    },
+    {
+      "term": "dynamic block",
+      "plain": "Writes one nested block per item, with an iterator named after the block."
+    },
+    {
+      "term": "merge()",
+      "plain": "Combines maps into one; later maps win on the same key."
+    },
+    {
+      "term": "templatefile()",
+      "plain": "Fills a template file with values and returns the text, like squid.conf."
+    },
+    {
+      "term": "moved block",
+      "plain": "Tells OpenTofu an old address is now a new one, so a rename is not a destroy."
+    }
+  ],
+  "tickets": [
+    {
+      "key": "G3-11",
+      "why": "The launch templates: for_each over sizes, metadata rules, an encrypted disk and a dynamic tag block."
+    },
+    {
+      "key": "G3-15",
+      "why": "The groups: the same keys, warm_pool from a map, the finish-setup hook, and Spot groups."
+    },
+    {
+      "key": "G3-03",
+      "why": "aws-vpc-private wraps the registry VPC module and adds an S3 endpoint policy with jsonencode()."
+    },
+    {
+      "key": "G3-09",
+      "why": "aws-egress-proxy: two /28s, the only internet route, and squid.conf from templatefile()."
+    }
+  ],
+  "remember": "Read a module from its variables, follow the keys through for_each, and before any PR run fmt, validate and a plan. A rename needs a moved block."
+}

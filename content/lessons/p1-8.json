@@ -1,0 +1,479 @@
+{
+ "id": "p1-8",
+ "title": "Docker for a Node service",
+ "minutes": 50,
+ "youNeed": [
+  "p1-7"
+ ],
+ "bridge": "A Docker image is like your dist folder frozen together with the exact Node it needs. Except: it runs as a process on a shared machine, next to secrets. So we make it boring and hard to abuse. It gets a pinned base, no root user, and a filesystem it cannot write.",
+ "intro": "The gateway, broker, orchestrator, Slack app and checks each ship as one Docker image, built like Byte's. This lesson writes that kind of Dockerfile for the notes service and runs it locked down. Then it shows the same rules in a Kubernetes pod.",
+ "picture": {
+  "caption": "Build in one stage, run in a small second stage, and start it with every lock on.",
+  "nodes": [
+   {
+    "id": "df",
+    "label": "Dockerfile (2 stages)",
+    "kind": "file"
+   },
+   {
+    "id": "base",
+    "label": "node:24-bookworm-slim@sha256:…",
+    "kind": "file"
+   },
+   {
+    "id": "build",
+    "label": "docker build",
+    "kind": "service"
+   },
+   {
+    "id": "image",
+    "label": "image p1-lab-svc:dev",
+    "kind": "file"
+   },
+   {
+    "id": "ctr",
+    "label": "container: user 10001, read-only, no capabilities",
+    "kind": "machine"
+   },
+   {
+    "id": "curl",
+    "label": "curl /health",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "base",
+    "to": "df",
+    "text": "both stages start from the same base, pinned by digest"
+   },
+   {
+    "from": "df",
+    "to": "build",
+    "text": "stage 1: npm ci --ignore-scripts, tsc, drop dev dependencies"
+   },
+   {
+    "from": "build",
+    "to": "image",
+    "text": "stage 2 copies only node_modules, shared and dist, and sets USER 10001"
+   },
+   {
+    "from": "image",
+    "to": "ctr",
+    "text": "docker run --read-only --cap-drop ALL --security-opt no-new-privileges"
+   },
+   {
+    "from": "curl",
+    "to": "ctr",
+    "text": "the service answers; writes to its own files fail"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "The build stage",
+   "p": [
+    "A Dockerfile is a list of steps. Each step makes a layer, and Docker reuses a layer when its inputs did not change. So we copy the package files first, install, and only then copy the source. A code change then skips the slow install.",
+    "This is a multi-stage build: the first stage has everything needed to build, and the second stage gets only what runs."
+   ],
+   "because": "We install from the lockfile before copying source because then editing a .ts file does not re-run npm ci.",
+   "code": {
+    "lang": "text",
+    "file": "~/p1-lab/Dockerfile (stage 1)",
+    "text": "FROM node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS build\nWORKDIR /app\nCOPY package.json package-lock.json .npmrc ./\nCOPY shared/package.json shared/\nCOPY svc/package.json svc/\nRUN npm ci --ignore-scripts\nCOPY tsconfig.base.json ./\nCOPY shared/src shared/src\nCOPY svc/tsconfig.json svc/\nCOPY svc/src svc/src\nRUN npm run build -w svc && npm prune --omit=dev --ignore-scripts",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Node 24 on Debian bookworm, slim variant. The digest names the exact bytes, not a tag that can move."
+     },
+     {
+      "line": 3,
+      "text": "Only the files npm ci needs. These change rarely, so this layer is usually cached."
+     },
+     {
+      "line": 6,
+      "text": "The lockfile exactly, and no install scripts (lesson p1-1)."
+     },
+     {
+      "line": 10,
+      "text": "The source comes last: it changes most often."
+     },
+     {
+      "line": 11,
+      "text": "tsc builds dist/, then dev dependencies (typescript, tsx, test tools) are removed."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The runtime stage",
+   "p": [
+    "The second stage starts again from the same base and copies only what the service needs: production node_modules, shared, and svc's dist. No compiler, no tests, no source of svc.",
+    "USER 10001 makes every later step, and the running process, use user ID 10001 instead of root. The ai-agents images and their pods all use 10001."
+   ],
+   "because": "We copy into a fresh stage because every tool left in an image is a tool an attacker can use.",
+   "code": {
+    "lang": "text",
+    "file": "~/p1-lab/Dockerfile (stage 2)",
+    "text": "FROM node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20\nENV NODE_ENV=production\nWORKDIR /app\nCOPY --from=build /app/node_modules node_modules\nCOPY --from=build /app/shared shared\nCOPY --from=build /app/svc/package.json svc/\nCOPY --from=build /app/svc/dist svc/dist\nUSER 10001:10001\nEXPOSE 8080\nCMD [\"node\", \"svc/dist/main.js\"]",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Some libraries skip dev-only work when this is set."
+     },
+     {
+      "line": 4,
+      "text": "Copy from the first stage, not from your laptop."
+     },
+     {
+      "line": 5,
+      "text": "The workspace link in node_modules points here, so shared must come along."
+     },
+     {
+      "line": 8,
+      "text": "A user and group with no name and no rights. Files in /app stay owned by root, so the process cannot change them."
+     },
+     {
+      "line": 9,
+      "text": "Documents the port. It opens nothing; docker run -p does that."
+     },
+     {
+      "line": 10,
+      "text": "The exec form: node runs as process 1 with no shell in between. The gateway uses CMD [\"node\", \"dist/server.js\"]."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Pinning the base by digest",
+   "p": [
+    "A tag like node:24-bookworm-slim moves: next week it points at a new image. A digest is a hash of the image's content, so it can never point at anything else. Byte pins its base by digest, and so do we.",
+    "docker pull prints the digest. A pinned digest only changes through a PR, and later Renovate opens those PRs for us (part G5)."
+   ],
+   "because": "We pin by digest because a moving base image can change a build without any change in our repo.",
+   "code": {
+    "lang": "bash",
+    "file": "terminal",
+    "text": "docker pull node:24-bookworm-slim\ndocker image inspect --format '{{index .RepoDigests 0}}' node:24-bookworm-slim\ndocker image ls node:24-bookworm-slim --format '{{.Size}}'",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Prints the digest again, any time later, without pulling."
+     },
+     {
+      "line": 1,
+      "text": "Fetches the image and prints its digest on the Digest line."
+     },
+     {
+      "line": 2,
+      "text": "Prints only the size of the base, before our files are added."
+     },
+     {
+      "line": 1,
+      "text": "Copy the digest you see into both FROM lines; yours may be newer than the one in this lesson."
+     }
+    ]
+   },
+   "see": "Digest: sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20\nStatus: Image is up to date for node:24-bookworm-slim\nnode@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20\n348MB"
+  },
+  {
+   "h": "Run it locked down",
+   "p": [
+    "Three docker run flags close the rest. --read-only mounts the image's filesystem read-only, so the process cannot write anywhere. --cap-drop ALL removes Linux capabilities, the small root powers a process may hold. --security-opt no-new-privileges stops any program inside from gaining more rights.",
+    "Byte starts its broker container with exactly these flags. The service needs none of what they take away."
+   ],
+   "because": "We start with every lock on because a service that holds keys should be able to do one thing: answer requests.",
+   "code": {
+    "lang": "bash",
+    "file": "terminal, in ~/p1-lab",
+    "text": "docker build -t p1-lab-svc:dev .\ndocker run -d --name p1svc -p 8080:8080 --read-only --cap-drop ALL --security-opt no-new-privileges p1-lab-svc:dev\ndocker logs p1svc\nCAP=$(docker logs p1svc | sed -n 's/^capability (shown once): //p')\ncurl -s -w ' [%{http_code}]\\n' -H \"Authorization: Bearer $CAP\" -X POST localhost:8080/v1/notes -d '{\"text\":\"from docker\"}'",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Builds both stages from the Dockerfile in this folder. The first build takes a minute or two."
+     },
+     {
+      "line": 2,
+      "text": "No writes to the container's filesystem at all."
+     },
+     {
+      "line": 2,
+      "text": "No capabilities: no raw network tricks, no changing file owners."
+     },
+     {
+      "line": 3,
+      "text": "What the process printed: the capability and the port."
+     },
+     {
+      "line": 5,
+      "text": "Same request as in p1-4, now against the container."
+     }
+    ]
+   },
+   "see": "capability (shown once): 9299c531…\nlistening on :8080\n{\"count\":1} [201]",
+   "ifInstead": "If instead docker build fails at COPY .npmrc with 'not found', create the file: printf 'save-exact=true\\n' > .npmrc. Also add a .dockerignore with node_modules, **/node_modules, **/dist, runs and .git."
+  },
+  {
+   "h": "Prove the walls hold",
+   "p": [
+    "Do not trust the flags; test them. docker exec runs a command inside the running container. id shows the user, and touch tries to write a file.",
+    "If a service really needs scratch space, mount a small in-memory folder with --tmpfs /tmp. Everything else stays read-only."
+   ],
+   "because": "We check the user and the filesystem from inside because one forgotten flag in a deploy would leave the service writable.",
+   "code": {
+    "lang": "bash",
+    "file": "terminal",
+    "text": "docker exec p1svc id\ndocker exec p1svc touch /app/x\ndocker exec p1svc sh -c 'touch /tmp/x'",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The process user: 10001, with no name."
+     },
+     {
+      "line": 2,
+      "text": "The app's own folder cannot be written."
+     },
+     {
+      "line": 3,
+      "text": "Not even /tmp. Add --tmpfs /tmp to docker run if a service needs it."
+     }
+    ]
+   },
+   "see": "uid=10001 gid=10001 groups=10001\ntouch: cannot touch '/app/x': Read-only file system\ntouch: cannot touch '/tmp/x': Read-only file system"
+  },
+  {
+   "h": "Stopping cleanly: SIGTERM",
+   "p": [
+    "docker stop sends SIGTERM to process 1 and waits 10 seconds. Node running as process 1 has no default handler for SIGTERM, so without ours it ignores the signal. Docker then kills it, and the exit code is 137.",
+    "Our main.ts closes the server on SIGTERM and exits 0 at once. Kubernetes stops pods the same way, so a deploy never cuts a request in the middle."
+   ],
+   "because": "We handle SIGTERM because every deploy and every scale-down stops pods this way.",
+   "code": {
+    "lang": "bash",
+    "file": "terminal",
+    "text": "time docker stop p1svc\ndocker inspect p1svc --format '{{.State.ExitCode}}'\ndocker rm p1svc",
+    "notes": [
+     {
+      "line": 1,
+      "text": "SIGTERM first; SIGKILL after 10 seconds if the process is still alive."
+     },
+     {
+      "line": 2,
+      "text": "0 means our handler ran. 137 means Docker had to kill it."
+     },
+     {
+      "line": 1,
+      "text": "With the handler it takes a fraction of a second; without it, about 10."
+     }
+    ]
+   },
+   "see": "p1svc\ndocker stop p1svc  0.01s user 0.01s system 12% cpu 0.091 total\n0\np1svc"
+  },
+  {
+   "h": "The same rules in a pod",
+   "p": [
+    "On inf-rhinohealth these images run as Kubernetes pods (part p5). The pod spec repeats the same locks as settings, so they hold even if someone forgets a flag. G0-15's chart runs the gateway as user 10001 with a read-only root filesystem. G3-17 does the same for the other services."
+   ],
+   "because": "We write the locks into the pod spec too, because in the cluster nobody types docker run.",
+   "code": {
+    "lang": "yaml",
+    "file": "the container part of a pod spec (sketch; the chart is modules/ai-agents-service)",
+    "text": "securityContext:\n  runAsNonRoot: true\n  runAsUser: 10001\n  readOnlyRootFilesystem: true # same as --read-only\n  allowPrivilegeEscalation: false # same as no-new-privileges\n  capabilities:\n    drop: [\"ALL\"] # same as --cap-drop ALL",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Kubernetes refuses to start the pod if the image would run as root."
+     },
+     {
+      "line": 4,
+      "text": "The --read-only flag, written as a setting."
+     },
+     {
+      "line": 5,
+      "text": "The no-new-privileges flag."
+     },
+     {
+      "line": 7,
+      "text": "No Linux capabilities at all."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "Services that hold keys run as user 10001, read-only, with every capability dropped. The VM holds no keys at all; these images are where the keys live, so they get the tightest box."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Build and lock down the notes service",
+  "youNeed": [
+   "~/p1-lab from p1-7",
+   "Docker Desktop running",
+   "About 1 GB of free disk"
+  ],
+  "worked": [
+   {
+    "do": "docker pull node:24-bookworm-slim",
+    "see": "Digest: sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20\nStatus: Downloaded newer image for node:24-bookworm-slim"
+   },
+   {
+    "do": "Write ~/p1-lab/Dockerfile from stage 1 and stage 2, with your digest in both FROM lines. Then: printf 'node_modules\\n**/node_modules\\n**/dist\\nruns\\n.git\\n' > .dockerignore",
+    "see": "(no output)"
+   },
+   {
+    "do": "docker build -t p1-lab-svc:dev .",
+    "see": "#20 naming to docker.io/library/p1-lab-svc:dev done\n(output trimmed)"
+   },
+   {
+    "do": "docker run -d --name p1svc -p 8080:8080 --read-only --cap-drop ALL --security-opt no-new-privileges p1-lab-svc:dev && sleep 2 && docker logs p1svc",
+    "see": "capability (shown once): <64 hex characters>\nlistening on :8080"
+   },
+   {
+    "do": "CAP=$(docker logs p1svc | sed -n 's/^capability (shown once): //p') && curl -s -w ' [%{http_code}]\\n' -H \"Authorization: Bearer $CAP\" -X POST localhost:8080/v1/notes -d '{\"text\":\"from docker\"}'",
+    "see": "{\"count\":1} [201]"
+   },
+   {
+    "do": "docker exec p1svc id && docker exec p1svc touch /app/x",
+    "see": "uid=10001 gid=10001 groups=10001\ntouch: cannot touch '/app/x': Read-only file system"
+   },
+   {
+    "do": "docker stop p1svc && docker inspect p1svc --format '{{.State.ExitCode}}' && docker rm p1svc",
+    "see": "p1svc\n0\np1svc"
+   }
+  ],
+  "faded": "Run the container again with --tmpfs /tmp added. Show that docker exec p1svc sh -c 'touch /tmp/x && ls /tmp' now works, while /app stays read-only. Left to you: where the flag goes in the docker run command.",
+  "alone": "Remove the process.on(\"SIGTERM\", ...) line from svc/src/main.ts, rebuild as p1-lab-svc:nosig, run it, and time docker stop. Write down the seconds and the exit code, explain both in one sentence, then put the line back and rebuild.",
+  "done": "The container answers 201, runs as uid 10001, cannot write /app, and stops in under a second with exit code 0."
+ },
+ "quiz": [
+  {
+   "q": "Why is the base image pinned by digest and not only by the tag node:24-bookworm-slim?",
+   "options": [
+    {
+     "text": "A tag can move to a new image; a digest names the exact bytes, so builds only change through a PR",
+     "correct": true,
+     "why": "Byte pins by digest for the same reason, and Renovate bumps the digest in a reviewed PR."
+    },
+    {
+     "text": "Digests download faster than tags",
+     "correct": false,
+     "why": "The download is the same; the point is that the content cannot change under you."
+    },
+    {
+     "text": "A tag only works on Docker Hub, a digest works on ECR",
+     "correct": false,
+     "why": "Both work on both registries."
+    }
+   ]
+  },
+  {
+   "q": "The service runs with --read-only and tries to write a cache file to /app/cache. What happens?",
+   "options": [
+    {
+     "text": "The write works, because the app owns /app",
+     "correct": false,
+     "why": "The whole root filesystem is read-only, and /app is owned by root anyway."
+    },
+    {
+     "text": "Docker silently writes it to memory instead",
+     "correct": false,
+     "why": "Nothing is redirected; you get an error."
+    },
+    {
+     "text": "The write fails with a read-only file system error; change the code or mount a tmpfs for that path",
+     "correct": true,
+     "why": "Read-only is the default; scratch space is an explicit, small exception."
+    }
+   ]
+  },
+  {
+   "q": "Which line makes the container run as a non-root user?",
+   "options": [
+    {
+     "text": "EXPOSE 8080",
+     "correct": false,
+     "why": "EXPOSE only documents a port."
+    },
+    {
+     "text": "USER 10001:10001",
+     "correct": true,
+     "why": "Every later step and the running process use that user and group."
+    },
+    {
+     "text": "--cap-drop ALL on docker run",
+     "correct": false,
+     "why": "It removes capabilities, but the process would still be root without USER."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p1-7: why does the harness ship as a bundle in a release, while the gateway ships as an image?",
+  "From p1-1: what does npm ci --ignore-scripts do that npm install does not?"
+ ],
+ "videos": [
+  {
+   "title": "Docker with Node.js: Build, Run, and Manage Containers",
+   "url": "https://www.youtube.com/watch?v=ozFFCrMedFM",
+   "channel": "Better Stack",
+   "minutes": 24,
+   "why": "Node-specific Dockerfile, images and Compose, written for beginners."
+  },
+  {
+   "title": "Docker Image BEST Practices - From 1.2GB to 10MB",
+   "url": "https://www.youtube.com/watch?v=t779DVjCKCs",
+   "channel": "Better Stack",
+   "minutes": 7,
+   "why": "Layers, caching, multi-stage builds and slim secure images in seven minutes."
+  }
+ ],
+ "words": [
+  {
+   "term": "image and container",
+   "plain": "An image is the frozen files and settings; a container is one running process started from it."
+  },
+  {
+   "term": "multi-stage build",
+   "plain": "A Dockerfile with a build stage and a smaller run stage that copies only what runs."
+  },
+  {
+   "term": "digest",
+   "plain": "A hash of an image's content, like sha256:…; it never points at anything else."
+  },
+  {
+   "term": "USER 10001",
+   "plain": "The Dockerfile line that makes the process run as a user with no rights instead of root."
+  },
+  {
+   "term": "read-only root filesystem",
+   "plain": "The container cannot write any of its files; set with --read-only or readOnlyRootFilesystem."
+  },
+  {
+   "term": "capabilities",
+   "plain": "Small pieces of root power a Linux process may hold; we drop them all."
+  },
+  {
+   "term": "exit code 137",
+   "plain": "The process was killed with SIGKILL, usually because it ignored SIGTERM."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-01",
+   "why": "images.yml builds every service image: node:24-bookworm-slim by digest, npm ci --ignore-scripts, user 10001."
+  },
+  {
+   "key": "G0-15",
+   "why": "The gateway runs on inf as user 10001 with a read-only root filesystem, through modules/ai-agents-service."
+  },
+  {
+   "key": "G3-17",
+   "why": "The broker, orchestrator and Slack app pods run non-root, read-only, with all capabilities dropped."
+  },
+  {
+   "key": "G3-07",
+   "why": "The broker image is hardened like Byte's broker container: read-only, no capabilities, no-new-privileges."
+  }
+ ],
+ "remember": "Pin the base by digest, build in one stage and run in another, USER 10001, read-only, no capabilities, and handle SIGTERM."
+}

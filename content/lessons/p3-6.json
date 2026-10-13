@@ -1,0 +1,397 @@
+{
+ "id": "p3-6",
+ "title": "Buckets: S3 for runs",
+ "minutes": 45,
+ "youNeed": [
+  "p3-1",
+  "p3-2"
+ ],
+ "bridge": "An S3 bucket is like a huge key-value store where each key looks like a file path. Except there are no real folders, only key prefixes. Who may read or write is decided by IAM and endpoint policies together. A presigned URL is like a one-time download link: whoever holds it can use it until it expires.",
+ "intro": "A VM is a workbench we throw away, so everything a run must keep lives in S3. That means its transcript, notes and artifacts. This lesson builds the runs bucket with encryption, blocked public access, versioning and a 30-day expiry. Then it shows how a VM with no AWS keys still reads and writes it.",
+ "picture": {
+  "caption": "The broker signs a short link for one key and the VM uses it over plain HTTP. S3 encrypts, and deletes after 30 days.",
+  "nodes": [
+   {
+    "id": "harness",
+    "label": "nova-worker in the VM (no AWS keys)",
+    "kind": "machine"
+   },
+   {
+    "id": "broker",
+    "label": "broker on inf",
+    "kind": "service"
+   },
+   {
+    "id": "ep",
+    "label": "S3 gateway endpoint policy",
+    "kind": "check"
+   },
+   {
+    "id": "s3",
+    "label": "bucket rhino-ai-agents-runs",
+    "kind": "cloud"
+   },
+   {
+    "id": "kms",
+    "label": "the bucket's KMS key",
+    "kind": "service"
+   },
+   {
+    "id": "lc",
+    "label": "lifecycle rule: 30 days",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "harness",
+    "to": "broker",
+    "text": "POST /v1/artifacts/url {name, write}: asks for a link to its own prefix"
+   },
+   {
+    "from": "broker",
+    "to": "harness",
+    "text": "signs a 15-minute PUT for runs/<run_id>/<name> with its own role"
+   },
+   {
+    "from": "harness",
+    "to": "ep",
+    "text": "PUTs the object with fetch; the endpoint allows only our buckets"
+   },
+   {
+    "from": "ep",
+    "to": "s3",
+    "text": "the request reaches the bucket without leaving AWS"
+   },
+   {
+    "from": "s3",
+    "to": "kms",
+    "text": "S3 encrypts the object with the bucket's own key"
+   },
+   {
+    "from": "lc",
+    "to": "s3",
+    "text": "after 30 days the rule deletes objects under runs/"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start: a bucket and a key",
+   "p": [
+    "A bucket is a named container for objects. An object is bytes plus a key, its name. The key runs/run-42/notes.md looks like a path, but S3 has no folders: runs/run-42/ is a prefix, the start of many keys.",
+    "Bucket names are global across all of AWS, which is why ours carries rhino in front. G3-04 creates rhino-ai-agents-runs in the ai-agents account. Every run writes under runs/<run_id>/, and its session transcript under runs/<run_id>/sessions/ (G3-23)."
+   ],
+   "because": "We make the bucket and one object by hand first, so the settings in the next sections have something to act on.",
+   "code": {
+    "lang": "bash",
+    "file": "~/academy/aws (moto running, source moto.env)",
+    "text": "aws s3api create-bucket --bucket rhino-ai-agents-runs\necho \"plan approved by Sean\" > notes.md\naws s3 cp notes.md s3://rhino-ai-agents-runs/runs/run-42/notes.md\naws s3 ls s3://rhino-ai-agents-runs/runs/run-42/",
+    "notes": [
+     {
+      "line": 1,
+      "text": "In us-east-1 no location setting is needed. Elsewhere you add --create-bucket-configuration."
+     },
+     {
+      "line": 3,
+      "text": "The key is runs/run-42/notes.md. The s3:// form is the CLI's shorthand for bucket plus key."
+     },
+     {
+      "line": 4,
+      "text": "Lists keys that start with the prefix, as if it were a folder."
+     }
+    ]
+   },
+   "see": "{\n    \"Location\": \"/rhino-ai-agents-runs\"\n}\nupload: ./notes.md to s3://rhino-ai-agents-runs/runs/run-42/notes.md\n2026-10-13 18:04:40         22 notes.md"
+  },
+  {
+   "h": "Encryption with our own key",
+   "p": [
+    "S3 can encrypt every object at rest with a key from KMS, AWS's key service. That is SSE-KMS: server-side encryption with KMS. With our own key, its key policy decides who may decrypt, on top of bucket access.",
+    "G3-04 gives the runs bucket its own KMS key. A bucket key setting makes S3 ask KMS less often, which keeps costs and throttling down. After this, every new object is encrypted without the writer doing anything."
+   ],
+   "because": "We use our own key because 'who may decrypt' should be one key policy we control, not AWS's default key.",
+   "code": {
+    "lang": "bash",
+    "file": "~/academy/aws (moto running)",
+    "text": "KEY=$(aws kms create-key --description \"runs bucket\" --query KeyMetadata.Arn --output text)\naws s3api put-bucket-encryption --bucket rhino-ai-agents-runs \\\n  --server-side-encryption-configuration \"{\\\"Rules\\\":[{\\\"ApplyServerSideEncryptionByDefault\\\":{\\\"SSEAlgorithm\\\":\\\"aws:kms\\\",\\\"KMSMasterKeyID\\\":\\\"$KEY\\\"},\\\"BucketKeyEnabled\\\":true}]}\"\naws s3 cp notes.md s3://rhino-ai-agents-runs/runs/run-42/notes.md\naws s3api head-object --bucket rhino-ai-agents-runs --key runs/run-42/notes.md \\\n  --query '[ServerSideEncryption,SSEKMSKeyId]' --output text",
+    "notes": [
+     {
+      "line": 1,
+      "text": "A new KMS key. In G3-04 it is a Terraform resource with a key policy."
+     },
+     {
+      "line": 3,
+      "text": "Default encryption: aws:kms with our key, and the bucket key on."
+     },
+     {
+      "line": 4,
+      "text": "Upload again: only objects written after the setting are encrypted with it."
+     },
+     {
+      "line": 5,
+      "text": "head-object reads an object's settings without downloading it."
+     }
+    ]
+   },
+   "see": "aws:kms\tarn:aws:kms:us-east-1:123456789012:key/b5e58356-1d81-4640-ab25-f43dc3a39b57"
+  },
+  {
+   "h": "Nothing public, ever",
+   "p": [
+    "Block Public Access is four switches that stop any ACL (an old per-object permission list) or bucket policy from making data public. G3-04 turns all four on. Even a mistaken policy later cannot open the bucket.",
+    "Versioning keeps every version of a key. An overwrite or a delete keeps the old version. A bad write by a run is not the end of its work. Old versions cost storage, so the next section cleans them up."
+   ],
+   "because": "We block public access at the bucket because a run's transcript may quote code and tickets. A single wrong setting must not expose it.",
+   "code": {
+    "lang": "bash",
+    "file": "~/academy/aws (moto running)",
+    "text": "aws s3api put-public-access-block --bucket rhino-ai-agents-runs \\\n  --public-access-block-configuration \\\n  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true\naws s3api put-bucket-versioning --bucket rhino-ai-agents-runs \\\n  --versioning-configuration Status=Enabled\naws s3api get-bucket-versioning --bucket rhino-ai-agents-runs --output text",
+    "notes": [
+     {
+      "line": 3,
+      "text": "Refuse public ACLs, ignore any that exist, refuse public policies, and limit access if one slips in."
+     },
+     {
+      "line": 5,
+      "text": "Once enabled, versioning can only be suspended, never fully turned off."
+     },
+     {
+      "line": 6,
+      "text": "Prints Enabled. trivy (p4-6) flags buckets without these settings."
+     }
+    ]
+   },
+   "see": "Enabled"
+  },
+  {
+   "h": "Lifecycle: delete after 30 days",
+   "p": [
+    "A lifecycle rule tells S3 to act on objects by age. G3-04 keeps transcripts 30 days, then they go. The Agent SDK never deletes from a session store, so this rule is the only retention (G3-23).",
+    "With versioning on, Expiration does not erase data. It adds a delete marker, and the old version stays as a noncurrent version. A second action, NoncurrentVersionExpiration, removes those. The ticket names only the 30 days; agree the noncurrent number with DevOps."
+   ],
+   "because": "We expire runs in S3 itself because nobody should have to remember to clean up a bucket.",
+   "code": {
+    "lang": "json",
+    "file": "~/academy/aws/lifecycle.json",
+    "text": "{\n  \"Rules\": [{\n    \"ID\": \"expire-runs-after-30-days\",\n    \"Status\": \"Enabled\",\n    \"Filter\": { \"Prefix\": \"runs/\" },\n    \"Expiration\": { \"Days\": 30 },\n    \"NoncurrentVersionExpiration\": { \"NoncurrentDays\": 1 }\n  }]\n}",
+    "notes": [
+     {
+      "line": 4,
+      "text": "Rules can be switched off without deleting them."
+     },
+     {
+      "line": 5,
+      "text": "Only keys under runs/. Other prefixes keep their own rules."
+     },
+     {
+      "line": 6,
+      "text": "30 days after an object is written, it gets a delete marker."
+     },
+     {
+      "line": 7,
+      "text": "One day after a version stops being current, it is deleted for good. The 1 is our choice."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Presigned URLs: access without keys",
+   "p": [
+    "A presigned URL is a request signed in advance. The broker signs it with its own role's credentials (G3-17), for one operation on one key, with an expiry. Whoever holds the URL can do exactly that until it expires, with no AWS keys at all.",
+    "G3-13 gives the broker POST /v1/artifacts/url: 15-minute PUT or GET links for runs/<run_id>/<name> only. The harness then uploads with fetch. Below is the same signing call, outside the broker."
+   ],
+   "because": "We presign because the VM must save its work, and the VM holds no credentials.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/academy/presign/presign.ts",
+    "text": "import { GetObjectCommand, PutObjectCommand, S3Client } from \"@aws-sdk/client-s3\";\nimport { getSignedUrl } from \"@aws-sdk/s3-request-presigner\";\n\nconst s3 = new S3Client({ forcePathStyle: true }); // endpoint and keys come from the AWS_* env vars\nconst runId = \"run-42\";\nconst name = process.argv[2] ?? \"notes.md\";\nconst params = { Bucket: \"rhino-ai-agents-runs\", Key: `runs/${runId}/${name}` };\n\nconst put = await getSignedUrl(s3, new PutObjectCommand(params), { expiresIn: 900 });\nconst get = await getSignedUrl(s3, new GetObjectCommand(params), { expiresIn: 900 });\nconsole.log(`PUT=${put}`);\nconsole.log(`GET=${get}`);",
+    "notes": [
+     {
+      "line": 4,
+      "text": "forcePathStyle puts the bucket in the path, which moto needs. Real S3 works either way."
+     },
+     {
+      "line": 7,
+      "text": "The key is always under this run's prefix. The broker also cleans the name (safeName in G3-13)."
+     },
+     {
+      "line": 9,
+      "text": "Builds the URL locally: no request is sent. 900 seconds is G3-13's 15 minutes."
+     },
+     {
+      "line": 11,
+      "text": "The URL carries the signature, the expiry and the signer's key ID, never the secret."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Three gates around the bucket",
+   "p": [
+    "The broker's role may put and get objects under runs/* only (G3-17). It is the only identity that signs links. The S3 gateway endpoint allows only our buckets (p3-2). A link to someone else's bucket fails from inside the sandbox VPC.",
+    "A link names one key and dies after 15 minutes. If one leaks into a log, the damage is one object for a few minutes. The VM never sees a key that could list, read or delete anything else."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "No keys in the VM. The harness asks the broker for each link; the broker decides which run may touch which prefix."
+   }
+  }
+ ],
+ "lab": {
+  "title": "A runs bucket on a fake AWS, and a link with no keys",
+  "youNeed": [
+   "moto and moto.env from p3-1",
+   "Node 24 and npm",
+   "curl"
+  ],
+  "worked": [
+   {
+    "do": "cd ~/academy/aws && source moto.env && curl -s -X POST localhost:5055/moto-api/reset. Then run the block from section 1",
+    "see": "{\"status\": \"ok\"}\n{ \"Location\": \"/rhino-ai-agents-runs\" }\nupload: ./notes.md to s3://rhino-ai-agents-runs/runs/run-42/notes.md\n2026-10-13 18:04:40         22 notes.md"
+   },
+   {
+    "do": "Run the block from section 2",
+    "see": "aws:kms\tarn:aws:kms:us-east-1:123456789012:key/b5e58356-1d81-4640-ab25-f43dc3a39b57"
+   },
+   {
+    "do": "Run the block from section 3",
+    "see": "Enabled"
+   },
+   {
+    "do": "Save lifecycle.json (section 4). aws s3api put-bucket-lifecycle-configuration --bucket rhino-ai-agents-runs --lifecycle-configuration file://lifecycle.json && aws s3api get-bucket-lifecycle-configuration --bucket rhino-ai-agents-runs --query 'Rules[0].[ID,Expiration.Days]' --output text",
+    "see": "expire-runs-after-30-days\t30"
+   },
+   {
+    "do": "mkdir -p ~/academy/presign && cd ~/academy/presign && npm init -y >/dev/null && npm pkg set type=module && npm i @aws-sdk/client-s3 @aws-sdk/s3-request-presigner tsx",
+    "see": "added 56 packages in 5s\n(the count may differ)"
+   },
+   {
+    "do": "Save presign.ts (section 5). source ~/academy/aws/moto.env && npx tsx presign.ts transcript.jsonl > urls.txt && cut -c1-80 urls.txt",
+    "see": "PUT=http://localhost:5055/rhino-ai-agents-runs/runs/run-42/transcript.jsonl?X-Am\nGET=http://localhost:5055/rhino-ai-agents-runs/runs/run-42/transcript.jsonl?X-Am"
+   },
+   {
+    "do": "PUT=$(grep ^PUT= urls.txt | cut -d= -f2-) && echo '{\"type\":\"user\",\"text\":\"hi\"}' > part.jsonl && curl -s -o /dev/null -w '%{http_code}\\n' -X PUT --upload-file part.jsonl \"$PUT\"",
+    "see": "200\n(curl knows no AWS keys: the URL is the permission)"
+   },
+   {
+    "do": "GET=$(grep ^GET= urls.txt | cut -d= -f2-) && curl -s \"$GET\" && aws s3 ls s3://rhino-ai-agents-runs/runs/run-42/",
+    "see": "{\"type\":\"user\",\"text\":\"hi\"}\n2026-10-13 18:04:40         22 notes.md\n2026-10-13 18:05:49         28 transcript.jsonl"
+   }
+  ],
+  "faded": "The broker also lists a run's own objects so a resumed run can find its parts (GET /v1/artifacts?prefix=, G3-13). Write list.ts with ListObjectsV2Command for Bucket rhino-ai-agents-runs and Prefix runs/run-42/. Left to you: the loop that prints each Key and Size from the response's Contents.",
+  "alone": "Write safeName(name) in safe-name.ts. It throws on '..', on a leading '/', and on any character outside A-Z, a-z, 0-9, '.', '_', '/' and '-'. Test it with node:test on notes.md, sessions/p/s/part-1.jsonl, ../run-41/notes.md and /etc/passwd. Then call it in presign.ts so a bad name fails before any URL is made.",
+  "done": "The bucket reports aws:kms, Enabled and the 30-day rule, and curl uploads and reads transcript.jsonl through presigned URLs with no AWS keys. Note: moto does not check signatures or expiry. Real S3 answers 403 when a URL is changed or too old."
+ },
+ "quiz": [
+  {
+   "q": "A sandbox VM has no AWS keys. How does it upload its transcript?",
+   "options": [
+    {
+     "text": "It reads the instance role's credentials from IMDS and calls S3",
+     "correct": false,
+     "why": "The role holds no S3 permission, and the agent cannot reach IMDS anyway (p3-3)."
+    },
+    {
+     "text": "It asks the broker for a presigned PUT URL for its own prefix, then uploads with fetch",
+     "correct": true,
+     "why": "The broker signs; the VM only holds a short-lived link to one key."
+    },
+    {
+     "text": "It sends the file through the proxy to s3.amazonaws.com with the broker's key",
+     "correct": false,
+     "why": "The broker's key never leaves the broker, and S3 goes through the endpoint, not the proxy."
+    }
+   ]
+  },
+  {
+   "q": "Versioning is on. What does a 30-day Expiration rule do to an object?",
+   "options": [
+    {
+     "text": "Deletes every version of it at once",
+     "correct": false,
+     "why": "Expiration on a versioned bucket only adds a delete marker."
+    },
+    {
+     "text": "Adds a delete marker; old versions stay until a noncurrent-version rule removes them",
+     "correct": true,
+     "why": "That is why the lesson adds NoncurrentVersionExpiration."
+    },
+    {
+     "text": "Nothing: lifecycle rules do not work on versioned buckets",
+     "correct": false,
+     "why": "They work; they act differently on current and noncurrent versions."
+    }
+   ]
+  },
+  {
+   "q": "Someone copies a presigned GET URL out of a log. What can they do with it?",
+   "options": [
+    {
+     "text": "List the whole bucket",
+     "correct": false,
+     "why": "A presigned URL is for one operation on one key."
+    },
+    {
+     "text": "Nothing: presigned URLs only work from the sandbox VPC",
+     "correct": false,
+     "why": "A presigned URL is a bearer link. Our endpoint policy limits what leaves the VPC, not who can use a link."
+    },
+    {
+     "text": "Read that one object until the link expires, 15 minutes after signing",
+     "correct": true,
+     "why": "That small, short window is why links are scoped and short."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p3-2: why does the S3 gateway endpoint policy list our buckets and nothing else?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "bucket",
+   "plain": "A named container for objects in S3; names are unique across all of AWS."
+  },
+  {
+   "term": "key and prefix",
+   "plain": "An object's name, like runs/run-42/notes.md; a prefix is the start shared by many keys."
+  },
+  {
+   "term": "SSE-KMS",
+   "plain": "S3 encrypting objects at rest with a KMS key; ours has its own key and key policy."
+  },
+  {
+   "term": "Block Public Access",
+   "plain": "Four bucket switches that stop any ACL or policy from making data public."
+  },
+  {
+   "term": "versioning",
+   "plain": "S3 keeps every version of a key, so overwrites and deletes keep the old data."
+  },
+  {
+   "term": "lifecycle rule",
+   "plain": "A bucket rule that expires or moves objects by age, such as 30 days under runs/."
+  },
+  {
+   "term": "presigned URL",
+   "plain": "A link signed in advance for one operation on one key, usable by anyone until it expires."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-04",
+   "why": "Creates rhino-ai-agents-runs with its own KMS key, public access blocked, versioning and a 30-day expiry."
+  },
+  {
+   "key": "G3-13",
+   "why": "The broker's POST /v1/artifacts/url: 15-minute presigned PUT or GET for the run's own prefix only."
+  },
+  {
+   "key": "G3-23",
+   "why": "The session store writes transcript parts under runs/<run_id>/sessions/ through presigned URLs."
+  }
+ ],
+ "remember": "A run keeps its work in one encrypted, private bucket under runs/<run_id>/. It gets there through 15-minute links the broker signs, and S3 deletes it after 30 days."
+}

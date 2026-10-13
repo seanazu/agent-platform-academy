@@ -1,0 +1,513 @@
+{
+ "id": "g0-2",
+ "title": "The agents’ identity: ZDR org, GitHub App, Vault",
+ "minutes": 50,
+ "youNeed": [
+  "g0-1",
+  "p2-4",
+  "p5-3"
+ ],
+ "bridge": "An App installation token is like a 1-hour API key for the bot, except it is minted fresh from a private key. There is nothing static to paste anywhere. That private key and the Anthropic keys live only in Vault, and one service each reads them.",
+ "intro": "An agent needs an identity to call Claude and an identity to push code. This lesson decides the zero-data-retention org and puts one Anthropic key per workload into Vault. It creates the rhino-ai-agents GitHub App and closes the hole that lets any Actions job become Vault admin.",
+ "picture": {
+  "caption": "Where each agent identity is decided, stored and read; nothing is ever pasted into a file.",
+  "nodes": [
+   {
+    "id": "ronen",
+    "label": "Ronen (Security) with DevOps",
+    "kind": "person"
+   },
+   {
+    "id": "org",
+    "label": "ZDR API org: workspaces nova, routines, brain-bot",
+    "kind": "cloud"
+   },
+   {
+    "id": "vault",
+    "label": "Vault kvv2 infrastructure/ai-agents/*",
+    "kind": "service"
+   },
+   {
+    "id": "gateway",
+    "label": "LLM gateway (G0-13)",
+    "kind": "service"
+   },
+   {
+    "id": "app",
+    "label": "GitHub App rhino-ai-agents",
+    "kind": "service"
+   },
+   {
+    "id": "broker",
+    "label": "Broker (G3)",
+    "kind": "service"
+   },
+   {
+    "id": "job",
+    "label": "Any Actions job with id-token: write",
+    "kind": "machine"
+   }
+  ],
+  "steps": [
+   {
+    "from": "ronen",
+    "to": "org",
+    "text": "decides: a separate ZDR org, Opus, Sonnet and Haiku 5.5 only, Fable and Batch off"
+   },
+   {
+    "from": "org",
+    "to": "vault",
+    "text": "DevOps creates one key per workspace and types it into Vault, never into a file"
+   },
+   {
+    "from": "vault",
+    "to": "gateway",
+    "text": "only the gateway reads the Anthropic keys, by workload name"
+   },
+   {
+    "from": "app",
+    "to": "vault",
+    "text": "the App's app_id and private key go to infrastructure/ai-agents/github-app"
+   },
+   {
+    "from": "vault",
+    "to": "broker",
+    "text": "only the broker reads the App key and mints a 1-hour token for one repo"
+   },
+   {
+    "from": "job",
+    "to": "vault",
+    "text": "login as gha-runners now works only from the 13 known workflow files"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Three doors an agent needs opened",
+   "p": [
+    "On VPN, run vault kv list -mount=kvv2 infrastructure/. You see n8n and nothing about agents. Vault (lesson p5-3) is the service that holds our secrets. kvv2 is its versioned key-value store, where every write makes a new version.",
+    "Before the first agent run, three things must exist. A Claude key that an agent may use, from an org that keeps no data (G0-03, G0-07). A GitHub identity that agents push and open PRs with (G0-08). And a Vault that is not wide open to any Actions job in the org (G0-11).",
+    "All three follow one pattern: a person decides, a person types the secret once into Vault, and exactly one service reads it. No agent, no VM and no file ever holds a key."
+   ],
+   "see": "Keys\n----\nn8n/",
+   "ifInstead": "If instead you see permission denied, log in first: vault login -method=oidc role=terraform opens a Google sign-in."
+  },
+  {
+   "h": "Decide the ZDR org (G0-03)",
+   "p": [
+    "ZDR means zero data retention: Anthropic keeps no prompts and no outputs from the API calls. Agents may only call Claude through an org set up that way. A HIPAA-ready org and a ZDR org cannot be one org. So the agents get their own API org, apart from the one people use for Claude Code.",
+    "Ronen (Security) decides this with DevOps in the room. The models: Opus 5.5, Sonnet 5.5 and Haiku 5.5 work under ZDR; Fable does not, because it needs 30-day data retention. Fable stays off for people too, since that retention is a compliance call we are not making now.",
+    "Managed Agents and Claude Code cloud sessions are not allowed under ZDR. So our agents run Claude Code and the Agent SDK inside our AWS. The Batch API stays off, except for eval data with no PHI and Ronen's explicit yes.",
+    "Name two org admins (one Security, one DevOps) and the billing owner. Name the workloads that get a workspace and a key: nova, routines, brain-bot. A workload is one kind of agent with its own meter. Record all of it in the agent inventory (G0-10, lesson g0-6)."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "PHI never enters a prompt. ZDR is the second wall behind that one: even if something slipped through, Anthropic keeps nothing."
+   }
+  },
+  {
+   "h": "One workspace and one key per workload (G0-07)",
+   "p": [
+    "A workspace is a sub-account inside the API org with its own key and its own spend meter. DevOps creates workspaces nova, routines and brain-bot, and one API key in each. Keys are named <workspace>-gateway-<yyyymm>, so a rotation is visible from the name. Before any key exists, the Anthropic account team confirms ZDR is on.",
+    "One key per workload gives each agent its own meter and its own kill switch. Revoking one key stops one agent and nothing else. Only the LLM gateway (lesson g0-5) ever reads these keys. The script below stores them."
+   ],
+   "because": "We type each key straight into Vault on VPN, because a key that touches a file or Slack counts as leaked.",
+   "code": {
+    "lang": "bash",
+    "file": "run once by a DevOps admin on VPN: vault kv kvv2/infrastructure/ai-agents/anthropic",
+    "text": "# Run by a DevOps admin on VPN. Keys go only into Vault: never into a ticket, Slack or a file.\nexport VAULT_ADDR=https://vault.example.com\nvault login -method=oidc role=terraform\n\nSECRET=infrastructure/ai-agents/anthropic   # same layout as infrastructure/n8n\nfor workload in nova routines brain-bot; do  # the workload names the gateway looks up\n  read -r -s -p \"Anthropic API key for ${workload}: \" key; echo\n  # \"=-\" reads the value from stdin, so the key never shows in the process list or shell history\n  if vault kv get -mount=kvv2 \"$SECRET\" >/dev/null 2>&1; then\n    printf '%s' \"$key\" | vault kv patch -mount=kvv2 \"$SECRET\" \"${workload}=-\"\n  else\n    printf '%s' \"$key\" | vault kv put -mount=kvv2 \"$SECRET\" \"${workload}=-\"\n  fi\n  unset key\ndone\n\nvault kv metadata put -mount=kvv2 \\\n  -custom-metadata=owner=platform \\\n  -custom-metadata=reader=llm-gateway \\\n  -custom-metadata=rotate_every=90d \\\n  \"$SECRET\"",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Point the vault CLI at our Vault. On the laptop in the lab you point it at a local dev server instead."
+     },
+     {
+      "line": 3,
+      "text": "Log in through Google (OIDC) as the terraform role. The lab skips this line and uses a dev token."
+     },
+     {
+      "line": 5,
+      "text": "One secret path for all three keys, laid out like the existing infrastructure/n8n secret."
+     },
+     {
+      "line": 6,
+      "text": "The three workload names. The gateway looks a key up by this exact name, so do not rename them here alone."
+     },
+     {
+      "line": 7,
+      "text": "read -s reads the key from the keyboard without echoing it. It is never a command-line argument, so it is not in shell history."
+     },
+     {
+      "line": 9,
+      "text": "If the secret already exists, patch adds one field and keeps the other workloads' keys. Otherwise put creates it."
+     },
+     {
+      "line": 10,
+      "text": "The field value is -, which tells vault to read the value from standard input: the printf pipe."
+     },
+     {
+      "line": 14,
+      "text": "Forget the key in the shell as soon as Vault has it."
+     },
+     {
+      "line": 17,
+      "text": "Custom metadata on the secret: who owns it, which service reads it, and rotate_every=90d as the rotation reminder."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "The inf ClusterSecretStore vault-store can read all of kvv2. Any ExternalSecret on inf could read these keys. Note this gap for G3's threat model; the fix is a dedicated SecretStore and role for the ai-agents namespace."
+   }
+  },
+  {
+   "h": "The GitHub App rhino-ai-agents (G0-08)",
+   "p": [
+    "A GitHub App (lesson p2-4) is an identity GitHub treats apart from people. It has a private key. From that key a service mints an installation token: a 1-hour token limited to one repo and a few permissions. Every agent pushes and opens PRs as this App. GitHub can then tell agent work apart, and the rules can treat it differently.",
+    "The settings live in the repo as a manifest, GitHub's JSON format for describing an App. The file is a reviewed record: anyone can compare the real App against it."
+   ],
+   "because": "We keep the App's settings as a manifest in the repo, because a permission written down can be reviewed in a PR.",
+   "code": {
+    "lang": "json",
+    "file": "ai-agents/settings/github-app.json",
+    "text": "{\n  \"name\": \"rhino-ai-agents\",\n  \"description\": \"Identity for Rhino's AI agents (Nova and the routines). The broker mints a 1-hour token per run for one repo.\",\n  \"url\": \"https://github.com/RhinoHealth/ai-agents\",\n  \"public\": false,\n  \"hook_attributes\": { \"active\": false },\n  \"default_events\": [],\n  \"default_permissions\": {\n    \"metadata\": \"read\",\n    \"contents\": \"write\",\n    \"pull_requests\": \"write\",\n    \"checks\": \"read\",\n    \"actions\": \"read\"\n  }\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The App's name; its bot login on GitHub is rhino-ai-agents[bot], which the independent-approval check (lesson g0-3) looks for."
+     },
+     {
+      "line": 5,
+      "text": "Private: only the RhinoHealth org can install it."
+     },
+     {
+      "line": 6,
+      "text": "The webhook is off. Agent triggers come from Jira polling, Slack and small Actions on our runners, not from GitHub events."
+     },
+     {
+      "line": 7,
+      "text": "No events subscribed, for the same reason."
+     },
+     {
+      "line": 9,
+      "text": "metadata read is the minimum every App needs to see a repo."
+     },
+     {
+      "line": 10,
+      "text": "contents write: push branches. There is no workflows permission, so GitHub refuses any push from this App that touches .github/workflows."
+     },
+     {
+      "line": 11,
+      "text": "pull_requests write: open PRs and comment. No administration and no members permission exist here on purpose."
+     },
+     {
+      "line": 12,
+      "text": "checks and actions read: see check results and workflow runs, never change them."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Install it, store the key, prove no bypass",
+   "p": [
+    "Create the App under RhinoHealth with these settings and install it on RhinoHealth/fcp only (choose Only select repositories). RhinoHealth/ai-agents is added when G4's dogfood starts. Download the private key once.",
+    "Store app_id and the private key at kvv2 infrastructure/ai-agents/github-app the same way as G0-07, then delete the downloaded .pem file. The broker (G3) is the only service that reads this secret.",
+    "Then push against the wall. Check that the App is not in the fcp ruleset's bypass_actors (lesson g0-1). Mint a test installation token, open an unapproved PR and try to merge it with that token: GitHub refuses. The broker also refuses the merge endpoint, so a person always merges."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Agents never merge. Two walls say so: the ruleset has no bypass for the App, and the broker refuses the merge endpoint."
+   }
+  },
+  {
+   "h": "Vault's gha-runners role is wide open (G0-11)",
+   "p": [
+    "A GitHub Actions job can ask GitHub for an OIDC token. That is a signed JSON statement (a JWT) naming the repo, the workflow file and the ref the job runs in. Each fact inside it is a claim. Vault's JWT auth checks claims and hands out a Vault token.",
+    "Today the role gha-runners binds the claim sub to repo:RhinoHealth/*. Any job in any org repo, the public agent-skills repo included, can log in and get the admin policy. That is one id-token: write line away from Vault admin, and the new ai-agents repo must not have that.",
+    "List the real callers first: gh search code gha-runners --owner RhinoHealth. Today there are 13 workflow files. 6 are reusable I&T workflows in fcp. 5 are in infrastructure: 3 ansible-*, backup-rhino-client-db and the fleetdm secrets rotator. 2 are in gitops (update-rhino-client-version)."
+   ],
+   "because": "We list the exact workflow files that use the role today, because a role open to any repo is open to everyone.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/vault/auth_backends.tf (part 1 of 2)",
+    "text": "# infrastructure/modules/vault/auth_backends.tf\n# Before: sub = \"repo:RhinoHealth/*\" gave admin to any job in any org repo, the public agent-skills repo included.\n# Now: only the 13 workflow files that log in with this role today. A new caller needs a reviewed change here.\n# Refs stay open (@*) because the fcp I&T workflows run on every branch push.\nlocals {\n  gha_runner_workflows = [\n    \"RhinoHealth/fcp/.github/workflows/_cloud-int-tests-reusable-*.yml@*\",\n    \"RhinoHealth/fcp/.github/workflows/_client-int-tests-reusable-*.yml@*\",\n    \"RhinoHealth/fcp/.github/workflows/_frontend-int-tests-reusable-*.yml@*\",\n    \"RhinoHealth/infrastructure/.github/workflows/ansible-molecule-test.yml@*\",\n    \"RhinoHealth/infrastructure/.github/workflows/ansible-molecule-test-everything.yml@*\",\n    \"RhinoHealth/infrastructure/.github/workflows/ansible-run-playbook.yml@*\",\n    \"RhinoHealth/infrastructure/.github/workflows/backup-rhino-client-db.yml@*\",\n    \"RhinoHealth/infrastructure/.github/workflows/scheduled-fleedm-enrollment-secrets-rotator.yml@*\",\n    \"RhinoHealth/gitops/.github/workflows/_update-rhino-client-version-batch.yml@*\",\n    \"RhinoHealth/gitops/.github/workflows/update-rhino-client-version-staging.yml@*\",\n  ]\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The old bound claim, kept as a comment so the reviewer sees what changed."
+     },
+     {
+      "line": 4,
+      "text": "The part after @ is the git ref. It stays * because fcp's I&T workflows run on every branch push, not only main."
+     },
+     {
+      "line": 5,
+      "text": "A locals block holds the list, so the role below stays readable."
+     },
+     {
+      "line": 7,
+      "text": "The three fcp globs cover the 6 reusable I&T workflows: cloud, client and frontend, one per cloud."
+     },
+     {
+      "line": 10,
+      "text": "The infrastructure repo: three ansible workflows, the client DB backup and the fleetdm enrollment secrets rotator."
+     },
+     {
+      "line": 15,
+      "text": "The two gitops workflows that update the Rhino client version."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Bind the role to those files",
+   "p": [
+    "The second block is the role itself. Only the bound claim changes: from sub to job_workflow_ref, the claim that names the workflow file the job runs in. A reusable workflow therefore matches whoever calls it, which is exactly how the fcp I&T workflows are used."
+   ],
+   "because": "We bind on job_workflow_ref, because that claim names the workflow file, so the list above is the complete allow-list.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/vault/auth_backends.tf (part 2 of 2)",
+    "text": "resource \"vault_jwt_auth_backend_role\" \"gha_runners\" {\n  backend   = vault_jwt_auth_backend.github_actions.path\n  role_name = \"gha-runners\"\n  role_type = \"jwt\"\n\n  user_claim        = \"sub\"\n  bound_audiences   = [\"https://github.com/RhinoHealth\"]\n  bound_claims_type = \"glob\"\n  bound_claims = {\n    # job_workflow_ref is the file the job runs in, so reusable workflows match whoever calls them.\n    job_workflow_ref = join(\",\", local.gha_runner_workflows) # comma-separated = \"any of these\"\n  }\n\n  token_policies = [\"admin\"] # unchanged in this step; least-privilege policies are the follow-up\n  token_ttl      = 3600\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The Terraform resource for the Vault role. Only its bound claims change in this ticket."
+     },
+     {
+      "line": 3,
+      "text": "The role name stays gha-runners, so no caller workflow has to change."
+     },
+     {
+      "line": 6,
+      "text": "user_claim sub: the sub claim becomes the Vault identity name in the audit log."
+     },
+     {
+      "line": 7,
+      "text": "The audience the token must be minted for; GitHub sets it to our org URL."
+     },
+     {
+      "line": 8,
+      "text": "glob lets the * in the list match, both in file names and in the ref."
+     },
+     {
+      "line": 11,
+      "text": "The provider wants one string, so join makes a comma-separated list; Vault reads that as any of these."
+     },
+     {
+      "line": 14,
+      "text": "The policy is still admin in this step. Replacing it with least-privilege policies is the DevOps follow-up."
+     },
+     {
+      "line": 15,
+      "text": "A Vault token lives one hour, matching a typical job."
+     }
+    ]
+   }
+  },
+  {
+   "h": "A person applies, then the follow-up",
+   "p": [
+    "Leave the duplicate jwt mount resources and the admin policy alone in this change. The infrastructure repo has CODEOWNERS * @RhinoHealth/devops, so DevOps reviews. Its CI only checks formatting, so a person runs tofu plan and apply over VPN and pastes the plan into the PR.",
+    "Then rerun one job per repo: an fcp I&T job, an infrastructure molecule test, a gitops staging update. Each must still log in. Confirm a job from any other repo is now refused.",
+    "Open the follow-up for DevOps, about 1 day: one role per workflow group with a least-privilege policy instead of admin. fcp I&T reads QA secrets only; the rotator and molecule leases write their own paths. This ticket must land before any agent workflow exists, so before agents push in week 5."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Agents never apply. Plan and apply for Vault are run by a person over VPN, every time."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Store three fake keys in a Vault dev server",
+  "youNeed": [
+   "Docker Desktop",
+   "The vault CLI (brew tap hashicorp/tap && brew install hashicorp/tap/vault)",
+   "jq and OpenTofu (brew install opentofu) or Terraform"
+  ],
+  "worked": [
+   {
+    "do": "docker run --rm -d --name vault-lab -p 8200:8200 -e VAULT_DEV_ROOT_TOKEN_ID=root hashicorp/vault",
+    "see": "<a 64-character container id>"
+   },
+   {
+    "do": "export VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root && vault status | head -5",
+    "see": "Key             Value\n---             -----\nSeal Type       shamir\nInitialized     true\nSealed          false"
+   },
+   {
+    "do": "vault secrets enable -path=kvv2 kv-v2",
+    "see": "Success! Enabled the kv-v2 secrets engine at: kvv2/"
+   },
+   {
+    "do": "Copy the G0-07 script from the section above into store-keys.sh. Delete lines 2 and 3 (export VAULT_ADDR and vault login): the dev token is already in your shell. Then run bash store-keys.sh and type fake-nova, fake-routines and fake-brain-bot at the three prompts.",
+    "see": "Anthropic API key for nova:\n==== Secret Path ====\nkvv2/data/infrastructure/ai-agents/anthropic\n... (a Metadata block with version 1, then 2, then 3)\nSuccess! Data written to: kvv2/metadata/infrastructure/ai-agents/anthropic"
+   },
+   {
+    "do": "vault kv get -mount=kvv2 infrastructure/ai-agents/anthropic",
+    "see": "====== Data ======\nKey          Value\n---          -----\nbrain-bot    fake-brain-bot\nnova         fake-nova\nroutines     fake-routines"
+   },
+   {
+    "do": "vault kv metadata get -mount=kvv2 infrastructure/ai-agents/anthropic | grep custom_metadata",
+    "see": "custom_metadata    map[owner:platform reader:llm-gateway rotate_every:90d]"
+   },
+   {
+    "do": "Save the G0-08 manifest from the section above as github-app.json, then run jq -r '.default_permissions | keys[]' github-app.json",
+    "see": "actions\nchecks\ncontents\nmetadata\npull_requests"
+   },
+   {
+    "do": "Save the two HCL blocks, part 1 then part 2, as auth_backends.tf in an empty folder. Then run: tofu fmt -check auth_backends.tf && echo formatted",
+    "see": "formatted"
+   },
+   {
+    "do": "docker stop vault-lab",
+    "see": "vault-lab"
+   }
+  ],
+  "faded": "Run store-keys.sh again with a fourth workload, evals, added to the for line, and type a fake key for it. The check is left to you: vault kv get must show four keys, and the metadata's current_version must be 4.",
+  "alone": "Store a fake GitHub App key the same way at infrastructure/ai-agents/github-app, with two fields: app_id=123 and private_key. Read the key from stdin: printf 'fake-pem' | vault kv put -mount=kvv2 infrastructure/ai-agents/github-app app_id=123 private_key=- is the shape. Add custom metadata owner=platform and reader=broker. Then show both with vault kv get and vault kv metadata get.",
+  "done": "vault kv get shows three keys under infrastructure/ai-agents/anthropic with rotate_every:90d in the metadata, jq lists five permissions, and tofu fmt -check passes."
+ },
+ "quiz": [
+  {
+   "q": "Which models may the agents' ZDR org use?",
+   "options": [
+    {
+     "text": "Opus 5.5, Sonnet 5.5 and Haiku 5.5; Fable stays off because it needs 30-day retention.",
+     "correct": true,
+     "why": "That is Ronen's decision in G0-03, and the managed settings (lesson g0-6) block Fable for people too."
+    },
+    {
+     "text": "Any model; ZDR is about billing, not models.",
+     "correct": false,
+     "why": "ZDR is about data retention, and Fable cannot run without 30 days of it."
+    },
+    {
+     "text": "Only Haiku 5.5, to keep spend low.",
+     "correct": false,
+     "why": "Spend is handled by the gateway meter and the workspace limits, not by banning models."
+    }
+   ]
+  },
+  {
+   "q": "Why one API key per workload instead of one shared key for all agents?",
+   "options": [
+    {
+     "text": "Anthropic requires one key per workspace.",
+     "correct": false,
+     "why": "A workspace can hold several keys; the one-per-workload rule is ours."
+    },
+    {
+     "text": "So each agent can read its own key from Vault inside the VM.",
+     "correct": false,
+     "why": "No key is ever in the VM; only the gateway reads these keys."
+    },
+    {
+     "text": "Each key is its own meter and its own kill switch: revoking one stops one agent.",
+     "correct": true,
+     "why": "That is the reason in G0-07, and the gateway looks the key up by workload name."
+    }
+   ]
+  },
+  {
+   "q": "After G0-11, a new workflow in RhinoHealth/ai-agents asks Vault for a token as gha-runners. What happens?",
+   "options": [
+    {
+     "text": "It logs in like every other org repo and gets the admin policy.",
+     "correct": false,
+     "why": "That was the old sub = repo:RhinoHealth/* binding; it is gone."
+    },
+    {
+     "text": "The login is refused until a reviewed change adds its job_workflow_ref to the list.",
+     "correct": true,
+     "why": "The role is bound to the 13 known workflow files, and a person applies any change."
+    },
+    {
+     "text": "It gets a token with id-token: write, but with a read-only policy.",
+     "correct": false,
+     "why": "id-token: write is a GitHub permission, not a Vault policy, and the role still grants admin to the files on the list."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From lesson g0-1: what does bypass_mode pull_request let the team fcp-break-glass do, and what does it not let them do?",
+  "From lesson p5-3: how does a pod on inf get a value from Vault without any Vault token in its code?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "ZDR",
+   "plain": "Zero data retention: an Anthropic org setting where no prompts and no outputs are kept."
+  },
+  {
+   "term": "workload",
+   "plain": "One kind of agent with its own meter: nova, routines or brain-bot."
+  },
+  {
+   "term": "workspace",
+   "plain": "A sub-account inside the API org that holds one workload's key and spend."
+  },
+  {
+   "term": "kvv2",
+   "plain": "Vault's versioned key-value store; every write makes a new version, and metadata sits beside the data."
+  },
+  {
+   "term": "manifest",
+   "plain": "GitHub's JSON description of an App: name, permissions, events, webhook."
+  },
+  {
+   "term": "installation token",
+   "plain": "A 1-hour token minted from the App's private key, limited to one repo and a few permissions."
+  },
+  {
+   "term": "bound claim",
+   "plain": "A fact inside a job's OIDC token (such as the workflow file) that Vault requires before it logs the job in."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G0-03",
+   "why": "This lesson explains what ZDR allows, which models and features are in or out, and what the decision must record.",
+   "walk": [
+    "Meet Ronen with DevOps. Confirm a separate ZDR API org for agents, apart from the org people use for Claude Code.",
+    "Confirm the models: Opus 5.5, Sonnet 5.5 and Haiku 5.5 work under ZDR; Fable does not. Agents run Claude Code and the Agent SDK in our AWS.",
+    "Confirm Fable stays off for people too (30-day retention). The Batch API stays off, except for eval data with no PHI and Ronen's yes.",
+    "Name two org admins (one Security, one DevOps), the billing owner, and the workloads nova, routines and brain-bot. Record it in the agent inventory (G0-10)."
+   ]
+  },
+  {
+   "key": "G0-07",
+   "why": "This lesson walks through the Vault script line by line and the lab runs it against a dev server.",
+   "walk": [
+    "With the Anthropic account team, create the org and confirm ZDR is on before any key exists.",
+    "Create workspaces nova, routines and brain-bot, and one key in each, named <workspace>-gateway-<yyyymm>.",
+    "On VPN, run the script from the sketch and type each key at the prompt. Never paste a key into Jira, Slack or a file.",
+    "Note the vault-store gap for G3's threat model: any ExternalSecret on inf could read these keys.",
+    "Add the 90-day rotation reminder to the Vault metadata (rotate_every=90d) and to the agent inventory."
+   ]
+  },
+  {
+   "key": "G0-08",
+   "why": "This lesson explains every permission in the manifest and why the App has no bypass and no workflows permission.",
+   "walk": [
+    "Create the App under RhinoHealth from ai-agents/settings/github-app.json: contents and pull requests write; checks, actions and metadata read; no workflows, administration or members.",
+    "Keep the webhook off; agent triggers come from Jira polling, Slack and small Actions on our runners.",
+    "Install it on RhinoHealth/fcp only (Only select repositories); add RhinoHealth/ai-agents when G4's dogfood starts.",
+    "Store app_id and the private key at kvv2 infrastructure/ai-agents/github-app the same way as G0-07, then delete the downloaded .pem.",
+    "Check the App is not in the fcp ruleset's bypass_actors. Mint a test token and confirm a merge of an unapproved PR fails."
+   ]
+  },
+  {
+   "key": "G0-11",
+   "why": "This lesson explains OIDC claims, why sub = repo:RhinoHealth/* is a hole, and every line of the new role binding.",
+   "walk": [
+    "List every caller with gh search code gha-runners --owner RhinoHealth: 6 fcp I&T reusable workflows, 5 in infrastructure, 2 in gitops.",
+    "In infrastructure/modules/vault/auth_backends.tf replace the sub claim with the job_workflow_ref list from the sketch. Leave the duplicate jwt mounts and the admin policy alone.",
+    "Open the PR; DevOps reviews (infrastructure CODEOWNERS). A person runs plan and apply over VPN.",
+    "Rerun one job per repo: an fcp I&T job, an infrastructure molecule test, a gitops staging update. Confirm a job from any other repo is refused.",
+    "Open the follow-up for DevOps (about 1 day): one role per workflow group with a least-privilege policy instead of admin."
+   ]
+  }
+ ],
+ "remember": "Each secret is typed once into Vault and read by one service; the App has no bypass; Vault trusts only named workflows."
+}

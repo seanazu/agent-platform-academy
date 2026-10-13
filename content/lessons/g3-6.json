@@ -1,0 +1,485 @@
+{
+ "id": "g3-6",
+ "title": "Egress proxy and launch templates",
+ "minutes": 50,
+ "youNeed": [
+  "g3-2",
+  "p4-5",
+  "p3-3"
+ ],
+ "bridge": "The Squid allow-list is like a browser CSP for outbound traffic from a VM: only listed hosts can be reached. Except it also stops curl, pip, npm and the agent itself. A name missing from the list fails a step of the run, not one image on a page.",
+ "intro": "Lesson g3-2 gave the sandbox a network with no route out. This lesson adds the one narrow way to the internet, a Squid proxy with a short allow-list. Then it defines the three machine sizes as launch templates, which set the 'no keys' wall for every VM.",
+ "picture": {
+  "caption": "A sandbox's only internet path is the proxy, and the proxy opens only listed names. Everything else is refused and logged.",
+  "nodes": [
+   {
+    "id": "lt",
+    "label": "launch template: no public IP, near-empty role",
+    "kind": "file"
+   },
+   {
+    "id": "vm",
+    "label": "sandbox VM",
+    "kind": "machine"
+   },
+   {
+    "id": "nlb",
+    "label": "internal NLB :3128",
+    "kind": "service"
+   },
+   {
+    "id": "squid",
+    "label": "Squid x2 in the proxy subnets",
+    "kind": "service"
+   },
+   {
+    "id": "nexus",
+    "label": "nexus.example.com (allowed)",
+    "kind": "cloud"
+   },
+   {
+    "id": "github",
+    "label": "github.com (not on the list)",
+    "kind": "cloud"
+   },
+   {
+    "id": "logs",
+    "label": "access.log in VictoriaLogs",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "lt",
+    "to": "vm",
+    "text": "boots the promoted image with IMDSv2, hop limit 1, an encrypted disk and the sandbox security group"
+   },
+   {
+    "from": "vm",
+    "to": "nlb",
+    "text": "HTTPS_PROXY sends every outbound HTTPS call to port 3128"
+   },
+   {
+    "from": "nlb",
+    "to": "squid",
+    "text": "one of two Squid instances takes the CONNECT request"
+   },
+   {
+    "from": "squid",
+    "to": "nexus",
+    "text": "on the allow-list: the tunnel opens"
+   },
+   {
+    "from": "squid",
+    "to": "github",
+    "text": "not on the list: refused with 403, TCP_DENIED"
+   },
+   {
+    "from": "squid",
+    "to": "logs",
+    "text": "every try, allowed or refused, is logged with its source address"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Why a short list, and no github.com",
+   "p": [
+    "A sandbox reads untrusted text. If an injected prompt can reach any website, it can send our code there. If the VM can reach only a short list of sites, the prompt has nowhere to send it.",
+    "The starting allow-list has one name: nexus.example.com, our package mirror (lesson g3-2). The LLM gateway, the broker and the OTel collector are not on it, because sandboxes reach them over PrivateLink (lesson g3-3).",
+    "github.com and api.github.com stay off on purpose. All git and API traffic goes through the broker. An open github.com would let an injected prompt push our code to a stranger's repo, with the stranger's own token."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "The allow-list has no github.com. The broker is the only way to GitHub, and it checks repo and branch first. Security confirms the list in G3-12."
+   }
+  },
+  {
+   "h": "Where Squid runs",
+   "p": [
+    "Squid is an open-source HTTP proxy: programs send their requests to it, and it decides whether to pass them on. G3-09 runs two small Squid instances (t3.small to start) in the ai-agents VPC. They sit behind an internal NLB on port 3128.",
+    "A new module, modules/aws-egress-proxy, cuts two /28 proxy subnets from the spare /18 of lesson g3-2. These subnets get an internet gateway route, the only route out in this VPC. The instances come from rhino-base-ubuntu-24 in an ASG of 2, with public IPs. The unit is core-services/egress-proxy/.",
+    "We do not reuse modules/squid-proxy. It is a public Helm release in a product cluster, with basic auth. We reuse only its config template. The proxy's security group allows port 3128 from the sandbox security group only. The record proxy.ai-agents.example.com goes into the private zone."
+   ],
+   "callout": {
+    "kind": "gotcha",
+    "text": "Whether the proxy gets its own tiny egress subnets here, or runs on inf behind PrivateLink, is a G3-12 decision. This lesson follows the ticket: its own subnets. Also: these egress subnets need an internet gateway, but the VPC module sets create_igw=false. Settle that in the same G3-12 decision, or Squid cannot reach the internet."
+   }
+  },
+  {
+   "h": "squid.conf, line by line",
+   "p": [
+    "The config is a template: ${sandbox_cidrs} is filled in by Terraform. Squid reads http_access lines from top to bottom, and the first line that matches decides."
+   ],
+   "because": "We allow by subnet and name, then deny everything, because an allow-list is a wall only if it ends in deny all.",
+   "code": {
+    "lang": "text",
+    "file": "infrastructure/modules/aws-egress-proxy/templates/squid.conf.tpl",
+    "text": "# Internal egress proxy for AI agent sandboxes. Based on modules/squid-proxy/templates/squid_proxy.tpl,\n# without basic auth (callers are known by subnet) and without proxy protocol (internal NLB).\nhttp_port 3128\n\nacl SSL_ports port 443\nacl CONNECT method CONNECT\nhttp_access deny !SSL_ports\nhttp_access deny CONNECT !SSL_ports\n\nacl sandboxes src ${sandbox_cidrs}\nacl whitelist dstdomain \"/etc/squid/sites.whitelist.txt\"\n\nhttp_access allow sandboxes whitelist\nhttp_access deny all\n\n# Blocked tries are a signal: G3-31 alerts Security on repeats (possible prompt injection).\naccess_log daemon:/var/log/squid/access.log squid\ncache deny all\nhttpd_suppress_version_string on\nvia off\nforwarded_for delete\n\n# Allow to upload large files\nclient_request_buffer_max_size 512 MB",
+    "notes": [
+     {
+      "line": 2,
+      "text": "No basic auth: callers are known by their subnet. No proxy protocol: the NLB is internal."
+     },
+     {
+      "line": 3,
+      "text": "The port the sandboxes send requests to."
+     },
+     {
+      "line": 5,
+      "text": "An acl is a named condition. SSL_ports is 'the destination port is 443'."
+     },
+     {
+      "line": 7,
+      "text": "Refuse any request to a port other than 443. Plain HTTP to port 80 is refused too."
+     },
+     {
+      "line": 8,
+      "text": "CONNECT is how a client asks for an HTTPS tunnel. Only to 443, the classic Squid safety line."
+     },
+     {
+      "line": 10,
+      "text": "sandboxes: the request comes from one of the sandbox subnets."
+     },
+     {
+      "line": 11,
+      "text": "whitelist: the destination name is in sites.whitelist.txt, today one line: nexus.example.com."
+     },
+     {
+      "line": 13,
+      "text": "Allow only when both are true."
+     },
+     {
+      "line": 14,
+      "text": "Everything else is denied. This line is the wall."
+     },
+     {
+      "line": 17,
+      "text": "Every request, allowed or not, is logged. G3-31 alerts Security on repeated blocked tries."
+     },
+     {
+      "line": 18,
+      "text": "No caching: each request goes upstream, and nothing from one run is served to another."
+     },
+     {
+      "line": 19,
+      "text": "Hide Squid's version in error pages and headers."
+     },
+     {
+      "line": 20,
+      "text": "via off and forwarded_for delete: Squid adds no header that names the proxy or the sandbox's address."
+     },
+     {
+      "line": 24,
+      "text": "Large uploads are allowed, for example publishing a big package to Nexus."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Logs, and how a VM uses the proxy",
+   "p": [
+    "Vector ships /var/log/squid/access.log to logs.example.com with processing type squid_access. vector-aggregator's existing parser then fills squid.result_code and source.address, so a blocked try shows which VM made it. Ask DevOps to add ai-agents to the long-term storage accounts.",
+    "Inside the VM, programs find the proxy through three environment variables. npm, pip, curl, git and Node's fetch all read them."
+   ],
+   "because": "We set NO_PROXY for AWS and our own names, because those calls stay inside the VPC and Squid would refuse them.",
+   "code": {
+    "lang": "text",
+    "file": "/etc/environment in the sandbox image (a sketch built from G3-09's steps)",
+    "text": "# Proxy settings every process in the sandbox inherits (written into the image, G3-14)\nHTTPS_PROXY=http://proxy.ai-agents.example.com:3128\nHTTP_PROXY=http://proxy.ai-agents.example.com:3128\nNO_PROXY=.amazonaws.com,.ai-agents.example.com",
+    "notes": [
+     {
+      "line": 1,
+      "text": "These lines are baked into the image by G3-14, so every process gets them, including the harness and FCP Lab."
+     },
+     {
+      "line": 2,
+      "text": "HTTPS calls go to the proxy's private name on port 3128."
+     },
+     {
+      "line": 3,
+      "text": "Plain HTTP goes there too, where line 7 of squid.conf refuses it."
+     },
+     {
+      "line": 4,
+      "text": "Names ending in .amazonaws.com (the endpoints) or .ai-agents.example.com (broker, gateway, otel) skip the proxy."
+     }
+    ]
+   },
+   "see": "$ curl -sI https://github.com | head -1    # expected inside a sandbox\nHTTP/1.1 403 Forbidden\n(Squid's access.log gets a TCP_DENIED/403 line with the VM's address)"
+  },
+  {
+   "h": "Three sizes, one template, part 1",
+   "p": [
+    "A launch template is a saved recipe for starting a VM: image, size, role, network, disk and metadata settings. G3-11 makes one per size in a new module, modules/aws-sandbox-pool. The unit terraform/accounts/ai-agents/aws/us-east-1/sandboxes/terragrunt.hcl passes sizes = { lite = \"m8i.xlarge\", full = \"m8i.2xlarge\", wide = \"m8i.4xlarge\" }.",
+    "The image is not written in the template. It is resolved from an SSM parameter each time a VM starts, so promoting an image (lesson g3-5) is one parameter change. Create the parameter with the first image."
+   ],
+   "because": "We use for_each over one map of sizes, because the 'no keys' settings must be identical on all three.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/aws-sandbox-pool/launch_templates.tf (part 1 of 2)",
+    "text": "resource \"aws_launch_template\" \"sandbox\" {\n  for_each = var.sizes # { lite = \"m8i.xlarge\", full = \"m8i.2xlarge\", wide = \"m8i.4xlarge\" }\n\n  name          = \"${var.name_prefix}-sandbox-${each.key}\"\n  image_id      = \"resolve:ssm:/ai-agents/sandbox/ami-id\" # promoted by the nightly smoke test (G3-16)\n  instance_type = each.value\n\n  iam_instance_profile { name = aws_iam_instance_profile.sandbox.name } # SSM core only\n  vpc_security_group_ids = [aws_security_group.sandbox.id]              # no ingress at all\n  metadata_options {\n    http_endpoint               = \"enabled\"\n    http_tokens                 = \"required\"\n    http_put_response_hop_limit = 1 # containers on the docker bridge can't get a token\n    instance_metadata_tags      = \"disabled\"\n  }",
+    "notes": [
+     {
+      "line": 2,
+      "text": "One template per entry: lite, full and wide. Only the instance type differs: 4, 8 and 16 vCPUs."
+     },
+     {
+      "line": 4,
+      "text": "Names ai-agents-sandbox-lite, -full and -wide. The smoke test (lesson g3-5) uses -full."
+     },
+     {
+      "line": 5,
+      "text": "resolve:ssm: means 'read this parameter at launch'. Promotion changes the parameter, not the template."
+     },
+     {
+      "line": 8,
+      "text": "The instance role, with almost nothing in it (section 7)."
+     },
+     {
+      "line": 9,
+      "text": "The sandbox security group: no ingress at all."
+     },
+     {
+      "line": 12,
+      "text": "IMDSv2 only: every metadata call needs a session token first."
+     },
+     {
+      "line": 13,
+      "text": "Hop limit 1: the token reply cannot cross the extra hop into a Docker container, so containers get no token."
+     },
+     {
+      "line": 14,
+      "text": "Instance tags are not exposed through metadata."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Part 2: the disk and the tags",
+   "p": [
+    "Part 2 gives every VM an encrypted 120 GiB gp3 disk and the tags the sweeper looks for (lesson g3-7). A tag is a key and value on an AWS resource; IAM policies and scripts can select resources by tag."
+   ],
+   "because": "We tag the instance and its volume, because a disk can outlive its VM and the sweeper finds orphans by tag.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/aws-sandbox-pool/launch_templates.tf (part 2 of 2)",
+    "text": "  block_device_mappings {\n    device_name = \"/dev/sda1\"\n    ebs {\n      volume_type                = \"gp3\"\n      volume_size                = 120\n      encrypted                  = true\n      kms_key_id                 = aws_kms_key.sandbox.arn\n      volume_initialization_rate = 300 # MiB/s; check aws provider 6.64.0 supports this argument\n    }\n  }\n\n  dynamic \"tag_specifications\" {\n    for_each = [\"instance\", \"volume\"]\n    content {\n      resource_type = tag_specifications.value\n      tags          = merge(var.tags, { \"ai-agents:managed\" = \"true\", \"ai-agents:size\" = each.key })\n    }\n  }\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "/dev/sda1 is the root disk name on our Ubuntu images."
+     },
+     {
+      "line": 4,
+      "text": "gp3, the general-purpose SSD type."
+     },
+     {
+      "line": 5,
+      "text": "120 GiB: room for the fcp mirror, node_modules, the uv caches and FCP Lab's images."
+     },
+     {
+      "line": 7,
+      "text": "Encrypted with the sandbox KMS key. Its key policy must allow the AutoScaling service-linked role, or warm-pool launches fail."
+     },
+     {
+      "line": 8,
+      "text": "A new disk made from an image loads its blocks lazily. This rate (MiB/s) makes the first reads fast. The lab's plan shows provider 6.64.0 accepts it."
+     },
+     {
+      "line": 12,
+      "text": "dynamic builds one tag_specifications block per item in the list."
+     },
+     {
+      "line": 13,
+      "text": "One for the instance, one for its volume."
+     },
+     {
+      "line": 16,
+      "text": "The account's tags plus ai-agents:managed = true and the size. The sweeper and the IAM conditions match on these."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The near-empty role and the security group",
+   "p": [
+    "We assume the agent can reach root on its VM (lesson g3-5). So the instance role, ai-agent-sandbox, holds only two things. AmazonSSMManagedInstanceCore lets the SSM agent take commands. autoscaling:CompleteLifecycleAction on the sandbox ASGs lets a warm VM finish its setup (lesson g3-7).",
+    "AmazonSSMManagedInstanceCore can read any SSM parameter. So the account keeps no secrets in Parameter Store: only the AMI ids live there.",
+    "The security group has no ingress rule at all. Egress goes only to the proxy NLB on 3128, the endpoints security group on 443 and the PrivateLink endpoint. Terraform removes the allow-all egress rule that AWS adds to every new group, so these rules are the whole list."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "No keys in the VM. The role can run SSM and finish a lifecycle hook. Nothing it can do reads code, tokens or other runs' data."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Plan the three launch templates with a local backend",
+  "youNeed": [
+   "OpenTofu and the providers.tf from the g3-2 lab (~/academy/sandbox-vpc/providers.tf)",
+   "No AWS account: fake keys and skipped checks, so plan makes no AWS calls"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/academy/sandbox-pool && cd ~/academy/sandbox-pool && cp ../sandbox-vpc/providers.tf .",
+    "see": "(no output)"
+   },
+   {
+    "do": "Save variables.tf:\n\nvariable \"name_prefix\" {\n  type    = string\n  default = \"ai-agents\"\n}\nvariable \"sizes\" {\n  type    = map(string)\n  default = { lite = \"m8i.xlarge\", full = \"m8i.2xlarge\", wide = \"m8i.4xlarge\" }\n}\nvariable \"tags\" {\n  type    = map(string)\n  default = { account_name = \"ai-agents\", created_by = \"terraform\" }\n}",
+    "see": "(a file)"
+   },
+   {
+    "do": "Save lab_stubs.tf. These stand in for the module's other files (key, role, profile, security group):\n\nresource \"aws_kms_key\" \"sandbox\" {\n  description = \"lab: sandbox disks\"\n}\nresource \"aws_iam_role\" \"sandbox\" {\n  name = \"ai-agent-sandbox\"\n  assume_role_policy = jsonencode({ Version = \"2012-10-17\", Statement = [{ Effect = \"Allow\",\n  Principal = { Service = \"ec2.amazonaws.com\" }, Action = \"sts:AssumeRole\" }] })\n}\nresource \"aws_iam_role_policy_attachment\" \"ssm\" {\n  role       = aws_iam_role.sandbox.name\n  policy_arn = \"arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore\"\n}\nresource \"aws_iam_instance_profile\" \"sandbox\" {\n  name = \"ai-agent-sandbox\"\n  role = aws_iam_role.sandbox.name\n}\nresource \"aws_security_group\" \"sandbox\" {\n  name   = \"ai-agents-sandbox\"\n  vpc_id = \"vpc-0lab\"\n}",
+    "see": "(a file)"
+   },
+   {
+    "do": "Save launch_templates.tf: parts 1 and 2 from sections 5 and 6, as one resource. Then: tofu init -input=false",
+    "see": "OpenTofu has been successfully initialized!\n(output trimmed)"
+   },
+   {
+    "do": "tofu plan -input=false -no-color | grep -E 'launch_template.sandbox|instance_type|Plan:'",
+    "see": "  # aws_launch_template.sandbox[\"full\"] will be created\n      + instance_type          = \"m8i.2xlarge\"\n  # aws_launch_template.sandbox[\"lite\"] will be created\n      + instance_type          = \"m8i.xlarge\"\n  # aws_launch_template.sandbox[\"wide\"] will be created\n      + instance_type          = \"m8i.4xlarge\"\nPlan: 8 to add, 0 to change, 0 to destroy."
+   },
+   {
+    "do": "Check the walls match on all three. tofu plan -input=false -no-color | grep -E 'http_tokens|hop_limit|volume_initialization_rate' | sed 's/^ *//' | sort | uniq -c",
+    "see": "   3 + http_put_response_hop_limit = 1\n   3 + http_tokens                 = \"required\"\n   3 + volume_initialization_rate = 300"
+   },
+   {
+    "do": "tofu plan -input=false -no-color | grep '\"ai-agents:size\"' | sed 's/^ *//' | sort | uniq -c",
+    "see": "   2 + \"ai-agents:size\"    = \"full\"\n   2 + \"ai-agents:size\"    = \"lite\"\n   2 + \"ai-agents:size\"    = \"wide\""
+   }
+  ],
+  "faded": "Add the sandbox's egress rules in sg_rules.tf. Make two stub groups, proxy_nlb and endpoints (vpc_id \"vpc-0lab\"). Add two aws_vpc_security_group_egress_rule resources on aws_security_group.sandbox: tcp 3128 to proxy_nlb and tcp 443 to endpoints, using referenced_security_group_id. Plan: expect 12 to add. The last step is yours. Prove there is no ingress rule with one grep -c on the plan, and say what it must print.",
+  "alone": "Write the proxy's side (G3-09) in proxy_sg.tf: one aws_vpc_security_group_ingress_rule on aws_security_group.proxy_nlb that allows tcp 3128 only from aws_security_group.sandbox. Plan it, and show that exactly one ingress rule appears and that its referenced_security_group_id comes from the sandbox group. Then explain in one sentence why the rule names a security group instead of a CIDR.",
+  "done": "The plan shows three templates that differ only in type and size tag, with the same metadata and disk settings. Egress goes only to 3128 and 443, and there is no ingress."
+ },
+ "quiz": [
+  {
+   "q": "Nova's tests need a package from registry.npmjs.org. What happens?",
+   "options": [
+    {
+     "text": "Squid opens a tunnel to registry.npmjs.org, because npm is a trusted site.",
+     "correct": false,
+     "why": "Only nexus.example.com is on the list. Trust is not by reputation."
+    },
+    {
+     "text": "npm is pointed at the Nexus npm proxy, which is on the allow-list, and Nexus fetches from npmjs.",
+     "correct": true,
+     "why": "The VM never talks to npmjs. The mirror does, from inf, and caches the package."
+    },
+    {
+     "text": "The call skips the proxy because of NO_PROXY.",
+     "correct": false,
+     "why": "NO_PROXY covers only .amazonaws.com and .ai-agents.example.com."
+    }
+   ]
+  },
+  {
+   "q": "Why is http_put_response_hop_limit set to 1?",
+   "options": [
+    {
+     "text": "So a container on the docker bridge cannot get an IMDSv2 token, because the reply cannot cross the extra hop.",
+     "correct": true,
+     "why": "With the iptables rules from lesson g3-5, this is the third guard on the metadata service."
+    },
+    {
+     "text": "To make metadata calls faster.",
+     "correct": false,
+     "why": "It changes who can get a token, not speed."
+    },
+    {
+     "text": "So the VM can be reached through one router only.",
+     "correct": false,
+     "why": "It is about the metadata service's replies, not about inbound traffic. There is no ingress at all."
+    }
+   ]
+  },
+  {
+   "q": "Why is the image id resolve:ssm:/ai-agents/sandbox/ami-id instead of an ami-... value in the template?",
+   "options": [
+    {
+     "text": "Terraform cannot store AMI ids.",
+     "correct": false,
+     "why": "It can. We want promotion without a Terraform change."
+    },
+    {
+     "text": "It is more secure, because SSM encrypts the id.",
+     "correct": false,
+     "why": "The id is not a secret. The point is who changes it, and how fast."
+    },
+    {
+     "text": "Promotion and rollback become one parameter write by the nightly workflow, with no apply.",
+     "correct": true,
+     "why": "The template reads the parameter at every launch, so new VMs boot whatever was last promoted."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From g3-5: what are the three guards on the metadata service at 169.254.169.254?",
+  "From g3-2: which spare /18 is cut into the proxy's /28 subnets, and why does only that subnet get an internet route?"
+ ],
+ "videos": [
+  {
+   "title": "Proxy vs Reverse Proxy (Real-world Examples)",
+   "url": "https://www.youtube.com/watch?v=4NB0NDtOwIQ",
+   "channel": "ByteByteGo",
+   "minutes": 5,
+   "why": "Five-minute foundation for why a forward proxy controls outbound traffic."
+  }
+ ],
+ "words": [
+  {
+   "term": "egress proxy",
+   "plain": "A server that outbound requests must pass through, which allows only listed destinations."
+  },
+  {
+   "term": "Squid",
+   "plain": "The open-source HTTP proxy we run as the egress proxy, configured by squid.conf."
+  },
+  {
+   "term": "acl (Squid)",
+   "plain": "A named condition in squid.conf, such as 'from a sandbox subnet' or 'to a listed domain'."
+  },
+  {
+   "term": "launch template",
+   "plain": "A saved recipe for starting a VM: image, size, role, network, disk and metadata settings."
+  },
+  {
+   "term": "hop limit",
+   "plain": "How many network hops an IMDSv2 token reply may cross; 1 keeps it away from containers."
+  },
+  {
+   "term": "instance role",
+   "plain": "The IAM role a VM's programs get credentials for through the metadata service."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-09",
+   "why": "This lesson explained the allow-list, where Squid runs, squid.conf line by line, the logs and the proxy variables.",
+   "walk": [
+    "Write modules/aws-egress-proxy: two /28 proxy subnets from the spare /18 with an internet gateway route. Add an ASG of 2 t3.small from rhino-base-ubuntu-24 with public IPs, and an internal NLB on 3128.",
+    "Add templates/squid.conf.tpl (code above) from modules/squid-proxy/templates/squid_proxy.tpl, without basic auth and proxy protocol, and sites.whitelist.txt with nexus.example.com.",
+    "Add the unit core-services/egress-proxy/ and the record proxy.ai-agents.example.com in the private zone.",
+    "Security groups: proxy ingress 3128 from the sandbox group only.",
+    "Ship /var/log/squid/access.log with Vector, processing type squid_access. Ask DevOps to add ai-agents to the long-term storage accounts.",
+    "Hand G3-14 the image environment: HTTPS_PROXY and HTTP_PROXY to the proxy, NO_PROXY=.amazonaws.com,.ai-agents.example.com. Security confirms the list in G3-12."
+   ]
+  },
+  {
+   "key": "G3-11",
+   "why": "This lesson explained the three launch templates line by line, the near-empty role and the no-ingress security group.",
+   "walk": [
+    "Create modules/aws-sandbox-pool with launch_templates.tf (code above), and the unit terraform/accounts/ai-agents/aws/us-east-1/sandboxes/terragrunt.hcl with the sizes map.",
+    "Create the SSM parameter /ai-agents/sandbox/ami-id with the first image id.",
+    "Add the KMS key for sandbox disks, with a key policy that allows the AutoScaling service-linked role.",
+    "Add the instance role ai-agent-sandbox: AmazonSSMManagedInstanceCore plus autoscaling:CompleteLifecycleAction on the sandbox ASGs only. Keep no secrets in Parameter Store.",
+    "Add the sandbox security group with no ingress. Egress goes to the proxy NLB on 3128, the endpoints on 443 and PrivateLink.",
+    "Run tofu plan locally. A writer checked that aws provider 6.64.0 accepts volume_initialization_rate, so the plan should show it. Plan over VPN, paste it into the PR, and a person applies."
+   ]
+  }
+ ],
+ "remember": "The only way out is Squid with a one-name list; the only identity on the VM is a role worth nothing."
+}

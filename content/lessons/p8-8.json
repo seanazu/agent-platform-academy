@@ -1,0 +1,441 @@
+{
+ "id": "p8-8",
+ "title": "Models, effort and cost",
+ "minutes": 45,
+ "youNeed": [
+  "p8-1",
+  "p8-2"
+ ],
+ "bridge": "The routing table is like a CI matrix for the model: each job names a model and an effort level. Except: effort can change inside a running session without a restart. The price is read back after the fact from modelUsage, not declared up front.",
+ "intro": "Opus 5.5 at medium, with only failed attempts re-run at high, was cheaper and better in Anthropic's tests than everything at high. This lesson puts that rule in code: the routing table and the one-level-up retry. Then the env that sends every call through the gateway with the right tags, and the prompt cache. Last come managed settings, and the test that no limit ever appears.",
+ "picture": {
+  "caption": "The plan names a job, and routing picks model and effort. env points the session at the gateway with tags. The result reports usage per model.",
+  "nodes": [
+   {
+    "id": "plan",
+    "label": "plan: job per step",
+    "kind": "file"
+   },
+   {
+    "id": "routing",
+    "label": "routing.ts",
+    "kind": "service"
+   },
+   {
+    "id": "options",
+    "label": "options { model, effort, env }",
+    "kind": "file"
+   },
+   {
+    "id": "claude",
+    "label": "claude (in the VM)",
+    "kind": "machine"
+   },
+   {
+    "id": "gateway",
+    "label": "LLM gateway",
+    "kind": "cloud"
+   },
+   {
+    "id": "api",
+    "label": "Anthropic API",
+    "kind": "cloud"
+   },
+   {
+    "id": "usage",
+    "label": "result.modelUsage",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "plan",
+    "to": "routing",
+    "text": "job 'build' for this step"
+   },
+   {
+    "from": "routing",
+    "to": "options",
+    "text": "Opus 5.5 at medium, plus ROUTING_ENV"
+   },
+   {
+    "from": "options",
+    "to": "claude",
+    "text": "env: gateway URL, run token, step header, OTel tags"
+   },
+   {
+    "from": "claude",
+    "to": "gateway",
+    "text": "every request, with the token and the x-ai-agents-step header"
+   },
+   {
+    "from": "gateway",
+    "to": "api",
+    "text": "adds the Anthropic key, meters spend per agent, ticket, run, step"
+   },
+   {
+    "from": "api",
+    "to": "usage",
+    "text": "tokens and cache reads come back per model"
+   },
+   {
+    "from": "usage",
+    "to": "routing",
+    "text": "checks failed? re-run that step once, one level higher"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "The routing table (G3-33)",
+   "p": [
+    "A job is the kind of work a step does: readiness, plan, build, a hard build, helper, QA, CI fix. The table maps each job to a model and an effort. Effort is a knob on the model: low, medium, high, xhigh (and max). Higher effort thinks longer and costs more.",
+    "The plan (G4-07) names the job per step; the harness looks it up. Unknown jobs fall back to build: Opus 5.5 at medium. G1's effort sweep confirms each row on our code; these are starting values."
+   ],
+   "because": "We put the table in code so one file decides cost and quality per job. An eval can then change one row at a time.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/routing.ts (the table)",
+    "text": "export type Effort = \"low\" | \"medium\" | \"high\" | \"xhigh\";\nexport interface Route { model: string; effort: Effort }\n\nexport const ROUTES: Record<string, Route> = {\n  readiness: { model: \"claude-sonnet-5-5\", effort: \"low\" },\n  plan: { model: \"claude-opus-5-5\", effort: \"medium\" }, // the plan asks for \"high\" on fuzzy or cross-module tickets\n  build: { model: \"claude-opus-5-5\", effort: \"medium\" }, // the default for every job not listed\n  \"build-hard\": { model: \"claude-opus-5-5\", effort: \"high\" }, // a bug in existing code, many edge cases\n  helper: { model: \"claude-haiku-5-5\", effort: \"medium\" }, // reading and search; returns file:line pointers\n  qa: { model: \"claude-sonnet-5-5\", effort: \"medium\" },\n  \"ci-fix\": { model: \"claude-opus-5-5\", effort: \"low\" }, // CI is the checker; re-run at medium if it fails\n};\nconst LEVELS: Effort[] = [\"low\", \"medium\", \"high\", \"xhigh\"];\nexport const ROUTING_ENV = {\n  CLAUDE_CODE_MAX_OUTPUT_TOKENS: \"64000\", // at 16K most long attempts were cut off\n  CLAUDE_CODE_PROMPT_CACHE_TTL: \"1h\", // Nova waits on people; routines use 5m\n};\n\nexport const routeFor = (job: string): Route => ROUTES[job] ?? ROUTES.build!;",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The SDK's effort type also has 'max'; the table stops at xhigh on purpose."
+     },
+     {
+      "line": 5,
+      "text": "Readiness is one cheap call with no VM: Sonnet at low."
+     },
+     {
+      "line": 9,
+      "text": "Helpers read and search; Haiku at medium is enough and cheap."
+     },
+     {
+      "line": 15,
+      "text": "Output limit: 64K, up to 128K for big steps, never a tight one. 16K cut attempts off mid-file."
+     },
+     {
+      "line": 16,
+      "text": "Cache time to live: 1 hour for runs that wait on people, 5 minutes for routines. Only these two values exist."
+     },
+     {
+      "line": 19,
+      "text": "The non-null assertion is fine: build is always in the table."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Re-run one level up, in the same session",
+   "p": [
+    "When a step's checks fail, the harness re-runs that step once, one effort level higher, then leaves it to the progress watcher. It does not restart the session. The session uses streaming input, so the harness calls query.applyFlagSettings({ effortLevel }) on the running Query. Then it sends the retry prompt, and the new effort applies from the next turn.",
+    "Same session means the prompt cache stays warm: the system prompt, the tools and the conversation so far are already cached. The W6 spike checks cache reads stay at 80% or more after the change."
+   ],
+   "because": "We change effort instead of restarting because a restart throws away the cache and the model's memory of what it already tried.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/routing.ts (rerunOneLevelUp)",
+    "text": "/** A step whose checks failed is re-run once, one level higher, in the same session (warm cache). */\nexport const rerunOneLevelUp = async (session: NovaSession, step: Step, route: Route): Promise<Route> => {\n  const higher = LEVELS[Math.min(LEVELS.indexOf(route.effort) + 1, LEVELS.length - 1)]!;\n  await session.query.applyFlagSettings({ effortLevel: higher }); // from the next turn; check cache reads in the W6 spike\n  await session.send(step.retryPrompt()); // streaming input: the same session, no restart\n  return { model: route.model, effort: higher };\n};\n\n// No maxTurns, no maxBudgetUsd, no taskBudget: test/no-limits.test.ts fails if one appears.",
+    "notes": [
+     {
+      "line": 3,
+      "text": "Index arithmetic on LEVELS; xhigh stays xhigh. Once, not a loop."
+     },
+     {
+      "line": 4,
+      "text": "applyFlagSettings is a method on the Query object query() returned. effortLevel is one of the keys that apply mid-session."
+     },
+     {
+      "line": 5,
+      "text": "session.send pushes a user message into the session's input stream (the prompt is an AsyncIterable, not a string)."
+     },
+     {
+      "line": 6,
+      "text": "The caller records the new route so the step's tags and cost show the bump."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "applyFlagSettings works in streaming-input mode. With a plain string prompt the session ends after one turn and there is nothing to adjust."
+   }
+  },
+  {
+   "h": "env replaces the environment: gateway, token, tags",
+   "p": [
+    "The env option is the environment of the claude process. It replaces process.env; it does not merge. Forget to spread process.env and the child has no PATH and no HOME, so it cannot even find your login.",
+    "In the VM, main.ts puts the gateway URL and the run token into process.env at start. ANTHROPIC_BASE_URL points every request at the gateway over PrivateLink.",
+    "ANTHROPIC_AUTH_TOKEN is the gateway's run token (G0-13), not an Anthropic key. It dies with the run, and it carries agent, Jira key and run. The gateway adds the real key.",
+    "stepEnv (G1-14) adds the OTel resource attributes and the x-ai-agents-step header, so every signal of a step carries the same tags. ENABLE_TOOL_SEARCH and fine-grained tool streaming are turned on by hand, because both are off behind a gateway."
+   ],
+   "because": "We build the env in one place because the gateway, the token and the tags make a run accountable. A missing variable fails silently.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/session.ts (env)",
+    "text": "env: {\n  ...process.env, // env REPLACES the subprocess environment, so spread it first\n  ANTHROPIC_BASE_URL: GATEWAY_URL, // https://gateway.ai-agents.example.com:8443 over PrivateLink\n  ANTHROPIC_AUTH_TOKEN: task.gatewayToken, // G0-13 run token: not an Anthropic key, dies with the run\n  ...stepEnv(task.run, task.step), // G1-14: OTel tags and the x-ai-agents-step header; agent, jira, run ride in the token\n  ENABLE_TOOL_SEARCH: \"true\", // off by default behind a gateway (G0-13)\n  CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: \"1\", // helpers can't start helpers\n  CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS: String(WORKFLOW_AGENTS[task.size]), // 3 / 6 / 12\n  ...ROUTING_ENV, // output limit and cache TTL (G3-33)\n},\n// No maxTurns, no maxBudgetUsd, no taskBudget: work is never cut off mid-run.",
+    "notes": [
+     {
+      "line": 2,
+      "text": "First, always. The docs say it: the value replaces the environment entirely."
+     },
+     {
+      "line": 3,
+      "text": "The docs: override the API endpoint to route requests through a proxy or gateway."
+     },
+     {
+      "line": 4,
+      "text": "The docs: the value goes into the Authorization header with 'Bearer ' in front."
+     },
+     {
+      "line": 5,
+      "text": "Later spreads win over earlier keys. stepEnv sets ANTHROPIC_CUSTOM_HEADERS; nothing after it may set it again."
+     },
+     {
+      "line": 7,
+      "text": "Default depth is 3; one layer keeps the tree flat and the cost readable."
+     },
+     {
+      "line": 9,
+      "text": "Two more variables from routing.ts: output limit and cache TTL."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Tags on every signal (G1-14)",
+   "p": [
+    "OTEL_RESOURCE_ATTRIBUTES is a comma-separated list of key=value pairs that OpenTelemetry attaches to every metric, log and trace from the process. stepEnv sets agent, jira, run, step and harness.version. Each step is its own session, so the attributes are right for the whole session.",
+    "ANTHROPIC_CUSTOM_HEADERS adds headers to every API request: one per line. The gateway reads x-ai-agents-step and x-ai-agents-harness; agent, Jira key and run already ride inside the token. Cost by step in Grafana then adds up to the run's gateway total."
+   ],
+   "because": "We tag every signal the same way. When a run goes wrong, we need to see which step spent the tokens and which step should have caught it.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/telemetry.ts",
+    "text": "import { readFileSync } from \"node:fs\";\n\n// harness/package.json is one level above both src/ and dist/; its version changes on every harness release\nconst pkg = JSON.parse(readFileSync(new URL(\"../package.json\", import.meta.url), \"utf8\")) as { version: string };\nexport const HARNESS_VERSION = pkg.version;\nexport const STEPS = [\"ticket\", \"plan\", \"plan_ok\", \"vm\", \"build\", \"pr\", \"byte\", \"approve\", \"learn\"] as const;\nexport type Step = (typeof STEPS)[number];\nexport interface RunTags { agent: string; jira: string; id: string }\n\n/** Env for one Agent SDK session. Its OTel data and its gateway calls carry the same tags. */\nexport function stepEnv(run: RunTags, step: Step): Record<string, string> {\n  if (!STEPS.includes(step)) throw new Error(`unknown step ${step}`);\n  const tags = { agent: run.agent, jira: run.jira, run: run.id, step, \"harness.version\": HARNESS_VERSION };\n  return {\n    OTEL_RESOURCE_ATTRIBUTES: Object.entries(tags).map(([k, v]) => `${k}=${v}`).join(\",\"),\n    // agent, jira and run reach the gateway inside the run token; step and version ride on headers\n    ANTHROPIC_CUSTOM_HEADERS: `x-ai-agents-step: ${step}\\nx-ai-agents-harness: ${HARNESS_VERSION}`,\n  };\n}",
+    "notes": [
+     {
+      "line": 4,
+      "text": "new URL('../package.json', import.meta.url) resolves next to the running file, in src/ and in dist/ alike."
+     },
+     {
+      "line": 6,
+      "text": "The nine steps of a run, as a const tuple; Step is the union of them."
+     },
+     {
+      "line": 12,
+      "text": "A runtime check too: a typo in a step name must fail loudly, not tag a run wrong."
+     },
+     {
+      "line": 15,
+      "text": "key=value pairs joined by commas: the format OpenTelemetry expects."
+     },
+     {
+      "line": 17,
+      "text": "Headers are newline-separated in this variable; the docs say 'Name: Value', one per line."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Prompt caching: keep the prefix stable",
+   "p": [
+    "The API caches the start of a request: system prompt, tools, and the conversation so far. A request that repeats a cached prefix pays much less for those tokens. modelUsage shows it: cacheReadInputTokens is what came from the cache, cacheCreationInputTokens is what was written to it.",
+    "The cache lives 5 minutes by default, or 1 hour with CLAUDE_CODE_PROMPT_CACHE_TTL=1h (the only two values). Nova waits on people, so it uses 1h; routines use 5m. A 1-hour cache write costs more than a 5-minute one, so do not set 1h everywhere.",
+    "The cache breaks when the prefix changes. Changing the system prompt mid-run, or restarting the session, means paying for everything again. Changing effort does not break it. That is why the re-run above changes effort in place."
+   ],
+   "callout": {
+    "kind": "tip",
+    "text": "Watch cacheReadInputTokens on the second call in the lab. If it stays near zero, something in the prefix changed between calls."
+   }
+  },
+  {
+   "h": "Managed settings: what the harness cannot override",
+   "p": [
+    "Managed settings are the policy tier: files in ai-agents/settings/managed-settings.d/*.json that an admin controls, loaded on every laptop and VM regardless of settingSources. They sit above the options object: your options cannot widen what they lock. Typical keys lock the models available, disable features, and pin permissions.",
+    "The SDK also has a managedSettings option, for a parent process to pass policy-tier settings. When an admin tier exists on the machine, it is dropped unless the admin opted in. Even then only restrictive values apply.",
+    "Read the docs for managedSettings before relying on it. For us the files are the source of truth, and one owner edits them. reconcile.md flags that G0, G1 and G8 all touch the file."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "Three layers, lowest to highest: settings files, your options object, managed settings. The harness lives in the middle."
+   }
+  },
+  {
+   "h": "The test that no limit ever appears",
+   "p": [
+    "A turn, budget or token limit that fires mid-task throws work away. The platform never sets maxTurns, maxBudgetUsd or taskBudget, on the session or on an AgentDefinition. The far-away backstop acts between turns, in the harness (G3-37), and pauses in shadow mode first.",
+    "A test keeps it that way: it builds the options for several jobs and asserts the three fields are undefined. Run it with node:test through tsx, like the rest of ai-agents."
+   ],
+   "because": "We test the absence of a limit because the easiest regression is a helpful-looking maxTurns: 50 in a quick fix.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/test/no-limits.test.ts",
+    "text": "import assert from \"node:assert/strict\";\nimport { test } from \"node:test\";\nimport type { Options } from \"@anthropic-ai/claude-agent-sdk\";\nimport { routeFor } from \"../src/routing.js\";\n\nconst buildOptions = (job: string): Options => ({ model: routeFor(job).model, effort: routeFor(job).effort });\n\ntest(\"no turn, budget or token limit is ever set\", () => {\n  for (const job of [\"plan\", \"build\", \"qa\", \"unknown-job\"]) {\n    const options = buildOptions(job);\n    assert.equal(options.maxTurns, undefined, `${job}: maxTurns must stay unset`);\n    assert.equal(options.maxBudgetUsd, undefined, `${job}: maxBudgetUsd must stay unset`);\n    assert.equal(options.taskBudget, undefined, `${job}: taskBudget must stay unset`);\n  }\n});\n\ntest(\"unknown jobs fall back to the build route\", () => {\n  assert.deepEqual(routeFor(\"unknown-job\"), { model: \"claude-opus-5-5\", effort: \"medium\" });\n});",
+    "notes": [
+     {
+      "line": 4,
+      "text": "ESM imports end in .js even from TypeScript; tsx and tsc both resolve it to routing.ts."
+     },
+     {
+      "line": 6,
+      "text": "In the harness this is session.ts's buildOptions; the lab uses a two-field stand-in."
+     },
+     {
+      "line": 11,
+      "text": "undefined, not falsy: a limit of 0 would also be wrong."
+     },
+     {
+      "line": 18,
+      "text": "The fallback row is part of the contract: a typo in the plan must not pick a strange model."
+     }
+    ]
+   },
+   "see": "ok 1 - no turn, budget or token limit is ever set\nok 2 - unknown jobs fall back to the build route\n# tests 2\n# pass 2\n# fail 0",
+   "ifInstead": "If instead you see ERR_UNSUPPORTED_DIR_IMPORT, you passed a folder; pass a glob: node --import tsx --test \"test/**/*.test.ts\"."
+  }
+ ],
+ "lab": {
+  "title": "Route a job, bump its effort, read the cache",
+  "youNeed": [
+   "The ~/sdk-lab project",
+   "A Claude Code login"
+  ],
+  "worked": [
+   {
+    "do": "Create src/routing.ts with the table, LEVELS, ROUTING_ENV, routeFor and oneLevelUp (a small function that returns the next level)",
+    "see": "export const oneLevelUp = (effort: Effort): Effort => LEVELS[Math.min(LEVELS.indexOf(effort) + 1, LEVELS.length - 1)]!;"
+   },
+   {
+    "do": "Create test/no-limits.test.ts from above and run: node --import tsx --test \"test/**/*.test.ts\"",
+    "see": "ok 1 - no turn, budget or token limit is ever set\nok 2 - unknown jobs fall back to the build route\n# pass 2"
+   },
+   {
+    "do": "Create src/lab8-cost.ts: a runStep(job, bumped) that builds options from routeFor, spreads process.env plus ROUTING_ENV plus a stepEnv('build') into env, asks one question with tools off, and prints total_cost_usd and each model's inputTokens, cacheReadInputTokens, cacheCreationInputTokens, outputTokens. Call it for 'helper' and then for 'helper' bumped.",
+    "see": "helper at medium: $0.0021\n  claude-haiku-5-5: in 12 cacheRead 0 cacheWrite 2900 out 60\nhelper at high: $0.0019\n  claude-haiku-5-5: in 12 cacheRead 2900 cacheWrite 0 out 70"
+   },
+   {
+    "do": "Remove ...process.env from env and run again",
+    "see": "An error or an authentication failure: the child process lost PATH and HOME. Put the spread back."
+   }
+  ],
+  "faded": "Add a third call for the job 'readiness' and print which model it ran on. Then add maxTurns: 5 to the options in runStep and run the test. Left to you: make the test see runStep's options (export a buildOptions from lab8-cost.ts and import it in the test).",
+  "alone": "Write src/alone8.ts: a streaming-input session. The prompt is an async generator that yields one user message, waits for the result, then yields a second one. Between the two, call query.applyFlagSettings({ effortLevel: 'high' }). Print each result's cost and the cacheReadInputTokens of the second call. Check the docs for the SDKUserMessage shape the generator must yield.",
+  "done": "The test passes, and the second call shows cacheReadInputTokens near the first call's cacheCreationInputTokens. You can say why removing the process.env spread broke the run."
+ },
+ "quiz": [
+  {
+   "q": "A build step's checks fail. What does the harness do?",
+   "options": [
+    {
+     "text": "Restarts the session at high effort",
+     "correct": false,
+     "why": "A restart throws away the warm cache and the model's memory of what it tried."
+    },
+    {
+     "text": "Changes effort one level up with applyFlagSettings and sends the retry in the same session, once",
+     "correct": true,
+     "why": "Same session, next turn, warm cache; after that the progress watcher takes over."
+    },
+    {
+     "text": "Switches to Haiku to save money",
+     "correct": false,
+     "why": "The rule goes up in effort on failure, not down in model."
+    }
+   ]
+  },
+  {
+   "q": "Why must env start with ...process.env?",
+   "options": [
+    {
+     "text": "Because env replaces the child's environment and the child needs PATH, HOME and the login",
+     "correct": true,
+     "why": "The docs say the value replaces the environment entirely; nothing is merged."
+    },
+    {
+     "text": "So the gateway URL is not overridden",
+     "correct": false,
+     "why": "Later keys override earlier ones; the spread goes first so our values win."
+    },
+    {
+     "text": "It is optional; the SDK merges process.env anyway",
+     "correct": false,
+     "why": "It does not merge; that is the whole gotcha."
+    }
+   ]
+  },
+  {
+   "q": "What does cacheReadInputTokens in modelUsage tell you?",
+   "options": [
+    {
+     "text": "How many tokens the model wrote to the cache",
+     "correct": false,
+     "why": "That is cacheCreationInputTokens; reads are the cheap part."
+    },
+    {
+     "text": "How many input tokens were served from the prompt cache at the lower price",
+     "correct": true,
+     "why": "High cache reads on later calls mean the prefix stayed stable."
+    },
+    {
+     "text": "How many tokens the output was cut to",
+     "correct": false,
+     "why": "Output limits are CLAUDE_CODE_MAX_OUTPUT_TOKENS; the cache is about input."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "In p8-1, why is modelUsage the field for cost accounting and not usage?",
+  "In p8-2, which option is set explicitly because a VM with no API key cannot fetch feature flags?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "routing table",
+   "plain": "ROUTES in routing.ts: the model and effort for each kind of job, with build as the fallback."
+  },
+  {
+   "term": "effort",
+   "plain": "A knob on the model: low, medium, high, xhigh, max; higher thinks longer and costs more."
+  },
+  {
+   "term": "applyFlagSettings",
+   "plain": "A method on the Query object that changes settings such as effortLevel for the next turn of a streaming session."
+  },
+  {
+   "term": "run token",
+   "plain": "The gateway's per-run bearer token in ANTHROPIC_AUTH_TOKEN; it carries agent, Jira key and run and dies with the run."
+  },
+  {
+   "term": "prompt cache",
+   "plain": "The API's cache of a request's prefix; cacheReadInputTokens shows how much was served from it."
+  },
+  {
+   "term": "OTEL_RESOURCE_ATTRIBUTES",
+   "plain": "key=value pairs that OpenTelemetry attaches to every signal from the process."
+  },
+  {
+   "term": "managed settings",
+   "plain": "The admin policy tier that loads everywhere and that the options object cannot override."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-33",
+   "why": "routing.ts, rerunOneLevelUp, ROUTING_ENV and the no-limits test are this lesson's code."
+  },
+  {
+   "key": "G1-14",
+   "why": "stepEnv is explained line by line: OTel attributes and the step header per session."
+  },
+  {
+   "key": "G3-19",
+   "why": "session.ts's env block is built here: gateway URL, run token, stepEnv, tool search, spawn depth, concurrency."
+  },
+  {
+   "key": "G4-01",
+   "why": "The spike's env uses the same pattern with a SPIKE-1 run token and checks modelUsage counts workflow agents."
+  }
+ ],
+ "remember": "Opus 5.5 at medium by default, one level up on failure in the same session. Spread process.env, point at the gateway, keep the prefix cached, and never set a limit."
+}

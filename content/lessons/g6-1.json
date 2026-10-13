@@ -1,0 +1,641 @@
+{
+ "id": "g6-1",
+ "title": "Scope, layout, schema and lint",
+ "minutes": 50,
+ "youNeed": [
+  "p10-1",
+  "p2-2"
+ ],
+ "bridge": "A brain page is like a React component with a zod schema for its props. The frontmatter at the top of the page is the props. The schema checks them before anyone uses the page. Except: here the schema is a Pydantic model in Python. The check runs in CI on every pull request, not in the browser.",
+ "intro": "The R&D brain is a small set of markdown pages about how our system works and why. Agents and the Slack bot will trust these pages, so this lesson sets the rules first. What may go in, where the pages live, what a page must declare, and the lint that checks it. All four tickets are Shai's, but you need to be able to do them.",
+ "picture": {
+  "caption": "A page is only merged when kb lint and kb scan have passed as a required check.",
+  "nodes": [
+   {
+    "id": "author",
+    "label": "Page author",
+    "kind": "person"
+   },
+   {
+    "id": "page",
+    "label": "rnd-kb/engineering/x.md",
+    "kind": "file"
+   },
+   {
+    "id": "schema",
+    "label": "Page model (schema.py)",
+    "kind": "file"
+   },
+   {
+    "id": "lint",
+    "label": "kb lint + kb scan",
+    "kind": "check"
+   },
+   {
+    "id": "ci",
+    "label": "kb-lint.yml (reusable workflow)",
+    "kind": "service"
+   },
+   {
+    "id": "ruleset",
+    "label": "rnd-kb ruleset: required check",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "author",
+    "to": "page",
+    "text": "writes a page with frontmatter from templates/page.md"
+   },
+   {
+    "from": "author",
+    "to": "ci",
+    "text": "opens a PR; rnd-kb calls the workflow pinned by SHA"
+   },
+   {
+    "from": "ci",
+    "to": "lint",
+    "text": "checks out rnd-kb-tooling and fcp, runs kb lint and kb scan"
+   },
+   {
+    "from": "lint",
+    "to": "schema",
+    "text": "validates the frontmatter against the one Page model"
+   },
+   {
+    "from": "lint",
+    "to": "ruleset",
+    "text": "prints path:line: message and exits 1 on a problem"
+   },
+   {
+    "from": "ruleset",
+    "to": "author",
+    "text": "blocks the merge until the problems are fixed"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start from a real page",
+   "p": [
+    "Open any page in rnd-kb and you see two parts. The top, between two --- lines, is YAML. We call it the frontmatter. The rest is normal markdown.",
+    "The frontmatter says who owns the page, when it was last checked, how sure we are, and where the facts come from. Every other brain tool reads these fields: lint, search, the weekly digest and the Slack bot. The body is for people and agents to read.",
+    "Here is the frontmatter of the first seed page. You will write the whole page in lesson g6-2; for now read only the fields."
+   ],
+   "because": "We start from the real file because every rule in this lesson exists to keep these few fields honest.",
+   "code": {
+    "lang": "markdown",
+    "file": "rnd-kb/engineering/code-run-path.md",
+    "text": "---\ntitle: How a code run reaches the on-prem client\nowner: \"@RhinoHealth/backend-guild\"\nreviewed: 2026-10-20\nreview_every: 90d\nconfidence: low # AI draft from the sources below; the owner raises it after checking\nsources:\n  - https://github.com/RhinoHealth/fcp/tree/main/common/fcp_common/rhinoAgentRpc\n  - https://github.com/RhinoHealth/fcp/tree/main/cloud/rhinoCloud/rhinoAgentRpc\n  - https://github.com/RhinoHealth/fcp/tree/main/client/rhinoOnPrem/rhinoAgentRpc/handlers\napplies_to:\n  - \"fcp:common/fcp_common/rhinoAgentRpc/*.proto\"\n  - \"fcp:cloud/rhinoCloud/rhinoAgentRpc/**\"\n  - \"fcp:client/rhinoOnPrem/rhinoAgentRpc/**\"\n---",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The --- line opens the frontmatter. It must be the first line of the file."
+     },
+     {
+      "line": 2,
+      "text": "title: 8 to 100 characters. The index and the search results show it."
+     },
+     {
+      "line": 3,
+      "text": "owner: a person's GitHub login or a GitHub team. Lint checks that it is in OWNERS.yml."
+     },
+     {
+      "line": 4,
+      "text": "reviewed: the date a person last checked the page against the code."
+     },
+     {
+      "line": 5,
+      "text": "review_every: how long the page stays fresh. 90d is the default."
+     },
+     {
+      "line": 6,
+      "text": "confidence: low means an AI draft that nobody checked yet. The bot repeats this to readers."
+     },
+     {
+      "line": 7,
+      "text": "sources: at least one. A Jira key (RH-1234) or a https link to a PR, commit, Drive doc or public thread."
+     },
+     {
+      "line": 11,
+      "text": "applies_to: repo:glob pairs. Lint checks that the glob matches a real file in that repo."
+     },
+     {
+      "line": 15,
+      "text": "The closing --- ends the frontmatter. Everything after it is the page body."
+     }
+    ]
+   }
+  },
+  {
+   "h": "First decide what may go in (G6-01)",
+   "p": [
+    "Before any page exists, Security and Nave have to agree the data scope. Nave's DATA-SCOPE.md already allows Google Drive \"Rhino Team/Engineering\" and \"Rhino Team/Product\", Jira, and public Slack channels. Private channels (#engineering, #eng-tooling, #devops, #claude-users) may be summarised, never quoted. Customer data, customer documents and secrets never go in.",
+    "Two things are missing. GitHub code and PRs in fcp, infrastructure and gitops are not listed as a source, and pages must cite them. And the customer-name deny-list needs a home: Vault plus a CI secret owned by Security. Never a repo file, so a leak of the repo does not leak the list.",
+    "The second decision is where the brain lives. The old plan said a kb/ folder inside fcp. Nave created RhinoHealth/rnd-kb for pages and RhinoHealth/rnd-kb-tooling for tools, so the brain lives there. fcp keeps only one pointer line in its root CLAUDE.md. Record it as decisions/ADR-0001-brain-home.md."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "PHI never enters a prompt. The scope says what may be read. kb scan (later in this lesson) is the automatic check that nothing patient-like or customer-like slips into a page."
+   }
+  },
+  {
+   "h": "One schema in code: the Page model (G6-02)",
+   "p": [
+    "Many tools read the frontmatter, so they must agree on what a page is. We write that once, as a Pydantic model called Page in rnd-kb-tooling, and every tool imports it. Pydantic is Python's zod: you declare fields with types and rules, and model_validate() checks a dict against them (as in lesson p10-1).",
+    "rnd-kb-tooling is a uv project on Python 3.13, with black and isort at 120 columns and pre-commit, like fcp. It has a package kb_tools and a console script named kb. The first file in that package is schema.py."
+   ],
+   "because": "We write the field rules as reusable types first. Three fields (sources, applies_to, review_every) carry a pattern that lint, search and the bot must all apply the same way.",
+   "code": {
+    "lang": "python",
+    "file": "rnd-kb-tooling/src/kb_tools/schema.py",
+    "text": "# rnd-kb-tooling/src/kb_tools/schema.py: the one definition of a brain page\nfrom datetime import date, timedelta\nfrom typing import Annotated, Literal\n\nfrom pydantic import BaseModel, ConfigDict, Field\n\nSource = Annotated[str, Field(pattern=r\"^(RH-\\d+|https://\\S+)$\")]  # a Jira key, or a link to a PR, commit, Drive doc, public thread\nRepoGlob = Annotated[str, Field(pattern=r\"^(fcp|infrastructure|gitops|byte):\\S+$\")]  # pages live outside fcp, so name the repo\nDAYS = {\"30d\": 30, \"90d\": 90, \"180d\": 180, \"365d\": 365}\n",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The comment names the file and its job: the one definition of a page."
+     },
+     {
+      "line": 2,
+      "text": "date and timedelta from the standard library: we compute due dates from them."
+     },
+     {
+      "line": 3,
+      "text": "Annotated lets us attach a Field rule to a plain str, so Source is \"a str that matches this pattern\"."
+     },
+     {
+      "line": 5,
+      "text": "Pydantic's BaseModel, ConfigDict and Field. Think of BaseModel as z.object()."
+     },
+     {
+      "line": 7,
+      "text": "Source: either a Jira key like RH-1234 or a https link. Anything else fails validation."
+     },
+     {
+      "line": 8,
+      "text": "RepoGlob: repo:glob, where repo is one of fcp, infrastructure, gitops or byte. Pages live outside fcp, so the repo must be named."
+     },
+     {
+      "line": 9,
+      "text": "DAYS maps the four allowed review periods to numbers of days."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The Page class and its two methods",
+   "p": [
+    "The class lists the fields in the order you saw in the real page. Two helper methods belong to the model, so every tool computes them the same way. One says when a page is due, the other what confidence a reader should see today."
+   ],
+   "because": "We put due() and effective_confidence() on the model because a far overdue page must read as low everywhere. Nobody has to edit the file.",
+   "code": {
+    "lang": "python",
+    "file": "rnd-kb-tooling/src/kb_tools/schema.py",
+    "text": "class Page(BaseModel):\n    model_config = ConfigDict(extra=\"forbid\")\n\n    title: str = Field(min_length=8, max_length=100)\n    owner: str = Field(pattern=r\"^@[\\w.-]+(/[\\w.-]+)?$\")  # a person or @RhinoHealth/<team>; lint checks it is in OWNERS.yml\n    reviewed: date\n    review_every: Literal[\"30d\", \"90d\", \"180d\", \"365d\"] = \"90d\"\n    confidence: Literal[\"high\", \"med\", \"low\"]  # low = AI-drafted, not yet checked by the owner\n    sources: list[Source] = Field(min_length=1)\n    applies_to: list[RepoGlob] = []\n    status: Literal[\"proposed\", \"accepted\", \"superseded\"] | None = None  # decisions/ only\n\n    def due(self) -> date:\n        return self.reviewed + timedelta(days=DAYS[self.review_every])\n\n    def effective_confidence(self, today: date) -> str:\n        # more than 2x overdue reads as low everywhere (search, index, bot); the file itself is not edited\n        too_old = (today - self.reviewed).days > 2 * DAYS[self.review_every]\n        return \"low\" if too_old else self.confidence",
+    "notes": [
+     {
+      "line": 1,
+      "text": "A Page is a BaseModel. model_validate(dict) returns a Page or raises ValidationError."
+     },
+     {
+      "line": 2,
+      "text": "extra=\"forbid\": an unknown frontmatter key is an error, so a typo like confidense is caught."
+     },
+     {
+      "line": 4,
+      "text": "title: min 8 and max 100 characters."
+     },
+     {
+      "line": 5,
+      "text": "owner must look like @login or @RhinoHealth/team. Lint later checks it against OWNERS.yml."
+     },
+     {
+      "line": 6,
+      "text": "reviewed is a date. YAML parses 2026-10-20 into a date object, so no string parsing is needed."
+     },
+     {
+      "line": 7,
+      "text": "Literal[...] allows only these four strings. Default 90d."
+     },
+     {
+      "line": 8,
+      "text": "confidence: high, med or low. low = AI draft, not yet checked by the owner."
+     },
+     {
+      "line": 9,
+      "text": "sources: a list of Source with at least one entry."
+     },
+     {
+      "line": 10,
+      "text": "applies_to: a list of RepoGlob; empty by default, for pages not about code."
+     },
+     {
+      "line": 11,
+      "text": "status is only for decision records (ADRs). None for every other page."
+     },
+     {
+      "line": 13,
+      "text": "due(): reviewed plus the review period, as a date."
+     },
+     {
+      "line": 16,
+      "text": "effective_confidence(): if the page is more than 2x overdue, return low; otherwise the page's own value."
+     }
+    ]
+   }
+  },
+  {
+   "h": "kb lint: one line per problem (G6-03)",
+   "p": [
+    "Lint reads every page and validates the frontmatter against Page. Then it checks what the schema cannot know. Is the owner in OWNERS.yml, and is the reviewed date in the past? Do relative links point at real pages, and do applies_to globs match real files in a checkout of that repo?",
+    "Each problem prints as path:line: message. People and agents can act on one line. Overdue review is only a warning so it never blocks an unrelated PR."
+   ],
+   "because": "We parse the frontmatter with one regular expression and hand the YAML to the Page model. So lint has no second copy of the rules.",
+   "code": {
+    "lang": "python",
+    "file": "rnd-kb-tooling/src/kb_tools/lint.py",
+    "text": "# rnd-kb-tooling/src/kb_tools/lint.py: sketch\nimport re\nfrom datetime import date\nfrom pathlib import Path\n\nimport yaml\nfrom pydantic import ValidationError\n\nfrom kb_tools.schema import Page\n\nFRONTMATTER = re.compile(r\"\\A---\\n(.*?)\\n---\\n\", re.DOTALL)\nREL_LINK = re.compile(r\"\\]\\((?!https?://|#)([^)#\\s]+)\")\n\ndef lint_page(path: Path, owners: set[str], repos: dict[str, Path]) -> list[str]:\n    text = path.read_text()\n    match = FRONTMATTER.match(text)\n    if not match:\n        return [f\"{path}:1: missing frontmatter (copy templates/page.md)\"]\n    try:\n        page = Page.model_validate(yaml.safe_load(match.group(1)))\n    except ValidationError as err:\n        return [f\"{path}:1: {'.'.join(map(str, e['loc']))}: {e['msg']}\" for e in err.errors()]\n    problems = []",
+    "notes": [
+     {
+      "line": 2,
+      "text": "re for the two regular expressions below."
+     },
+     {
+      "line": 6,
+      "text": "PyYAML parses the frontmatter text into a dict."
+     },
+     {
+      "line": 7,
+      "text": "Pydantic's ValidationError holds one entry per bad field."
+     },
+     {
+      "line": 9,
+      "text": "The same Page model from schema.py. No second definition."
+     },
+     {
+      "line": 11,
+      "text": "FRONTMATTER: from the start of the file (\\A), a --- line, anything (lazily), another --- line. re.DOTALL lets . match newlines."
+     },
+     {
+      "line": 12,
+      "text": "REL_LINK finds markdown links ](target) that are not http(s) and not #anchors: those are relative page links."
+     },
+     {
+      "line": 14,
+      "text": "lint_page takes a page path, the set of allowed owners, and a dict of repo name to local checkout path."
+     },
+     {
+      "line": 17,
+      "text": "No frontmatter at all: return one problem that tells the author where the template is."
+     },
+     {
+      "line": 20,
+      "text": "model_validate turns the YAML dict into a Page, or raises."
+     },
+     {
+      "line": 22,
+      "text": "Each error becomes one line: path:1: field.path: message. loc is a tuple like (\"sources\", 0)."
+     }
+    ]
+   },
+   "see": "rnd-kb/engineering/ci-map.md:1: owner @RhinoHealth/frontend-guild is not in OWNERS.yml\nrnd-kb/engineering/ci-map.md:1: reviewed date is in the future"
+  },
+  {
+   "h": "Owners, dates, links and paths",
+   "p": [
+    "The second half of lint_page runs after the schema passed. These checks need context the schema does not have. That is OWNERS.yml, today's date, the file system, and the repo checkouts given with --repo fcp=<path>.",
+    "kb index is the other command in this ticket. It writes index.md (a table for people) and index.json (path, title, owner, reviewed, review_every, confidence, applies_to, sources, for tools). A pre-commit hook in rnd-kb runs it, so nobody edits the index by hand. lint --index-check fails when the committed index is stale."
+   ],
+   "because": "We check applies_to against a real checkout. A glob that matches nothing means the page describes code that moved. Then the PR comment in g6-4 would never fire for it.",
+   "code": {
+    "lang": "python",
+    "file": "rnd-kb-tooling/src/kb_tools/lint.py",
+    "text": "    if page.owner not in owners:\n        problems.append(f\"{path}:1: owner {page.owner} is not in OWNERS.yml\")\n    if page.reviewed > date.today():\n        problems.append(f\"{path}:1: reviewed date is in the future\")\n    for target in REL_LINK.findall(text):\n        if not (path.parent / target).resolve().is_file():\n            problems.append(f\"{path}: link to a missing page: {target}\")\n    for item in page.applies_to:\n        repo, pattern = item.split(\":\", 1)\n        if repo in repos and next(repos[repo].glob(pattern), None) is None:\n            problems.append(f\"{path}:1: applies_to {item} matches no file in {repo}\")\n    return problems",
+    "notes": [
+     {
+      "line": 1,
+      "text": "problems collects every finding for this page, so an author sees all of them at once."
+     },
+     {
+      "line": 2,
+      "text": "owner not in OWNERS.yml: the digest in g6-4 could not reach anyone, so this is an error."
+     },
+     {
+      "line": 4,
+      "text": "A reviewed date in the future would hide an overdue page. Error."
+     },
+     {
+      "line": 6,
+      "text": "For each relative link, resolve it next to the page and check that a file exists there."
+     },
+     {
+      "line": 9,
+      "text": "applies_to entries are repo:pattern. split(\":\", 1) splits only at the first colon."
+     },
+     {
+      "line": 10,
+      "text": "If we have a checkout for that repo, glob the pattern. next(..., None) returns None when nothing matches."
+     },
+     {
+      "line": 12,
+      "text": "Return the list. Empty means the page is clean."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "Test lint with tiny fixture KBs in tests/test_lint.py. Use a good page, an unknown owner, a dead link, a glob that matches nothing and a stale index. Each fixture is three or four files, so the tests stay readable."
+   }
+  },
+  {
+   "h": "Run it in CI as a reusable workflow (G6-04)",
+   "p": [
+    "The pages repo rnd-kb has no Python. The lint lives in rnd-kb-tooling. So rnd-kb-tooling publishes a reusable workflow (on: workflow_call, as in lesson p2-2). rnd-kb calls it from a thin caller on pull_request, pinned by SHA with secrets: inherit. That is the same shape as fcp calling Byte's review.yml.",
+    "The job needs to read two other repos: rnd-kb-tooling for the code and fcp for the applies_to check. A small GitHub App, rhino-kb, with contents:read on those repos mints a short-lived token for that. Ask DevOps for the App; its id and private key become org secrets limited to these repos."
+   ],
+   "because": "We run gitleaks before checking out any other repo. So a secret pasted into a page is found before the job touches anything else.",
+   "code": {
+    "lang": "yaml",
+    "file": "rnd-kb-tooling/.github/workflows/kb-lint.yml",
+    "text": "# rnd-kb-tooling/.github/workflows/kb-lint.yml: reusable; rnd-kb calls it on every PR, pinned by SHA\nname: kb-lint\non:\n  workflow_call:\n    secrets:\n      KB_APP_ID: { required: true }\n      KB_APP_PRIVATE_KEY: { required: true }\n      KB_DENY_TERMS: { required: true } # customer names and terms, owned by Security; never stored in a repo\npermissions:\n  contents: read\njobs:\n  lint:\n    runs-on: ubuntu-latest # confirm with DevOps: GitHub-hosted or an ARC runner set for these repos\n    steps:\n      - uses: actions/checkout@v5 # rnd-kb itself; pin actions by SHA like the infrastructure repo\n      - name: gitleaks (before any other repo is checked out)\n        run: |",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The file lives in rnd-kb-tooling. rnd-kb calls it on every PR."
+     },
+     {
+      "line": 4,
+      "text": "workflow_call makes this reusable. The caller passes the secrets below."
+     },
+     {
+      "line": 6,
+      "text": "KB_APP_ID and KB_APP_PRIVATE_KEY: the rhino-kb GitHub App."
+     },
+     {
+      "line": 8,
+      "text": "KB_DENY_TERMS: customer names and terms. Owned by Security and never stored in a repo (decision from G6-01)."
+     },
+     {
+      "line": 9,
+      "text": "contents: read is the only permission the job's own token needs."
+     },
+     {
+      "line": 13,
+      "text": "ubuntu-latest for now; confirm with DevOps whether an ARC runner set should run it."
+     },
+     {
+      "line": 15,
+      "text": "Check out rnd-kb itself. Pin actions by SHA like the infrastructure repo does."
+     },
+     {
+      "line": 16,
+      "text": "gitleaks runs first, over the pages only."
+     },
+     {
+      "line": 17,
+      "text": "Download the pinned gitleaks release binary; --redact hides any matched value in the log."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The token, the checkouts and the scans",
+   "p": [
+    "After gitleaks, the job mints the App token. It checks out rnd-kb-tooling into .tooling and fcp into .repos/fcp, and runs the two commands with uv.",
+    "kb scan is new in this ticket. It looks for PHI patterns and for the deny-list. The patterns are SSN, MRN-like ids, a date of birth next to a name, DICOM patient tags, non-rhinohealth emails and phone numbers. It prints path and line, never the matched value, because CI logs are visible to many people.",
+    "The last step is not in the file: ask DevOps to make kb-lint / lint a required check in rnd-kb's ruleset. Without that, the workflow is advice, not a wall."
+   ],
+   "because": "We let the App token see only rnd-kb-tooling and fcp. A token that could read every repo would turn a bug in this job into a data leak.",
+   "code": {
+    "lang": "yaml",
+    "file": "rnd-kb-tooling/.github/workflows/kb-lint.yml",
+    "text": "          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz | tar xz gitleaks\n          ./gitleaks dir . --redact --no-banner --exit-code 1\n      - id: app\n        uses: actions/create-github-app-token@v2\n        with:\n          app-id: ${{ secrets.KB_APP_ID }}\n          private-key: ${{ secrets.KB_APP_PRIVATE_KEY }}\n          owner: RhinoHealth\n          repositories: rnd-kb-tooling,fcp\n      - uses: actions/checkout@v5\n        with: { repository: RhinoHealth/rnd-kb-tooling, path: .tooling, token: \"${{ steps.app.outputs.token }}\" }\n      - uses: actions/checkout@v5\n        with: { repository: RhinoHealth/fcp, path: .repos/fcp, token: \"${{ steps.app.outputs.token }}\" }\n      - uses: astral-sh/setup-uv@v6\n      - run: uv run --project .tooling kb lint . --repo fcp=.repos/fcp --index-check\n      - run: uv run --project .tooling kb scan . # PHI patterns + deny-list; prints path:line, never the value\n        env:\n          KB_DENY_TERMS: ${{ secrets.KB_DENY_TERMS }}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "actions/create-github-app-token turns the App id and key into a 1-hour installation token."
+     },
+     {
+      "line": 6,
+      "text": "repositories limits the token to the two repos this job reads."
+     },
+     {
+      "line": 7,
+      "text": "Check out rnd-kb-tooling into .tooling with that token."
+     },
+     {
+      "line": 9,
+      "text": "Check out fcp into .repos/fcp. The --repo flag below points lint at it."
+     },
+     {
+      "line": 11,
+      "text": "setup-uv installs uv, which runs the tooling project without a manual install."
+     },
+     {
+      "line": 12,
+      "text": "kb lint over the current directory (rnd-kb), with fcp for applies_to and --index-check for a stale index."
+     },
+     {
+      "line": 13,
+      "text": "kb scan: PHI patterns and the deny-list. Prints path:line only."
+     },
+     {
+      "line": 15,
+      "text": "The deny-list arrives as an environment variable from the secret, never as a file in the repo."
+     }
+    ]
+   },
+   "ifInstead": "If instead the checkout of .tooling fails with \"repository not found\", rnd-kb-tooling has not allowed access from other repos. Fix it in Settings > Actions > Access > accessible from repositories in the organization."
+  }
+ ],
+ "lab": {
+  "title": "Lint three brain pages on your laptop",
+  "youNeed": [
+   "Python 3.13 and uv",
+   "a terminal"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/labs/kb && cd ~/labs/kb && uv init --python 3.13 --name kb_lab --no-readme . && uv add \"pydantic>=2\" pyyaml",
+    "see": "Resolved 7 packages in ...\nInstalled 7 packages in ..."
+   },
+   {
+    "do": "mkdir -p src/kb_tools kb/engineering && touch src/kb_tools/__init__.py; then create src/kb_tools/schema.py from the two schema blocks above (block 1, then block 2).",
+    "see": "A 30-line file. uv run python -c \"from kb_tools.schema import Page; print(Page.model_fields.keys())\" with PYTHONPATH=src prints the eight field names."
+   },
+   {
+    "do": "Create src/kb_tools/lint.py from the two lint blocks above, then add this at the end:\n\ndef main() -> None:\n    kb = Path(sys.argv[1])\n    repos = {a.split(\"=\")[0]: Path(a.split(\"=\")[1]) for a in sys.argv[2:] if \"=\" in a}\n    owners = set(yaml.safe_load((kb / \"OWNERS.yml\").read_text()).keys())\n    problems = [p for f in sorted(kb.rglob(\"*.md\")) for p in lint_page(f, owners, repos)]\n    for p in problems:\n        print(p)\n    print(f\"kb lint: {len(problems)} problems\")\n    sys.exit(1 if problems else 0)\n\nif __name__ == \"__main__\":\n    main()\n\n(add `import sys` at the top)",
+    "see": "No output yet; the file is about 50 lines."
+   },
+   {
+    "do": "printf '\"@RhinoHealth/backend-guild\": { slack: C0123 }\\n\"@RhinoHealth/devops\": { slack: C0456 }\\n' > kb/OWNERS.yml",
+    "see": "A two-line OWNERS.yml."
+   },
+   {
+    "do": "Create kb/engineering/code-run-path.md with the 15-line frontmatter from the first section (set reviewed to today, keep one source and one applies_to) and a one-line body that links to [the CI map](ci-map.md). Then create kb/engineering/ci-map.md with owner \"@RhinoHealth/frontend-guild\" and reviewed: 2027-01-01. Then create kb/engineering/no-frontmatter.md with only a heading.",
+    "see": "Three pages. Two of them are wrong on purpose."
+   },
+   {
+    "do": "mkdir -p fakefcp/common/fcp_common/rhinoAgentRpc && touch fakefcp/common/fcp_common/rhinoAgentRpc/agent.proto && PYTHONPATH=src uv run python -m kb_tools.lint kb fcp=fakefcp; echo exit=$?",
+    "see": "kb/engineering/ci-map.md:1: owner @RhinoHealth/frontend-guild is not in OWNERS.yml\nkb/engineering/ci-map.md:1: reviewed date is in the future\nkb/engineering/no-frontmatter.md:1: missing frontmatter (copy templates/page.md)\nkb lint: 3 problems\nexit=1"
+   },
+   {
+    "do": "rm kb/engineering/no-frontmatter.md; fix ci-map.md (owner @RhinoHealth/backend-guild, reviewed a past date); run the same command again.",
+    "see": "kb lint: 0 problems\nexit=0"
+   },
+   {
+    "do": "PYTHONPATH=src uv run python -m kb_tools.lint kb fcp=/tmp; echo exit=$?",
+    "see": "kb/engineering/code-run-path.md:1: applies_to fcp:common/fcp_common/rhinoAgentRpc/*.proto matches no file in fcp\nkb lint: 1 problems\nexit=1"
+   }
+  ],
+  "faded": "Add a third check to lint_page: a warning when page.due() is before today. Print it with a \"warning:\" prefix, and do not count it as a problem. Write the condition yourself; the model already has due().",
+  "alone": "Write tests/test_lint.py with pytest (uv add --dev pytest). Add two tests over tiny fixture folders you create with tmp_path. A clean page gives an empty list. A page with a dead relative link gives exactly one problem, whose text contains \"missing page\". Run uv run pytest -q.",
+  "done": "Lint exits 1 with one line per bad page, exits 0 on a clean KB, and your two pytest tests pass."
+ },
+ "quiz": [
+  {
+   "q": "A page's frontmatter has the key confidense: high. What happens in kb lint?",
+   "options": [
+    {
+     "text": "It passes; unknown keys are ignored like extra JSON fields.",
+     "correct": false,
+     "why": "The Page model sets extra=\"forbid\", so an unknown key is a validation error."
+    },
+    {
+     "text": "It fails with a line like path:1: confidense: Extra inputs are not permitted, and confidence is reported missing.",
+     "correct": true,
+     "why": "extra=\"forbid\" rejects the typo, and the required field confidence is absent."
+    },
+    {
+     "text": "It passes with a warning, because only overdue reviews are warnings.",
+     "correct": false,
+     "why": "Overdue review is the one warning; bad frontmatter is always an error."
+    }
+   ]
+  },
+  {
+   "q": "Where does the customer-name deny-list live?",
+   "options": [
+    {
+     "text": "In rnd-kb/deny-list.txt, so lint can read it with the pages.",
+     "correct": false,
+     "why": "A file in the repo would leak the names with any clone or fork; G6-01 rules this out."
+    },
+    {
+     "text": "In Vault plus a CI secret owned by Security; kb lint, ingest and the bot load it from there.",
+     "correct": true,
+     "why": "That is the decision in G6-01, and KB_DENY_TERMS arrives in CI as a secret."
+    },
+    {
+     "text": "Hard-coded in kb_tools/scan.py, so every tool has the same copy.",
+     "correct": false,
+     "why": "rnd-kb-tooling is a repo too; the list would still be in git."
+    }
+   ]
+  },
+  {
+   "q": "A page was reviewed 200 days ago with review_every: 90d and confidence: high. What does the bot show?",
+   "options": [
+    {
+     "text": "high, because the file says high.",
+     "correct": false,
+     "why": "effective_confidence() returns low when a page is more than 2x overdue (180 days here)."
+    },
+    {
+     "text": "low, computed by effective_confidence(); the file itself is not edited.",
+     "correct": true,
+     "why": "The model computes it from reviewed and review_every, and every tool uses the same method."
+    },
+    {
+     "text": "med, as a middle ground.",
+     "correct": false,
+     "why": "There is no middle ground in the code: either the page's own value or low."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p10-1: what does Pydantic's model_validate() do when a field has the wrong type?",
+  "From p2-2: why does a caller pin a reusable workflow by commit SHA instead of a branch name?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "frontmatter",
+   "plain": "The YAML block between two --- lines at the top of a markdown page; it holds the page's fields."
+  },
+  {
+   "term": "Pydantic model",
+   "plain": "A Python class that declares fields with types and rules and validates data against them, like a zod schema."
+  },
+  {
+   "term": "kb lint",
+   "plain": "The command that checks every page's frontmatter, owner, dates, links and paths and prints path:line: message per problem."
+  },
+  {
+   "term": "reusable workflow",
+   "plain": "A GitHub Actions workflow with on: workflow_call that another repo's workflow can call, pinned by SHA."
+  },
+  {
+   "term": "required check",
+   "plain": "A check named in a repo's ruleset that must pass before a PR can merge."
+  },
+  {
+   "term": "deny-list",
+   "plain": "The customer names and terms that must never appear in a page or a bot reply. It is held in Vault and a CI secret."
+  },
+  {
+   "term": "effective confidence",
+   "plain": "The confidence a reader should see today: the page's own value, or low when the page is more than twice overdue."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G6-01",
+   "why": "This lesson explained the data scope, the deny-list decision and why the brain lives in rnd-kb and rnd-kb-tooling.",
+   "walk": [
+    "Read Nave's DATA-SCOPE.md in RhinoHealth/rnd-kb and list the two gaps. One is GitHub code and PRs as a source. The other is the explicit never-list: Slack Connect channels, client email, PHI/PII, customer names.",
+    "Propose the gaps to Ronen (Security) in a PR on DATA-SCOPE.md. Decide that the deny-list lives in Vault plus a CI secret owned by Security.",
+    "Decide with Ronen what the bot may repeat from Jira in a public channel: keys and summaries, with deny-list terms redacted. Also decide that it answers only in public engineering channels.",
+    "Meet Nave and Shai to confirm: pages in rnd-kb, tools in rnd-kb-tooling, one pointer line in fcp's root CLAUDE.md. Write rnd-kb/decisions/ADR-0001-brain-home.md.",
+    "Merge the DATA-SCOPE.md change with Ronen as approver and post the summary on the G6 epic (RH-9215)."
+   ]
+  },
+  {
+   "key": "G6-02",
+   "why": "This lesson explained the frontmatter fields and walked through schema.py line by line.",
+   "walk": [
+    "In RhinoHealth/rnd-kb create engineering/, product/, decisions/, runbooks/ and templates/page.md; keep README.md and DATA-SCOPE.md at the root. index.md and index.json are generated, never hand-edited.",
+    "Add OWNERS.yml: each owner key (@RhinoHealth/backend-guild, @RhinoHealth/frontend-guild, @RhinoHealth/devops, or a GitHub login) with its Slack user or channel ID.",
+    "In RhinoHealth/rnd-kb-tooling run uv init --python 3.13 and add pydantic and pyyaml. Set black and isort to 120 columns with pre-commit. Create package kb_tools and a kb console script in pyproject.toml.",
+    "Write src/kb_tools/schema.py exactly as in the two blocks above (Source, RepoGlob, DAYS, class Page with due() and effective_confidence()).",
+    "Ask DevOps for a ruleset on rnd-kb like fcp's from G0. PR required, exactly 1 approval, stale approvals dismissed, no bypass for agent apps."
+   ]
+  },
+  {
+   "key": "G6-03",
+   "why": "This lesson walked through lint.py line by line and you ran a lint of the same shape in the lab.",
+   "walk": [
+    "Add src/kb_tools/lint.py with lint_page() as in the two blocks above. Add a CLI entry `kb lint <kb-dir> [--repo fcp=<path> ...] [--index-check]`. It prints path:line: message and exits 1 on errors.",
+    "Make overdue review a warning only, so it never blocks an unrelated PR.",
+    "Add `kb index`: write index.md (title, owner, effective confidence, reviewed, per folder) and index.json (path, title, owner, reviewed, review_every, confidence, applies_to, sources).",
+    "Write tests/test_lint.py with tiny fixture KBs. Use a good page, an unknown owner, a dead link, a glob that matches nothing and a stale index. Run uv run pytest.",
+    "Add a pre-commit hook in rnd-kb that runs kb index, so authors never edit the index by hand."
+   ]
+  },
+  {
+   "key": "G6-04",
+   "why": "This lesson walked through kb-lint.yml and explained the App token, the two checkouts and the scans.",
+   "walk": [
+    "Add .github/workflows/kb-lint.yml to rnd-kb-tooling as in the two blocks above. It has workflow_call, three secrets, gitleaks first, the App token, checkouts of .tooling and .repos/fcp, kb lint and kb scan.",
+    "In rnd-kb add a thin caller on pull_request that uses the workflow pinned by SHA with secrets: inherit.",
+    "In rnd-kb-tooling: Settings > Actions > Access > accessible from repositories in the organization.",
+    "Ask DevOps for the rhino-kb GitHub App with contents:read on rnd-kb, rnd-kb-tooling and fcp now. Its id and key become org secrets limited to these repos.",
+    "Add `kb scan` to kb_tools: PHI patterns plus the deny-list from KB_DENY_TERMS; print path and line, never the matched value.",
+    "Ask DevOps to add kb-lint / lint as a required check in rnd-kb's ruleset."
+   ]
+  }
+ ],
+ "remember": "One Page model in code, one lint that prints path:line: message, and one required check. That is what keeps the brain honest before any agent reads it."
+}

@@ -1,0 +1,452 @@
+{
+ "id": "p7-1",
+ "title": "Why Temporal",
+ "minutes": 40,
+ "youNeed": [
+  "p0-2",
+  "p1-1"
+ ],
+ "bridge": "A Temporal workflow is like an async function that may await for three days. Except: the process running it will die many times in between. So Temporal writes every finished step to a log, and a new process rebuilds the state by replaying that log.",
+ "intro": "One Nova ticket lives for hours or days: plan, wait for a person, build, ask, open a PR. A normal Node process cannot hold that, because deploys and crashes wipe its memory. This lesson shows the three parts of Temporal: workflows, activities and workers. Then you prove on your laptop that a run survives a killed worker.",
+ "picture": {
+  "caption": "The workflow decides, activities do the outside work, and the history lets any worker pick the run up again.",
+  "nodes": [
+   {
+    "id": "poll",
+    "label": "Jira poll (a client)",
+    "kind": "service"
+   },
+   {
+    "id": "server",
+    "label": "Temporal Service: histories + task queues",
+    "kind": "service"
+   },
+   {
+    "id": "worker",
+    "label": "orchestrator worker (your Node process)",
+    "kind": "machine"
+   },
+   {
+    "id": "wf",
+    "label": "ticketToPr workflow code",
+    "kind": "file"
+   },
+   {
+    "id": "act",
+    "label": "acquireSandbox activity",
+    "kind": "service"
+   },
+   {
+    "id": "person",
+    "label": "requester",
+    "kind": "person"
+   }
+  ],
+  "steps": [
+   {
+    "from": "poll",
+    "to": "server",
+    "text": "starts workflow nova:RH-1234; the server writes the first event of its history"
+   },
+   {
+    "from": "server",
+    "to": "worker",
+    "text": "a worker polling the queue ai-agents-nova gets a task for this run"
+   },
+   {
+    "from": "worker",
+    "to": "wf",
+    "text": "runs ticketToPr until it reaches an await"
+   },
+   {
+    "from": "wf",
+    "to": "act",
+    "text": "asks for a VM; the activity runs and its result is written to the history"
+   },
+   {
+    "from": "wf",
+    "to": "person",
+    "text": "waits up to three days for Approve; no code runs while it waits"
+   },
+   {
+    "from": "server",
+    "to": "worker",
+    "text": "after a deploy, a new worker replays the history and the run continues"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "A ticket run lasts days",
+   "p": [
+    "Follow RH-1234. At 09:00 Sean assigns it to Nova. At 09:01 a lite VM starts and Nova writes a plan in 20 minutes. Then the plan waits for Sean's Approve, and Sean is on holiday.",
+    "Sean clicks Approve two days later. The build takes 70 minutes, Nova asks one question, and the PR opens on day three.",
+    "During those three days the orchestrator is deployed four times and one pod crashes. If the run lived in the memory of a Node process, it would be gone. You could store state in a database and write a cron job that resumes it, with retries, timers and locks. That is a lot of code, and every bug in it loses a ticket.",
+    "Temporal is that code, written once and tested by many teams. You write the run as one async function. Temporal makes sure it finishes, even when the machines under it do not."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "G3-24 says it in one line: a three-day wait costs nothing and survives restarts and deploys. That is the reason we use Temporal."
+   }
+  },
+  {
+   "h": "Three parts: the service, workers, clients",
+   "p": [
+    "The Temporal Service is a server with a database. It stores the event history of every run: a list of what happened, in order. It also holds task queues: named lists of work waiting for a worker. It never runs your code.",
+    "A worker is your own Node process. It connects to the service, polls one task queue, and runs your workflow and activity code when a task arrives. The worker dials out to the service, so nothing has to call into it.",
+    "A client is any code that starts a run or sends it a message. For us that is the Jira poll, the Slack app and the CLI. On your laptop, `temporal server start-dev` runs the whole service in one process, with a web UI at http://localhost:8233.",
+    "In the lab we add two flags. --namespace ai-agents creates our namespace (a separate space for runs). --search-attribute Agent=Keyword adds a search field that p7-4 explains."
+   ]
+  },
+  {
+   "h": "Workflows decide, activities do",
+   "p": [
+    "A workflow is the plan of a run: call this, wait for that, then call the next thing. An activity is one piece of outside work: start a VM, post to Slack, read Jira. Activities are plain async functions and may use any Node API.",
+    "The split matters because Temporal records each activity's result in the history. Later, it can read the result instead of doing the work again. Here is the activity for the lab."
+   ],
+   "because": "We put every outside call in an activity because Temporal records its result; a replay reads it instead of calling out again.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/temporal-lab/src/activities.ts",
+    "text": "// ~/temporal-lab/src/activities.ts: activities may use the network, files and the clock\nexport async function greet(name: string): Promise<string> {\n  console.log(`greet called for ${name}`); // so you can see when it really runs\n  return `Hello, ${name}!`;\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The comment is the rule: everything with side effects lives in an activity."
+     },
+     {
+      "line": 2,
+      "text": "A normal exported async function. Its name, greet, becomes the activity type in the history."
+     },
+     {
+      "line": 3,
+      "text": "The log line lets you see in the lab when the activity really runs and when it is skipped."
+     },
+     {
+      "line": 4,
+      "text": "The return value is saved in the history as JSON, so it must be serializable."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The workflow: a function that can wait",
+   "p": [
+    "The workflow calls the activity through proxyActivities. You never import the activity code itself, only its type. The call does not run greet directly: it asks the service to schedule it, and the worker runs it.",
+    "sleep(\"30 seconds\") starts a durable timer. The service keeps the timer, not your process. If no worker is running when it fires, the run waits until one comes back."
+   ],
+   "because": "We write the run as one function because that is how we think about a ticket; each await becomes a recorded step.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/temporal-lab/src/workflows.ts",
+    "text": "import { proxyActivities, sleep } from \"@temporalio/workflow\";\nimport type * as activities from \"./activities.js\";\n\nconst { greet } = proxyActivities<typeof activities>({ startToCloseTimeout: \"1 minute\" });\n\nexport async function hello(name: string): Promise<string> {\n  const first = await greet(name); // the result is written to the history\n  await sleep(\"30 seconds\"); // a durable timer: stop the worker now\n  const second = await greet(`${name} again`);\n  return `${first} ${second}`;\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Workflow code imports only from @temporalio/workflow, never from Node or fetch."
+     },
+     {
+      "line": 2,
+      "text": "import type: only the types come in, so the activity code is not bundled into the workflow."
+     },
+     {
+      "line": 4,
+      "text": "proxyActivities returns stand-ins. startToCloseTimeout says how long one attempt may run (more in p7-2)."
+     },
+     {
+      "line": 7,
+      "text": "This await schedules greet on a worker and waits for its recorded result."
+     },
+     {
+      "line": 8,
+      "text": "A durable timer. The process can die here; the service fires the timer anyway."
+     },
+     {
+      "line": 10,
+      "text": "The return value ends the run and is stored as its result."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The worker runs your code",
+   "p": [
+    "Worker.create bundles the workflow file with webpack, a bundler like esbuild from p1-7. It runs the bundle in an isolated sandbox. This sandbox is a locked-down JavaScript space inside the worker, not the sandbox VM from p0-2. It has no Node APIs, no fetch and no real clock. Activities are registered as an object of plain functions and run as normal Node code.",
+    "The worker polls one task queue. A run started on queue ai-agents-lab only reaches workers polling ai-agents-lab. On the platform each agent has its own queue, such as ai-agents-nova (p7-4)."
+   ],
+   "because": "We run code in our own worker process because the service only stores and hands out tasks; it never executes anything.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/temporal-lab/src/worker.ts",
+    "text": "import { fileURLToPath } from \"node:url\";\nimport { NativeConnection, Worker } from \"@temporalio/worker\";\nimport * as activities from \"./activities.js\";\n\nconst connection = await NativeConnection.connect({ address: \"localhost:7233\" });\nconst worker = await Worker.create({\n  connection,\n  namespace: \"ai-agents\",\n  taskQueue: \"ai-agents-lab\",\n  workflowsPath: fileURLToPath(new URL(\"./workflows.ts\", import.meta.url)), // bundled for the sandbox\n  activities, // plain functions, run as normal Node code\n});\nawait worker.run(); // polls the task queue until you press Ctrl+C",
+    "notes": [
+     {
+      "line": 5,
+      "text": "7233 is the service's port. In production this is the in-cluster address of our Temporal (G3-06)."
+     },
+     {
+      "line": 8,
+      "text": "A namespace is a separate space for runs. Ours is ai-agents, on the laptop and on inf (our infra cluster, inf-rhinohealth from p5-1)."
+     },
+     {
+      "line": 9,
+      "text": "The task queue this worker serves."
+     },
+     {
+      "line": 10,
+      "text": "ESM has no __dirname, so we build the path from import.meta.url. The bundler compiles the .ts file."
+     },
+     {
+      "line": 11,
+      "text": "Activities are passed in as functions; workflows are passed in as a file path. That difference is the sandbox."
+     },
+     {
+      "line": 13,
+      "text": "run() keeps polling until the process gets Ctrl+C."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Starting a run",
+   "p": [
+    "A client starts a run with a workflow ID. The ID names the run, and only one open run may have it. Nova's IDs are the ticket itself, nova:RH-1234, so the same ticket can never get two runs (p7-4).",
+    "start() returns as soon as the service has recorded the start. The run itself goes on without the client."
+   ],
+   "because": "We start runs from a client because the code that notices work is not the code that does it.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/temporal-lab/src/start.ts",
+    "text": "import { Client, Connection } from \"@temporalio/client\";\nimport { hello } from \"./workflows.js\";\n\nconst connection = await Connection.connect({ address: \"localhost:7233\" });\nconst client = new Client({ connection, namespace: \"ai-agents\" });\nconst handle = await client.workflow.start(hello, {\n  taskQueue: \"ai-agents-lab\",\n  workflowId: \"lab:RH-1\", // the run's name; Nova uses nova:RH-1234\n  args: [\"Sean\"],\n});\nconsole.log(\"started\", handle.workflowId);",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Importing the function gives type checking on args. Only its name is sent to the service."
+     },
+     {
+      "line": 5,
+      "text": "The client talks to the same namespace the worker serves."
+     },
+     {
+      "line": 8,
+      "text": "The workflow ID. Pick IDs that mean something; you search and signal by them."
+     },
+     {
+      "line": 9,
+      "text": "args are the workflow's parameters, sent as JSON."
+     },
+     {
+      "line": 11,
+      "text": "This prints right away. The run continues on the worker."
+     }
+    ]
+   },
+   "see": "started lab:RH-1",
+   "ifInstead": "If instead you see 'Namespace ai-agents is not found', the dev server was started without --namespace ai-agents. Stop it and start it again with that flag."
+  },
+  {
+   "h": "The history, and replay",
+   "p": [
+    "Every run has an event history. `temporal workflow show` prints it. Each line is a fact the service recorded: the start, each activity scheduled and completed, each timer started and fired.",
+    "When a worker gets a task for a run it has not seen, it replays. It runs the workflow function from the top. At each activity call it finds the recorded result in the history and returns it at once, without calling greet. When it reaches a step with no record yet, it carries on for real.",
+    "Replay only works if the workflow makes the same calls in the same order every time. That is why workflow code must be deterministic: no I/O, no real clock, no random numbers (p7-2)."
+   ],
+   "see": "  1  WorkflowExecutionStarted\n  5  ActivityTaskScheduled\n  7  ActivityTaskCompleted\n 11  TimerStarted\n 12  TimerFired\n 18  ActivityTaskScheduled\n 20  ActivityTaskCompleted\n 24  WorkflowExecutionCompleted   (output trimmed; your numbers may differ)",
+   "callout": {
+    "kind": "gotcha",
+    "text": "Replay is why a workflow must never call fetch or read a file. On replay that call would run again and might return something else, and the run would no longer match its own history."
+   }
+  },
+  {
+   "h": "What this buys the platform",
+   "p": [
+    "Waits on people are durable timers and conditions (waits until something becomes true). So a three-day wait costs nothing and needs no VM (p7-3). Retries come from a policy object instead of hand-written loops (p7-2). One run per ticket comes from the workflow ID (p7-4). Schedules start the Jira poll every minute with no public webhook (p7-5).",
+    "The web UI and the CLI show every run, its history and why it is stuck. Temporal does not run the agent. The agent runs on the VM; the workflow only starts it, watches its heartbeat and reacts. A heartbeat is a regular \"I am still alive\" message (p7-2)."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Only the orchestrator starts runs. A VM has no route to Temporal, so an agent can never start more agents (G3-25)."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Kill a worker in the middle of a run",
+  "youNeed": [
+   "Node 24",
+   "temporal CLI (brew install temporal)",
+   "Three terminal tabs"
+  ],
+  "worked": [
+   {
+    "do": "Tab 1: temporal server start-dev --namespace ai-agents --search-attribute Agent=Keyword",
+    "see": "Temporal Server:      localhost:7233\nTemporal UI:          http://localhost:8233\nTemporal Metrics:     http://localhost:<port>/metrics"
+   },
+   {
+    "do": "Open http://localhost:8233 and switch the namespace (top left) to ai-agents",
+    "see": "An empty Workflows list"
+   },
+   {
+    "do": "Tab 2: mkdir ~/temporal-lab && cd ~/temporal-lab && npm init -y && npm pkg set type=module\nnpm i @temporalio/client@1.24.0 @temporalio/worker@1.24.0 @temporalio/workflow@1.24.0 @temporalio/activity@1.24.0 @temporalio/common@1.24.0\nnpm i -D typescript tsx @types/node",
+    "see": "added <n> packages in <n>s"
+   },
+   {
+    "do": "mkdir src and create src/activities.ts, src/workflows.ts, src/worker.ts and src/start.ts with the four blocks above",
+    "see": "(no output)"
+   },
+   {
+    "do": "Tab 2: npx tsx src/worker.ts",
+    "see": "[INFO] Workflow bundle created { ... size: '1.57MB' }\n[INFO] Worker state changed { ... state: 'RUNNING' }   (output trimmed)"
+   },
+   {
+    "do": "Tab 3: cd ~/temporal-lab && npx tsx src/start.ts",
+    "see": "started lab:RH-1\n(and in tab 2) greet called for Sean"
+   },
+   {
+    "do": "Within 30 seconds, press Ctrl+C in tab 2. Open lab:RH-1 in the UI.",
+    "see": "Status Running; the last event is TimerStarted"
+   },
+   {
+    "do": "Wait until the 30 seconds have passed, then start the worker again in tab 2: npx tsx src/worker.ts",
+    "see": "greet called for Sean again\n(not 'greet called for Sean': the first result came from the history)"
+   },
+   {
+    "do": "Tab 3: temporal workflow result --workflow-id lab:RH-1 --namespace ai-agents",
+    "see": "Results:\n  Status          COMPLETED\n  Result          \"Hello, Sean! Hello, Sean again!\""
+   },
+   {
+    "do": "temporal workflow show --workflow-id lab:RH-1 --namespace ai-agents",
+    "see": "The event list from the section above, ending in WorkflowExecutionCompleted"
+   }
+  ],
+  "faded": "Change workflowId in start.ts to lab:RH-2 and args to [\"Dana\"]. Start it, stop the worker during the sleep, and start the worker again. Left to you: the command that prints the result, and the event number in the history where the timer fired.",
+  "alone": "Add a second activity, shout(text), that logs and returns text.toUpperCase(). Call it at the end of hello and return its result. Restart the worker, because it bundles the workflow only at start. Run lab:RH-3 and check that the history now has three ActivityTaskCompleted events.",
+  "done": "After you killed and restarted the worker, the run completed, and the first greet did not run a second time."
+ },
+ "quiz": [
+  {
+   "q": "The worker is killed during sleep(). After it starts again, what happens to the first greet call?",
+   "options": [
+    {
+     "text": "It runs again, because the new worker starts the function from the top",
+     "correct": false,
+     "why": "The function does start from the top, but the call is answered from the history; greet itself does not run."
+    },
+    {
+     "text": "Its result is read from the history, so greet is not called again",
+     "correct": true,
+     "why": "That is replay: recorded steps return their saved result, and only new steps do real work."
+    },
+    {
+     "text": "The run fails and must be started again by hand",
+     "correct": false,
+     "why": "Nothing is lost: the timer fired on the service and the run waits for any worker."
+    }
+   ]
+  },
+  {
+   "q": "Where must code that calls the Jira API go?",
+   "options": [
+    {
+     "text": "In the workflow function, since it is async anyway",
+     "correct": false,
+     "why": "Workflow code must be deterministic and cannot do I/O; the bundler even refuses Node modules."
+    },
+    {
+     "text": "In the client that starts the run",
+     "correct": false,
+     "why": "The client only starts runs; the run may need Jira again days later, with retries."
+    },
+    {
+     "text": "In an activity",
+     "correct": true,
+     "why": "Activities do all outside work; their results are recorded and retried by policy."
+    }
+   ]
+  },
+  {
+   "q": "What does the Temporal Service do?",
+   "options": [
+    {
+     "text": "It stores each run's history and hands tasks to workers through task queues",
+     "correct": true,
+     "why": "It stores and dispatches; your code always runs in your workers."
+    },
+    {
+     "text": "It runs your workflow and activity code",
+     "correct": false,
+     "why": "It never runs your code; workers do."
+    },
+    {
+     "text": "It runs the agent's Claude session",
+     "correct": false,
+     "why": "The harness on the VM runs the session; an activity only starts and watches it."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "In p0-2, which part of the platform runs the agent, and which part only decides what happens next?",
+  "In p1-1, what runs a TypeScript file directly, without a build step?"
+ ],
+ "videos": [
+  {
+   "title": "Temporal in 7 Minutes - the TL;DR Intro",
+   "url": "https://www.youtube.com/watch?v=2HjnQlnA5eY",
+   "channel": "Temporal",
+   "minutes": 7,
+   "why": "Official short intro to workflows, activities and durability."
+  },
+  {
+   "title": "Simplifying distributed systems development with Temporal's durable execution",
+   "url": "https://www.youtube.com/watch?v=0yZAqIsyskA",
+   "channel": "Stripe Developers",
+   "minutes": 23,
+   "why": "Stripe-hosted talk on why durable execution beats hand-written retries."
+  }
+ ],
+ "words": [
+  {
+   "term": "workflow",
+   "plain": "The plan of a run, written as one deterministic async function that Temporal can replay."
+  },
+  {
+   "term": "activity",
+   "plain": "A plain async function that does outside work; its result is recorded in the history."
+  },
+  {
+   "term": "worker",
+   "plain": "Your Node process that polls a task queue and runs workflow and activity code."
+  },
+  {
+   "term": "Temporal Service",
+   "plain": "The server that stores histories and task queues; it never runs your code."
+  },
+  {
+   "term": "task queue",
+   "plain": "A named list of work; only workers polling that name pick it up."
+  },
+  {
+   "term": "event history",
+   "plain": "The ordered list of facts the service recorded for one run."
+  },
+  {
+   "term": "replay",
+   "plain": "Running the workflow from the top and answering recorded steps from the history."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-24",
+   "why": "ticketToPr is one workflow whose long waits and VM steps only work because Temporal keeps the run alive."
+  },
+  {
+   "key": "G3-06",
+   "why": "DevOps runs our own Temporal Service on inf with the namespace ai-agents, the same name you used in the lab."
+  },
+  {
+   "key": "G3-29",
+   "why": "Runs live for days, so every deploy lands in the middle of some run; replay is what makes that safe."
+  }
+ ],
+ "remember": "Workflows decide and are replayed from their history; activities do the outside work once and their results are recorded."
+}

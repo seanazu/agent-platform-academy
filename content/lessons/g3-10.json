@@ -1,0 +1,719 @@
+{
+ "id": "g3-10",
+ "title": "ticketToPr and the fan-out walls",
+ "minutes": 55,
+ "youNeed": [
+  "p7-3",
+  "p7-4",
+  "g3-8"
+ ],
+ "bridge": "ticketToPr is like a React component written as a state machine: plan, wait, build, wait, open the PR. Except it replays from a stored history. So it can wait three days for a click, survive a deploy, and pick up where it was.",
+ "intro": "This lesson writes the one workflow that turns a Jira ticket into a PR, and the walls around it. One run per ticket, a fixed number of VMs per agent, a kill switch. And timeouts that are safety nets, never work limits. Every later lesson in G3 plugs into this function.",
+ "picture": {
+  "caption": "One ticket, one run: a slot, a small VM to plan, a click, a big VM to build, every VM released.",
+  "nodes": [
+   {
+    "id": "start",
+    "label": "startRun: nova:RH-1234",
+    "kind": "service"
+   },
+   {
+    "id": "wf",
+    "label": "ticketToPr workflow",
+    "kind": "service"
+   },
+   {
+    "id": "slots",
+    "label": "slots:nova (3 slots)",
+    "kind": "service"
+   },
+   {
+    "id": "lite",
+    "label": "lite VM: plan",
+    "kind": "machine"
+   },
+   {
+    "id": "person",
+    "label": "Requester in Slack",
+    "kind": "person"
+   },
+   {
+    "id": "full",
+    "label": "full VM: build",
+    "kind": "machine"
+   },
+   {
+    "id": "pr",
+    "label": "draft PR",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "start",
+    "to": "wf",
+    "text": "starts the run, or joins the open one with the same ID"
+   },
+   {
+    "from": "wf",
+    "to": "slots",
+    "text": "asks for a slot and waits in line if all 3 are taken"
+   },
+   {
+    "from": "wf",
+    "to": "lite",
+    "text": "claims a lite VM, plans, posts the plan, releases the VM"
+   },
+   {
+    "from": "person",
+    "to": "wf",
+    "text": "clicks Approve: the decidePlan signal"
+   },
+   {
+    "from": "wf",
+    "to": "full",
+    "text": "claims a full VM at the same base commit and builds"
+   },
+   {
+    "from": "full",
+    "to": "pr",
+    "text": "the harness opens the PR; the workflow releases the VM in finally"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "RH-1234, from assignment to PR",
+   "p": [
+    "Sean assigns RH-1234 to Nova. A minute later the Jira poll (lesson g3-12) calls startRun, and a workflow called ticketToPr starts with the ID nova:RH-1234. A workflow is Temporal's durable function. Every step is written to a history, so it can stop and resume anywhere (lesson p7-2).",
+    "The workflow plans on a small VM and waits for the requester to approve. Then it builds on a big VM, asking questions and waiting for answers. It opens the PR. Whatever happens, it releases every VM it claimed.",
+    "The waits can last days. In Temporal a wait is a durable timer. Nothing runs, no VM is up, and an orchestrator deploy does not lose it. That is why this function can be plain, linear TypeScript."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "Plan small, build big: a plan needs to read code, not run FCP Lab, so it gets a lite VM. Only an approved plan pays for a full VM."
+   }
+  },
+  {
+   "h": "ticketToPr, part 1: signals and the sandbox helper",
+   "p": [
+    "Here is the ticket's sketch, split in two. Part 1 declares the signals, sets up the shared state and starts the inSandbox helper. The first comment line of the sketch is dropped; nothing else changes.",
+    "A signal is a message a person or service sends to a running workflow (lesson p7-3). RunState is a small object in the shared package. Every piece of the run reads it: the latest answer, and whether someone pressed Stop."
+   ],
+   "because": "We keep all I/O in activities, because a replayed workflow must make the same decisions every time.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (part 1 of 2)",
+    "text": "import { CancellationScope, condition, defineSignal, setHandler, workflowInfo } from \"@temporalio/workflow\";\nimport type { Handoff, PlanDecision, RunState } from \"@rhinohealth/ai-agents-shared\"; // Handoff: { key, requester, drill? } (G4-04)\nimport { act } from \"../policies.js\"; // proxied activities: 7-day start-to-close as a safety net, 2-minute heartbeats (G3-29)\nimport { waitForPerson } from \"../waiting.js\"; // reminders, then parking (G3-38); no VM runs while we wait\nexport const decidePlan = defineSignal<[PlanDecision]>(\"decidePlan\"); // Slack buttons (G3-35)\nexport const answerQuestion = defineSignal<[text: string, by: string]>(\"answerQuestion\"); // a reply in the ticket's thread\nexport async function ticketToPr(t: Handoff): Promise<string> { // workflow ID \"nova:RH-1234\": one run per ticket (G3-25)\n  const run: RunState = { stopped: false }; // shared with G4-12's grill block and the Stop button (G3-38)\n  let decision: PlanDecision | undefined;\n  setHandler(decidePlan, (d) => { decision = d; });\n  setHandler(answerQuestion, (text) => { run.answer = text; });\n  const base = await act.mainHead(); // plan and build start from the same main commit\n  const inSandbox = async (task: Task, size: Size): Promise<RunResult> => {\n    const vm = await act.acquireSandbox({ runId: workflowInfo().runId, size, agent: \"nova\", jiraKey: t.key });\n    try {\n      await act.freshenSandbox(vm, base);\n      run.answer = undefined; // cleared before the run, so a quick reply to its question is never lost\n      let result = await act.workInSandbox(vm, task); // heartbeats; no work-time limit",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Only workflow APIs. No fetch, no node: imports, no Date.now(): this file is replayed, and replay must be deterministic."
+     },
+     {
+      "line": 2,
+      "text": "Handoff is what starts a run: { key, requester, drill? }. PlanDecision and RunState come from the shared package too, so Slack and the workflow agree on the shapes."
+     },
+     {
+      "line": 3,
+      "text": "act is the set of activities with our timeouts and retries. Section 4 explains them."
+     },
+     {
+      "line": 4,
+      "text": "waitForPerson waits with reminders and parking. Lesson g3-12 builds it."
+     },
+     {
+      "line": 5,
+      "text": "decidePlan carries the requester's click: approve, change or reject. The Slack app sends it (lesson g3-13)."
+     },
+     {
+      "line": 6,
+      "text": "answerQuestion carries a reply typed in the ticket's thread, and who typed it."
+     },
+     {
+      "line": 7,
+      "text": "ticketToPr takes a Handoff and returns a string: the PR URL, \"parked\" or \"stopped\"."
+     },
+     {
+      "line": 8,
+      "text": "RunState is shared with other code in the run: the Stop signal sets run.stopped (G3-38) and the grill block reads it (G4-12)."
+     },
+     {
+      "line": 10,
+      "text": "setHandler connects a signal to a function. The handler only stores the value; the main code reads it later."
+     },
+     {
+      "line": 12,
+      "text": "mainHead is an activity that reads main's latest commit once. Plan and build both start from this sha, so the build matches the approved plan."
+     },
+     {
+      "line": 13,
+      "text": "inSandbox runs one task on one VM of a given size and always gives the VM back."
+     },
+     {
+      "line": 14,
+      "text": "acquireSandbox claims a warm VM (lesson g3-8). The run ID makes a retried claim find the same VM."
+     },
+     {
+      "line": 16,
+      "text": "freshenSandbox fetches the base commit and reinstalls only what changed."
+     },
+     {
+      "line": 17,
+      "text": "The answer is cleared before the run starts. A reply that arrives while the harness is still running is then kept, not wiped later."
+     },
+     {
+      "line": 18,
+      "text": "workInSandbox starts the harness and follows its heartbeats. It returns when the harness says done, needs an answer, or failed."
+     }
+    ]
+   }
+  },
+  {
+   "h": "ticketToPr, part 2: questions, finally, plan and build",
+   "p": [
+    "Part 2 continues inside inSandbox. When the harness asks a question, the loop waits for the answer. It parks the VM if the wait gets long, then resumes the same session. Then the bottom of the function runs the plan and the build."
+   ],
+   "because": "We wrap the VM's life in try and finally, because a forgotten VM costs money every hour. No error, cancel or Stop may skip the release.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (part 2 of 2)",
+    "text": "      while (result.needsAnswer) {\n        const idle = !(await condition(() => run.answer !== undefined, \"10 minutes\")); // no answer yet\n        if (idle) await act.parkSandbox(vm); // stop the VM and keep its disk while a person thinks (G3-20)\n        if (!(await waitForPerson(run, \"question\", () => run.answer !== undefined, t))) return { ...result, parked: true };\n        if (idle) await act.wakeSandbox(vm); // start it again, freshen if main moved (G3-20)\n        const reply = run.answer ?? \"\"; run.answer = undefined;\n        result = await act.workInSandbox(vm, resumeTask(task, result.sessionId, reply));\n      }\n      return result;\n    } finally {\n      await CancellationScope.nonCancellable(() => act.releaseSandbox(vm)); // always: no VM is left behind\n    }\n  };\n  const plan = await inSandbox(planTask(t), \"lite\"); // plan small\n  if (plan.parked) return \"parked\";\n  await act.postPlan(t, plan);\n  if (!(await waitForPerson(run, \"plan\", () => decision !== undefined, t))) return \"parked\"; // remind at 1 day, park at 3\n  if (decision?.kind !== \"approve\") return \"stopped\";\n  const built = await inSandbox(buildTask(t, plan), \"full\"); // build big\n  return built.parked ? \"parked\" : built.prUrl;\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "needsAnswer is true when the harness called ask_human and ended its turn (lesson g3-9)."
+     },
+     {
+      "line": 2,
+      "text": "condition(fn, \"10 minutes\") resolves true when fn becomes true, and false when the 10 minutes pass first. idle means nobody answered in 10 minutes."
+     },
+     {
+      "line": 3,
+      "text": "parkSandbox stops the instance and keeps its disk (lesson g3-8). A stopped VM costs only its disk."
+     },
+     {
+      "line": 4,
+      "text": "The long wait: remind after 1 day, park the ticket after 2. If it parks, the run ends and finally releases the VM."
+     },
+     {
+      "line": 5,
+      "text": "Only a parked VM needs waking. wakeSandbox starts it and freshens again if main moved."
+     },
+     {
+      "line": 6,
+      "text": "Take the reply and clear it, so the next question starts empty."
+     },
+     {
+      "line": 7,
+      "text": "resumeTask tells the harness to resume the stored session with the reply. Same session, same context."
+     },
+     {
+      "line": 10,
+      "text": "finally runs on success, on error and on cancel."
+     },
+     {
+      "line": 11,
+      "text": "CancellationScope.nonCancellable: even when the whole run is cancelled, this activity still runs. Without it, a cancelled run would skip the release."
+     },
+     {
+      "line": 14,
+      "text": "Plan small: a lite VM. planTask, buildTask and resumeTask are small helpers that build the task file for the harness."
+     },
+     {
+      "line": 16,
+      "text": "postPlan posts the plan to the ticket's thread with the Approve, Change and Stop buttons (G4 formats it)."
+     },
+     {
+      "line": 17,
+      "text": "Wait for the decision: remind at 1 day, park at 3. Parking returns false, and the run ends as parked."
+     },
+     {
+      "line": 18,
+      "text": "The sketch treats anything but approve as stopped. The ticket's steps add the re-plan for change; see the walk below."
+     },
+     {
+      "line": 19,
+      "text": "Build big: a full VM, with the approved plan in the task."
+     },
+     {
+      "line": 20,
+      "text": "The result is the PR URL, or parked if a question was never answered."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "In the final version, each inSandbox call runs inside withSlot (section 8). It uses runWithRecovery (lesson g3-11) instead of the claim, freshen and work lines. The sketch shows the plain path first."
+   }
+  },
+  {
+   "h": "Timeouts are safety nets, not work limits",
+   "p": [
+    "Temporal requires a timeout on every activity call. Our rule is that no time limit may cut an agent's work. The two fit together because of one detail. When a timeout fires, Temporal retries the activity. Our workInSandbox then re-attaches to the harness still running on the VM.",
+    "So the 7-day startToCloseTimeout ends one attempt to follow the harness, not the harness itself. A different timeout catches real trouble: heartbeatTimeout. The activity calls heartbeat() every 30 seconds while the harness is alive. Two minutes of silence means the worker process died, and Temporal starts a new attempt."
+   ],
+   "because": "We keep every timeout and retry in one file, so every workflow behaves the same when a service is slow.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/policies.ts",
+    "text": "import { proxyActivities, type ActivityOptions, type RetryPolicy } from \"@temporalio/workflow\";\nimport type * as activities from \"./activities/index.js\";\n\nconst NEVER_RETRY = [\"ScopeDenied\", \"PlanRejected\", \"NeedsPerson\", \"StoppedByPerson\"];\nexport const AWS: RetryPolicy = { initialInterval: \"1s\", backoffCoefficient: 2, maximumInterval: \"1 minute\",\n  maximumAttempts: 10, nonRetryableErrorTypes: NEVER_RETRY };\nexport const PEOPLE_APIS: RetryPolicy = { initialInterval: \"5s\", backoffCoefficient: 2, maximumInterval: \"5 minutes\",\n  nonRetryableErrorTypes: NEVER_RETRY }; // no attempt limit: G3-39 pauses the ticket on long outages\nexport const HARNESS_STEP: RetryPolicy = { maximumAttempts: 1 }; // recovery (G3-27) decides, not blind retries\n\nexport const SHORT: ActivityOptions = { startToCloseTimeout: \"5 minutes\" };\n// startToCloseTimeout is required by the SDK and is NOT a work limit: when 7 days pass, the retry re-attaches to the\n// harness still running on the VM. The 2-minute heartbeat is what catches a dead worker.\nexport const LONG: ActivityOptions = { startToCloseTimeout: \"7 days\", heartbeatTimeout: \"2 minutes\" };\n\n/** One place for timeouts and retries, so every workflow behaves the same (by default LONG, with AWS retries). */\nexport const act = proxyActivities<typeof activities>({ ...LONG, retry: AWS });\nexport const peopleApis = proxyActivities<typeof activities>({ ...SHORT, retry: PEOPLE_APIS });",
+    "notes": [
+     {
+      "line": 1,
+      "text": "RetryPolicy says how often to retry; ActivityOptions says how long an attempt may take."
+     },
+     {
+      "line": 2,
+      "text": "import type gives the activity function types without loading their code into the workflow bundle."
+     },
+     {
+      "line": 4,
+      "text": "Errors that must never be retried: a refused scope, a rejected plan, a run that needs a person, a person's Stop."
+     },
+     {
+      "line": 5,
+      "text": "AWS and SSM calls: wait 1 s, then 2 s, 4 s and so on, never more than 1 minute between tries."
+     },
+     {
+      "line": 6,
+      "text": "At most 10 attempts. AWS errors are usually short."
+     },
+     {
+      "line": 7,
+      "text": "Jira, Slack and GitHub through the broker: start at 5 s, grow to 5 minutes."
+     },
+     {
+      "line": 8,
+      "text": "No maximumAttempts, so retries never stop. A long outage pauses the ticket instead (lesson g3-11)."
+     },
+     {
+      "line": 9,
+      "text": "For harness steps where recovery decides what to do, not a blind retry."
+     },
+     {
+      "line": 11,
+      "text": "SHORT: 5 minutes per attempt, for quick calls like posting a message."
+     },
+     {
+      "line": 12,
+      "text": "The comment that must stay in the code: this timeout is required by the SDK and is never a work limit."
+     },
+     {
+      "line": 14,
+      "text": "LONG: 7 days per attempt, and the heartbeat timeout of 2 minutes that catches a dead worker."
+     },
+     {
+      "line": 17,
+      "text": "act: LONG options with AWS retries. A timed-out workInSandbox is retried, and the retry re-attaches to the same VM."
+     },
+     {
+      "line": 18,
+      "text": "peopleApis: SHORT options with endless back-off, for the Jira poll and messages."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "No time, turn or budget limit cuts a run in the middle. The 7-day timeout re-attaches; it never kills the harness. Heartbeats, not clocks, decide that a worker is dead."
+   }
+  },
+  {
+   "h": "Safe deploys: patched and the replay test",
+   "p": [
+    "A run lives for days, so every orchestrator deploy lands in the middle of some runs. When the new code replays an old history, it must make the same calls in the same order. If it does not, Temporal stops the run with a non-determinism error.",
+    "So a change to workflow code goes behind patched(\"<change-id>\"): if (patched(\"ask-qa-first\")) { new step }. Old runs replay the old path, new runs take the new one. Later you switch to deprecatePatch, and delete the old branch when no run that started before the change is still open.",
+    "The safety net in CI is a replay test. You save real histories as JSON with temporal workflow show --workflow-id nova:RH-1 --output json. You commit them under test/histories/. CI replays them against the new code on every PR.",
+    "The stack guide also names Worker Versioning with build IDs for safe deploys. That older API is deprecated in Temporal TS SDK 1.24; workerDeploymentOptions replaces it (lesson p7-6). This lesson uses patched and the replay test."
+   ],
+   "because": "We replay saved histories on every PR, because a non-deterministic change should fail in CI, not in someone's three-day run.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/test/replay.test.ts",
+    "text": "import { test } from \"node:test\";\nimport { readdir, readFile } from \"node:fs/promises\";\nimport { fileURLToPath } from \"node:url\";\nimport { Worker } from \"@temporalio/worker\";\n\ntest(\"saved workflow histories still replay\", async () => {\n  const workflowsPath = fileURLToPath(new URL(\"../src/workflows/index.ts\", import.meta.url));\n  const dir = new URL(\"./histories/\", import.meta.url); // next to this file: npm test runs from the repo root\n  for (const file of (await readdir(dir)).filter((f) => f.endsWith(\".json\")).sort()) {\n    const history = JSON.parse(await readFile(new URL(file, dir), \"utf8\"));\n    await Worker.runReplayHistory({ workflowsPath }, history, file);\n  }\n});",
+    "notes": [
+     {
+      "line": 1,
+      "text": "node:test, like every test in the repo (lesson p1-6)."
+     },
+     {
+      "line": 4,
+      "text": "Worker from @temporalio/worker has the replay function."
+     },
+     {
+      "line": 7,
+      "text": "The path to the workflow code. The replayer bundles it the same way a real worker does."
+     },
+     {
+      "line": 8,
+      "text": "Histories live next to the test file. new URL with import.meta.url finds them wherever npm test runs from."
+     },
+     {
+      "line": 9,
+      "text": "Every saved .json history, in a stable order."
+     },
+     {
+      "line": 11,
+      "text": "runReplayHistory runs the history through today's workflow code and throws on any difference. A throw fails the PR."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "With SDK 1.24.0, npm can install two copies of protobufjs, and the replay test fails with TypeError: type must be a Type. Run npm ls protobufjs, then pin protobufjs at the repo root to the version under @temporalio/common (lesson p7-7)."
+   }
+  },
+  {
+   "h": "startRun: one run per thing",
+   "p": [
+    "The fastest way to burn a budget is many agents doing work nobody needed. So only the orchestrator starts runs, and it does so through one function, startRun. The Jira poll, /nova in Slack and the routines all call it.",
+    "The workflow ID is the thing itself: nova:RH-1234, cifix:fcp:<fingerprint>, upgrade:fcp:pr-<n>, bugfix:RH-1240. A conflict policy tells Temporal what to do when a run with that ID is already open. USE_EXISTING means: return the open run, start nothing new."
+   ],
+   "because": "We build the ID from the ticket, because a poll and a Slack command for one ticket must give one run.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/fanout.ts",
+    "text": "// Only the orchestrator starts runs.\nimport type { Client, Workflow } from \"@temporalio/client\";\nimport { defineSearchAttributeKey, SearchAttributeType, TypedSearchAttributes, WorkflowIdConflictPolicy } from \"@temporalio/common\";\n\nconst AGENT = defineSearchAttributeKey(\"Agent\", SearchAttributeType.KEYWORD);\n\nexport const startRun = (client: Client, agent: string, thing: string, wf: string | Workflow, ...args: unknown[]) =>\n  client.workflow.start(wf, {\n    workflowId: `${agent}:${thing}`, // nova:RH-1234 | cifix:fcp:<fingerprint> | upgrade:fcp:pr-<n> | bugfix:RH-1240\n    taskQueue: `ai-agents-${agent}`, // one queue per agent: nobody starves anybody\n    workflowIdConflictPolicy: WorkflowIdConflictPolicy.USE_EXISTING, // a second trigger joins the open run\n    typedSearchAttributes: new TypedSearchAttributes([{ key: AGENT, value: agent }]),\n    args,\n  });",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Client is the Temporal client. Workflow is the type of a workflow function."
+     },
+     {
+      "line": 5,
+      "text": "Agent is a search attribute: a field Temporal indexes, so you can list or signal every run of one agent."
+     },
+     {
+      "line": 7,
+      "text": "startRun(client, agent, thing, workflow, ...args). Every trigger in the platform calls this one function."
+     },
+     {
+      "line": 9,
+      "text": "The workflow ID is agent:thing. Two triggers for RH-1234 build the same ID."
+     },
+     {
+      "line": 10,
+      "text": "One task queue per agent. A busy cifix agent cannot take worker time from Nova."
+     },
+     {
+      "line": 11,
+      "text": "USE_EXISTING: if nova:RH-1234 is open, this call returns its handle and starts nothing."
+     },
+     {
+      "line": 12,
+      "text": "Tag the run with its agent, for the batch Stop and the dashboards."
+     },
+     {
+      "line": 13,
+      "text": "The workflow's arguments, for ticketToPr a Handoff."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "startOrSignal is the same call with signalWithStart: same ID, queue and Agent attribute. Routines use it to join an open run by root cause (G5-09)."
+   }
+  },
+  {
+   "h": "The slots workflow: a fixed number of VMs",
+   "p": [
+    "Each agent has a fixed number of VM slots. To start: nova 3, cifix 2, upgrade 2, flaky 1, bugfix 2, health 1, security 1. A slot is a permission to have one VM running. A 4th Nova ticket waits in line until a run gives a slot back.",
+    "The line is itself a workflow, slots:nova, that never ends. Runs send it request and release signals, and it answers with slotGranted. A run gives the slot back when its VM is parked or released. So a run waiting on a person holds no slot."
+   ],
+   "because": "We count slots in a workflow, because signals and conditions give a durable queue with no locks and no polling.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/workflows/slots.ts",
+    "text": "// ID \"slots:<agent>\"; lives forever, continues-as-new now and then.\nimport { condition, continueAsNew, defineSignal, getExternalWorkflowHandle, setHandler, workflowInfo } from \"@temporalio/workflow\";\n\nexport const SLOTS: Record<string, number> = { nova: 3, cifix: 2, upgrade: 2, flaky: 1, bugfix: 2, health: 1, security: 1 }; // VMs in parallel per agent, to start\nexport const request = defineSignal<[workflowId: string]>(\"request\");\nexport const release = defineSignal<[workflowId: string]>(\"release\"); // on park (VM stopped) and at the end of a run\nexport const slotGranted = defineSignal(\"slotGranted\");\n\nexport async function slots(agent: string, holders: string[] = [], waiting: string[] = []): Promise<void> {\n  setHandler(request, (id) => { waiting.push(id); });\n  setHandler(release, (id) => { holders = holders.filter((h) => h !== id); });\n  while (workflowInfo().historyLength < 5000) {\n    await condition(() => waiting.length > 0 && holders.length < (SLOTS[agent] ?? 1));\n    const holder = waiting.shift()!;\n    holders.push(holder);\n    await getExternalWorkflowHandle(holder).signal(slotGranted);\n  }\n  await continueAsNew<typeof slots>(agent, holders, waiting); // carries holders and waiting along\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The workflow ID is slots:<agent>, for example slots:nova. One per agent."
+     },
+     {
+      "line": 4,
+      "text": "Starting numbers, from the ticket. The account's vCPU quota is the final cap behind them (lesson g3-7)."
+     },
+     {
+      "line": 5,
+      "text": "request: a run asks for a slot, by its own workflow ID."
+     },
+     {
+      "line": 6,
+      "text": "release: a run gives its slot back, when its VM is parked or at the end."
+     },
+     {
+      "line": 7,
+      "text": "slotGranted: the answer, sent to the waiting run."
+     },
+     {
+      "line": 9,
+      "text": "holders and waiting are parameters, so continueAsNew can carry them to the next run of this workflow."
+     },
+     {
+      "line": 10,
+      "text": "A request only joins the line. The loop below decides."
+     },
+     {
+      "line": 11,
+      "text": "A release removes the holder, which frees a slot."
+     },
+     {
+      "line": 12,
+      "text": "Loop until the history gets long. Every signal adds events to the history."
+     },
+     {
+      "line": 13,
+      "text": "Sleep until someone is waiting and a slot is free."
+     },
+     {
+      "line": 14,
+      "text": "First come, first served."
+     },
+     {
+      "line": 16,
+      "text": "Tell that run its slot is ready. getExternalWorkflowHandle signals another workflow by ID."
+     },
+     {
+      "line": 18,
+      "text": "continueAsNew starts a fresh history with the same ID and the same holders and line (lesson p7-6)."
+     }
+    ]
+   }
+  },
+  {
+   "h": "withSlot, the kill switch and the VM wall",
+   "p": [
+    "ticketToPr takes a slot before acquireSandbox and gives it back when the VM is parked or released. The ticket names the helper withSlot(agent, fn) in workflows/slots.ts. This sketch is built from those steps; on park, the run signals release and requests again before it wakes."
+   ],
+   "because": "We wrap the VM's life in withSlot, because the slot must come back on every path, the same way the VM does.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/workflows/slots.ts (withSlot, a sketch)",
+    "text": "// A sketch built from the ticket's steps: hold a slot only while a VM runs.\nimport { CancellationScope, condition, getExternalWorkflowHandle, setHandler, workflowInfo } from \"@temporalio/workflow\";\nimport { release, request, slotGranted } from \"./slots.js\";\n\nexport const withSlot = async <T>(agent: string, fn: () => Promise<T>): Promise<T> => {\n  const me = workflowInfo().workflowId; // nova:RH-1234\n  const line = getExternalWorkflowHandle(`slots:${agent}`);\n  let granted = false;\n  setHandler(slotGranted, () => { granted = true; });\n  await line.signal(request, me); // join the line\n  await condition(() => granted); // waits as long as it takes; costs nothing\n  try {\n    return await fn(); // claim, freshen and run the VM inside the slot\n  } finally {\n    await CancellationScope.nonCancellable(() => line.signal(release, me)); // give the slot back\n  }\n};",
+    "notes": [
+     {
+      "line": 5,
+      "text": "withSlot runs fn while holding one of the agent's slots."
+     },
+     {
+      "line": 6,
+      "text": "The run's own workflow ID, so the slots workflow knows whom to answer."
+     },
+     {
+      "line": 7,
+      "text": "A handle to slots:nova. The orchestrator starts each slots workflow once, when its worker starts."
+     },
+     {
+      "line": 9,
+      "text": "When slotGranted arrives, remember it."
+     },
+     {
+      "line": 10,
+      "text": "Join the line."
+     },
+     {
+      "line": 11,
+      "text": "Wait for the grant. No timeout: waiting in line is free."
+     },
+     {
+      "line": 13,
+      "text": "Inside the slot: acquire, freshen and work, through runWithRecovery."
+     },
+     {
+      "line": 15,
+      "text": "Give the slot back even if the run was cancelled, like the VM release."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "Kill switch: a row per agent in the broker DB. A local activity (proxyLocalActivities) reads it before every step, and a stopped agent ends cleanly with its branch kept. startRun reads it too and refuses new starts. Nothing inside a VM can reach Temporal or a broker endpoint that starts runs."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Test a small ticketToPr with mocked activities and skipped time",
+  "youNeed": [
+   "Node 24 (nvm use 24)",
+   "npm",
+   "about 300 MB of disk for the Temporal packages and the test server",
+   "a scratch folder (nothing from the company)"
+  ],
+  "worked": [
+   {
+    "do": "mkdir ticket-lab && cd ticket-lab && npm init -y >/dev/null && npm pkg set type=module && mkdir src test\nnpm i -D @temporalio/client@1.24.0 @temporalio/worker@1.24.0 @temporalio/workflow@1.24.0 @temporalio/activity@1.24.0 @temporalio/testing@1.24.0 typescript@5.9.3 tsx@4.20.3 @types/node@24",
+    "see": "added <n> packages, and audited <n> packages in 40s\nfound 0 vulnerabilities"
+   },
+   {
+    "do": "Create src/activities.ts. These are the real activity signatures; the test replaces their bodies.\n\nexport interface Sandbox { id: string; size: \"lite\" | \"full\" }\nexport interface RunResult { needsAnswer?: boolean; sessionId?: string; prUrl?: string }\nexport const acquireSandbox = async (size: \"lite\" | \"full\"): Promise<Sandbox> => ({ id: \"i-real\", size });\nexport const workInSandbox = async (_vm: Sandbox, _task: string): Promise<RunResult> => ({});\nexport const postPlan = async (_key: string): Promise<void> => {};\nexport const releaseSandbox = async (_vm: Sandbox): Promise<void> => {};",
+    "see": "(a file)"
+   },
+   {
+    "do": "Create src/workflows.ts, a small ticketToPr with the same shape as the lesson's: plan on lite, wait for decidePlan, build on full, release in finally. condition with \"3 days\" stands in for waitForPerson.\n\nimport { CancellationScope, condition, defineSignal, proxyActivities, setHandler } from \"@temporalio/workflow\";\nimport type * as activities from \"./activities.js\";\n\nconst act = proxyActivities<typeof activities>({ startToCloseTimeout: \"7 days\", heartbeatTimeout: \"2 minutes\" });\nexport interface Handoff { key: string; requester: string }\nexport interface PlanDecision { kind: \"approve\" | \"change\" | \"reject\" }\nexport const decidePlan = defineSignal<[PlanDecision]>(\"decidePlan\");\n\nexport async function ticketToPr(t: Handoff): Promise<string> {\n  let decision: PlanDecision | undefined;\n  setHandler(decidePlan, (d) => { decision = d; });\n  const inSandbox = async (task: string, size: \"lite\" | \"full\") => {\n    const vm = await act.acquireSandbox(size);\n    try {\n      return await act.workInSandbox(vm, task);\n    } finally {\n      await CancellationScope.nonCancellable(() => act.releaseSandbox(vm));\n    }\n  };\n  await inSandbox(`plan ${t.key}`, \"lite\");\n  await act.postPlan(t.key);\n  if (!(await condition(() => decision !== undefined, \"3 days\"))) return \"parked\";\n  if (decision?.kind !== \"approve\") return \"stopped\";\n  const built = await inSandbox(`build ${t.key}`, \"full\");\n  return built.prUrl ?? \"no PR\";\n}",
+    "see": "(a file)"
+   },
+   {
+    "do": "Create test/ticket-to-pr.test.ts with the environment, the mocks and two tests.\n\nimport { after, before, test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { fileURLToPath } from \"node:url\";\nimport { TestWorkflowEnvironment } from \"@temporalio/testing\";\nimport { Worker } from \"@temporalio/worker\";\nimport { decidePlan, ticketToPr } from \"../src/workflows.js\";\nimport type { Sandbox } from \"../src/activities.js\";\n\nlet env: TestWorkflowEnvironment;\nbefore(async () => { env = await TestWorkflowEnvironment.createTimeSkipping(); });\nafter(async () => { await env?.teardown(); });\n\nconst released: string[] = [];\nconst mocks = {\n  acquireSandbox: async (size: \"lite\" | \"full\"): Promise<Sandbox> => ({ id: `i-${size}`, size }),\n  workInSandbox: async (vm: Sandbox) => (vm.size === \"full\" ? { prUrl: \"https://github.com/x/pull/1\" } : {}),\n  postPlan: async () => {},\n  releaseSandbox: async (vm: Sandbox) => { released.push(vm.id); },\n};\nconst run = async (fn: (id: string) => Promise<string>) => {\n  const worker = await Worker.create({\n    connection: env.nativeConnection, taskQueue: \"test\",\n    workflowsPath: fileURLToPath(new URL(\"../src/workflows.ts\", import.meta.url)), activities: mocks,\n  });\n  return worker.runUntil(fn(`nova:RH-${released.length}`));\n};\n\ntest(\"approve: plan on lite, build on full, both VMs released\", async () => {\n  released.length = 0;\n  const result = await run(async (workflowId) => {\n    const handle = await env.client.workflow.start(ticketToPr, { taskQueue: \"test\", workflowId, args: [{ key: \"RH-1\", requester: \"sean\" }] });\n    await handle.signal(decidePlan, { kind: \"approve\" });\n    return handle.result();\n  });\n  assert.equal(result, \"https://github.com/x/pull/1\");\n  assert.deepEqual(released, [\"i-lite\", \"i-full\"]);\n});\n\ntest(\"reject: stopped, no full VM\", async () => {\n  released.length = 0;\n  const result = await run(async (workflowId) => {\n    const handle = await env.client.workflow.start(ticketToPr, { taskQueue: \"test\", workflowId: workflowId + \"r\", args: [{ key: \"RH-2\", requester: \"sean\" }] });\n    await handle.signal(decidePlan, { kind: \"reject\" });\n    return handle.result();\n  });\n  assert.equal(result, \"stopped\");\n  assert.deepEqual(released, [\"i-lite\"]);\n});",
+    "see": "(a file)"
+   },
+   {
+    "do": "node --import tsx --test test/*.test.ts",
+    "see": "(worker log lines trimmed; the first run also downloads the Temporal test server)\n✔ approve: plan on lite, build on full, both VMs released (4849ms)\n✔ reject: stopped, no full VM (1975ms)\nℹ tests 2\nℹ pass 2\nℹ fail 0"
+   },
+   {
+    "do": "Break it on purpose: in src/workflows.ts delete the finally block's release line, keep the braces, and run the tests again. Then put the line back.",
+    "see": "✖ approve: plan on lite, build on full, both VMs released\n✖ reject: stopped, no full VM\n  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\nℹ pass 0\nℹ fail 2"
+   }
+  ],
+  "faded": "Add a third test, \"nobody decides for 3 days: parked\". Start ticketToPr with env.client.workflow.execute (start and wait in one call) and send no signal. The time-skipping server jumps over the 3 days, so the test takes about a second. The last step is yours: assert the result equals \"parked\", and assert that only the lite VM was released.",
+  "alone": "Add the Stop path. Define a stop signal that sets a stopped flag. Make the plan wait end on a decision or on stop, and return \"stopped\" for stop. Write a test that signals stop during the plan wait and checks that the result is \"stopped\" and that released equals [\"i-lite\"].",
+  "done": "The test run prints pass 4 and fail 0, and the parked test finishes in seconds although it waits 3 days."
+ },
+ "quiz": [
+  {
+   "q": "A workInSandbox call has been following a healthy harness for 7 days. What happens when the startToCloseTimeout fires?",
+   "options": [
+    {
+     "text": "The run ends and the ticket is parked, because 7 days is the work limit.",
+     "correct": false,
+     "why": "There is no work limit. The 7-day timeout is a safety net the SDK requires."
+    },
+    {
+     "text": "Temporal retries the activity, and the new attempt re-attaches to the harness still running on the VM.",
+     "correct": true,
+     "why": "That is the design: the timeout ends one attempt to follow the harness, never the harness."
+    },
+    {
+     "text": "The heartbeat timeout fires at the same moment and the VM is replaced.",
+     "correct": false,
+     "why": "The heartbeat timeout fires only after 2 minutes of silence. A healthy harness keeps heartbeating."
+    }
+   ]
+  },
+  {
+   "q": "The Jira poll and /nova RH-1234 both try to start Nova on the same ticket. What does startRun do?",
+   "options": [
+    {
+     "text": "It starts two runs, and the slots workflow lets only one of them claim a VM.",
+     "correct": false,
+     "why": "Slots limit VMs, not duplicate runs. The ID is what stops the duplicate."
+    },
+    {
+     "text": "It fails the second call with an error that Slack shows to the person.",
+     "correct": false,
+     "why": "With USE_EXISTING there is no error: the second call gets the open run's handle."
+    },
+    {
+     "text": "Both build the ID nova:RH-1234; with USE_EXISTING the second call joins the open run.",
+     "correct": true,
+     "why": "The workflow ID is the thing itself, so repeats are no-ops."
+    }
+   ]
+  },
+  {
+   "q": "Three Nova runs hold VMs and a 4th ticket is assigned. What happens to it?",
+   "options": [
+    {
+     "text": "Its run starts and waits in line at slots:nova until a run parks or ends.",
+     "correct": true,
+     "why": "A run asks for a slot before acquireSandbox; waiting in line costs nothing."
+    },
+    {
+     "text": "startRun refuses it and the poll tries again next minute.",
+     "correct": false,
+     "why": "startRun refuses only when the kill switch is on. A full line is normal."
+    },
+    {
+     "text": "It gets a lite VM instead of a full one, so it fits.",
+     "correct": false,
+     "why": "Slots count VMs of any size. There is no downgrade."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From lesson p7-3: what does condition(fn, \"10 minutes\") return when the 10 minutes pass before fn becomes true?",
+  "From lesson g3-8: what does parkSandbox do to the VM and its disk, and what does releaseSandbox do?"
+ ],
+ "videos": [
+  {
+   "title": "Temporal for React Developers",
+   "url": "https://www.youtube.com/watch?v=Cxaf8E00GMM",
+   "channel": "Temporal",
+   "minutes": 27,
+   "why": "TypeScript SDK introduced at a React conference, for frontend developers."
+  }
+ ],
+ "words": [
+  {
+   "term": "RunState",
+   "plain": "A small object shared by every piece of one run: the latest answer and whether someone pressed Stop."
+  },
+  {
+   "term": "startToCloseTimeout",
+   "plain": "How long one attempt of an activity may take before Temporal retries it; for us a safety net, never a work limit."
+  },
+  {
+   "term": "heartbeatTimeout",
+   "plain": "How long an activity may stay silent before Temporal treats its worker as dead; 2 minutes for us."
+  },
+  {
+   "term": "conflict policy",
+   "plain": "What Temporal does when a run with the same workflow ID is open; USE_EXISTING returns the open run."
+  },
+  {
+   "term": "slot",
+   "plain": "Permission for one run to have one VM up; each agent has a fixed number, counted by its slots workflow."
+  },
+  {
+   "term": "kill switch",
+   "plain": "A row per agent in the broker DB that stops its runs between steps and refuses new starts."
+  },
+  {
+   "term": "replay test",
+   "plain": "A CI test that runs saved workflow histories through new code to catch non-deterministic changes."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-24",
+   "why": "This lesson explained ticketToPr line by line: signals, RunState, plan small and build big, the question loop, the release in finally.",
+   "walk": [
+    "Create ai-agents/orchestrator/src/workflows/ticket-to-pr.ts with ticketToPr(t: Handoff) and the decidePlan and answerQuestion signals (code above). Export it from src/workflows/index.ts.",
+    "Add a stop(by) signal that sets run.stopped, and a status query (defineQuery) that returns the state Slack and Jira show.",
+    "Add the re-plan for change: loop back to the plan step with the person's comment in the task. Reject or Stop ends the run as stopped.",
+    "Wrap each inSandbox call in withSlot(\"nova\", ...) and replace the claim, freshen and work lines with runWithRecovery (lesson g3-11).",
+    "Use act from policies.ts for every activity call, so workInSandbox gets the 7-day safety net and 2-minute heartbeats.",
+    "Write orchestrator/test/ticket-to-pr.test.ts with TestWorkflowEnvironment.createTimeSkipping() and mocked activities: approve, change, reject, a question and answer, and a worker crash between steps.",
+    "Run npm test from the repo root and check that the time-skipped tests finish in seconds."
+   ]
+  },
+  {
+   "key": "G3-25",
+   "why": "This lesson explained startRun with USE_EXISTING, the slots workflow, withSlot, one queue per agent and the kill switch.",
+   "walk": [
+    "Create ai-agents/orchestrator/src/fanout.ts with startRun (code above) and startOrSignal, the same call through signalWithStart.",
+    "Register the Agent search attribute in the ai-agents namespace: temporal operator search-attribute create --name Agent --type Keyword. On inf, DevOps runs it.",
+    "Create src/workflows/slots.ts with slots and withSlot. Start slots:<agent> once per agent when the worker starts, with USE_EXISTING. Gotcha: the G3-25 ticket does not say who starts these workflows; this is our answer, so write it in the PR.",
+    "Run one worker per task queue: ai-agents-nova, ai-agents-cifix, ai-agents-upgrade, ai-agents-flaky, ai-agents-bugfix, ai-agents-health, ai-agents-security, plus ai-agents-orchestrator.",
+    "Add the kill-switch row per agent in the broker DB. Add a local activity that reads it before every step, and a check in startRun that refuses new starts.",
+    "Write the batch stop into the runbook: temporal workflow signal --namespace ai-agents --query 'Agent=\"nova\" AND ExecutionStatus=\"Running\"' --name stop, plus G0-13's epoch bump. Gotcha: the ticket's command has no --input, but the stop signal takes by. Add --input with the person who stops, for example --input '\"sean@example.com\"'.",
+    "Tests in TestWorkflowEnvironment: two starts for one ticket give one run. A 4th Nova ticket waits for a slot. The kill switch stops a run between steps."
+   ]
+  },
+  {
+   "key": "G3-29",
+   "why": "This lesson explained why timeouts are safety nets, what the heartbeat catches, the retry policies, patched and the replay test.",
+   "walk": [
+    "Create ai-agents/orchestrator/src/policies.ts with the retry policies, SHORT and LONG, act and peopleApis (code above). Gotcha: the G3-29 sketch says two things. HARNESS_STEP (maximumAttempts 1) means no retry, but act gives workInSandbox the AWS policy (10 attempts), and the 7-day re-attach needs that retry. Decide one with the G3-29 owner before you write it.",
+    "Make every activity longer than a minute call heartbeat(). Keep activities idempotent: claim finds its VM by tag, release accepts a VM already gone.",
+    "Throw the never-retry errors as ApplicationFailure with type ScopeDenied, PlanRejected, NeedsPerson or StoppedByPerson.",
+    "Wrap every later change to workflow code in patched(\"<change-id>\"), then deprecatePatch. Delete the old branch only when no older run is open.",
+    "Save a few real histories with temporal workflow show --workflow-id <id> --output json into orchestrator/test/histories/.",
+    "Add orchestrator/test/replay.test.ts (code above) so npm test replays them on every PR."
+   ]
+  }
+ ],
+ "remember": "One run per ticket, a slot per VM, every VM released in finally, and timeouts that re-attach instead of cutting the work."
+}

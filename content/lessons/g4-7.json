@@ -1,0 +1,620 @@
+{
+ "id": "g4-7",
+ "title": "TICKET-BENCH",
+ "minutes": 55,
+ "youNeed": [
+  "p10-6",
+  "g4-6",
+  "g4-1"
+ ],
+ "bridge": "TICKET-BENCH is like a Playwright suite for Nova itself: fixed cases, and a red check when a PR makes things worse. Except: each case is a whole past ticket, and the agent is not deterministic, so each task runs 3 times. Time and cost are measured, never limits.",
+ "intro": "How do we know a change to Nova's harness, a skill line or a model setting helps? We run it on 40 real past tickets whose fixes we already know. This lesson mines the tasks and defines them for Harbor. BE and FE engineers curate 40, and every harness change is scored and gated.",
+ "picture": {
+  "caption": "From merged fcp PRs to a score on every harness PR.",
+  "nodes": [
+   {
+    "id": "prs",
+    "label": "merged fcp PRs (2025-26)",
+    "kind": "file"
+   },
+   {
+    "id": "mine",
+    "label": "mine.py",
+    "kind": "service"
+   },
+   {
+    "id": "gold",
+    "label": "restricted golden-set repo",
+    "kind": "file"
+   },
+   {
+    "id": "eng",
+    "label": "BE and FE curators",
+    "kind": "person"
+   },
+   {
+    "id": "harbor",
+    "label": "Harbor + Nova adapter",
+    "kind": "service"
+   },
+   {
+    "id": "vm",
+    "label": "task container on the sandbox image",
+    "kind": "machine"
+   },
+   {
+    "id": "score",
+    "label": "score.py and the smoke gate",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "mine",
+    "to": "prs",
+    "text": "keeps PRs with an RH key, their own tests and no excluded paths"
+   },
+   {
+    "from": "mine",
+    "to": "gold",
+    "text": "writes candidates.jsonl; convert.py makes task folders"
+   },
+   {
+    "from": "eng",
+    "to": "gold",
+    "text": "pick 40, clean the ticket text, prove nop scores 0 and oracle scores 1"
+   },
+   {
+    "from": "harbor",
+    "to": "vm",
+    "text": "the adapter runs nova-worker run on the base commit with the ticket text"
+   },
+   {
+    "from": "vm",
+    "to": "score",
+    "text": "test.sh copies the hidden tests in and writes reward 1 or 0"
+   },
+   {
+    "from": "score",
+    "to": "harbor",
+    "text": "pass@1 and pass^3 by kind; a harness PR may not lower pass@1"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "A bench made of our own past tickets",
+   "p": [
+    "TICKET-BENCH is a fixed set of 40 past fcp tickets. Each one has a known fix and the tests that fix added. We hand Nova the ticket text on the commit before the fix, and grade its work with those tests.",
+    "Real tickets with real tests are the closest thing to pilot work. Mining them from merged PRs costs much less than writing tasks by hand.",
+    "Lesson p10-6 introduced Harbor, our bench runner, and its task folder. A task is a folder with instruction.md, task.toml, tests/ and solution/. The tests decide pass or fail by writing a reward to a file.",
+    "The bench data never goes into ai-agents or rnd-kb. It lives in a restricted golden-set repo, so the brain never indexes the answers. Its name is still to decide with Sean and Ronen."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Bench code is Python in ai-agents/evals/, next to Harbor. Bench data lives only in the restricted golden-set repo, never where an agent can read the answers."
+   }
+  },
+  {
+   "h": "Mining, part 1: what counts as a candidate",
+   "p": [
+    "mine.py lives in the evals uv project. Part 1 sets the rules as regular expressions. A candidate PR must change tests and must not touch the paths the pilot leaves out.",
+    "kind() labels each task by the kind of change, from the Jira issue type and the paths. The kinds match readiness (lesson g4-1), so scores can be split the same way. The blank line between the helper functions is dropped to fit."
+   ],
+   "because": "We mine merged PRs that added their own tests, because those tests are a ready-made grade for the same ticket.",
+   "code": {
+    "lang": "python",
+    "file": "ai-agents/evals/ticket_bench/mine.py (part 1 of 2)",
+    "text": "# ai-agents/evals/ticket_bench/mine.py: Python, in the evals uv project next to Harbor. Output goes to the restricted golden-set repo only.\nimport json, re, subprocess\nfrom pathlib import PurePath\n\nTESTS = re.compile(r\"^(frontend/test/unit/|frontend/e2e/pr/|cloud/rhinoCloud/.+/tests/|client/rhinoOnPrem/.+/tests/)\")\nEXCLUDED = re.compile(r\"/migrations/|^cloud/rhinoCloud/rhinoDjango/login/|^frontend/src/app/\\(auth\\)/\"\n                      r\"|^frontend/src/app/api/auth/|^common/fcp_common/rhinoAgentRpc/|^\\.github/workflows/\")\nJIRA_KEY = re.compile(r\"\\bRH-\\d+\\b\")\nLOCKFILES = {\"package.json\", \"package-lock.json\", \"pyproject.toml\", \"uv.lock\"}\n\ndef gh(*args: str) -> list[dict]:\n    return json.loads(subprocess.run([\"gh\", *args], check=True, capture_output=True, text=True).stdout)\n\ndef kind(issue_type: str, files: list[str]) -> str:\n    code = [f for f in files if not TESTS.match(f)]\n    if not code:\n        return \"add_tests\"\n    if all(PurePath(f).name in LOCKFILES for f in code):\n        return \"dependency_bump\"\n    side = \"fe\" if all(f.startswith(\"frontend/\") for f in code) else \"be\"\n    return f\"{side}_bug\" if issue_type == \"Bug\" else \"small_feature\"",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The header: Python in the evals project, and the output goes only to the restricted repo."
+     },
+     {
+      "line": 5,
+      "text": "Test folders: vitest unit tests, PR e2e specs, and the cloud and client Django tests."
+     },
+     {
+      "line": 6,
+      "text": "The pilot's excluded areas: migrations, auth, the gRPC contract and workflow files."
+     },
+     {
+      "line": 8,
+      "text": "An RH key like RH-1234 in the PR title. About 740 of ~1,700 main commits since 2025 carry one."
+     },
+     {
+      "line": 9,
+      "text": "Files that only move versions. A PR that changes only these is a dependency bump."
+     },
+     {
+      "line": 11,
+      "text": "Runs the gh CLI and parses its JSON output. check=True raises if gh fails."
+     },
+     {
+      "line": 15,
+      "text": "The non-test files of the PR: the actual change."
+     },
+     {
+      "line": 17,
+      "text": "No code changed, only tests: the kind is add_tests."
+     },
+     {
+      "line": 20,
+      "text": "Only frontend/ files means FE; anything else counts as BE."
+     },
+     {
+      "line": 21,
+      "text": "A Jira Bug becomes fe_bug or be_bug; any other issue type is small_feature."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Mining, part 2: one line per candidate",
+   "p": [
+    "Part 2 lists merged PRs in the date range and prints one JSON line per candidate. The base commit is the parent of the merge commit, because fcp squash-merges: one commit per PR on main.",
+    "multi_file marks the big cases: 8 or more files across 2 or more top folders. The bench keeps 5 of them on purpose, to test workflows and parallel attempts (lesson g4-5).",
+    "The ticket text (summary, description, comments up to the merge date) comes from Jira with a read-only token. Attachments are never downloaded."
+   ],
+   "because": "We print JSON lines, because each line is one candidate a person can read, filter and pass to convert.py.",
+   "code": {
+    "lang": "python",
+    "file": "ai-agents/evals/ticket_bench/mine.py (part 2 of 2)",
+    "text": "prs = gh(\"pr\", \"list\", \"--repo\", \"RhinoHealth/fcp\", \"--state\", \"merged\", \"--limit\", \"2000\",\n         \"--search\", \"merged:2025-01-01..2026-09-30\", \"--json\", \"number,title,files,mergeCommit\")\nfor pr in prs:\n    files = [f[\"path\"] for f in pr[\"files\"]]\n    key = JIRA_KEY.search(pr[\"title\"])\n    if not key or not any(TESTS.match(f) for f in files) or any(EXCLUDED.search(f) for f in files):\n        continue\n    merge = pr[\"mergeCommit\"][\"oid\"]\n    print(json.dumps({\"pr\": pr[\"number\"], \"jira\": key.group(), \"merge\": merge, \"base\": f\"{merge}^\",  # squash merges\n                      \"kind\": kind(jira_issue_type(key.group()), files),  # read-only Jira call (helper not shown)\n                      \"multi_file\": len(files) >= 8 and len({f.split(\"/\")[0] for f in files}) >= 2}))",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Merged fcp PRs, up to 2000, with gh's search syntax for the merge dates."
+     },
+     {
+      "line": 2,
+      "text": "Only the fields we need: number, title, changed files and the merge commit."
+     },
+     {
+      "line": 4,
+      "text": "The list of changed paths."
+     },
+     {
+      "line": 6,
+      "text": "Skip PRs with no RH key, with no test changes, or touching an excluded path."
+     },
+     {
+      "line": 8,
+      "text": "The squash commit on main."
+     },
+     {
+      "line": 9,
+      "text": "base is the parent: main right before the fix. Nova starts from here."
+     },
+     {
+      "line": 10,
+      "text": "A read-only Jira call (not shown) gives the issue type for kind()."
+     },
+     {
+      "line": 11,
+      "text": "8+ files across 2+ top folders: one of the big cases."
+     }
+    ]
+   },
+   "ifInstead": "If gh prints HTTP 401 or 403, gh auth status is not logged in to RhinoHealth. Log in with your own account; the script only reads."
+  },
+  {
+   "h": "One task in Harbor's format",
+   "p": [
+    "convert.py turns each candidate into a task folder. instruction.md holds the ticket text. tests/test.sh plus tests/hidden/ hold the PR's tests at their real paths. solution/solve.sh applies the merged diff; only Harbor's oracle agent uses it.",
+    "task.toml carries the metadata. Its field names depend on the Harbor version pinned in evals/pyproject.toml, so check the docs before you copy. Three blank lines are dropped to fit."
+   ],
+   "because": "We keep the tests hidden until grading, so Nova solves the ticket as written instead of reading the answer's tests.",
+   "code": {
+    "lang": "toml",
+    "file": "tasks/fe-bug-1234/task.toml (restricted golden-set repo)",
+    "text": "# tasks/fe-bug-1234/task.toml: in the restricted golden-set repo (name to decide). Field names per the pinned Harbor version.\nversion = \"1.0\"\n\n[metadata]\nkind = \"fe_bug\"                 # fe_bug | be_bug | add_tests | small_feature | dependency_bump\nmulti_file = false              # true for the 5 big cases that test workflows\nsource_repo = \"RhinoHealth/fcp\"\nsource_pr = 1234                # example values; convert.py fills them\njira = \"RH-1234\"\nbase_sha = \"<parent of the squash commit on main>\"\nhidden_tests = [\"frontend/test/unit/<file>.test.tsx\"]\nsmoke = false                   # true for the 15 tasks in the smoke set\ncurated_by = \"<BE or FE engineer>\"\n[agent]\n# A far-away eval backstop only, to free a stuck eval VM. Nova itself has no time limit:\n# minutes per task are measured and reported, and a timeout is reported as \"stuck\", not as a slow pass.\ntimeout_sec = 21600.0\n[verifier]\ntimeout_sec = 3600.0\n[environment]\n# the task image carries Node 24 and the nova-worker harness tarball next to fcp's toolchain;\n# the Python adapter runs `nova-worker run` inside it\n# full size (8 vCPU, 32 GB) with FCP Lab and browsers; see README for the environment decision\ncpus = 8\nmemory_mb = 32768",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The task lives in the restricted repo. Field names follow the pinned Harbor version."
+     },
+     {
+      "line": 5,
+      "text": "The kind from mine.py. Scores are split by it."
+     },
+     {
+      "line": 6,
+      "text": "true for the 5 big cases."
+     },
+     {
+      "line": 10,
+      "text": "Where Nova starts: the parent of the squash commit."
+     },
+     {
+      "line": 11,
+      "text": "The PR's test files. They are copied in only at grading."
+     },
+     {
+      "line": 12,
+      "text": "true for the 15 tasks of the smoke set that runs on every harness PR."
+     },
+     {
+      "line": 13,
+      "text": "The engineer who checked this task (G4-10)."
+     },
+     {
+      "line": 15,
+      "text": "Nova has no time limit. This timeout only frees a stuck eval VM, and a timeout is reported as stuck."
+     },
+     {
+      "line": 17,
+      "text": "6 hours, far away on purpose. Minutes per task are measured and reported."
+     },
+     {
+      "line": 24,
+      "text": "A full-size environment, 8 vCPU and 32 GB, with FCP Lab and browsers."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The adapter runs the real Nova",
+   "p": [
+    "Harbor runs an agent through an adapter: a Python class that starts the agent inside the task container. Ours is ai-agents/evals/ticket_bench/nova_agent.py. It starts the TypeScript harness CLI, nova-worker run <task.json>, on the base commit with the instruction.",
+    "So the task image carries Node 24 and the harness tarball from release-harness.yml next to fcp's toolchain. The tarball is one bundled file: nothing to install. The bench tests the same Nova that runs real tickets, on the same image.",
+    "Bench mode removes the people. The plan is approved automatically, and a question gets \"no answer, use your judgement\". There is no Jira, Slack or PR; the result is the working tree.",
+    "Answers must not leak. The checkout is reset to base_sha and git mirror refs are dropped. In bench mode the broker refuses the source PR and anything merged after base."
+   ],
+   "callout": {
+    "kind": "gotcha",
+    "text": "Where trials run is still open; write the choice in ai-agents/evals/ticket_bench/README.md. Preferred: a fresh full VM per trial on Nova's AMI. Else: Harbor's docker environment inside one wide VM."
+   }
+  },
+  {
+   "h": "Grading: the PR's tests and the neighbours",
+   "p": [
+    "test.sh runs after Nova finishes. It copies the hidden tests in, over any edits Nova made to them. Reward 1 needs the PR's own tests to pass and the existing tests next to the change to pass too. A fix that breaks its neighbours scores 0.",
+    "Curation (G4-10) proves every task. Harbor's nop agent does nothing and must score 0; the oracle agent applies the real fix and must score 1. A task that fails either is fixed or dropped.",
+    "BE and FE engineers pick 40: about 12 fe_bug, 9 be_bug, 6 add_tests, 5 small_feature, 3 dependency_bump, plus 5 multi_file. They keep the ticket text as people wrote it, remove links to the PR, and mark 15 tasks smoke = true."
+   ],
+   "because": "A task whose tests pass without the fix, or fail with it, only measures noise, so each task is proven both ways.",
+   "code": {
+    "lang": "bash",
+    "file": "tasks/<task>/tests/test.sh (restricted golden-set repo)",
+    "text": "#!/usr/bin/env bash\n# tasks/<task>/tests/test.sh: grades one TICKET-BENCH task. Harbor copies tests/ in only after the agent has finished.\n# Reward 1 only if the PR's own tests pass AND the existing tests next to the change still pass.\nset -uo pipefail\ncd /work/fcp\nBASE_SHA=\"$(cat /tests/base_sha)\"                 # written by convert.py\n\ncp -R /tests/hidden/. .                           # the PR's tests at their real paths; overwrites any edits to them\nstatus=0\n\nfe_tests=$(cd /tests/hidden && find frontend -name '*.test.*' 2>/dev/null | sed 's|^frontend/||')\nif [ -n \"$fe_tests\" ]; then\n  (cd frontend && npx vitest --run $fe_tests) || status=1\n  (cd frontend && npx vitest --run --changed \"$BASE_SHA\") || status=1      # tests related to the changed files\nfi\n\nbe_modules=$(cd /tests/hidden && find cloud -name 'test_*.py' 2>/dev/null | sed -e 's|^cloud/||' -e 's|\\.py$||' -e 's|/|.|g')\nif [ -n \"$be_modules\" ]; then\n  ./scripts/local_run_backend_unit_tests.sh cloud $be_modules || status=1\n  ./scripts/local_run_backend_unit_tests.sh cloud $(cat /tests/neighbour_modules) || status=1   # e.g. rhinoCloud.rhinoCore.tests.services\nfi\n# client/ tasks: the same with `local_run_backend_unit_tests.sh client`\n\nmkdir -p /logs/verifier\nif [ \"$status\" -eq 0 ]; then echo 1 > /logs/verifier/reward.txt; else echo 0 > /logs/verifier/reward.txt; fi",
+    "notes": [
+     {
+      "line": 4,
+      "text": "No -e: we want every test command to run and collect the status, not stop at the first failure."
+     },
+     {
+      "line": 6,
+      "text": "The base commit, written by convert.py into /tests/base_sha."
+     },
+     {
+      "line": 8,
+      "text": "The PR's tests land at their real paths and overwrite any edit Nova made to them."
+     },
+     {
+      "line": 11,
+      "text": "The hidden frontend test files, as paths relative to frontend/."
+     },
+     {
+      "line": 13,
+      "text": "Run the PR's own vitest files."
+     },
+     {
+      "line": 14,
+      "text": "Then the existing tests related to files changed since base: the neighbours."
+     },
+     {
+      "line": 17,
+      "text": "Hidden cloud test files turned into dotted module labels for Django's runner."
+     },
+     {
+      "line": 19,
+      "text": "Run the PR's own backend tests with fcp's script."
+     },
+     {
+      "line": 20,
+      "text": "Then the neighbouring modules convert.py listed."
+     },
+     {
+      "line": 25,
+      "text": "Harbor reads the reward from this file: 1 only if every command passed."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Scoring, part 1: pass^k for consistency",
+   "p": [
+    "pass@1 is the mean success rate over trials. pass^3 is the chance that 3 tries of a task all pass. It measures consistency: a task that passes once in three has pass^3 of zero.",
+    "pass_hat_k uses combinations. comb(n, k) counts the ways to pick k items from n. With 2 wins in 3 tries, comb(2, 3) is 0, so pass^3 is 0."
+   ],
+   "because": "A people-facing agent must pass reliably, not once in a while, so we measure consistency next to the average.",
+   "code": {
+    "lang": "python",
+    "file": "ai-agents/evals/ticket_bench/score.py (part 1 of 2)",
+    "text": "# ai-agents/evals/ticket_bench/score.py: pass@1, pass^3, cost and minutes, split by kind. Python, next to Harbor.\nimport json\nimport sys\nfrom collections import defaultdict\nfrom math import comb\nfrom statistics import mean, median\n\n\ndef pass_hat_k(successes: int, tries: int, k: int) -> float:\n    \"\"\"Chance that k tries picked from this task's runs all pass (tau-bench's pass^k).\"\"\"\n    return comb(successes, k) / comb(tries, k) if tries >= k else float(\"nan\")",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The file's job: pass@1, pass^3, cost and minutes, split by kind."
+     },
+     {
+      "line": 5,
+      "text": "comb(n, k): the number of ways to choose k things from n."
+     },
+     {
+      "line": 6,
+      "text": "mean for rates and cost, median for minutes, so one slow run does not skew it."
+     },
+     {
+      "line": 9,
+      "text": "The chance that k tries drawn from this task's runs all pass."
+     },
+     {
+      "line": 10,
+      "text": "The name pass^k comes from the tau-bench paper."
+     },
+     {
+      "line": 11,
+      "text": "Ways to pick k winning tries, divided by ways to pick any k tries. nan when there are fewer than k tries."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Scoring, part 2: by kind, and the gate",
+   "p": [
+    "score() groups trials by task, then tasks by kind. Cost per task comes from the gateway's run tag bench:<task>:<try>; minutes from Harbor's trial timings. Both are measured to learn, never used as limits.",
+    "An evalRun workflow (ai-agents/orchestrator/src/workflows/eval-run.ts) runs the bench on its own eval queue with fixed slots. So bench runs never take Nova's VMs, and only the orchestrator starts runs.",
+    "Some ai-agents PRs touch harness/, prompts, skills or the image. On those, a required check asks the orchestrator for a smoke run, 1 try per task. No workflow_dispatch. A drop of one task (about 6.7 points) means run again; two or more fail the check.",
+    "The full 40 run monthly with 3 tries on a Temporal schedule, and the trend goes to #ai-agents-alerts and the weekly review. A new rule in Nova's prompt or skills ships only if it raises pass@1 on the full set."
+   ],
+   "because": "One table per kind shows where Nova is strong and where a change hurt, which a single number would hide.",
+   "code": {
+    "lang": "python",
+    "file": "ai-agents/evals/ticket_bench/score.py (part 2 of 2)",
+    "text": "def score(rows: list[dict]) -> dict:\n    by_task = defaultdict(list)\n    for r in rows:  # one row per trial: task, kind, reward, cost_usd, minutes\n        by_task[(r[\"kind\"], r[\"task\"])].append(r)\n    by_kind = defaultdict(list)\n    for (kind, _), trials in by_task.items():\n        wins = sum(t[\"reward\"] == 1 for t in trials)\n        by_kind[kind].append({\"p1\": wins / len(trials), \"p3\": pass_hat_k(wins, len(trials), 3),\n                              \"cost\": mean(t[\"cost_usd\"] for t in trials), \"min\": median(t[\"minutes\"] for t in trials)})\n    return {kind: {\"tasks\": len(v),\n                   \"pass@1\": round(mean(x[\"p1\"] for x in v), 3),\n                   \"pass^3\": round(mean(x[\"p3\"] for x in v), 3),\n                   \"cost_per_task_usd\": round(mean(x[\"cost\"] for x in v), 2),  # measured, never a limit\n                   \"minutes_per_task\": round(median(x[\"min\"] for x in v), 1)}\n            for kind, v in sorted(by_kind.items())}\n\n\nif __name__ == \"__main__\":\n    print(json.dumps(score([json.loads(line) for line in open(sys.argv[1])]), indent=2))",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Input: one row per trial. Output: a table per kind."
+     },
+     {
+      "line": 4,
+      "text": "Group the trials of each task, keyed by kind and task."
+     },
+     {
+      "line": 7,
+      "text": "How many trials of this task scored 1."
+     },
+     {
+      "line": 8,
+      "text": "pass@1 for one task, and its pass^3 from part 1."
+     },
+     {
+      "line": 9,
+      "text": "Mean cost and median minutes per task."
+     },
+     {
+      "line": 10,
+      "text": "How many tasks of this kind were scored."
+     },
+     {
+      "line": 11,
+      "text": "The kind's pass@1: the mean over its tasks."
+     },
+     {
+      "line": 13,
+      "text": "Cost is reported, never used to stop a run."
+     },
+     {
+      "line": 15,
+      "text": "One entry per kind, sorted by name."
+     },
+     {
+      "line": 18,
+      "text": "Run it as a script: python3 score.py trials.jsonl."
+     }
+    ]
+   }
+  }
+ ],
+ "lab": {
+  "title": "Score a bench run on your laptop",
+  "youNeed": [
+   "Python 3.10 or newer (python3 --version)",
+   "a terminal",
+   "no packages: score.py uses only the standard library"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/academy/g4-7 && cd ~/academy/g4-7",
+    "see": "(no output)"
+   },
+   {
+    "do": "Save both score.py blocks from this lesson as one file, score.py: part 1, two blank lines, then part 2.",
+    "see": "score.py has pass_hat_k, score and the __main__ block."
+   },
+   {
+    "do": "cat > trials.jsonl <<'EOF'\n{\"task\": \"fe-bug-1234\", \"kind\": \"fe_bug\", \"reward\": 1, \"cost_usd\": 3.10, \"minutes\": 41}\n{\"task\": \"fe-bug-1234\", \"kind\": \"fe_bug\", \"reward\": 1, \"cost_usd\": 2.90, \"minutes\": 38}\n{\"task\": \"fe-bug-1234\", \"kind\": \"fe_bug\", \"reward\": 1, \"cost_usd\": 3.40, \"minutes\": 45}\n{\"task\": \"fe-bug-1301\", \"kind\": \"fe_bug\", \"reward\": 1, \"cost_usd\": 4.20, \"minutes\": 52}\n{\"task\": \"fe-bug-1301\", \"kind\": \"fe_bug\", \"reward\": 0, \"cost_usd\": 5.00, \"minutes\": 70}\n{\"task\": \"fe-bug-1301\", \"kind\": \"fe_bug\", \"reward\": 1, \"cost_usd\": 4.60, \"minutes\": 49}\n{\"task\": \"be-bug-0877\", \"kind\": \"be_bug\", \"reward\": 0, \"cost_usd\": 2.20, \"minutes\": 33}\n{\"task\": \"be-bug-0877\", \"kind\": \"be_bug\", \"reward\": 0, \"cost_usd\": 2.50, \"minutes\": 36}\n{\"task\": \"be-bug-0877\", \"kind\": \"be_bug\", \"reward\": 1, \"cost_usd\": 2.40, \"minutes\": 31}\nEOF",
+    "see": "trials.jsonl: 9 trials, 3 per task, for 2 fe_bug tasks and 1 be_bug task."
+   },
+   {
+    "do": "python3 score.py trials.jsonl",
+    "see": "{\n  \"be_bug\": { \"tasks\": 1, \"pass@1\": 0.333, \"pass^3\": 0.0, \"cost_per_task_usd\": 2.37, \"minutes_per_task\": 33 },\n  \"fe_bug\": { \"tasks\": 2, \"pass@1\": 0.833, \"pass^3\": 0.5, \"cost_per_task_usd\": 3.87, \"minutes_per_task\": 46.5 }\n}\n(output trimmed: the real output puts each key on its own line)"
+   },
+   {
+    "do": "python3 -c 'from score import pass_hat_k; print(pass_hat_k(2, 3, 3), pass_hat_k(3, 3, 3), pass_hat_k(1, 1, 3))'",
+    "see": "0.0 1.0 nan"
+   },
+   {
+    "do": "Explain fe_bug's pass^3 of 0.5 from that output.",
+    "see": "fe-bug-1234 won 3 of 3 (pass^3 1.0); fe-bug-1301 won 2 of 3 (pass^3 0.0). The mean is 0.5."
+   },
+   {
+    "do": "In trials.jsonl, change the first be-bug-0877 reward from 0 to 1 and run python3 score.py trials.jsonl again.",
+    "see": "be_bug \"pass@1\": 0.667 and \"pass^3\": 0.0. Two wins of three still give no consistency."
+   }
+  ],
+  "faded": "Write gate.py that reads two score outputs (before.json and after.json) for the 15-task smoke set and prints run again, pass or fail. Count tasks lost as (before pass@1 minus after pass@1) times 15, rounded. The last step, the rule itself, is left to you: one task lost means run again, two or more fail.",
+  "alone": "Add 3 trials of a dependency_bump task to trials.jsonl so that its pass@1 is 0.667 and its cost is about $1.50. Predict the new dependency_bump row before you run score.py, then check it.",
+  "done": "python3 score.py prints a row per kind, and you can explain every number in the fe_bug row by hand."
+ },
+ "quiz": [
+  {
+   "q": "A task's hidden tests pass on the base commit, before any fix. What do curators do?",
+   "options": [
+    {
+     "text": "Keep it: a simple-looking task is still a task",
+     "correct": false,
+     "why": "Harbor's nop agent would score 1 on it. It measures nothing about Nova."
+    },
+    {
+     "text": "Fix or drop it: nop must score 0 and oracle must score 1",
+     "correct": true,
+     "why": "Each task is proven both ways before it enters the 40."
+    },
+    {
+     "text": "Lower its weight in the score",
+     "correct": false,
+     "why": "There are no weights. A task that cannot fail is noise and goes."
+    }
+   ]
+  },
+  {
+   "q": "A harness PR drops the smoke set's pass@1 by one task (about 6.7 points). What happens?",
+   "options": [
+    {
+     "text": "The check fails and the PR is blocked",
+     "correct": false,
+     "why": "15 tasks are noisy. One task is within noise, so it runs again."
+    },
+    {
+     "text": "Nothing; only the monthly full run counts",
+     "correct": false,
+     "why": "The smoke run is a required check on harness PRs."
+    },
+    {
+     "text": "The smoke run is repeated; two or more tasks lost fail the check",
+     "correct": true,
+     "why": "The gate is: a change must not lower pass@1, read with the noise of 15 tasks."
+    }
+   ]
+  },
+  {
+   "q": "How does the adapter run Nova inside a task?",
+   "options": [
+    {
+     "text": "It calls the Anthropic API directly with the ticket text",
+     "correct": false,
+     "why": "That would test a different agent. The bench must run the real harness."
+    },
+    {
+     "text": "It starts nova-worker run on the base commit, from the harness tarball in the task image",
+     "correct": true,
+     "why": "Same harness, same image as real tickets, so the scores say something about the pilot."
+    },
+    {
+     "text": "It opens a draft PR and waits for Byte",
+     "correct": false,
+     "why": "Bench mode has no Jira, Slack or PR. The result is the working tree."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From lesson g4-6: which four things must be clean before the ready gate marks a PR ready?",
+  "From lesson p10-6: what does Harbor's oracle agent do, and what score must it get?"
+ ],
+ "videos": [
+  {
+   "title": "The Most Important Skill for AI Engineers: Evals Explained",
+   "url": "https://www.youtube.com/watch?v=MltkRz94SWA",
+   "channel": "Aish Reganti",
+   "minutes": 18,
+   "why": "What an eval is, golden sets and judges, explained plainly."
+  }
+ ],
+ "words": [
+  {
+   "term": "golden-set repo",
+   "plain": "A restricted repo that holds bench data, so no agent or brain ever reads the answers."
+  },
+  {
+   "term": "candidate",
+   "plain": "A merged PR that mine.py found suitable: an RH key, its own tests, no excluded paths."
+  },
+  {
+   "term": "hidden tests",
+   "plain": "The PR's own tests, copied into the task only at grading time."
+  },
+  {
+   "term": "nop and oracle agents",
+   "plain": "Harbor's check agents: nop does nothing and must score 0; oracle applies the real fix and must score 1."
+  },
+  {
+   "term": "pass@1",
+   "plain": "The mean success rate over all trials of the tasks in a group."
+  },
+  {
+   "term": "pass^3",
+   "plain": "The chance that three tries of a task all pass: a measure of consistency."
+  },
+  {
+   "term": "smoke set",
+   "plain": "The 15 tasks that run on every harness change, one try each."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G4-02",
+   "why": "This lesson walked through mine.py's rules, kinds and output.",
+   "walk": [
+    "Write ai-agents/evals/ticket_bench/mine.py (code above) in the evals uv project.",
+    "List merged fcp PRs with gh pr list --state merged --search \"merged:2025-01-01..2026-09-30\" and keep those with an RH key in the title.",
+    "Keep PRs that change tests; drop migrations, auth, the gRPC contract and .github/workflows.",
+    "Tag kind and multi_file. Pull the ticket text with a read-only Jira token, up to the merge date, never attachments.",
+    "Decide the golden-set repo's name with Sean and Ronen. Write candidates.jsonl there, never to ai-agents or rnd-kb."
+   ]
+  },
+  {
+   "key": "G4-03",
+   "why": "This lesson explained the task folder, task.toml, the adapter and bench mode.",
+   "walk": [
+    "Add Harbor as a pinned dependency: uv add --project evals harbor. Bench code lives in ai-agents/evals/ticket_bench/.",
+    "Write convert.py: candidates.jsonl to task folders, git show <merge>:<path> for hidden tests, git diff <base> <merge> for the solution.",
+    "Write nova_agent.py, a Harbor custom agent that runs nova-worker run <task.json> inside the task container on the base commit.",
+    "Build the task image with Node 24 and the ai-agents-harness-<version>.tgz tarball next to fcp's toolchain.",
+    "Bench mode: plan auto-approved, questions get \"no answer, use your judgement\", no Jira, Slack or PR.",
+    "Stop leaks: reset to base_sha, drop git mirror refs, and make the broker refuse the source PR and anything merged after base.",
+    "Decide where trials run and write it in ai-agents/evals/ticket_bench/README.md."
+   ]
+  },
+  {
+   "key": "G4-10",
+   "why": "This lesson explained test.sh, the nop and oracle proof and the curation mix.",
+   "walk": [
+    "With BE and FE engineers, pick 40: about 12 fe_bug, 9 be_bug, 6 add_tests, 5 small_feature, 3 dependency_bump, plus 5 multi_file.",
+    "Prefer unit-level hidden tests; keep e2e ones to FE page flows that run on FCP Lab seed data.",
+    "Clean instruction.md: keep the ticket as written, remove PR links, follow rnd-kb's DATA-SCOPE.md rules.",
+    "Add tests/test.sh (code above). convert.py writes /tests/base_sha and /tests/neighbour_modules.",
+    "Run Harbor with the nop agent (must score 0) and the oracle agent (must score 1). Fix or drop any task that fails either.",
+    "Mark 15 tasks smoke = true across the kinds. Record kind, size, user-visible test and curator in tasks/INDEX.md."
+   ]
+  },
+  {
+   "key": "G4-25",
+   "why": "This lesson walked through score.py and the smoke gate.",
+   "walk": [
+    "Add ai-agents/evals/ticket_bench/score.py (code above).",
+    "Join cost per task from the gateway tag bench:<task>:<try> and minutes from Harbor's timings. Report by kind and the 5 big cases alone.",
+    "Add the evalRun workflow in ai-agents/orchestrator/src/workflows/eval-run.ts on its own eval queue with fixed slots.",
+    "Add a required check on ai-agents PRs that touch harness/, prompts, skills or the image. It asks the orchestrator for a smoke run and posts the table.",
+    "Gate: one task lost means run again; two or more fail. New prompt or skill rules ship only if pass@1 rises on the full set.",
+    "Add a monthly Temporal schedule for the full 40 with 3 tries; post the trend to #ai-agents-alerts and the weekly review."
+   ]
+  }
+ ],
+ "remember": "Past tickets with their own tests, proven both ways, run on the real harness: a change must not lower pass@1."
+}

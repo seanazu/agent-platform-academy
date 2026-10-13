@@ -1,0 +1,643 @@
+{
+ "id": "g4-4",
+ "title": "Fresh eyes",
+ "minutes": 55,
+ "youNeed": [
+  "g4-3",
+  "p8-5",
+  "p8-2"
+ ],
+ "bridge": "Fresh eyes is like asking a colleague who did not write the code to review it. Except: each reviewer is a separate query() session that gets only its slice. That is the ticket and the diff, or the app and the QA plan. None of them ever sees Nova's transcript.",
+ "intro": "Models grade their own work too kindly. This lesson adds three readers who never saw Nova's reasoning. A reviewer with Byte's lenses, a scope judge that can veto, and a QA agent that tests the app in a browser. A loop ties them together and keeps a receipt.",
+ "picture": {
+  "caption": "After the build: review, fix, re-check, judge scope, then test in a browser. Each reader gets only its slice.",
+  "nodes": [
+   {
+    "id": "nova",
+    "label": "Nova (builder)",
+    "kind": "agent"
+   },
+   {
+    "id": "diff",
+    "label": "/run/nova/review/diff.patch",
+    "kind": "file"
+   },
+   {
+    "id": "rev",
+    "label": "reviewer (fresh context)",
+    "kind": "agent"
+   },
+   {
+    "id": "receipt",
+    "label": ".nova/receipt.json",
+    "kind": "file"
+   },
+   {
+    "id": "scope",
+    "label": "scope judge",
+    "kind": "check"
+   },
+   {
+    "id": "qa",
+    "label": "QA agent in a browser",
+    "kind": "agent"
+   },
+   {
+    "id": "results",
+    "label": ".nova/qa_results.json",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "nova",
+    "to": "diff",
+    "text": "the harness runs git diff and writes the patch; the reviewer only reads"
+   },
+   {
+    "from": "rev",
+    "to": "nova",
+    "text": "findings with a severity; Nova fixes or explains each one"
+   },
+   {
+    "from": "nova",
+    "to": "receipt",
+    "text": "found, fixed, left with reasons; a returning finding goes to a person"
+   },
+   {
+    "from": "scope",
+    "to": "nova",
+    "text": "ticket and diff only: veto unrelated changes and weakened tests"
+   },
+   {
+    "from": "qa",
+    "to": "results",
+    "text": "runs each QA check against FCP Lab, one video per check"
+   },
+   {
+    "from": "results",
+    "to": "nova",
+    "text": "a failed check comes back as a finding; Nova cannot mark it passed"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "The scope judge, part 1: what it sees and what it says",
+   "p": [
+    "Start from a real habit. An agent fixes a bug. Then it tidies the function next to it, renames a variable, and loosens a flaky assertion to get green. Each change looks reasonable in the moment. Together they make the PR hard to review.",
+    "The scope judge is a reader with no context but the ticket and the diff. It cannot be persuaded by Nova's notes because it never gets them. Its job is one question: does every change serve the ticket? Spotify's judge vetoes about 25% of sessions; that is a reference, not a target.",
+    "A rubric judge is a model given a fixed set of rules and asked for a verdict in a fixed shape. The rules are the prompt below; the shape is the ScopeVerdict schema."
+   ],
+   "because": "A judge without Nova's reasoning keeps PRs to the ticket, and its fixed shape lets the loop act on the verdict.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/judges/scope.ts (part 1)",
+    "text": "import { query } from \"@anthropic-ai/claude-agent-sdk/core\";\nimport { z } from \"zod\";\nimport { testChanges } from \"./test-changes.js\";  // mechanical: removed assertions, .skip/.only, @skip, longer timeouts\n\nconst SCOPE_PROMPT = `You review a pull request for scope, as a careful reviewer from another team would.\nYou get the ticket and the diff, nothing else. Decide whether every change serves the ticket.\n\nVeto when you see:\n- a change the ticket does not need: refactors, renames, reformatting or \"while I was here\" fixes in other code;\n- a test made weaker: removed or loosened assertions, skipped tests, longer timeouts, fewer cases, lower thresholds.\n\nSmall supporting changes the ticket clearly needs are fine (a new test ID, a helper the fix uses, a type).\nWhen you are unsure, say so in the note and pass. Cite the file and lines for every item.`;\n\nconst Item = z.object({ path: z.string(), lines: z.string(), why: z.string() });\nexport const ScopeVerdict = z.object({\n  verdict: z.enum([\"pass\", \"veto\"]), unrelated: z.array(Item), weakened_tests: z.array(Item), note: z.string(),\n});\nexport type ScopeVerdict = z.infer<typeof ScopeVerdict>;",
+    "notes": [
+     {
+      "line": 3,
+      "text": "A mechanical list of test changes, computed by code: removed assertions, .skip, .only, longer timeouts. The judge gets it as input."
+     },
+     {
+      "line": 5,
+      "text": "The prompt sets the role: a careful reviewer from another team, with the ticket and the diff only."
+     },
+     {
+      "line": 9,
+      "text": "The first veto reason: refactors, renames and \"while I was here\" fixes the ticket did not ask for."
+     },
+     {
+      "line": 10,
+      "text": "The second: a weaker test. This one is never explained away; Nova restores the test."
+     },
+     {
+      "line": 12,
+      "text": "Small supporting changes are fine. The judge should not veto a new test ID or a helper the fix needs."
+     },
+     {
+      "line": 13,
+      "text": "Unsure means pass with a note. Every item cites file and lines, so Nova can act on it."
+     },
+     {
+      "line": 16,
+      "text": "The verdict: pass or veto, two lists of cited items, and a free note."
+     },
+     {
+      "line": 19,
+      "text": "The type the self-review loop uses to branch on verdict."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The scope judge, part 2: one session, no tools",
+   "p": [
+    "scopeJudge builds one prompt from the ticket, the diff and the test-change list, and runs it as its own query() session. Sonnet 5.5 at medium is the routing table's choice for a rubric judge. No tools: it reads what it was given and answers.",
+    "On a veto, Nova gets the reasons. It reverts the unrelated change, or explains why the ticket needs it; the explanation goes into the PR. A second veto on the same item goes to a person instead of another round."
+   ],
+   "because": "We spend one Sonnet call per PR to catch drift that a tired human reviewer would wave through.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/judges/scope.ts (part 2)",
+    "text": "export async function scopeJudge(ticket: string, diff: string): Promise<ScopeVerdict> {\n  const prompt = `Ticket:\\n${ticket}\\n\\nDiff:\\n${diff}\\n\\nTest changes:\\n${testChanges(diff)}`;\n  for await (const msg of query({ prompt, options: {\n    model: \"claude-sonnet-5-5\", effort: \"medium\", tools: [], settingSources: [],  // a rubric judge in its own session\n    systemPrompt: SCOPE_PROMPT,\n    outputFormat: { type: \"json_schema\", schema: z.toJSONSchema(ScopeVerdict) },\n  } })) {\n    if (msg.type === \"result\" && msg.subtype === \"success\") return ScopeVerdict.parse(msg.structured_output);\n  }\n  throw new Error(\"the scope judge returned no verdict\");\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Three inputs, clearly labelled. The diff is git diff origin/main...HEAD, produced by the harness."
+     },
+     {
+      "line": 4,
+      "text": "tools: [] and settingSources: []: no repo access, no skills, no memory. The judge cannot wander."
+     },
+     {
+      "line": 6,
+      "text": "Structured output in the ScopeVerdict shape, so the loop never parses prose."
+     },
+     {
+      "line": 8,
+      "text": "parse checks the JSON and returns the typed verdict."
+     },
+     {
+      "line": 10,
+      "text": "No result is an error. The harness retries or flags it; it never assumes a pass."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The reviewer, part 1: findings and lenses",
+   "p": [
+    "The reviewer is different from the judge. It does get the approved plan, because it checks the diff against the plan. Is every plan item done? Is there anything the plan did not ask for? It still never sees Nova's transcript or notes.",
+    "A lens is a review checklist for one concern. Byte already has them: convention, logic, security and performance for the frontend, and a BE playbook. We bake the same files into the image, so Nova and Byte look for the same things.",
+    "Important means correctness, security, a missed requirement, a plan item not done, or a change the plan did not ask for. Everything else is a nit, counted but not fixed one by one."
+   ],
+   "because": "A reviewer that never saw Nova's reasoning finds more, and sharing Byte's lenses means two reviews use one standard.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/review.ts (part 1)",
+    "text": "import { execFile } from \"node:child_process\";\nimport { writeFile } from \"node:fs/promises\";\nimport { promisify } from \"node:util\";\nimport { query } from \"@anthropic-ai/claude-agent-sdk/core\";\nimport { z } from \"zod\";\n\nconst LENSES = \"/opt/ai-agents/byte-playbooks\";  // Byte's lens files, baked into the image\n\nexport const Finding = z.object({\n  path: z.string(), line: z.number().int(), rule: z.string(), severity: z.enum([\"important\", \"nit\"]), body: z.string(),\n});\nexport type Finding = z.infer<typeof Finding>;\nconst Findings = z.object({ findings: z.array(Finding) });\n\nconst PROMPT = `You review a change you did not write. Read the ticket, the approved plan and the diff in /run/nova/review/diff.patch.\nUse the lenses in ${LENSES}. Report what matters: bugs, security problems, a requirement or plan item that is missing,\nand changes the plan did not ask for. Mark each finding important or nit, with path and line.\nDon't list every possible improvement. No findings is a fine answer for a clean diff.`;",
+    "notes": [
+     {
+      "line": 1,
+      "text": "execFile with an argv, never a shell string. The harness runs git; the reviewer does not get git."
+     },
+     {
+      "line": 7,
+      "text": "Byte's playbook files, copied into the sandbox image at build time (lesson g3-5)."
+     },
+     {
+      "line": 9,
+      "text": "One finding: where, which rule, how severe, and the text. The schema is also what the panel returns (lesson g4-5)."
+     },
+     {
+      "line": 10,
+      "text": "Two severities only. important is fixed or explained; nit is counted."
+     },
+     {
+      "line": 13,
+      "text": "The structured output wraps findings in an object, which JSON Schema prefers over a bare array."
+     },
+     {
+      "line": 15,
+      "text": "The prompt names the diff file and the lenses, and says what matters."
+     },
+     {
+      "line": 18,
+      "text": "No findings is a fine answer. The reviewer is not rewarded for finding something."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The reviewer, part 2: read-only, and why no Bash",
+   "p": [
+    "The harness writes the diff to /run/nova/review/diff.patch and starts the reviewer with Read, Grep and Glob only. It can look at any file in the checkout and the lens folder, and it can change nothing.",
+    "Bash is refused for a precise reason. git diff --no-index can read any two paths on the machine, and --output= can write a file. Byte's engines.ts warns about the same thing. A read-only reviewer with Bash is not read-only.",
+    "Opus 5.5 at medium does the logic and security pass. On a big diff, a second pass on Sonnet 5.5 at low checks conventions. The harness adds a fingerprint per finding and appends them to .nova/review.jsonl."
+   ],
+   "because": "The reviewer must be unable to change anything, so the tool list is short and Bash is out.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/review.ts (part 2)",
+    "text": "export async function reviewOnce(ticket: string, planMd: string): Promise<Finding[]> {\n  const { stdout } = await promisify(execFile)(\"git\", [\"diff\", \"origin/main...HEAD\"], { cwd: \"/work/fcp\", maxBuffer: 64 << 20 });\n  await writeFile(\"/run/nova/review/diff.patch\", stdout);  // the harness runs git; the reviewer only reads\n  const prompt = `Ticket:\\n${ticket}\\n\\nApproved plan:\\n${planMd}`;\n  for await (const msg of query({ prompt, options: {\n    model: \"claude-opus-5-5\", effort: \"medium\",  // logic and security, per the routing table\n    cwd: \"/work/fcp\", settingSources: [\"project\"],  // repo conventions (frontend/AGENTS.md) still apply\n    systemPrompt: PROMPT,\n    allowedTools: [\"Read\", \"Grep\", \"Glob\"],  // no Bash: git diff --no-index or --output= could read or write outside the repo\n    disallowedTools: [\"Bash\", \"Edit\", \"Write\", \"NotebookEdit\", \"WebFetch\", \"WebSearch\"],\n    permissionMode: \"dontAsk\",  // anything not allowed above is refused\n    additionalDirectories: [LENSES, \"/run/nova/review\"],\n    outputFormat: { type: \"json_schema\", schema: z.toJSONSchema(Findings) },\n  } })) {\n    if (msg.type === \"result\" && msg.subtype === \"success\") return Findings.parse(msg.structured_output).findings;\n  }\n  throw new Error(\"the reviewer returned no result\");  // the harness adds fingerprints and saves to .nova/review.jsonl\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The harness computes the diff against origin/main. maxBuffer 64 MiB allows a large patch."
+     },
+     {
+      "line": 3,
+      "text": "The patch is written where the reviewer may read. The reviewer never runs git itself."
+     },
+     {
+      "line": 6,
+      "text": "Opus 5.5 at medium, the routing table's choice for logic and security."
+     },
+     {
+      "line": 7,
+      "text": "settingSources [\"project\"]: frontend/AGENTS.md and the repo's own rules still apply to the review."
+     },
+     {
+      "line": 9,
+      "text": "Three read tools. Grep and Glob let it look around the diff for context."
+     },
+     {
+      "line": 10,
+      "text": "Bash is denied by name, along with every write tool and the web."
+     },
+     {
+      "line": 11,
+      "text": "dontAsk: anything not in allowedTools is refused, not asked about. Nobody is there to answer."
+     },
+     {
+      "line": 12,
+      "text": "additionalDirectories opens the lens folder and the patch folder for Read."
+     },
+     {
+      "line": 17,
+      "text": "The caller fingerprints each finding (sha1 of path, rule and normalised message) for the receipt."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The loop, part 1: the receipt",
+   "p": [
+    "One review pass leaves things behind. An endless loop wastes money and hides a real disagreement. The loop in between needs memory: which findings were fixed, which were left, and why. That memory is the Receipt.",
+    "A fingerprint is a short hash of a finding's path, rule and normalised message. Two findings with the same fingerprint are the same finding, even if the line number moved. The receipt keeps two sets of fingerprints: fixed and left.",
+    "The receipt is written to .nova/receipt.json. The PR body shows it as one line: \"Found 6 · fixed 5 · left 1, because …\". Byte reads it too (lesson g2-5), so it does not repeat findings Nova already handled."
+   ],
+   "because": "Fingerprints let the loop tell real progress from ping-pong, and the receipt tells the human reviewer what was already looked at.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/self-review.ts (part 1)",
+    "text": "import type { Plan } from \"@rhinohealth/ai-agents-shared\";\nimport { scopeJudge } from \"./judges/scope.js\";\nimport { fingerprinted, reviewOnce, reviewPanel, type Fingerprinted } from \"./review.js\";  // sha1 per finding (G4-18)\nimport type { NovaSession } from \"./session.js\";  // G3's harness session\nexport class Receipt {  // .nova/receipt.json (found, fixed, left) is written from it for the PR body and Byte\n  found = 0;\n  get fixed() { return this.fixedPrints.size; }  // each finding is fixed at most once; a return is ping-pong\n  left: [finding: string, reason: string][] = [];\n  fixedPrints = new Set<string>();\n  leftPrints = new Set<string>();\n  leave(f: Fingerprinted, reason: string) { this.left.push([`${f.path}:${f.line}`, reason]); this.leftPrints.add(f.fingerprint); }\n}",
+    "notes": [
+     {
+      "line": 3,
+      "text": "fingerprinted adds the sha1 to each finding. reviewPanel is the workflow version for big diffs (lesson g4-5)."
+     },
+     {
+      "line": 4,
+      "text": "NovaSession is G3's harness session: it can ask the model to fix, re-run checks, and ask a human."
+     },
+     {
+      "line": 6,
+      "text": "found counts every important finding seen, across all rounds."
+     },
+     {
+      "line": 7,
+      "text": "fixed is derived: the size of the fixed set. A finding is fixed at most once."
+     },
+     {
+      "line": 8,
+      "text": "left holds pairs of location and reason, for the PR's \"left 1, because …\" line."
+     },
+     {
+      "line": 11,
+      "text": "leave records the finding and its fingerprint, so the next round skips it."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The loop, part 2: review, fix, re-check, until nothing important is open",
+   "p": [
+    "Each round starts with a review: the single reviewer, or the panel workflow when the plan asked for one. Important findings not already left are handled one by one. Then the checks from checks.json run again, so a fix cannot quietly break a QA check.",
+    "A finding whose fingerprint was fixed before and is back is ping-pong. Nova stops fixing it, leaves it with a reason, and asks in the ticket's Slack thread. There is no round cap: the loop ends when nothing important is open or every open item is with a person. G3's progress watcher still steps in if nothing moves.",
+    "The scope judge runs once the reviewer is clean. A veto is handled by reverting or explaining; a second veto on the same item goes to a person."
+   ],
+   "because": "No cap, but no loop either: fingerprints end the ping-pong, and people decide the disagreements.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/self-review.ts (part 2)",
+    "text": "export async function selfReview(session: NovaSession, plan: Plan, receipt: Receipt): Promise<Receipt> {\n  while (true) {  // no round cap: it ends when nothing important is open; G3's progress watcher spots loops\n    const found = plan.workflow ? await reviewPanel(session, plan) : await reviewOnce(session.ticket, session.planMd);\n    const important = fingerprinted(found).filter((f) => f.severity === \"important\" && !receipt.leftPrints.has(f.fingerprint));\n    if (!important.length) break;\n    receipt.found += important.length;\n    for (const f of important) {\n      if (receipt.fixedPrints.has(f.fingerprint)) {  // back after a \"fix\": ping-pong, so a person decides\n        receipt.leave(f, \"it came back after a fix; asked the requester\");\n        await session.askHuman(`A review finding keeps coming back: ${f.path}:${f.line} ${f.body}`);\n        continue;\n      }\n      const outcome = await session.fixOrExplain(f);  // Nova may disagree, with a reason\n      if (outcome.fixed) receipt.fixedPrints.add(f.fingerprint);\n      else receipt.leave(f, outcome.reason);\n    }\n    await session.rerunChecks();  // a fix must not break a QA check\n  }\n  const verdict = await scopeJudge(session.ticket, await session.diff());  // G4-17: ticket + diff only\n  if (verdict.verdict === \"veto\") await session.handleVeto(verdict);  // revert or explain; a second veto goes to a person\n  return receipt;\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "while (true) with no counter. The exits are below: nothing important, or every item with a person."
+     },
+     {
+      "line": 3,
+      "text": "plan.workflow is the plan's own line saying why a panel helps; otherwise one reviewer."
+     },
+     {
+      "line": 4,
+      "text": "Keep important findings that were not already left. Nits are counted elsewhere."
+     },
+     {
+      "line": 5,
+      "text": "The normal exit: a clean review."
+     },
+     {
+      "line": 8,
+      "text": "Seen and fixed before, and back again: ping-pong. The person decides, not another round."
+     },
+     {
+      "line": 13,
+      "text": "fixOrExplain lets Nova disagree with a reason. The reason lands in the PR."
+     },
+     {
+      "line": 17,
+      "text": "Re-run the chosen checks after every round of fixes."
+     },
+     {
+      "line": 19,
+      "text": "Scope judge last, on the final diff, with the ticket only."
+     },
+     {
+      "line": 20,
+      "text": "handleVeto reverts or explains. A second veto on the same item goes to a person."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The QA agent, part 1: a tester who sees only the app",
+   "p": [
+    "Tests can pass while the screen is still wrong. A toast shows while the form still saves. An empty state overlaps the table at 760 pixels. A count is off by one. A tester who looks at the screen catches these.",
+    "The QA agent gets the QA plan and the app's URL. It does not get the code, the diff or Nova's notes. For each check it opens a fresh browser context, does what a user would do, and records a short video. Pass only when it saw the expected result itself.",
+    "Calibration is a set of 8 to 10 labelled examples that show what a fail looks like. Before the pilot the QA agent must fail every planted-bug case, and its leniency is tracked weekly."
+   ],
+   "because": "The videos are the proof reviewers trust most, and a tester that never saw the code cannot be lenient on purpose.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/qa.ts (part 2: the QA run, first half)",
+    "text": "import type { Options } from \"@anthropic-ai/claude-agent-sdk/core\";\nimport { z } from \"zod\";\n\nconst QA_PROMPT = `You are a careful tester. You get the QA plan and the app's URL. You do not get the code or the diff.\nFor each check, open a fresh browser context, do what a user would do, and look at what the screen really shows.\nPass a check only when you saw the expected result yourself. Close is not a pass: a missing state, an overlap,\na wrong count, or text that appears only after a reload is a fail. Read the calibration examples first.`;\n\nexport const QaResults = z.object({  // saved as .nova/qa_results.json\n  checks: z.array(z.object({ id: z.string(), passed: z.boolean(), saw: z.string(), video: z.string() })),  // video: S3 key\n});",
+    "notes": [
+     {
+      "line": 4,
+      "text": "The role in one line: a careful tester with the plan and the URL, and nothing else."
+     },
+     {
+      "line": 5,
+      "text": "A fresh browser context per check, so one check's state cannot leak into the next."
+     },
+     {
+      "line": 6,
+      "text": "Close is not a pass. The prompt names the failure modes the calibration examples show."
+     },
+     {
+      "line": 9,
+      "text": "The result per check: id, passed, what it saw, and the video's S3 key."
+     },
+     {
+      "line": 10,
+      "text": "A fail comes back to Nova as a finding. Nova cannot edit this file to mark it passed."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The QA agent, part 2: a browser and one folder",
+   "p": [
+    "qaOptions builds the session options. The model is Sonnet 5.5 at medium, or Opus 5.5 at low when judging screens is the main job. The working directory is /work/.nova/qa, which holds the QA plan and the calibration examples, not the checkout.",
+    "Its only tools are Read and the Playwright MCP server, pinned in the image. Bash, Grep, Glob and every write tool are denied, and so is Read on /work/fcp. The app is FCP Lab on the same VM, seeded with fake data. Layout checks run at 760x900 and 1440x900, the two widths from e2e/helpers/responsive.ts.",
+    "One decision is still open: the Playwright MCP server or the Playwright CLI for agents, which uses fewer tokens. Check the docs of the pinned version for the exact video flag."
+   ],
+   "because": "A tester with a browser and nothing else is the closest thing to a user, and it cannot peek at the code.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/qa.ts (part 2: the QA run, second half)",
+    "text": "export function qaOptions(screensAreTheJob: boolean): Options {\n  return {\n    model: screensAreTheJob ? \"claude-opus-5-5\" : \"claude-sonnet-5-5\",  // routing table\n    effort: screensAreTheJob ? \"low\" : \"medium\",\n    cwd: \"/work/.nova/qa\",  // the QA plan and calibration examples, not the checkout\n    settingSources: [],  // no repo CLAUDE.md, skills or memory\n    systemPrompt: QA_PROMPT,\n    mcpServers: { playwright: {  // pinned in the image; flags per the pinned version (check --save-video)\n      type: \"stdio\",\n      command: \"/opt/ai-agents/bin/playwright-mcp\",\n      args: [\"--isolated\", \"--save-video=1280x720\", \"--output-dir=/work/.nova/qa/videos\"],\n    } },\n    strictMcpConfig: true,\n    allowedTools: [\"Read\", \"mcp__playwright\"],  // check the server-level allow rule\n    disallowedTools: [\"Bash\", \"Grep\", \"Glob\", \"Edit\", \"Write\", \"WebFetch\", \"WebSearch\", \"Read(/work/fcp/**)\"],\n    permissionMode: \"dontAsk\",\n    outputFormat: { type: \"json_schema\", schema: z.toJSONSchema(QaResults) },  // per check: id, passed, saw, video\n  };\n}\n// App under test: FCP Lab on this VM, seeded with fake data via POST {API_PREFIX}test/create_test_data.",
+    "notes": [
+     {
+      "line": 3,
+      "text": "The routing table: Sonnet for most QA plans, Opus at low effort when screens are the job."
+     },
+     {
+      "line": 5,
+      "text": "cwd is the QA folder. Relative paths in the plan resolve there, not in the repo."
+     },
+     {
+      "line": 6,
+      "text": "No settings sources: no CLAUDE.md, no skills, no memory. The tester has the plan and the prompt."
+     },
+     {
+      "line": 8,
+      "text": "The browser, as an MCP server over stdio. The binary is pinned in the sandbox image."
+     },
+     {
+      "line": 11,
+      "text": "Isolated contexts and video on, saved under the QA folder for upload."
+     },
+     {
+      "line": 13,
+      "text": "strictMcpConfig: only the servers listed here, nothing from user or project settings."
+     },
+     {
+      "line": 14,
+      "text": "Read plus the whole playwright server. Check how the pinned SDK spells a server-level allow rule."
+     },
+     {
+      "line": 15,
+      "text": "Read(/work/fcp/**) is denied explicitly: the checkout is off limits even for reading."
+     },
+     {
+      "line": 18,
+      "text": "Structured output in the QaResults shape, saved as .nova/qa_results.json."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "Nova cannot mark a QA check passed. The QA agent writes qa_results.json in its own session, and the ready gate (lesson g4-6) reads that file."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Trace a finding through the loop (reading lab)",
+  "youNeed": [
+   "~/Desktop/agentic-plan-app/tickets/g4.json",
+   "this lesson's code blocks",
+   "a text editor"
+  ],
+  "worked": [
+   {
+    "do": "Read G4-18 how 2. Why does the reviewer get no Bash tool?",
+    "see": "git diff --no-index could read any path on the VM and --output= could write a file; a read-only reviewer with Bash is not read-only."
+   },
+   {
+    "do": "In selfReview, finding X (fingerprint abc) is fixed in round 1 and reported again in round 2. Predict the code path.",
+    "see": "fixedPrints has abc, so receipt.leave(X, \"it came back after a fix; asked the requester\") runs, askHuman posts in Slack, and continue skips a second fix."
+   },
+   {
+    "do": "In qaOptions, list what the QA agent may read.",
+    "see": "Files under /work/.nova/qa (cwd) through Read. Read(/work/fcp/**) is disallowed, so the checkout is off limits."
+   },
+   {
+    "do": "List the scope judge's inputs and name two things it never gets.",
+    "see": "Ticket text, the diff, and the mechanical test-change list. Never the plan, the transcript or Nova's notes."
+   },
+   {
+    "do": "In selfReview, when does the scope judge run?",
+    "see": "Once, after the while loop ends, on the final diff. A veto is then reverted or explained."
+   }
+  ],
+  "faded": "Write fingerprint(f: Finding): string in TypeScript with node:crypto: sha1 of path, rule and the normalised body. The normalise step is yours: decide what to strip (numbers, line numbers, whitespace) so a moved finding keeps its fingerprint.",
+  "alone": "Write 3 calibration cases for the QA agent (G4-24 how 5), one line each with the expected verdict. Use the three examples from this lesson: the early toast, the overlap at 760, the count off by one.",
+  "done": "For each of the three readers, you can say what it gets as input and what it can touch. You can also say what happens when a finding comes back."
+ },
+ "quiz": [
+  {
+   "q": "What does the scope judge see?",
+   "options": [
+    {
+     "text": "The ticket, the diff and a mechanical list of test changes",
+     "correct": true,
+     "why": "Nothing else. Without Nova's notes it cannot be persuaded that a refactor was needed."
+    },
+    {
+     "text": "The ticket, the plan and the transcript, for context",
+     "correct": false,
+     "why": "The transcript is exactly what would let Nova's reasoning leak into the verdict."
+    },
+    {
+     "text": "Only the diff, so it stays neutral",
+     "correct": false,
+     "why": "Without the ticket it cannot tell which changes serve it."
+    }
+   ]
+  },
+  {
+   "q": "A finding was fixed in round 1 and comes back in round 2. What does the loop do?",
+   "options": [
+    {
+     "text": "Fixes it again; the loop has no round cap",
+     "correct": false,
+     "why": "No round cap is true, but a returning fingerprint is ping-pong, not progress."
+    },
+    {
+     "text": "Leaves it with a reason and asks a person in the ticket's Slack thread",
+     "correct": true,
+     "why": "fixedPrints remembers the first fix; the second sighting goes to a person."
+    },
+    {
+     "text": "Stops the whole run as failed",
+     "correct": false,
+     "why": "One disagreement is not a failed run. The item is listed in the PR as left, with a reason."
+    }
+   ]
+  },
+  {
+   "q": "Which tools does the QA agent have?",
+   "options": [
+    {
+     "text": "Read on the checkout and Bash, so it can run the tests",
+     "correct": false,
+     "why": "It runs no tests and never reads the code. Tests passing is not what it checks."
+    },
+    {
+     "text": "A browser (the Playwright MCP server) and Read on /work/.nova/qa only",
+     "correct": true,
+     "why": "It sees the app and the QA plan, like a user with a checklist."
+    },
+    {
+     "text": "The same tools as Nova, with a different prompt",
+     "correct": false,
+     "why": "A different prompt is not fresh eyes. The tool list is what keeps it blind to the code."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From lesson g4-3: what two things does the Stop hook check before Nova may say done?",
+  "From lesson p8-5: why is a judge run as its own session instead of as a subagent of the builder?"
+ ],
+ "videos": [
+  {
+   "title": "Get Started with Playwright and VS Code (2025 edition)",
+   "url": "https://www.youtube.com/watch?v=WvsLGZnHmzw",
+   "channel": "Playwright",
+   "minutes": 20,
+   "why": "Official Playwright team refresher on writing and running tests."
+  },
+  {
+   "title": "What is Playwright? (Playwright introduction tutorial, features & demo)",
+   "url": "https://www.youtube.com/watch?v=wGr5rz8WGCE",
+   "channel": "Testopic",
+   "minutes": 12,
+   "why": "Twelve-minute overview of Playwright features with a live demo."
+  }
+ ],
+ "words": [
+  {
+   "term": "fresh context",
+   "plain": "A separate model session that starts with none of the builder's history."
+  },
+  {
+   "term": "scope judge",
+   "plain": "A rubric judge that sees the ticket and the diff and can veto unrelated changes."
+  },
+  {
+   "term": "lens",
+   "plain": "A review checklist for one concern, such as security or conventions; Byte's are reused."
+  },
+  {
+   "term": "fingerprint",
+   "plain": "A short hash of a finding's path, rule and message, so the same finding is recognised later."
+  },
+  {
+   "term": "receipt",
+   "plain": "The record found / fixed / left with reasons, shown in the PR and read by Byte."
+  },
+  {
+   "term": "ping-pong",
+   "plain": "A finding that comes back after it was fixed; it goes to a person, not another round."
+  },
+  {
+   "term": "calibration",
+   "plain": "Labelled examples that teach the QA agent what a fail looks like, so it is not lenient."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G4-17",
+   "why": "This lesson explained the scope judge's inputs, prompt and verdict shape.",
+   "walk": [
+    "Create ai-agents/harness/src/judges/scope.ts with SCOPE_PROMPT, ScopeVerdict and scopeJudge (code above), and judges/test-changes.ts for the mechanical list.",
+    "Run it as its own query() on Sonnet 5.5 at medium, no tools, structured output. Input: ticket text, git diff origin/main...HEAD, the test-change list.",
+    "On a veto, Nova reverts or explains; the explanation goes into the PR. A second veto on the same item goes to a person.",
+    "A weakened test is never explained away: Nova restores it (the G0 and G4-16 wall).",
+    "Check the judge on 20 TICKET-BENCH diffs plus 10 with a planted refactor or a loosened assertion before turning it on.",
+    "Track the veto rate in the weekly review (lesson g4-8)."
+   ]
+  },
+  {
+   "key": "G4-18",
+   "why": "This lesson explained the read-only reviewer, Byte's lenses and the fingerprint.",
+   "walk": [
+    "Create ai-agents/harness/src/review.ts with Finding, PROMPT and reviewOnce (code above).",
+    "The harness writes git diff to /run/nova/review/diff.patch. The reviewer gets Read, Grep, Glob and no Bash.",
+    "Bake Byte's lens files (skills/fe/references/passes/*.md and skills/be/SKILL.md from RhinoHealth/byte) into the image at /opt/ai-agents/byte-playbooks.",
+    "Opus 5.5 at medium for logic and security; a Sonnet 5.5 pass at low for conventions on big diffs.",
+    "Add a fingerprint per finding (sha1 of path, rule, normalised message) and append to .nova/review.jsonl."
+   ]
+  },
+  {
+   "key": "G4-23",
+   "why": "This lesson walked through the Receipt and the selfReview loop.",
+   "walk": [
+    "Create ai-agents/harness/src/self-review.ts with Receipt and selfReview (code above).",
+    "Small diffs use reviewOnce; when plan.workflow is set, use the nova-review-panel workflow (lesson g4-5).",
+    "After each round of fixes, re-run the checks in checks.json.",
+    "A returning fingerprint is ping-pong: leave it with a reason and ask in the ticket's Slack thread.",
+    "No round cap. Run the scope judge once the reviewer is clean; revert or explain a veto.",
+    "Write .nova/receipt.json (found, fixed, left with reasons) for the PR body and for Byte."
+   ]
+  },
+  {
+   "key": "G4-24",
+   "why": "This lesson explained qaOptions, the browser tools and the calibration set.",
+   "walk": [
+    "Add QA_PROMPT, QaResults and qaOptions to ai-agents/harness/src/qa.ts (code above). The harness starts it as its own query().",
+    "Decide between the Playwright MCP server and the Playwright CLI for agents, and pin it in the image. Use one isolated context per check, with video on.",
+    "Run FCP Lab on the VM seeded with fake data (POST {API_PREFIX}test/create_test_data). Layout checks at 760x900 and 1440x900.",
+    "Write 8 to 10 labelled calibration cases in ai-agents/harness/prompts/qa-calibration/. It must fail every planted-bug case before the pilot.",
+    "Save .nova/qa_results.json; a fail goes back to Nova as a finding. Videos are 30 seconds or less and show seed data only."
+   ]
+  }
+ ],
+ "remember": "Three readers with no memory of Nova's reasoning: a reviewer, a scope judge and a tester; fingerprints end the loop."
+}

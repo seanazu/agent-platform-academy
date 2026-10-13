@@ -1,0 +1,409 @@
+{
+ "id": "p3-5",
+ "title": "Reaching a machine without SSH",
+ "minutes": 45,
+ "youNeed": [
+  "p3-3"
+ ],
+ "bridge": "SSM Run Command is like SSH without port 22 or keys. The SSM agent on the VM dials out to AWS, and IAM decides who may send it a command. Except a command is a job with a time limit of at most 48 hours, not a live terminal. So a long run lives in a systemd unit that the command only starts.",
+ "intro": "The sandbox security group has no ingress, so nobody can SSH in. The orchestrator still has to start the harness and check on it. This lesson does that with SSM Run Command. The long work goes to systemd, which keeps it running after the command has ended.",
+ "picture": {
+  "caption": "SSM delivers one short command; systemd keeps nova-worker alive; heartbeats through the broker say how it goes.",
+  "nodes": [
+   {
+    "id": "orch",
+    "label": "workInSandbox activity (orchestrator)",
+    "kind": "service"
+   },
+   {
+    "id": "ssm",
+    "label": "SSM service",
+    "kind": "cloud"
+   },
+   {
+    "id": "agentd",
+    "label": "SSM agent on the VM (root)",
+    "kind": "service"
+   },
+   {
+    "id": "systemd",
+    "label": "systemd",
+    "kind": "service"
+   },
+   {
+    "id": "unit",
+    "label": "unit nova-<run>: nova-worker as agent",
+    "kind": "machine"
+   },
+   {
+    "id": "broker",
+    "label": "broker heartbeat API",
+    "kind": "service"
+   }
+  ],
+  "steps": [
+   {
+    "from": "orch",
+    "to": "ssm",
+    "text": "SendCommand with AWS-RunShellScript to one tagged instance"
+   },
+   {
+    "from": "agentd",
+    "to": "ssm",
+    "text": "the agent polls out over the ssmmessages and ec2messages endpoints and picks it up"
+   },
+   {
+    "from": "agentd",
+    "to": "systemd",
+    "text": "runs systemd-run --uid agent --unit nova-<run> ...; the command ends in a second"
+   },
+   {
+    "from": "systemd",
+    "to": "unit",
+    "text": "starts and watches nova-worker, which may run for days"
+   },
+   {
+    "from": "unit",
+    "to": "broker",
+    "text": "nova-worker sends heartbeats with its step and progress"
+   },
+   {
+    "from": "orch",
+    "to": "broker",
+    "text": "the activity reads the heartbeat every 30 s, not the SSM command"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "No door, but a line out",
+   "p": [
+    "Try to SSH into a sandbox and there is nothing to try: no key, no port 22, no public IP. Instead, the SSM agent, a program that runs as root on the VM, connects out. It reaches AWS through the ssm, ssmmessages and ec2messages endpoints from p3-2, and asks for work.",
+    "The VM's side needs AmazonSSMManagedInstanceCore in its role (p3-1). The sender's side needs permission to send. G3-17 gives the orchestrator's role ssm:SendCommand with AWS-RunShellScript, only on instances tagged ai-agents:managed=true."
+   ],
+   "because": "We limit SendCommand by document and by tag. 'Run any command on any VM' is the most powerful permission in the account.",
+   "code": {
+    "lang": "json",
+    "file": "the orchestrator role's SSM statements (G3-17, sketch)",
+    "text": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    { \"Effect\": \"Allow\", \"Action\": \"ssm:SendCommand\",\n      \"Resource\": \"arn:aws:ec2:us-east-1:<AI_AGENTS_ACCOUNT_ID>:instance/*\",\n      \"Condition\": { \"StringEquals\": { \"ssm:resourceTag/ai-agents:managed\": \"true\" } } },\n    { \"Effect\": \"Allow\", \"Action\": \"ssm:SendCommand\",\n      \"Resource\": \"arn:aws:ssm:us-east-1::document/AWS-RunShellScript\" },\n    { \"Effect\": \"Allow\", \"Action\": \"ssm:GetCommandInvocation\", \"Resource\": \"*\" }\n  ]\n}",
+    "notes": [
+     {
+      "line": 5,
+      "text": "SendCommand names two resources at once: the instances and the document. Both must be allowed."
+     },
+     {
+      "line": 6,
+      "text": "Only our sandbox VMs. Check the exact condition key in the SSM docs before you ship it."
+     },
+     {
+      "line": 8,
+      "text": "Only the plain shell document, owned by AWS (no account number in its ARN)."
+     },
+     {
+      "line": 9,
+      "text": "Reading a command's result. It has no resource-level control, so it takes '*'."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Send a command, read the result",
+   "p": [
+    "SendCommand returns a command ID at once. The agent picks the command up a moment later and runs it. Each instance gets a command invocation with a status: Pending, InProgress, then Success, Failed or TimedOut, plus the output.",
+    "G3-16's smoke test needs this in a script: .github/scripts/ssm-run.sh sends one command and waits for it. The CLI has a waiter, but it gives up after about 100 seconds. A smoke test runs longer, so the script polls by itself."
+   ],
+   "because": "We poll in our own loop because the built-in waiter stops long before an FCP Lab test finishes.",
+   "code": {
+    "lang": "bash",
+    "file": ".github/scripts/ssm-run.sh (infrastructure repo, sketch for G3-16)",
+    "text": "#!/usr/bin/env bash\n# ssm-run.sh <instance-id> <command>: run one shell command over SSM, wait, print its output\nset -euo pipefail\nid=\"$1\"; cmd=\"$2\"\nparams=$(jq -n --arg c \"$cmd\" '{commands: [$c], executionTimeout: [\"7200\"]}')\ncommand_id=$(aws ssm send-command --instance-ids \"$id\" --document-name AWS-RunShellScript \\\n  --parameters \"$params\" --query Command.CommandId --output text)\nwhile :; do\n  sleep 5\n  status=$(aws ssm get-command-invocation --command-id \"$command_id\" --instance-id \"$id\" \\\n    --query Status --output text 2>/dev/null || echo Pending)\n  case \"$status\" in Pending|InProgress|Delayed) continue ;; *) break ;; esac\ndone\naws ssm get-command-invocation --command-id \"$command_id\" --instance-id \"$id\" \\\n  --query '[Status, StandardOutputContent, StandardErrorContent]' --output text\n[ \"$status\" = \"Success\" ]",
+    "notes": [
+     {
+      "line": 5,
+      "text": "jq builds the parameters JSON, so quotes inside the command cannot break it. Two hours is plenty for a smoke test."
+     },
+     {
+      "line": 6,
+      "text": "AWS-RunShellScript is AWS's document for 'run these shell lines as root'."
+     },
+     {
+      "line": 11,
+      "text": "Right after sending, the invocation may not exist yet. Treat that error as Pending."
+     },
+     {
+      "line": 12,
+      "text": "Keep waiting while it is pending or running; stop on any final status."
+     },
+     {
+      "line": 16,
+      "text": "The script's exit code is the command's result, so a CI step fails when the test fails."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The 48-hour ceiling",
+   "p": [
+    "AWS-RunShellScript has an executionTimeout parameter. It defaults to 3600 seconds and allows at most 172800 seconds: 48 hours. When it runs out, SSM stops the command.",
+    "A Nova run has no time limit. It may wait days for a person, and we never cut a run in the middle. So the run cannot live inside an SSM command. The command only starts it and ends."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Guide, don't cage: no time, turn or budget limit cuts a run in the middle. A tool's built-in timeout counts too, which is why the harness is a systemd service and not an SSM command."
+   }
+  },
+  {
+   "h": "systemd: the OS keeps a process alive",
+   "p": [
+    "systemd is the program that starts and watches services on Linux. It is like pm2 owned by the operating system: a restart policy, logs and start on boot. A unit is one thing systemd manages; a service unit runs a program.",
+    "systemd-run creates a unit on the spot, called a transient unit, and returns at once. G3-20 starts the harness this way as user agent, in a unit named after the run. systemctl asks about a unit and journalctl shows its logs."
+   ],
+   "because": "We use systemd-run because it gives a long process a name, an owner and logs, with no unit file in the image.",
+   "code": {
+    "lang": "bash",
+    "file": "on a sandbox VM, as root (the lab runs these in a container)",
+    "text": "systemd-run --uid agent --unit nova-run-42 \\\n  /usr/local/bin/nova-worker run /run/nova/task.json\nsystemctl is-active nova-run-42          # active, inactive or failed\nsystemctl status nova-run-42 --no-pager  # state, main PID, last log lines\njournalctl -u nova-run-42 --no-pager -n 3",
+    "notes": [
+     {
+      "line": 1,
+      "text": "--uid agent runs it as the non-root user; --unit gives it a name we can find again."
+     },
+     {
+      "line": 2,
+      "text": "The harness and the task file that G3-18 wrote to /run/nova/."
+     },
+     {
+      "line": 3,
+      "text": "The question a retry asks: is this run's harness still running?"
+     },
+     {
+      "line": 5,
+      "text": "The harness's stdout and stderr, collected by systemd."
+     }
+    ]
+   },
+   "see": "Running as unit: nova-run-42.service; invocation ID: caf769587bae4120812cb3b97f166505\nactive\n● nova-run-42.service - /usr/local/bin/nova-worker run /run/nova/task.json\n     Loaded: loaded (/run/systemd/transient/nova-run-42.service; transient)\n     Active: active (running) since Tue 2026-10-13 15:10:14 UTC; 11s ago\n(output trimmed)"
+  },
+  {
+   "h": "Start once, re-attach on retry",
+   "p": [
+    "Temporal retries an activity when its worker dies. If workInSandbox ran systemd-run twice, the VM would run two harnesses on one checkout. So the command checks first: if the unit is active, do nothing.",
+    "After that, workInSandbox never asks SSM again. It reads the harness's heartbeat from the broker every 30 seconds and heartbeats to Temporal (G3-20). A retry re-attaches to the unit that is already running."
+   ],
+   "because": "We put the check and the start in one shell line, so sending the command twice does what sending it once does.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/activities/run.ts (ensureHarnessRunning, sketch)",
+    "text": "import { GetCommandInvocationCommand, SendCommandCommand, SSMClient } from \"@aws-sdk/client-ssm\";\nimport { setTimeout as sleep } from \"node:timers/promises\";\n\nconst ssm = new SSMClient({});\n\n/** Start nova-worker as a systemd unit unless it already runs. Safe to call again on a retry. */\nexport const ensureHarnessRunning = async (vm: Sandbox, task: Task): Promise<void> => {\n  const unit = `nova-${task.runId}`;\n  const script = `systemctl is-active --quiet ${unit} || ` +\n    `systemd-run --uid agent --unit ${unit} /usr/local/bin/nova-worker run /run/nova/task.json`;\n  const sent = await ssm.send(new SendCommandCommand({\n    InstanceIds: [vm.instanceId],\n    DocumentName: \"AWS-RunShellScript\",\n    Parameters: { commands: [script] }, // ends in a second; the unit lives on\n  }));\n  const commandId = sent.Command?.CommandId ?? \"\";\n  for (;;) {\n    await sleep(2_000);\n    const inv = await ssm.send(new GetCommandInvocationCommand({ CommandId: commandId, InstanceId: vm.instanceId }))\n      .catch(() => undefined); // InvocationDoesNotExist for a moment after sending\n    if (inv?.Status === \"Success\") return;\n    if (inv && [\"Failed\", \"Cancelled\", \"TimedOut\"].includes(inv.Status ?? \"\")) throw new Error(`could not start ${unit}`);\n  }\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "AWS SDK v3: one client per service, one Command class per API call."
+     },
+     {
+      "line": 9,
+      "text": "is-active --quiet exits 0 when the unit runs, so the || part is skipped."
+     },
+     {
+      "line": 14,
+      "text": "The default timeout applies, and it does not matter: this command takes a second."
+     },
+     {
+      "line": 20,
+      "text": "Same pattern as ssm-run.sh: a missing invocation means 'not yet'."
+     },
+     {
+      "line": 22,
+      "text": "A failed start is a real error. Temporal retries the activity, and the check makes that safe."
+     }
+    ]
+   }
+  },
+  {
+   "h": "What SSM remembers",
+   "p": [
+    "SSM keeps a command history in the account: the document, the parameters and the output. Anyone with ssm:ListCommands can read it. G3-18 writes the run's task, its broker capability and its gateway token to /run/nova/ over SSM, so they show up there. G3-12 lists this as a known soft spot.",
+    "It is accepted because neither value is a key to an outside service, and both die with the run. Keep it that way: never send a real secret in a command. Session Manager, SSM's interactive shell, exists too; we do not use it for runs, and its logging is off unless turned on."
+   ],
+   "callout": {
+    "kind": "gotcha",
+    "text": "Command parameters are not secret. Treat anything you put in SendCommand as readable by everyone who can read the account's SSM history."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Send a command the SSM way, then hand it to systemd",
+  "youNeed": [
+   "moto and moto.env from p3-1",
+   "jq (brew install jq)",
+   "Docker Desktop running (about 170 MB for a small systemd image)"
+  ],
+  "worked": [
+   {
+    "do": "cd ~/academy/aws && source moto.env && ID=$(aws ec2 run-instances --image-id ami-03cf127a --instance-type m8i.xlarge --query 'Instances[0].InstanceId' --output text) && echo $ID",
+    "see": "i-6c96344f46c47ed55"
+   },
+   {
+    "do": "Save ssm-run.sh (section 2), chmod +x ssm-run.sh, then: ./ssm-run.sh $ID 'nova-worker --version'; echo \"exit $?\"",
+    "see": "Success\t\t\nexit 0\n(moto runs nothing and reports Success with empty output; a real VM would print the version)"
+   },
+   {
+    "do": "mkdir -p ~/academy/systemd && cd ~/academy/systemd && printf 'FROM ubuntu:24.04\\nRUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv && rm -rf /var/lib/apt/lists/*\\nRUN useradd -m -u 1001 agent\\nCMD [\"/sbin/init\"]\\n' > Dockerfile && docker build -q -t academy-systemd .",
+    "see": "sha256:c5a535b855d70443de4e02322efdbdfdb6fae236ac5d91d3b623ec50bc5b08b4"
+   },
+   {
+    "do": "docker run -d --name sd-lab --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw academy-systemd && sleep 5 && docker exec sd-lab systemctl is-system-running",
+    "see": "a99e32a4f5ed308fe0374d97e14fe2bd3c97a2d99d6c31066a7d1734b45ba828\nrunning\n(degraded is fine too: some services do not start in a container)"
+   },
+   {
+    "do": "docker exec sd-lab sh -c 'printf \"#!/bin/sh\\nwhile true; do echo \\\"working on \\$2\\\"; sleep 5; done\\n\" > /usr/local/bin/nova-worker && chmod 755 /usr/local/bin/nova-worker'",
+    "see": "(no output; a fake nova-worker that prints a line every 5 seconds)"
+   },
+   {
+    "do": "docker exec sd-lab systemd-run --uid agent --unit nova-run-42 /usr/local/bin/nova-worker run run-42",
+    "see": "Running as unit: nova-run-42.service; invocation ID: caf769587bae4120812cb3b97f166505"
+   },
+   {
+    "do": "sleep 11; docker exec sd-lab systemctl status nova-run-42 --no-pager | head -4",
+    "see": "● nova-run-42.service - /usr/local/bin/nova-worker run run-42\n     Loaded: loaded (/run/systemd/transient/nova-run-42.service; transient)\n  Transient: yes\n     Active: active (running) since Tue 2026-10-13 15:10:14 UTC; 11s ago"
+   },
+   {
+    "do": "docker exec sd-lab journalctl -u nova-run-42 --no-pager -n 2",
+    "see": "Oct 13 15:10:19 a99e32a4f5ed nova-worker[109]: working on run-42\nOct 13 15:10:24 a99e32a4f5ed nova-worker[109]: working on run-42"
+   },
+   {
+    "do": "docker exec sd-lab systemctl is-active nova-run-99; echo \"exit $?\"",
+    "see": "inactive\nexit 4\n(no such unit: this is the case where the ensure command starts one)"
+   }
+  ],
+  "faded": "Write the ensure line from section 5 for run-43: systemctl is-active --quiet nova-run-43 || systemd-run .... Run it twice with docker exec sd-lab sh -c '...'. Left to you: predict what the second run prints, then prove there is one nova-run-43 unit with systemctl list-units 'nova-*' --no-pager.",
+  "alone": "Start nova-run-44 with -p Restart=on-failure. Inside the container, kill its main process: kill -9 $(systemctl show -p MainPID --value nova-run-44). Wait 2 seconds and show NRestarts=1 with systemctl show -p NRestarts nova-run-44. Then write two sentences. What could go wrong if a crashed harness restarted by itself on the same VM? Which part of the platform decides instead (G3-27)? Finish with docker rm -f sd-lab.",
+  "done": "ssm-run.sh exits 0 against moto. In the container the transient unit runs as agent and logs to the journal. It shows inactive with exit 4 for a run that does not exist."
+ },
+ "quiz": [
+  {
+   "q": "Why is nova-worker not run directly inside the SSM command?",
+   "options": [
+    {
+     "text": "SSM cannot run a program as another user",
+     "correct": false,
+     "why": "It can, through systemd-run --uid or sudo. The problem is time."
+    },
+    {
+     "text": "An SSM Run Command stops after at most 48 hours, and runs have no time limit",
+     "correct": true,
+     "why": "executionTimeout tops out at 172800 seconds. A run waiting on people may take longer."
+    },
+    {
+     "text": "SSM commands cannot reach the broker",
+     "correct": false,
+     "why": "Network reach is the same for any process on the VM."
+    }
+   ]
+  },
+  {
+   "q": "The sandbox security group has no ingress. How does the SSM agent get commands?",
+   "options": [
+    {
+     "text": "It connects out over HTTPS to the ssm, ssmmessages and ec2messages endpoints and polls",
+     "correct": true,
+     "why": "Outbound to interface endpoints on 443 is allowed; nothing ever connects in."
+    },
+    {
+     "text": "AWS opens port 22 for SSM behind the scenes",
+     "correct": false,
+     "why": "SSM does not use SSH or any inbound port."
+    },
+    {
+     "text": "The orchestrator connects to the VM's private IP over PrivateLink",
+     "correct": false,
+     "why": "PrivateLink goes the other way, from sandboxes to three services on inf."
+    }
+   ]
+  },
+  {
+   "q": "workInSandbox is retried after its worker crashed. What stops a second nova-worker from starting?",
+   "options": [
+    {
+     "text": "SSM refuses to send the same command twice",
+     "correct": false,
+     "why": "SSM sends whatever you ask, as often as you ask."
+    },
+    {
+     "text": "Temporal never retries activities",
+     "correct": false,
+     "why": "It does retry them; that is the case we must be ready for."
+    },
+    {
+     "text": "The command starts the unit only if systemctl is-active says it is not running",
+     "correct": true,
+     "why": "Check and start in one line makes the command safe to send again."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p3-4: after DetachInstances, who owns the VM's life, and what cleans it up if that owner disappears?"
+ ],
+ "videos": [
+  {
+   "title": "Connect to AWS EC2 Using AWS SSM Session Manager",
+   "url": "https://www.youtube.com/watch?v=SwSEmvWMuMU",
+   "channel": "Tech With Yeshwanth",
+   "minutes": 19,
+   "why": "Hands-on setup of Session Manager as an SSH replacement."
+  },
+  {
+   "title": "Mini Project - Learn how to use AWS Systems Manager",
+   "url": "https://www.youtube.com/watch?v=B2MecqC5nJA",
+   "channel": "LearnCantrill",
+   "minutes": 24,
+   "why": "Adrian Cantrill's guided lab covering Run Command and Session Manager."
+  }
+ ],
+ "words": [
+  {
+   "term": "SSM agent",
+   "plain": "A root program on the VM that connects out to AWS Systems Manager and runs the commands it receives."
+  },
+  {
+   "term": "Run Command",
+   "plain": "SSM's way to run a document, such as a shell script, on chosen instances and collect the result."
+  },
+  {
+   "term": "AWS-RunShellScript",
+   "plain": "AWS's document for running shell lines as root; executionTimeout is at most 48 hours."
+  },
+  {
+   "term": "command invocation",
+   "plain": "One command on one instance, with a status (Pending, InProgress, Success, Failed, TimedOut) and output."
+  },
+  {
+   "term": "systemd unit",
+   "plain": "One thing systemd manages; a service unit runs and watches a program."
+  },
+  {
+   "term": "systemd-run",
+   "plain": "Creates a transient unit on the spot and returns at once; the unit disappears when it stops."
+  },
+  {
+   "term": "journalctl",
+   "plain": "Shows the logs systemd collected for a unit (journalctl -u <unit>)."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-20",
+   "why": "workInSandbox starts nova-worker with systemd-run over SSM, then follows heartbeats; retries re-attach."
+  },
+  {
+   "key": "G3-16",
+   "why": "The nightly smoke test runs its checks on a fresh VM through ssm-run.sh."
+  },
+  {
+   "key": "G3-17",
+   "why": "The orchestrator's role may send AWS-RunShellScript only to instances tagged ai-agents:managed=true."
+  }
+ ],
+ "remember": "SSM starts the work, systemd keeps it alive, and heartbeats through the broker tell us how it is going."
+}

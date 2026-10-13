@@ -1,0 +1,417 @@
+{
+ "id": "p6-2",
+ "title": "Prometheus metrics in a Node service",
+ "minutes": 45,
+ "youNeed": [
+  "p6-1",
+  "p1-3"
+ ],
+ "bridge": "A Prometheus counter is like a Redux counter that only goes up: you call inc() and never set it. Except: nobody reads it back in code. A scraper fetches the whole store every 30 seconds, and you ask for rates on the server, never for the raw value.",
+ "intro": "The gateway counts every model call, the broker counts refused writes, and the nightly job writes delivery numbers. All of them speak Prometheus. This lesson adds a counter and a histogram to a Node service and exposes /metrics. It also explains when a job pushes instead of being scraped.",
+ "picture": {
+  "caption": "A service increments counters in memory; VMAgent scrapes /metrics on a timer and stores every series; Grafana asks the store for rates. A nightly job pushes with timestamps instead.",
+  "nodes": [
+   {
+    "id": "gw",
+    "label": "gateway (node:http)",
+    "kind": "service"
+   },
+   {
+    "id": "reg",
+    "label": "Registry in memory",
+    "kind": "file"
+   },
+   {
+    "id": "agent",
+    "label": "VMAgent (scrapes every 30 s)",
+    "kind": "service"
+   },
+   {
+    "id": "vm",
+    "label": "VictoriaMetrics",
+    "kind": "service"
+   },
+   {
+    "id": "job",
+    "label": "nightly metrics job",
+    "kind": "service"
+   },
+   {
+    "id": "graf",
+    "label": "Grafana",
+    "kind": "service"
+   }
+  ],
+  "steps": [
+   {
+    "from": "gw",
+    "to": "reg",
+    "text": "costUsd.inc({ agent: \"nova\" }, 0.12) on every model answer"
+   },
+   {
+    "from": "agent",
+    "to": "gw",
+    "text": "GET /metrics; the registry renders every series as text"
+   },
+   {
+    "from": "agent",
+    "to": "vm",
+    "text": "writes the samples with the scrape time and the pod's labels"
+   },
+   {
+    "from": "job",
+    "to": "vm",
+    "text": "POST Prometheus text with millisecond timestamps for last night's and backfilled weeks"
+   },
+   {
+    "from": "graf",
+    "to": "vm",
+    "text": "sum by (agent) (increase(ai_agents_llm_cost_usd_total[1d]))"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "What a scrape looks like",
+   "p": [
+    "Open any /metrics endpoint and you see plain text: one line per series, a HELP and a TYPE comment above each metric. A series is a metric name plus a set of label values; the number after it is the current value. The gateway's two main series are below, in the shape G1-09 and G1-10 query.",
+    "Names end in _total for counters and carry the unit (usd, seconds, bytes). Labels split the number: agent, type. A label with thousands of values (a run id, a login) makes thousands of series, so labels stay few and never personal."
+   ],
+   "because": "We read the text format first because every tool in the chain speaks exactly this and nothing else. That means VMAgent, Grafana and the import endpoint.",
+   "code": {
+    "lang": "text",
+    "file": "GET http://gateway:9464/metrics (what VMAgent fetches)",
+    "text": "# HELP ai_agents_llm_cost_usd_total Model spend in USD, from the gateway's usage accounting.\n# TYPE ai_agents_llm_cost_usd_total counter\nai_agents_llm_cost_usd_total{agent=\"nova\"} 184.2\nai_agents_llm_cost_usd_total{agent=\"cifix\"} 12.7\n# HELP ai_agents_llm_tokens_total Tokens by type.\n# TYPE ai_agents_llm_tokens_total counter\nai_agents_llm_tokens_total{agent=\"nova\",type=\"input\"} 4210033\nai_agents_llm_tokens_total{agent=\"nova\",type=\"cache_read\"} 31880120\nai_agents_llm_tokens_total{agent=\"nova\",type=\"output\"} 902114",
+    "notes": [
+     {
+      "line": 2,
+      "text": "counter: only goes up. The store keeps every scraped value, so a rate over any window can be computed later."
+     },
+     {
+      "line": 3,
+      "text": "One series: name plus labels. The value is the total since the process started, not since the last scrape."
+     },
+     {
+      "line": 8,
+      "text": "The cache-read share in G1-09 is cache_read divided by input plus cache_read plus cache_write, from these series."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Counters with @prometheus-io/client",
+   "p": [
+    "The Node library is @prometheus-io/client. It was published as prom-client until recently; npm now marks prom-client as replaced, so install the new name. You create a Registry and define a Counter with a name, a help text and label names. Then you call inc() with label values and an amount.",
+    "Define metrics once at module level and export them; the handler code only calls inc(). If the process restarts, counters start from zero again; that is fine, because the store computes rates across the reset."
+   ],
+   "because": "We count in the gateway because every model call passes through it. So the number is complete, whatever agent or laptop made the call.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/gateway/src/metrics.ts (sketch)",
+    "text": "import * as client from \"@prometheus-io/client\";\n\nexport const registry = new client.Registry();\nclient.collectDefaultMetrics({ register: registry }); // process CPU, memory, event loop lag\n\nexport const costUsd = new client.Counter({\n  name: \"ai_agents_llm_cost_usd_total\",\n  help: \"Model spend in USD, from the gateway's usage accounting.\",\n  labelNames: [\"agent\"] as const,\n  registers: [registry],\n});\n\nexport const tokens = new client.Counter({\n  name: \"ai_agents_llm_tokens_total\",\n  help: \"Tokens by type.\",\n  labelNames: [\"agent\", \"type\"] as const,\n  registers: [registry],\n});\n\n// in the response handler, after reading the usage block of the model's answer:\n//   costUsd.inc({ agent: run.agent }, usd);\n//   tokens.inc({ agent: run.agent, type: \"cache_read\" }, usage.cache_read_input_tokens);",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The README shows import * as client; use that form. Pin the exact version in package.json (0.16.1 today)."
+     },
+     {
+      "line": 3,
+      "text": "Our own registry instead of the global one, so tests can create a fresh one."
+     },
+     {
+      "line": 4,
+      "text": "Default metrics are free and useful: memory growth and event-loop lag show a sick pod before users do."
+     },
+     {
+      "line": 9,
+      "text": "Label names are fixed here; values come at inc() time. as const keeps the names typed."
+     },
+     {
+      "line": 21,
+      "text": "inc(labels, amount). Amount defaults to 1; cost and tokens pass the real number."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Histograms: how long, in buckets",
+   "p": [
+    "A counter cannot tell you how long something took. A histogram counts observations into buckets: how many calls took under 1 s, under 5 s, under 30 s. From that the store estimates p50 or p95 with histogram_quantile. You choose the bucket edges to match what you care about.",
+    "On /metrics a histogram shows as several series: one _bucket per edge with an le label, plus _sum and _count. Grafana works on those."
+   ],
+   "because": "We use a histogram for model-call latency because the median hides a slow tail. The tail is where a stuck run shows first.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/gateway/src/metrics.ts (continued)",
+    "text": "export const callSeconds = new client.Histogram({\n  name: \"ai_agents_llm_call_seconds\",\n  help: \"Wall time of one upstream model call.\",\n  labelNames: [\"agent\"] as const,\n  buckets: [1, 5, 15, 30, 60, 120, 300],\n  registers: [registry],\n});\n\n// around the upstream fetch:\n//   const end = callSeconds.startTimer({ agent: run.agent });\n//   const res = await fetch(upstream, init);\n//   end(); // observes the elapsed seconds into the right bucket",
+    "notes": [
+     {
+      "line": 2,
+      "text": "No _total suffix: a histogram is not a counter. The unit (seconds) is in the name."
+     },
+     {
+      "line": 5,
+      "text": "Edges in seconds, in increasing order. Pick edges where you would draw a line between fine and slow."
+     },
+     {
+      "line": 10,
+      "text": "startTimer returns a function; calling it observes the time since start. observe(value) is the manual form."
+     },
+     {
+      "line": 12,
+      "text": "Every observation adds 1 to _count, the value to _sum, and 1 to every bucket with le at or above it."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The /metrics endpoint",
+   "p": [
+    "The library renders the registry as text; you serve it from your node:http server (p1-3) on a path the scraper knows. Keep it on a separate port from the API when you can, so the public route never exposes it. The content type matters: the scraper reads it to know the format."
+   ],
+   "because": "We expose /metrics on its own port because the gateway's API port is reachable by VMs, and metrics are for VMAgent only.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/gateway/src/metrics-server.ts (sketch)",
+    "text": "import { createServer } from \"node:http\";\nimport * as client from \"@prometheus-io/client\";\nimport { registry } from \"./metrics.js\";\n\nexport const startMetricsServer = (port = 9464) =>\n  createServer(async (req, res) => {\n    if (req.url !== \"/metrics\") {\n      res.writeHead(404).end();\n      return;\n    }\n    const body = await registry.metrics();\n    res.writeHead(200, { \"content-type\": client.contentType }).end(body);\n  }).listen(port);",
+    "notes": [
+     {
+      "line": 5,
+      "text": "9464 is the port the OpenTelemetry Prometheus exporter uses by default; VMAgent's scrape config names it."
+     },
+     {
+      "line": 11,
+      "text": "metrics() is async and renders every registered metric, defaults included, as the text you saw in the first section."
+     },
+     {
+      "line": 12,
+      "text": "client.contentType is the Prometheus text content type with its version; the scraper parses by it."
+     }
+    ]
+   },
+   "see": "$ curl -s localhost:9464/metrics | grep -v '^#' | head -3\nprocess_cpu_user_seconds_total 0.09\nai_agents_llm_cost_usd_total{agent=\"nova\"} 0.12\nai_agents_llm_tokens_total{agent=\"nova\",type=\"input\"} 1200",
+   "ifInstead": "If instead you see an empty body with 200, no metric is registered on that registry. Check registers: [registry] on each metric, and check that you did not render the global registry by mistake."
+  },
+  {
+   "h": "Pull or push: who starts the transfer",
+   "p": [
+    "Prometheus is pull: the scraper visits each target on a timer. That fits long-running services, and VMAgent on inf already scrapes pods by annotation. A job that runs for two minutes at 02:20 is never up when the scraper comes, so it pushes instead.",
+    "G1-03's nightly job writes Prometheus text lines with a millisecond timestamp to VictoriaMetrics' import endpoint. It goes through the integration VMUser (a login for writing metrics), the way infrastructure's send-workflow-result.yml does. The timestamp is what puts a backfilled week on the right day instead of on the day the job ran."
+   ],
+   "because": "We push with explicit timestamps because the baseline is the 12 weeks before October. Those points must land on their own weeks.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/vm.ts (sketch; the endpoint path is the one send-workflow-result.yml uses, check it there)",
+    "text": "import type { Point } from \"./types.js\"; // [name, labels, value, timestampMs]\n\nconst line = ([name, labels, value, ts]: Point): string => {\n  const pairs = Object.entries(labels).map(([k, v]) => `${k}=\"${v}\"`).join(\",\");\n  return `${name}{${pairs}} ${value} ${ts}`;\n};\n\nexport const writePoints = async (baseUrl: string, token: string, points: Point[]): Promise<void> => {\n  const res = await fetch(`${baseUrl}/api/v1/import/prometheus`, {\n    method: \"POST\",\n    headers: { authorization: `Bearer ${token}`, \"content-type\": \"text/plain\" },\n    body: points.map(line).join(\"\\n\") + \"\\n\",\n  });\n  if (!res.ok) throw new Error(`VictoriaMetrics answered ${res.status}: ${await res.text()}`);\n};\n// delivery_review_wait_hours{team=\"fe\",q=\"p50\"} 9.5 1759104000000",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The same Point tuple G1-07's weeklyPoints yields: name, labels, value, week timestamp."
+     },
+     {
+      "line": 5,
+      "text": "Prometheus text with a trailing timestamp in milliseconds. Without it, the store would stamp the point with 'now'."
+     },
+     {
+      "line": 9,
+      "text": "The import endpoint accepts this text. The real base URL and the VMUser token come from Secrets Manager via the OIDC role (p2-3)."
+     },
+     {
+      "line": 14,
+      "text": "A failed write must fail the job loudly; a silent gap in the baseline is worse than a red run."
+     },
+     {
+      "line": 16,
+      "text": "One real line: team and quantile labels, a value in hours, a Monday 00:00 UTC timestamp."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "Pushed series are not counters. delivery_* values are already weekly numbers, so dashboards plot them as they are and never wrap them in rate()."
+   }
+  },
+  {
+   "h": "Naming and labels, the rules we keep",
+   "p": [
+    "Prefix by owner: ai_agents_ for platform services, delivery_ for the nightly job, claude_code_ comes from the client. Unit in the name, _total on counters, snake_case always. Labels: agent, team, type, step, q, suite, version. Never login, email, run id or Jira key as a label on a scraped series; those belong in events.",
+    "Check the real names in vmui before writing a query. OTLP metrics arrive through the collector with Prometheus naming turned on, so what Claude Code calls claude_code.cost.usage becomes claude_code_cost_usage_USD_total."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "Why so strict about labels? Every distinct label combination is one series kept in memory and on disk. A login label on a per-call counter would make one series per person, per agent, per type. It would also make a dashboard that names people."
+   }
+  }
+ ],
+ "lab": {
+  "title": "A service with a counter and a histogram, scraped by curl",
+  "youNeed": [
+   "Node 24",
+   "curl"
+  ],
+  "worked": [
+   {
+    "do": "mkdir metrics-lab && cd metrics-lab && npm init -y && npm pkg set type=module && npm install @prometheus-io/client@0.16.1 tsx@4.23.15",
+    "see": "added N packages"
+   },
+   {
+    "do": "Write server.ts: a Registry with collectDefaultMetrics; a Counter lab_requests_total with labelNames ['agent']; a Histogram lab_request_seconds with buckets [0.01, 0.1, 1]; a node:http server on 9464 where GET /work?agent=<name> runs end = histogram.startTimer(), waits a random 0 to 200 ms, calls counter.inc({ agent }), end(), and answers 200 'ok'; GET /metrics answers registry.metrics() with client.contentType.",
+    "see": "(file saved)"
+   },
+   {
+    "do": "npx tsx server.ts &",
+    "see": "listening on 9464"
+   },
+   {
+    "do": "curl -s localhost:9464/metrics | grep lab_",
+    "see": "# HELP lab_requests_total ...\n# TYPE lab_requests_total counter\n# HELP lab_request_seconds ...\n# TYPE lab_request_seconds histogram\n(no samples yet: nothing was counted)"
+   },
+   {
+    "do": "for i in 1 2 3; do curl -s 'localhost:9464/work?agent=nova'; done; curl -s 'localhost:9464/work?agent=cifix'; echo",
+    "see": "okokokok"
+   },
+   {
+    "do": "curl -s localhost:9464/metrics | grep -E '^lab_'",
+    "see": "lab_requests_total{agent=\"nova\"} 3\nlab_requests_total{agent=\"cifix\"} 1\nlab_request_seconds_bucket{le=\"0.01\"} 0\nlab_request_seconds_bucket{le=\"0.1\"} 2\nlab_request_seconds_bucket{le=\"1\"} 4\nlab_request_seconds_bucket{le=\"+Inf\"} 4\nlab_request_seconds_sum 0.41\nlab_request_seconds_count 4"
+   },
+   {
+    "do": "curl -s localhost:9464/metrics | grep -E 'process_resident_memory_bytes|nodejs_eventloop_lag_seconds '",
+    "see": "process_resident_memory_bytes 61128704\nnodejs_eventloop_lag_seconds 0.001"
+   }
+  ],
+  "faded": "Add a second counter lab_errors_total{agent} and make GET /work?agent=<name>&fail=1 increment it and answer 500. Call it twice and scrape. The curl line that proves both counters moved is yours to write.",
+  "alone": "Write push.ts with the writePoints function from the lesson and point it at http://localhost:8428 (nothing is listening yet). Run it, read the error it throws, then start VictoriaMetrics with docker run --rm -p 8428:8428 victoriametrics/victoria-metrics:latest and run push.ts again. Open http://localhost:8428/vmui and query delivery_review_wait_hours; the point should sit on the timestamp you sent, not on now.",
+  "done": "curl shows lab_requests_total per agent and the histogram's buckets, sum and count. A pushed point appears in vmui at its own timestamp."
+ },
+ "quiz": [
+  {
+   "q": "The gateway pod restarts and ai_agents_llm_cost_usd_total drops from 184 to 0. Is the day's spend lost?",
+   "options": [
+    {
+     "text": "Yes; you must persist counters to disk.",
+     "correct": false,
+     "why": "Counters live in memory by design; the store already holds every scraped value."
+    },
+    {
+     "text": "No; the store saw every value and increase() handles the reset.",
+     "correct": true,
+     "why": "Prometheus-style stores treat a drop as a reset and add the pieces when computing rate or increase."
+    },
+    {
+     "text": "Only if VMAgent scraped in the last 30 seconds.",
+     "correct": false,
+     "why": "You lose at most the un-scraped tail of one interval, not the day."
+    }
+   ]
+  },
+  {
+   "q": "Which of these is a good label for a scraped counter in the gateway?",
+   "options": [
+    {
+     "text": "jira=\"RH-8744\"",
+     "correct": false,
+     "why": "One series per ticket, forever; the run token carries the ticket, and events hold that detail."
+    },
+    {
+     "text": "agent=\"nova\"",
+     "correct": true,
+     "why": "A handful of values, meaningful to split by, and never a person."
+    },
+    {
+     "text": "user=\"sean@example.com\"",
+     "correct": false,
+     "why": "Personal and high-cardinality; no dashboard has a person dimension."
+    }
+   ]
+  },
+  {
+   "q": "Why does the nightly job push with millisecond timestamps instead of serving /metrics?",
+   "options": [
+    {
+     "text": "Because pushing is faster than scraping.",
+     "correct": false,
+     "why": "Speed is not the point; the job is not running when a scraper would visit."
+    },
+    {
+     "text": "Because it runs for minutes at 02:20 and backfills 12 weeks, so each point must land on its own week.",
+     "correct": true,
+     "why": "A scrape would stamp everything with the scrape time; explicit timestamps put the baseline where it belongs."
+    },
+    {
+     "text": "Because VictoriaMetrics cannot scrape.",
+     "correct": false,
+     "why": "VMAgent scrapes every pod on inf; the job is the exception, not the store."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p6-1: which processor deletes the prompt attribute, and why does it run before batch?",
+  "From p1-3: what does a node:http handler receive, and how do you send a status code and a body?"
+ ],
+ "videos": [
+  {
+   "title": "Server Monitoring // Prometheus and Grafana Tutorial",
+   "url": "https://www.youtube.com/watch?v=9TJx7QTrTyo",
+   "channel": "Christian Lempa",
+   "minutes": 25,
+   "why": "Very popular hands-on setup of Prometheus scraping and a Grafana dashboard."
+  },
+  {
+   "title": "Creating alerts with Grafana | Grafana for Beginners Ep 11",
+   "url": "https://www.youtube.com/watch?v=6W8Nu4b_PXM",
+   "channel": "Grafana",
+   "minutes": 17,
+   "why": "Official Grafana beginner episode on alert rules and notifications."
+  }
+ ],
+ "words": [
+  {
+   "term": "series",
+   "plain": "One metric name with one set of label values; each distinct combination is its own line on /metrics."
+  },
+  {
+   "term": "counter",
+   "plain": "A metric that only goes up; you call inc() and let the store compute rates."
+  },
+  {
+   "term": "histogram",
+   "plain": "Counts observations into buckets (le edges) plus _sum and _count, so the store can estimate p50 or p95."
+  },
+  {
+   "term": "registry",
+   "plain": "The in-memory set of metrics that metrics() renders as text."
+  },
+  {
+   "term": "scrape",
+   "plain": "A timed GET of /metrics by VMAgent; pull, not push."
+  },
+  {
+   "term": "import endpoint",
+   "plain": "VictoriaMetrics' write path for Prometheus text with timestamps, used by jobs that are not up to be scraped."
+  },
+  {
+   "term": "cardinality",
+   "plain": "How many distinct label combinations a metric has; keep it small, never a person."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G1-03",
+   "why": "The nightly job writes Prometheus text with millisecond timestamps to VictoriaMetrics: the push half of this lesson."
+  },
+  {
+   "key": "G1-07",
+   "why": "weeklyPoints yields the Point tuples that writePoints turns into lines."
+  },
+  {
+   "key": "G1-10",
+   "why": "The spend view and the burn-rate alert read the gateway's counters by agent and the job's ai_spend_* series."
+  },
+  {
+   "key": "G1-14",
+   "why": "The gateway's token and cost series must carry the step label set by the harness."
+  }
+ ],
+ "remember": "Counters go up, histograms bucket, and /metrics is scraped on a timer. A job that is not alive at scrape time pushes text with its own timestamps."
+}

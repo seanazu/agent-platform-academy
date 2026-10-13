@@ -1,0 +1,454 @@
+{
+ "id": "p6-4",
+ "title": "Measuring delivery",
+ "minutes": 50,
+ "youNeed": [
+  "p6-3",
+  "p1-6"
+ ],
+ "bridge": "The nightly metrics job is like a Playwright nightly suite that reports numbers instead of pass or fail. A cron starts it; it pulls data, computes, and writes a result. Except: its inputs are GitHub, Jira and CI history, and its output is time series per team and week. Nothing it writes is ever per person.",
+ "intro": "'Is it helping?' can only be answered against a baseline. G1-03, G1-06 and G1-07 build a job that pulls PRs, tickets and CI runs every night. It computes review wait, lead time, change failure and red-main hours per team. It also backfills the 12 weeks before October. G1-13 adds DX's three lenses so no single number misleads.",
+ "picture": {
+  "caption": "A cron starts the job, and three collectors pull raw facts. Compute turns them into weekly team-level points, and the writer pushes them. The delivery dashboard draws them against the baseline.",
+  "nodes": [
+   {
+    "id": "cron",
+    "label": "delivery-metrics.yml, cron 20 2 * * *",
+    "kind": "file"
+   },
+   {
+    "id": "pull",
+    "label": "github.ts / jira.ts / ci.ts",
+    "kind": "service"
+   },
+   {
+    "id": "raw",
+    "label": "raw JSON artifact for the day",
+    "kind": "file"
+   },
+   {
+    "id": "compute",
+    "label": "compute.ts and lenses.ts",
+    "kind": "service"
+   },
+   {
+    "id": "vm",
+    "label": "VictoriaMetrics (delivery_*)",
+    "kind": "service"
+   },
+   {
+    "id": "dash",
+    "label": "delivery-impact dashboard",
+    "kind": "service"
+   }
+  ],
+  "steps": [
+   {
+    "from": "cron",
+    "to": "pull",
+    "text": "02:20 UTC on ubuntu-22.04-2core; read-only App token for GitHub, service token for Jira"
+   },
+   {
+    "from": "pull",
+    "to": "raw",
+    "text": "store the day's raw pull so a metric fix can be recomputed without the APIs"
+   },
+   {
+    "from": "raw",
+    "to": "compute",
+    "text": "one function per metric, weekly, per team, with p50, p85 and counts"
+   },
+   {
+    "from": "compute",
+    "to": "vm",
+    "text": "Point tuples become Prometheus lines with the week's timestamp (p6-2)"
+   },
+   {
+    "from": "vm",
+    "to": "dash",
+    "text": "panels draw each metric next to its delivery_baseline_* line"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "The numbers and the baseline",
+   "p": [
+    "Five metrics have history and can be backfilled. Review wait runs from ready for review to the first human review. Lead time runs from first commit to merge.",
+    "Change failure is a revert, hotfix or Bug fix within 14 days on the same lines. The last two are red-main hours and the share of PRs with AI help. Three are agent-only and start as 'no data': agent PR merge rate, human rework, CI auto-fix success. Byte's and the runtime's quality numbers join under the same delivery_ prefix, seventeen in all.",
+    "The baseline is the 12 weeks before October, computed once with delivery-metrics backfill --weeks 12 --until 2026-09-30 and written as delivery_baseline_* series. Every panel draws its baseline as a reference line. Without it, December's numbers compare to nothing."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "Why team level, never person? A number per person becomes a ranking, and a ranking changes behaviour in the wrong direction. Teams under 3 people report as 'other' for the same reason."
+   }
+  },
+  {
+   "h": "Pulling PRs with their timeline",
+   "p": [
+    "github.ts asks GitHub's GraphQL API (p2-5) for PRs in one week with their commits and two kinds of timeline event. One is when the PR became ready for review; the other is each review with its state and author type. It asks one week per query, because search stops at 1000 results. The generator pages through each week and yields one PR at a time."
+   ],
+   "because": "We derive firstCommitAt and the AI trailer while pulling. Every metric downstream needs them, and the raw page is in hand only here.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/github.ts (from G1-03, the generator; the QUERY is in p2-5)",
+    "text": "/** One week per query (GitHub search stops at 1000 results). Run again with field = \"merged\". */\nexport async function* pullRequests(repo: string, weekStart: string, weekEnd: string, field: \"created\" | \"merged\" = \"created\") {\n  const q = `repo:${repo} is:pr ${field}:${weekStart}..${weekEnd}`;\n  let after: string | null = null;\n  do {\n    const { search }: PrSearch = await graphql(QUERY, { q, after });\n    for (const { commits, timelineItems, ...pr } of search.nodes) {\n      const done = commits.nodes.map((n) => n.commit);\n      const firstCommitAt = done.map((c) => c.authoredDate).sort()[0] ?? pr.createdAt; // ISO strings sort by time\n      const aiTrailer = pr.bodyText.includes(\"Generated with Claude Code\") || done.some((c) => c.message.includes(\"Co-Authored-By: Claude\"));\n      yield { ...pr, firstCommitAt, aiTrailer, timeline: timelineItems.nodes };\n    }\n    after = search.pageInfo.hasNextPage ? search.pageInfo.endCursor : null;\n  } while (after);\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "async function* yields PRs one by one; the caller uses for await and never holds a whole quarter in memory."
+     },
+     {
+      "line": 3,
+      "text": "A GitHub search string. created: finds PRs opened that week; merged: finds those merged that week, for lead time."
+     },
+     {
+      "line": 9,
+      "text": "ISO timestamps sort as strings, so the first element is the earliest commit. A PR with no commits falls back to createdAt."
+     },
+     {
+      "line": 10,
+      "text": "AI help is detected from the trailer Claude Code writes, in the body or in any commit message."
+     },
+     {
+      "line": 13,
+      "text": "Cursor paging: endCursor goes back as after until hasNextPage is false."
+     }
+    ]
+   }
+  },
+  {
+   "h": "From events to one number per PR",
+   "p": [
+    "compute.ts has one small pure function per metric. Each takes a PR (or a merged PR and the list of fixes) and returns a number. It returns undefined when the PR does not qualify. Keeping them pure means node:test can check them with fixture data, no API in sight."
+   ],
+   "because": "We count only reviews by a different person of type User. A bot's review or the author's own comment is not the wait we are measuring.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/compute.ts (from G1-07, the per-PR functions)",
+    "text": "import { days, hours, median, quantile } from \"./stats.js\"; // ISO timestamps in, numbers out; quantile as Python's statistics\nimport type { Fix, MergedPr, Point, PullRequest } from \"./types.js\";\n\n/** Ready for review (or opened, if never a draft) to the first review by another person. */\nexport function reviewWaitHours(pr: PullRequest): number | undefined {\n  const ready = pr.timeline.find((e) => e.__typename === \"ReadyForReviewEvent\")?.createdAt ?? pr.createdAt;\n  const first = pr.timeline.find((e) => e.__typename === \"PullRequestReview\"\n    && e.author?.__typename === \"User\" && e.author.login !== pr.author.login)?.createdAt;\n  return first ? hours(ready, first) : undefined;\n}\n\nexport const leadTimeHours = (pr: PullRequest) => (pr.mergedAt ? hours(pr.firstCommitAt, pr.mergedAt) : undefined);\n\n/** A revert, hotfix or Bug fix within 14 days on the same lines (G2's miner does the blame). */\nexport const changeFailed = (pr: MergedPr, fixes: Fix[]) =>\n  fixes.some((f) => f.introducedBy === pr.number && days(pr.mergedAt, f.mergedAt) <= 14);",
+    "notes": [
+     {
+      "line": 6,
+      "text": "A PR opened as a draft starts the clock when it becomes ready; one opened ready starts at creation."
+     },
+     {
+      "line": 8,
+      "text": "Two filters: a human (not Byte), and not the author. The first such review ends the wait."
+     },
+     {
+      "line": 9,
+      "text": "undefined, not 0, when no review happened yet; the weekly step drops those instead of counting a zero wait."
+     },
+     {
+      "line": 12,
+      "text": "Lead time only exists for merged PRs: first commit to merge."
+     },
+     {
+      "line": 16,
+      "text": "G2's golden-set miner says which merged PR a later fix touched; this only applies the 14-day window."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Weekly points per team",
+   "p": [
+    "weeklyPoints groups a week's PRs by team and yields Point tuples: name, labels, value, timestamp. The team comes from a function the caller passes. It maps the author (or the requester, for agent PRs) to a team through the Vault team map. Small teams fold into 'other'. Medians need at least two values, so a team with one PR that week yields no wait point."
+   ],
+   "because": "We yield p50 and p85 with counts, not a mean. One 3-day review would drag a mean for a team of six and tell a false story.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/compute.ts (continued)",
+    "text": "export function* weeklyPoints(prs: PullRequest[], fixes: Fix[], teamOf: (pr: PullRequest) => string, weekTs: number): Generator<Point> {\n  const byTeam = new Map<string, PullRequest[]>();\n  for (const pr of prs) { // agent PRs count for the requester's team; teams under 3 people map to \"other\"\n    byTeam.set(teamOf(pr), [...(byTeam.get(teamOf(pr)) ?? []), pr]);\n  }\n  for (const [team, items] of byTeam) {\n    const waits = items.map(reviewWaitHours).filter((w) => w !== undefined);\n    if (waits.length >= 2) {\n      yield [\"delivery_review_wait_hours\", { team, q: \"p50\" }, median(waits), weekTs];\n      yield [\"delivery_review_wait_hours\", { team, q: \"p85\" }, quantile(waits, 0.85), weekTs];\n    }\n    const merged = items.filter((p): p is MergedPr => p.mergedAt !== null);\n    yield [\"delivery_merged_prs\", { team }, merged.length, weekTs];\n    yield [\"delivery_failed_changes\", { team }, merged.filter((p) => changeFailed(p, fixes)).length, weekTs];\n  }\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "A generator of Points; the writer from p6-2 turns each into one Prometheus line with weekTs as the timestamp."
+     },
+     {
+      "line": 4,
+      "text": "Append to the team's list. teamOf is injected so tests can pass a fixed map."
+     },
+     {
+      "line": 7,
+      "text": "Drop PRs with no review yet; they would be zeros and pull the median down."
+     },
+     {
+      "line": 9,
+      "text": "Two points with a q label instead of two metric names, so one panel can draw both with legend {{q}}."
+     },
+     {
+      "line": 14,
+      "text": "Failed changes next to merged PRs, so the dashboard can show both in one panel and compute the percentage."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Red main: hours with a failing required job",
+   "p": [
+    "ci.ts lists runs of cloud-ci.yml, client-ci.yml and frontend-ci.yaml on main. It keeps only the required unit-test jobs, under both the new name and the old 'Unit Tests'. So flaky integration tests do not paint main red. Then redHours walks the results in time order and adds up the stretches where any workflow's latest result was a failure. Two red workflows at once count once."
+   ],
+   "because": "We count overlapping red windows once because the question is 'how long could nobody trust main'. That does not double when two things break together.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/ci.ts (from G1-06, redHours)",
+    "text": "export type Result = { workflow: string; at: Date; ok: boolean };\n\n/** main is red while any required job's latest result is a failure; overlaps count once. */\nexport function redHours(results: Result[]): number {\n  const state = new Map<string, boolean>();\n  let redSince: Date | undefined, total = 0;\n  for (const { workflow, at, ok } of results.toSorted((a, b) => a.at.getTime() - b.at.getTime())) {\n    state.set(workflow, ok);\n    const redNow = [...state.values()].includes(false);\n    if (redNow && !redSince) redSince = at;\n    else if (!redNow && redSince) { total += (at.getTime() - redSince.getTime()) / 3_600_000; redSince = undefined; }\n  }\n  return total;\n}",
+    "notes": [
+     {
+      "line": 5,
+      "text": "One boolean per workflow: its latest result. Main is red if any is false."
+     },
+     {
+      "line": 7,
+      "text": "toSorted returns a sorted copy (Node 20+), oldest first, without changing the input."
+     },
+     {
+      "line": 10,
+      "text": "Going red starts a window; a later red result while already red changes nothing."
+     },
+     {
+      "line": 11,
+      "text": "Going green closes the window and adds its length in hours. 3_600_000 ms is one hour."
+     },
+     {
+      "line": 13,
+      "text": "A window still open at the end is not counted; tomorrow's run sees it close."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The three DX lenses",
+   "p": [
+    "DX's framework reads three lenses together. Utilization: are people and agents using it?",
+    "Impact: is delivery better, with change failure beside throughput? Cost: what does it cost, per engineer and per hour of agent work? Any one alone misleads: usage can rise while impact falls; impact can rise at a price we do not want.",
+    "lenses.ts computes them per team and week. Every key becomes a delivery_lens_<key> series, and a 'Three lenses' row sits at the top of the delivery dashboard."
+   ],
+   "because": "We compute the three lenses from the same inputs as the other metrics. They must line up week for week on one chart.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/metrics/src/lenses.ts (from G1-13, utilization and impact)",
+    "text": "export const share = <T>(items: T[], predicate: (item: T) => boolean): number =>\n  items.length ? items.filter(predicate).length / items.length : 0;\n\nexport const utilization = async (week: Week, otel: Otel, prs: PullRequest[], jira: Jira) => ({\n  weekly_ai_users: await otel.distinct(\"user_hash\", week), // salted hash from the collector; no emails\n  pr_ai_share: share(prs, (pr) => pr.aiTrailer), // Co-Authored-By: Claude / \"Generated with Claude Code\"\n  tasks_to_agents: (await jira.count('assignee = \"Nova\"', week)) + (await jira.routineRuns(week)),\n});\n\nexport const impact = (_week: Week, prs: PullRequest[], failed: Set<number>, agentRuns: AgentRun[]) => {\n  const merged = prs.filter((pr) => pr.mergedAt);\n  return {\n    merged_prs: merged.length, // always shown next to change failure, never alone\n    change_fail_pct: 100 * share(merged, (pr) => failed.has(pr.number)),\n    // decide (Nir): proposal = the hours an engineer would need, stated in Nova's approved plan\n    human_equivalent_hours: agentRuns.filter((run) => run.merged).reduce((sum, run) => sum + run.humanHours, 0),\n  };\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "share is the one helper every lens uses: fraction of items that match, 0 for an empty list."
+     },
+     {
+      "line": 5,
+      "text": "Distinct user.hash values from the collector (p6-1): a count of people with no names."
+     },
+     {
+      "line": 7,
+      "text": "Tasks given to agents: tickets assigned to Nova plus routine runs. Both are counts, never who."
+     },
+     {
+      "line": 14,
+      "text": "Change failure as a percent of merged PRs, from the same failed set weeklyPoints used."
+     },
+     {
+      "line": 16,
+      "text": "Human-equivalent hours is a decision with Nir; the proposal is the estimate in Nova's approved plan."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Cost, and the workflow that runs it all",
+   "p": [
+    "The cost lens adds agent spend (the gateway's counter) and people's spend (Claude Code's counter). It divides by engineers for a team average, and reports agent dollars per human-equivalent hour. The plan text wrote the rate upside down, as hours over cost. As a rate it is cost over hours, and the wording is confirmed with Nir.",
+    "The job runs from ai-agents/.github/workflows/delivery-metrics.yml. It is a plain workflow from p2-1: a cron, setup-node, npm ci for the workspace, build, run. It logs in to AWS with the GitHubActions OIDC role (p2-3) to read the VMUser token from Secrets Manager. It reads GitHub with a read-only App token (p2-4)."
+   ],
+   "because": "We write the workflow from the ticket's steps. Then you can see that the hardest part of this goal is the arithmetic, not the plumbing.",
+   "code": {
+    "lang": "yaml",
+    "file": "ai-agents/.github/workflows/delivery-metrics.yml (sketch from G1-03)",
+    "text": "name: Delivery metrics\non:\n  schedule:\n    - cron: '20 2 * * *'\n  workflow_dispatch:\npermissions:\n  id-token: write   # OIDC to the GitHubActions role, for the VMUser token in Secrets Manager\n  contents: read\njobs:\n  nightly:\n    runs-on: ubuntu-22.04-2core   # only public APIs are called; an ai-agents runner set if G3 or G5 adds one\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with: { persist-credentials: false }\n      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0\n        with: { node-version: 24, cache: npm }\n      - run: npm ci --workspace metrics --include-workspace-root\n      - run: npm run build -w shared -w metrics\n      - id: gh\n        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0\n        with: { app-id: \"${{ secrets.METRICS_APP_ID }}\", private-key: \"${{ secrets.METRICS_APP_PRIVATE_KEY }}\", permission-pull-requests: read, permission-contents: read, permission-actions: read, permission-checks: read }\n      - run: node metrics/dist/cli.js nightly\n        env:\n          GITHUB_TOKEN: ${{ steps.gh.outputs.token }}",
+    "notes": [
+     {
+      "line": 4,
+      "text": "02:20 UTC every night. The 12-week backfill is run once by hand with the backfill subcommand."
+     },
+     {
+      "line": 11,
+      "text": "A GitHub-hosted runner: the job calls api.github.com, Jira and the public VictoriaMetrics write path only."
+     },
+     {
+      "line": 17,
+      "text": "Install only the metrics workspace and the root, so the job does not pull the harness or the orchestrator."
+     },
+     {
+      "line": 18,
+      "text": "metrics imports the shared package, so both must be built."
+     },
+     {
+      "line": 20,
+      "text": "A separate read-only App for metrics; the agents' rhino-ai-agents key stays with the broker alone."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "Agent-only metrics start as 'no data', not 0. A zero would draw a fake drop on the chart before the first agent PR exists."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Test the delivery arithmetic with fixtures, no API needed",
+  "youNeed": [
+   "Node 24",
+   "the metrics-lab folder from p6-2 (or a new folder)"
+  ],
+  "worked": [
+   {
+    "do": "cd metrics-lab && mkdir -p src test && npm install typescript@5.9.3 @types/node@24.10.1",
+    "see": "added N packages"
+   },
+   {
+    "do": "Write src/stats.ts: hours(a, b) = (Date.parse(b) - Date.parse(a)) / 3_600_000; days(a, b) = hours(a, b) / 24; median(xs) = the middle value of the sorted copy (mean of the two middles for an even length); quantile(xs, q) = the sorted value at index Math.ceil(q * xs.length) - 1.",
+    "see": "(file saved)"
+   },
+   {
+    "do": "Write src/types.ts with the types the lesson's code uses: PullRequest { number, createdAt, mergedAt: string | null, firstCommitAt, aiTrailer, author: { login }, timeline: TimelineEvent[] }, TimelineEvent (__typename, createdAt, author?: { login, __typename }), MergedPr (mergedAt: string), Fix { introducedBy, mergedAt }, Point tuple.",
+    "see": "(file saved)"
+   },
+   {
+    "do": "Copy reviewWaitHours, leadTimeHours, changeFailed and weeklyPoints from the lesson into src/compute.ts, and redHours into src/ci.ts.",
+    "see": "(two files saved)"
+   },
+   {
+    "do": "Write test/compute.test.ts with node:test: a PR created 2026-09-01T09:00:00Z, a ReadyForReviewEvent at 12:00, a PullRequestReview at 15:00 by { login: 'dana', __typename: 'User' }, author { login: 'sean' }. assert.equal(reviewWaitHours(pr), 3). A second test: a review by { login: 'byte[bot]', __typename: 'Bot' } only gives undefined.",
+    "see": "(file saved)"
+   },
+   {
+    "do": "node --import tsx --test test/",
+    "see": "✔ review wait counts from ready-for-review to the first human review (2ms)\n✔ a bot review does not end the wait (1ms)\nℹ tests 2\nℹ pass 2"
+   },
+   {
+    "do": "Add test/ci.test.ts: results for cloud at 00:00 failure, client at 01:00 failure, cloud at 02:00 success, client at 03:00 success. assert.equal(redHours(results), 3). Run the tests again.",
+    "see": "✔ overlapping red windows count once\nℹ pass 3"
+   }
+  ],
+  "faded": "Add a weeklyPoints test with three PRs for team fe and one for team be. Two fe PRs are merged, and one of them is failed by a fix 5 days later. Use teamOf by a fixed map and weekTs 1756684800000. Collect the generator into an array and assert that delivery_merged_prs for fe is 2 and delivery_failed_changes for fe is 1. The assertion that the be team yields no delivery_review_wait_hours point (only one PR) is yours to write.",
+  "alone": "Write src/vm.ts with writePoints from p6-2. Write a small cli.ts that builds the fixture PRs, runs weeklyPoints, and prints the Prometheus lines instead of posting them. Check by eye that every line has a team label, a value and the week timestamp. No line may carry a login. Then write one test for leadTimeHours with a draft PR whose first commit is 30 hours before merge.",
+  "done": "node --import tsx --test passes. It has tests for review wait, the bot case, overlapping red hours, weekly points per team and lead time. The printed lines carry team and q labels only."
+ },
+ "quiz": [
+  {
+   "q": "A PR got one review from byte[bot] and none from a person. What is its review wait?",
+   "options": [
+    {
+     "text": "0 hours, because a review happened.",
+     "correct": false,
+     "why": "Byte's review has author __typename Bot and is filtered out; a bot is not the reviewer we are waiting for."
+    },
+    {
+     "text": "undefined, and it is dropped from the week's median.",
+     "correct": true,
+     "why": "reviewWaitHours returns undefined with no human review; weeklyPoints filters undefined out instead of counting a zero."
+    },
+    {
+     "text": "The time to Byte's review, since it is the first.",
+     "correct": false,
+     "why": "The find() requires __typename User and a login different from the author."
+    }
+   ]
+  },
+  {
+   "q": "cloud-ci and client-ci are both red from 10:00 to 12:00. How many red-main hours is that?",
+   "options": [
+    {
+     "text": "4",
+     "correct": false,
+     "why": "That double counts; the question is how long nobody could trust main."
+    },
+    {
+     "text": "2",
+     "correct": true,
+     "why": "redHours keeps one window while any workflow is red, so overlaps count once."
+    },
+    {
+     "text": "0, because integration tests are excluded.",
+     "correct": false,
+     "why": "Integration jobs are excluded; the required unit-test jobs of both workflows count."
+    }
+   ]
+  },
+  {
+   "q": "Why do agent-only metrics start as 'no data' rather than 0?",
+   "options": [
+    {
+     "text": "Because VictoriaMetrics cannot store zeros.",
+     "correct": false,
+     "why": "It stores zeros fine; the choice is about what the chart would say."
+    },
+    {
+     "text": "Because a 0 before the first agent PR would draw a fake drop on the chart.",
+     "correct": true,
+     "why": "G1-07 says it: no data means the panel is empty until there is something to show."
+    },
+    {
+     "text": "Because the baseline has no agent data.",
+     "correct": false,
+     "why": "True, but that is the reason for the baseline line, not for the no-data rule."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p6-3: which two numbers must always share a panel on the delivery dashboard?",
+  "From p1-6: how do you run node:test files written in TypeScript, and which assert module do we use?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "review wait",
+   "plain": "Hours from ready-for-review (or open) to the first review by a different person."
+  },
+  {
+   "term": "lead time",
+   "plain": "Hours from a PR's first commit to its merge."
+  },
+  {
+   "term": "change failure",
+   "plain": "A merged PR that a revert, hotfix or Bug fix touched within 14 days."
+  },
+  {
+   "term": "red main",
+   "plain": "Hours during which any required unit-test job's latest result on main was a failure, overlaps counted once."
+  },
+  {
+   "term": "baseline",
+   "plain": "The same metrics for the 12 weeks before October, written once as delivery_baseline_* and drawn as a line."
+  },
+  {
+   "term": "DX lenses",
+   "plain": "Utilization, impact and cost read together, because any one alone misleads."
+  },
+  {
+   "term": "human-equivalent hours",
+   "plain": "The hours an engineer would have needed for agent work; proposal: the estimate in Nova's approved plan, decided with Nir."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G1-03",
+   "why": "The GraphQL pull, the generator and the nightly workflow are this lesson's first half."
+  },
+  {
+   "key": "G1-06",
+   "why": "redHours and the required-job filter are the CI collector you tested with fixtures."
+  },
+  {
+   "key": "G1-07",
+   "why": "reviewWaitHours, leadTimeHours, changeFailed and weeklyPoints are the compute step you copied and tested."
+  },
+  {
+   "key": "G1-13",
+   "why": "The three lenses are computed from the same inputs and written as delivery_lens_* series."
+  }
+ ],
+ "remember": "Pull raw facts nightly and keep them. Compute pure weekly numbers per team with counts beside medians, and draw them against a baseline. Never write a number per person."
+}

@@ -1,0 +1,452 @@
+{
+ "id": "p1-6",
+ "title": "Tests with node:test",
+ "minutes": 50,
+ "youNeed": [
+  "p1-5"
+ ],
+ "bridge": "node:test is like Vitest with fewer features: test(), assertions and a runner, built into Node. Except: there is no expect() and no automatic mocking. You assert with node:assert/strict, and you replace real services with fakes that you pass in.",
+ "intro": "Every ai-agents package tests with node:test and node:assert/strict, run through tsx, like Byte. This lesson writes tests for the token, the server and an AWS call. It also shows how to read a failure.",
+ "picture": {
+  "caption": "The runner loads each test file through tsx; the code under test talks to fakes, never to real services.",
+  "nodes": [
+   {
+    "id": "cmd",
+    "label": "node --import tsx --test",
+    "kind": "service"
+   },
+   {
+    "id": "files",
+    "label": "svc/test/*.test.ts",
+    "kind": "file"
+   },
+   {
+    "id": "code",
+    "label": "code under test",
+    "kind": "service"
+   },
+   {
+    "id": "fakes",
+    "label": "fakes: clock, port 0, mock.fn, EC2 mock",
+    "kind": "service"
+   },
+   {
+    "id": "result",
+    "label": "✔ / ✖ and a summary",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "cmd",
+    "to": "files",
+    "text": "finds the files from the quoted glob and loads each one through tsx"
+   },
+   {
+    "from": "files",
+    "to": "code",
+    "text": "each test() calls our functions with known inputs"
+   },
+   {
+    "from": "code",
+    "to": "fakes",
+    "text": "time, network and AWS are fakes the test passed in"
+   },
+   {
+    "from": "files",
+    "to": "result",
+    "text": "assert/strict throws on a mismatch; the test turns ✖"
+   },
+   {
+    "from": "result",
+    "to": "cmd",
+    "text": "any ✖ makes the exit code 1, so CI fails"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "The first test file",
+   "p": [
+    "A test file imports test from node:test and assert from node:assert/strict. Each test() has a name and a function; it passes if the function returns or resolves without throwing.",
+    "assert.equal compares with Object.is, like ===. assert.deepEqual compares objects field by field. Both are strict because we import the /strict module."
+   ],
+   "because": "We test the token first because it is pure: same inputs, same output, no server and no network.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/test/token.test.ts",
+    "text": "import assert from \"node:assert/strict\";\nimport { test } from \"node:test\";\nimport { signToken, verifyToken } from \"../src/token.js\";\n\nconst KEY = \"test-key\";\nconst claims = { agent: \"nova\", jira: \"RH-1\", run: \"run-1\", exp: 2_000_000_000 };\n\ntest(\"a signed token verifies and returns its claims\", () => {\n  assert.deepEqual(verifyToken(signToken(claims, KEY), KEY), claims);\n});\ntest(\"a token signed with another key is refused\", () => {\n  assert.equal(verifyToken(signToken(claims, \"other\"), KEY), null);\n});\ntest(\"changing a claim breaks the signature\", () => {\n  const [, mac] = signToken(claims, KEY).split(\".\");\n  const forged = Buffer.from(JSON.stringify({ ...claims, agent: \"admin\" })).toString(\"base64url\");\n  assert.equal(verifyToken(`${forged}.${mac}`, KEY), null);\n});\ntest(\"an expired token is refused\", () => {\n  const now = (claims.exp + 1) * 1000; // a fake clock: one second after exp\n  assert.equal(verifyToken(signToken(claims, KEY), KEY, now), null);\n});",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The strict module: equal means ===, deepEqual is a deep strict compare."
+     },
+     {
+      "line": 3,
+      "text": "Tests import the source with a .js ending too; tsx finds token.ts."
+     },
+     {
+      "line": 6,
+      "text": "A fixed expiry in 2033, so the test does not depend on today's date."
+     },
+     {
+      "line": 16,
+      "text": "The attack from p1-4's faded lab, kept as a test so nobody breaks it later."
+     },
+     {
+      "line": 20,
+      "text": "The fake clock: verifyToken takes now as a parameter, so no real time passes."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Run them through tsx",
+   "p": [
+    "node --test runs test files. --import tsx loads tsx first, so Node can read .ts files. The glob is in quotes, so Node expands it, not your shell, and ** reaches every folder.",
+    "This is the root test script of ai-agents: node --import tsx --test \"*/test/**/*.test.ts\". Add it to ~/p1-lab's package.json as scripts.test with svc/ in place of the first *."
+   ],
+   "because": "We run tests through tsx because then there is no build step between editing a test and running it.",
+   "code": {
+    "lang": "bash",
+    "file": "terminal, in ~/p1-lab",
+    "text": "node --import tsx --test \"svc/test/**/*.test.ts\"\nnpm pkg set scripts.test='node --import tsx --test \"svc/test/**/*.test.ts\"'\nnpm test",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Registers tsx inside Node before any test file loads."
+     },
+     {
+      "line": 1,
+      "text": "Quoted: Node 24 expands the glob itself, the same on every shell and in CI."
+     },
+     {
+      "line": 3,
+      "text": "The same command, saved as the script CI calls."
+     }
+    ]
+   },
+   "see": "✔ a signed token verifies and returns its claims (3.2ms)\n✔ a token signed with another key is refused (1.9ms)\n✔ changing a claim breaks the signature (0.4ms)\n✔ an expired token is refused (0.2ms)\nℹ tests 4\nℹ pass 4\nℹ fail 0",
+   "ifInstead": "If instead you passed a folder and see '✖ svc/test' with 'test failed', pass the quoted glob. A folder is read as one file."
+  },
+  {
+   "h": "Test a real server on port 0",
+   "p": [
+    "The server is tested for real: start it, send fetch requests, read status codes. listen(0) asks the operating system for any free port, so two test files never fight over 8080.",
+    "before() starts the server once for the file and after() closes it. Each test makes its own requests."
+   ],
+   "because": "We start the real server because callers rely on its routes, its 401 and its 413, and a fake would hide them.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/test/server.test.ts",
+    "text": "import assert from \"node:assert/strict\";\nimport type { AddressInfo } from \"node:net\";\nimport { after, before, test } from \"node:test\";\nimport { newCapability } from \"../src/capability.js\";\nimport { createApp } from \"../src/server.js\";\n\nconst { capability, digest } = newCapability();\nconst server = createApp(digest);\nconst auth = { authorization: `Bearer ${capability}` };\nlet base = \"\";\nbefore(async () => {\n  await new Promise<void>((done) => server.listen(0, done)); // port 0: the OS picks a free port\n  base = `http://localhost:${(server.address() as AddressInfo).port}`;\n});\nafter(() => server.close());\ntest(\"GET /health answers without a capability\", async () => {\n  assert.equal((await fetch(`${base}/health`)).status, 200);\n});\ntest(\"a missing capability gets 401\", async () => {\n  assert.equal((await fetch(`${base}/v1/notes`)).status, 401);\n});\ntest(\"a body over 1 MiB gets 413\", async () => {\n  const res = await fetch(`${base}/v1/notes`, { method: \"POST\", headers: auth, body: \"a\".repeat(1024 * 1024 + 1) });\n  assert.equal(res.status, 413);\n});",
+    "notes": [
+     {
+      "line": 8,
+      "text": "This is why p1-4 made createApp: the test brings its own capability."
+     },
+     {
+      "line": 12,
+      "text": "listen takes a callback; we wrap it in a promise so before() can await it."
+     },
+     {
+      "line": 13,
+      "text": "Asks which port the OS chose."
+     },
+     {
+      "line": 15,
+      "text": "Close the server, or the test process never exits."
+     },
+     {
+      "line": 23,
+      "text": "One byte over the limit: the smallest body that must fail."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Fakes you pass in",
+   "p": [
+    "A fake is a stand-in for something slow or outside: a clock, a broker, a file reader. The trick is in the code under test, not in the test. A function that takes its broker, clock or readFile as a parameter can be tested with a fake one.",
+    "mock.fn from node:test makes a fake function that records its calls. You check how many calls there were and with what arguments."
+   ],
+   "because": "We pass dependencies in because then a test needs no network, no Slack and no AWS, and runs in milliseconds.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/test/progress.test.ts",
+    "text": "import assert from \"node:assert/strict\";\nimport { mock, test } from \"node:test\";\n\ninterface Broker { post(text: string): Promise<void> }\nconst postProgress = async (broker: Broker, text: string): Promise<string> => {\n  await broker.post(text.slice(0, 400)); // keep updates short\n  return \"posted\";\n};\n\ntest(\"postProgress sends the text to the broker once\", async () => {\n  const post = mock.fn(async (_text: string) => {}); // a fake broker method that records its calls\n  assert.equal(await postProgress({ post }, \"step 2 done\"), \"posted\");\n  assert.equal(post.mock.callCount(), 1);\n  assert.deepEqual(post.mock.calls[0]?.arguments, [\"step 2 done\"]);\n});",
+    "notes": [
+     {
+      "line": 4,
+      "text": "The function asks only for what it uses: an object with post()."
+     },
+     {
+      "line": 5,
+      "text": "In the harness this is a tool handler that calls the broker (lesson p8-3)."
+     },
+     {
+      "line": 11,
+      "text": "A real function that does nothing here and remembers every call."
+     },
+     {
+      "line": 13,
+      "text": "How many times it was called."
+     },
+     {
+      "line": 14,
+      "text": "The arguments of the first call. ?. because the array may be empty."
+     }
+    ]
+   }
+  },
+  {
+   "h": "AWS without AWS: the function",
+   "p": [
+    "The orchestrator calls AWS with the AWS SDK v3. There is one client per service, and one Command object per API call, sent with client.send(). The claim activity (G3-18) tags a VM with its run id this way.",
+    "Here is a small version. It takes the client as a parameter, so a test can hand it a mocked one."
+   ],
+   "because": "We take the EC2 client as a parameter, so the test can replace what the code calls.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/tags.ts",
+    "text": "import { CreateTagsCommand, EC2Client } from \"@aws-sdk/client-ec2\";\n\nexport const tagForRun = async (ec2: EC2Client, instanceId: string, runId: string): Promise<void> => {\n  await ec2.send(new CreateTagsCommand({\n    Resources: [instanceId],\n    Tags: [{ Key: \"ai-agents:run-id\", Value: runId }],\n  }));\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "One package per AWS service. Install it with npm install -w svc @aws-sdk/client-ec2@3.1150.0."
+     },
+     {
+      "line": 4,
+      "text": "Every AWS call is client.send(new XCommand(input))."
+     },
+     {
+      "line": 6,
+      "text": "The tag the sweeper (G3-22) and retries use to find this run's VM."
+     }
+    ]
+   }
+  },
+  {
+   "h": "AWS without AWS: aws-sdk-client-mock",
+   "p": [
+    "aws-sdk-client-mock replaces the send() of every client of one class. You say what each Command returns, or that it fails. No request leaves the laptop, and no AWS account is needed.",
+    "ai-agents uses it wherever an activity calls AWS: claiming a VM, tagging it, detaching it from its group."
+   ],
+   "because": "We mock at the client because the code under test stays exactly the code that runs in production.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/test/tags.test.ts",
+    "text": "import assert from \"node:assert/strict\";\nimport { test } from \"node:test\";\nimport { CreateTagsCommand, EC2Client } from \"@aws-sdk/client-ec2\";\nimport { mockClient } from \"aws-sdk-client-mock\";\nimport { tagForRun } from \"../src/tags.js\";\n\nconst ec2Mock = mockClient(EC2Client); // every EC2Client now answers from this fake, not AWS\n\ntest(\"tagForRun tags the VM with its run id\", async () => {\n  ec2Mock.reset();\n  ec2Mock.on(CreateTagsCommand).resolves({});\n  await tagForRun(new EC2Client({ region: \"us-east-1\" }), \"i-0abc\", \"run-7\");\n  const calls = ec2Mock.commandCalls(CreateTagsCommand);\n  assert.equal(calls.length, 1);\n  assert.deepEqual(calls[0]?.args[0].input.Tags, [{ Key: \"ai-agents:run-id\", Value: \"run-7\" }]);\n});\n\ntest(\"an AWS error reaches the caller\", async () => {\n  ec2Mock.reset();\n  ec2Mock.on(CreateTagsCommand).rejects(new Error(\"UnauthorizedOperation\"));\n  await assert.rejects(tagForRun(new EC2Client({ region: \"us-east-1\" }), \"i-0abc\", \"run-7\"), /UnauthorizedOperation/);\n});",
+    "notes": [
+     {
+      "line": 7,
+      "text": "From here on, every EC2Client in this process uses the mock."
+     },
+     {
+      "line": 10,
+      "text": "Forget earlier rules and calls, so tests do not leak into each other."
+     },
+     {
+      "line": 11,
+      "text": "CreateTags returns an empty answer when it works."
+     },
+     {
+      "line": 13,
+      "text": "Every CreateTagsCommand that was sent, with its input."
+     },
+     {
+      "line": 20,
+      "text": "Make the call fail, to test the error path without breaking anything real."
+     },
+     {
+      "line": 21,
+      "text": "Passes only if the promise rejects with an error matching the pattern."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Reading a failure",
+   "p": [
+    "A failing test shows ✖, then a block with the expected and actual values and the file and line of the assert. The summary says fail 1, and the exit code is 1, which fails CI.",
+    "Read the two values first, then the line. Fix the code, not the test, unless the test was wrong. Agents may not weaken a test to pass, and a check (G0-19) flags removed asserts and new skips."
+   ],
+   "see": "✖ a body over 1 MiB gets 413 (26.6ms)\n  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n\n  413 !== 400\n\n      at TestContext.<anonymous> (.../svc/test/server.test.ts:21:10)\nℹ fail 1",
+   "callout": {
+    "kind": "wall",
+    "text": "Agents never change the checks they are judged by. A test made easier to pass is caught by the weakened-tests check, and test config files are locked."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Ten tests for ~/p1-lab",
+  "youNeed": [
+   "~/p1-lab from p1-5",
+   "about 90 MB of disk for the AWS SDK"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p svc/test and create svc/test/token.test.ts. Then: node --import tsx --test \"svc/test/**/*.test.ts\"",
+    "see": "✔ a signed token verifies and returns its claims (3.2ms)\n...\nℹ tests 4\nℹ pass 4\nℹ fail 0"
+   },
+   {
+    "do": "npm pkg set scripts.test='node --import tsx --test \"svc/test/**/*.test.ts\"' and create svc/test/server.test.ts. Then: npm test",
+    "see": "✔ GET /health answers without a capability (14.7ms)\n✔ a missing capability gets 401 (1.7ms)\n✔ a body over 1 MiB gets 413 (13.6ms)\n...\nℹ tests 7\nℹ pass 7"
+   },
+   {
+    "do": "Create svc/test/progress.test.ts. Then: npm test",
+    "see": "✔ postProgress sends the text to the broker once (0.8ms)\n...\nℹ tests 8\nℹ pass 8"
+   },
+   {
+    "do": "npm install -w svc @aws-sdk/client-ec2@3.1150.0 && npm install -w svc -D aws-sdk-client-mock@4.1.0",
+    "see": "added <n> packages, and audited <n> packages\nfound 0 vulnerabilities"
+   },
+   {
+    "do": "Create svc/src/tags.ts and svc/test/tags.test.ts. Then: npm test",
+    "see": "✔ tagForRun tags the VM with its run id (3.2ms)\n✔ an AWS error reaches the caller (0.6ms)\n...\nℹ tests 10\nℹ pass 10\nℹ fail 0"
+   },
+   {
+    "do": "In server.test.ts change the 413 assert to 400. Run npm test, read the block, then change it back.",
+    "see": "✖ a body over 1 MiB gets 413\n  413 !== 400\nℹ fail 1"
+   },
+   {
+    "do": "npm test; echo \"exit $?\"",
+    "see": "ℹ tests 10\nℹ pass 10\nℹ fail 0\nexit 0"
+   }
+  ],
+  "faded": "Write svc/test/capability.test.ts with two tests: the capability from newCapability() matches its digest, and the string 'guess' does not. Left to you: the two assert lines.",
+  "alone": "Test readBody from p1-3 without a server. A Readable from node:stream can stand in for the request: Readable.from([Buffer.from(\"hello\")]) as unknown as IncomingMessage. Write one test that reads 'hello', and one that calls readBody with a limit of 3 and uses assert.rejects to expect TooLarge.",
+  "done": "npm test prints ten passing tests and exits 0, and a broken assert makes it print the two values and exit 1."
+ },
+ "quiz": [
+  {
+   "q": "Which import gives assertions where equal means ===?",
+   "options": [
+    {
+     "text": "import assert from \"node:assert\"",
+     "correct": false,
+     "why": "The legacy module's equal uses ==, so 1 equals \"1\". We always import /strict."
+    },
+    {
+     "text": "import assert from \"node:assert/strict\"",
+     "correct": true,
+     "why": "Strict mode: equal is Object.is and deepEqual is deep strict."
+    },
+    {
+     "text": "import { assert } from \"node:test\"",
+     "correct": false,
+     "why": "node:test gives test, before, after and mock; assertions come from node:assert/strict."
+    }
+   ]
+  },
+  {
+   "q": "Why does server.test.ts listen on port 0?",
+   "options": [
+    {
+     "text": "Port 0 is faster than port 8080",
+     "correct": false,
+     "why": "Speed is the same; the point is a free port."
+    },
+    {
+     "text": "The OS picks a free port, so test files and a running dev server never clash",
+     "correct": true,
+     "why": "server.address() then tells the test which port it got."
+    },
+    {
+     "text": "Port 0 skips the network and calls the handler directly",
+     "correct": false,
+     "why": "It is a real port; fetch makes real HTTP requests to it."
+    }
+   ]
+  },
+  {
+   "q": "With aws-sdk-client-mock set up for EC2Client, what happens to real AWS calls in that test file?",
+   "options": [
+    {
+     "text": "None are made: every EC2Client.send answers from the rules you set",
+     "correct": true,
+     "why": "No account, no credentials, no network."
+    },
+    {
+     "text": "They go to LocalStack instead of AWS",
+     "correct": false,
+     "why": "LocalStack is a separate emulator; this library replaces send() in memory."
+    },
+    {
+     "text": "They hit AWS with DryRun set to true",
+     "correct": false,
+     "why": "Nothing reaches AWS at all."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p1-5: what does safeParse return when the data is wrong, and when it is right?",
+  "From p1-4: why does verifyToken take now as a parameter?"
+ ],
+ "videos": [
+  {
+   "title": "Node.js has a built-in test runner!",
+   "url": "https://www.youtube.com/watch?v=eXv_fxoc8UM",
+   "channel": "Daniel Bergholz [EN]",
+   "minutes": 12,
+   "why": "Writes real tests with node:test and node:assert, no Jest needed."
+  },
+  {
+   "title": "How to Setup Node.js and TypeScript",
+   "url": "https://www.youtube.com/watch?v=u_GQSEjis48",
+   "channel": "Better Stack",
+   "minutes": 20,
+   "why": "Modern Node + TypeScript project setup, including running .ts files directly in dev."
+  }
+ ],
+ "words": [
+  {
+   "term": "node:test",
+   "plain": "Node's built-in test runner: test(), before(), after() and mock."
+  },
+  {
+   "term": "node:assert/strict",
+   "plain": "Node's assertions in strict mode: equal is ===, deepEqual compares deeply and strictly."
+  },
+  {
+   "term": "--import tsx",
+   "plain": "Loads tsx before the tests, so node --test can run .ts files with no build."
+  },
+  {
+   "term": "port 0",
+   "plain": "Asks the operating system for any free port; server.address() tells you which."
+  },
+  {
+   "term": "fake",
+   "plain": "A stand-in for something slow or outside, passed into the code under test."
+  },
+  {
+   "term": "mock.fn",
+   "plain": "node:test's fake function that records every call and its arguments."
+  },
+  {
+   "term": "aws-sdk-client-mock",
+   "plain": "Replaces send() of an AWS SDK v3 client, so tests never call AWS."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-07",
+   "why": "The broker's tests start from Byte's: wrong capability gets 401, repo A cannot read repo B, no token in any log."
+  },
+  {
+   "key": "G0-13",
+   "why": "The gateway's node:test case fails if any request text reaches the logs."
+  },
+  {
+   "key": "G3-18",
+   "why": "The claim activity's ASG and EC2 calls are unit-tested with aws-sdk-client-mock."
+  },
+  {
+   "key": "G0-09",
+   "why": "The independent-approval check is tested with fixtures and node:test, run by npm test."
+  }
+ ],
+ "remember": "node --import tsx --test with a quoted glob, assert from node:assert/strict, and fakes passed in, so no test touches a real service."
+}

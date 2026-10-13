@@ -1,0 +1,414 @@
+{
+ "id": "p6-1",
+ "title": "Metrics, logs and traces with OpenTelemetry",
+ "minutes": 45,
+ "youNeed": [
+  "p1-8"
+ ],
+ "bridge": "OpenTelemetry is like console.log that goes to a dashboard, with a trace id that follows one request across services. Except: a metric is a number summed over time, not a line. An event is a record with named attributes. A trace is made of spans with a start, an end and a parent.",
+ "intro": "Claude Code and the Agent SDK already send cost, tokens and tool decisions over OpenTelemetry; we have nowhere to receive them. G1 builds the collector that takes them in, strips content, and stores numbers and events. This lesson gives you the three signals, the collector pipeline, and the scrubbing rule.",
+ "picture": {
+  "caption": "Every laptop and every agent VM sends OTLP to one address. The collector drops content and replaces the email with a team and a hash. It writes numbers to VictoriaMetrics and events to VictoriaLogs.",
+  "nodes": [
+   {
+    "id": "cc",
+    "label": "Claude Code on a laptop or in a VM",
+    "kind": "agent"
+   },
+   {
+    "id": "envoy",
+    "label": "otel.example.com (Envoy + WAF)",
+    "kind": "cloud"
+   },
+   {
+    "id": "col",
+    "label": "OTel Collector on inf (2 replicas)",
+    "kind": "service"
+   },
+   {
+    "id": "vm",
+    "label": "VictoriaMetrics",
+    "kind": "service"
+   },
+   {
+    "id": "vl",
+    "label": "VictoriaLogs (1 year)",
+    "kind": "service"
+   },
+   {
+    "id": "graf",
+    "label": "Grafana",
+    "kind": "service"
+   }
+  ],
+  "steps": [
+   {
+    "from": "cc",
+    "to": "envoy",
+    "text": "POST /v1/metrics and /v1/logs over HTTPS with Authorization: Bearer <ingest token>"
+   },
+   {
+    "from": "envoy",
+    "to": "col",
+    "text": "only those two paths pass the WAF; the collector checks the bearer token itself"
+   },
+   {
+    "from": "col",
+    "to": "col",
+    "text": "transform/scrub: delete prompt, command and path attributes; email becomes team plus a salted hash"
+   },
+   {
+    "from": "col",
+    "to": "vm",
+    "text": "metrics go to vminsert with Prometheus names (claude_code_cost_usage_USD_total)"
+   },
+   {
+    "from": "col",
+    "to": "vl",
+    "text": "events (api_error, tool_decision) go to long-term VictoriaLogs"
+   },
+   {
+    "from": "graf",
+    "to": "vm",
+    "text": "dashboards query both stores; no panel has a person dimension"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start from the settings file on your laptop",
+   "p": [
+    "OpenTelemetry (OTel) is an open standard for sending metrics, logs and traces. OTLP is its wire protocol: the program POSTs batches to a collector. We use HTTP with protobuf bodies on /v1/metrics and /v1/logs (port 4318 by default).",
+    "Claude Code sends telemetry this way when a few environment variables are set. G1-05 puts them in a managed settings file so every engineer and every agent sends the same way. Read the file once; every line is one decision about what leaves the machine."
+   ],
+   "because": "We turn telemetry on at the source with content off. The collector scrubs a second time, and two walls are better than one.",
+   "code": {
+    "lang": "json",
+    "file": "ai-agents/settings/managed-settings.d/20-telemetry.json (from G1-05)",
+    "text": "{\n  \"$schema\": \"https://json.schemastore.org/claude-code-settings.json\",\n  \"env\": {\n    \"CLAUDE_CODE_ENABLE_TELEMETRY\": \"1\",\n    \"OTEL_METRICS_EXPORTER\": \"otlp\",\n    \"OTEL_LOGS_EXPORTER\": \"otlp\",\n    \"OTEL_EXPORTER_OTLP_PROTOCOL\": \"http/protobuf\",\n    \"OTEL_EXPORTER_OTLP_ENDPOINT\": \"https://otel.example.com\",\n    \"OTEL_EXPORTER_OTLP_HEADERS\": \"Authorization=Bearer <ingest token: set only in the admin console>\",\n    \"OTEL_LOG_USER_PROMPTS\": \"0\",\n    \"OTEL_LOG_ASSISTANT_RESPONSES\": \"0\",\n    \"OTEL_LOG_TOOL_DETAILS\": \"0\",\n    \"OTEL_LOG_TOOL_CONTENT\": \"0\",\n    \"OTEL_METRICS_INCLUDE_ACCOUNT_UUID\": \"false\",\n    \"OTEL_RESOURCE_ATTRIBUTES\": \"department=rnd,source=human\"\n  }\n}",
+    "notes": [
+     {
+      "line": 5,
+      "text": "Two exporters, metrics and logs, both OTLP: the OpenTelemetry wire format. No traces exporter: there is no trace store yet."
+     },
+     {
+      "line": 7,
+      "text": "OTLP over HTTP with protobuf bodies. The collector's receiver listens for exactly this on port 4318."
+     },
+     {
+      "line": 9,
+      "text": "The ingest token only lets you write telemetry. It is pasted in the admin console, never committed to git."
+     },
+     {
+      "line": 10,
+      "text": "Four content flags, all off. Prompts, answers, tool arguments and tool output never leave the laptop."
+     },
+     {
+      "line": 15,
+      "text": "Resource attributes ride on every signal. Agents set agent, jira, run, step and harness.version instead (G1-14)."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The three signals",
+   "p": [
+    "A metric is a number with a name and labels, reported over time: claude_code_cost_usage_USD_total{team=\"fe\"} 12.4. You never read one value; you ask how it changes, such as cost per day. A log, called an event in Claude Code's output, is one record with a timestamp, a body and attributes: event.name=tool_decision, tool_name=Bash, decision=reject.",
+    "A trace follows one request through several services. It is made of spans; each span has a name, a start, an end, attributes and a parent span. Temporal can emit spans for every workflow and activity, but we have no store for them yet. So G1 builds a metrics and a logs pipeline only.",
+    "The rule of thumb: count it as a metric, describe it as an event, and follow it as a trace."
+   ],
+   "callout": {
+    "kind": "gotcha",
+    "text": "Metrics are cheap to store and fast to query but have no detail. Events have the detail. The operations dashboard (G1-09) draws cost from metrics and API errors from events."
+   }
+  },
+  {
+   "h": "The collector: receivers, processors, exporters",
+   "p": [
+    "The OpenTelemetry Collector is a program that receives signals, changes them, and sends them on. Its config has three lists: receivers (where data comes in), processors (what happens to it, in order) and exporters (where it goes). A pipeline wires one receiver through some processors to an exporter, once for metrics and once for logs.",
+    "G1-02 runs the contrib image as a Helm release on inf with two replicas. The first half of its values file sets the receiver with bearer-token auth."
+   ],
+   "because": "We put one collector between every client and the stores because scrubbing in one place holds even when a laptop is misconfigured.",
+   "code": {
+    "lang": "yaml",
+    "file": "infrastructure/modules/otel-collector/templates/otel_collector_values.yml.tpl (from G1-02, part 1)",
+    "text": "mode: deployment\nreplicaCount: 2\nimage:\n  repository: otel/opentelemetry-collector-contrib   # contrib: transform processor and bearertokenauth\nextraEnvsFrom:\n  - secretRef: { name: otel-collector }              # ExternalSecret from kvv2 infrastructure/otel-collector\nconfig:\n  extensions:\n    bearertokenauth: { token: \"$${env:INGEST_TOKEN}\" }\n  receivers:\n    otlp:\n      protocols:\n        http: { endpoint: \"0.0.0.0:4318\", auth: { authenticator: bearertokenauth } }\n  processors:\n    memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 20 }",
+    "notes": [
+     {
+      "line": 4,
+      "text": "The contrib build has the transform processor and the auth extension; the core build does not."
+     },
+     {
+      "line": 6,
+      "text": "INGEST_TOKEN and USER_SALT arrive as environment variables from a Kubernetes Secret filled from Vault (p5-3)."
+     },
+     {
+      "line": 9,
+      "text": "$${env:...} is a Terraform template escape for the collector's own ${env:...} syntax; the rendered file has one dollar sign."
+     },
+     {
+      "line": 13,
+      "text": "OTLP over HTTP on 4318, and every request must carry the bearer token or gets 401."
+     },
+     {
+      "line": 15,
+      "text": "memory_limiter first in every pipeline: it drops data instead of letting the pod be killed for memory."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Scrubbing: content never leaves",
+   "p": [
+    "The transform processor runs small statements on every record. Ours deletes any attribute that could hold content. It maps the person's work email to a team name, adds a salted SHA-256 hash of the email, and deletes the email. The same list runs for metric data points.",
+    "Why a hash at all? To count weekly active users without names. The salt is generated by Terraform and lives only in Vault, so the hash cannot be reversed by trying every email."
+   ],
+   "because": "We scrub in the collector even though content flags are off. A client with OTEL_LOG_USER_PROMPTS=1 must still not get a prompt into our store.",
+   "code": {
+    "lang": "yaml",
+    "file": "the same values template, part 2 (the scrub and the exporters)",
+    "text": "    transform/scrub:\n      error_mode: ignore\n      log_statements:\n        - context: log      # metric_statements repeat this list with context: datapoint\n          statements:\n            - delete_matching_keys(attributes, \"^(prompt|prompt_text|user_system_prompt|full_command|file_path|tool_parameters)$\")\n%{ for email, team in teams ~}\n            - set(attributes[\"team\"], \"${team}\") where attributes[\"user.email\"] == \"${email}\"\n%{ endfor ~}\n            - set(attributes[\"user.hash\"], SHA256(Concat([attributes[\"user.email\"], \"$${env:USER_SALT}\"], \"\"))) where attributes[\"user.email\"] != nil\n            - delete_key(attributes, \"user.email\")\n    batch: {}\n  exporters:\n    otlphttp/metrics: { metrics_endpoint: \"${metrics_endpoint}\" }   # vminsert .../insert/0/opentelemetry/v1/metrics\n    otlphttp/logs: { logs_endpoint: \"${logs_endpoint}\" }            # vlsingle-rhino-logs-longterm:9428\n  service:\n    extensions: [bearertokenauth]\n    pipelines:\n      metrics: { receivers: [otlp], processors: [memory_limiter, transform/scrub, batch], exporters: [otlphttp/metrics] }\n      logs: { receivers: [otlp], processors: [memory_limiter, transform/scrub, batch], exporters: [otlphttp/logs] }",
+    "notes": [
+     {
+      "line": 6,
+      "text": "A regex of attribute names to delete. Any match is gone before the record reaches an exporter."
+     },
+     {
+      "line": 7,
+      "text": "A Terraform loop: the team map (email to team) is read from Vault and rendered into one set() line per person."
+     },
+     {
+      "line": 10,
+      "text": "SHA256 of email plus salt. The same person always gets the same hash; nobody can get the email back."
+     },
+     {
+      "line": 11,
+      "text": "Only now is the email removed; the two lines above needed it."
+     },
+     {
+      "line": 19,
+      "text": "Order matters: limiter, scrub, batch. Scrub before batch so nothing unscrubbed waits in memory."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "PHI never enters a prompt, and prompts never enter telemetry. G1-02's last test sends one session with OTEL_LOG_USER_PROMPTS=1 on purpose; the prompt must not show up in VictoriaLogs."
+   }
+  },
+  {
+   "h": "Where it lands and how to reach it",
+   "p": [
+    "Metrics go to vminsert, VictoriaMetrics' write endpoint on inf, with -opentelemetry.usePrometheusNaming=true so series get Prometheus-style names with unit and _total suffixes. Logs go to the long-term VictoriaLogs (one year). Grafana at grafana.example.com reads both.",
+    "Laptops are not always on VPN, and agent VMs have no path into inf. So G1-04 gives the collector a public route, otel.example.com.",
+    "It sits behind Envoy's external gateway and the Coraza WAF (a filter for bad web requests), and fails closed like n8n's webhooks. Only /v1/metrics and /v1/logs pass. The token is the only credential, and it can only write telemetry."
+   ],
+   "because": "We add the route in the same Terragrunt unit as the collector. The collector, its secret and its route are one thing to deploy and one thing to remove.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/multi_tenant/accounts/infrastructure/otel-collector/terragrunt.hcl (from G1-04, shortened)",
+    "text": "inputs = {\n  namespace     = \"otel-collector\"\n  chart_version = \"0.0.0\" # pin the current open-telemetry/opentelemetry-collector chart release\n\n  vault_secret_path = \"infrastructure/otel-collector\"  # ingest_token, user_salt (generated by Terraform)\n  teams_secret_path = \"infrastructure/ai-agents/teams\" # work email -> team; owner Sean\n\n  metrics_endpoint = \"http://vminsert-rhino-metrics.${include.root.locals.metrics_namespace}.svc:8480/insert/0/opentelemetry/v1/metrics\"\n  logs_endpoint    = \"http://vlsingle-rhino-logs-longterm.${include.root.locals.logs_namespace}.svc:9428/insert/opentelemetry/v1/logs\"\n\n  external_route = {\n    parent_ref = \"envoy-external\"\n    hostname   = \"otel.example.com\"\n    paths      = [\"/v1/metrics\", \"/v1/logs\"] # no traces store yet\n  }\n  waf_enabled   = true\n  waf_fail_open = false # fail closed, like n8n's webhooks\n}",
+    "notes": [
+     {
+      "line": 5,
+      "text": "The module generates the token and salt into Vault, the way modules/n8n-secrets does; nobody types them."
+     },
+     {
+      "line": 6,
+      "text": "The team map is a Vault secret you own: email to team, read by Terraform and rendered into the scrub."
+     },
+     {
+      "line": 8,
+      "text": "Inside the cluster, plain HTTP to the write endpoints; the public side is HTTPS through Envoy."
+     },
+     {
+      "line": 14,
+      "text": "Two paths only. A request to /v1/traces is refused at the gateway."
+     },
+     {
+      "line": 17,
+      "text": "If the WAF is down, requests fail instead of passing unchecked."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Tags that make a signal useful",
+   "p": [
+    "A signal without labels is a number nobody can split. People's signals carry department=rnd,source=human and, after the collector, team and user.hash. Agents' signals carry agent, jira, run, step and harness.version. The harness sets them per Agent SDK session (G1-14), so cost by step adds up to the run's total.",
+    "Keep label values few and never personal. A login or an email as a label is a leak and a cardinality problem (one series per person). Team, agent, step and q (p50, p85) are the kind of labels we use."
+   ],
+   "callout": {
+    "kind": "tip",
+    "text": "Before building a dashboard, check the exact series and field names in vmui and VictoriaLogs. Prometheus naming adds unit and _total suffixes, so claude_code_cost_usage_USD_total is the real name, not claude_code.cost.usage."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Run a collector that scrubs, and prove it with curl",
+  "youNeed": [
+   "Docker Desktop running",
+   "curl and jq"
+  ],
+  "worked": [
+   {
+    "do": "mkdir otel-lab && cd otel-lab",
+    "see": "(no output)"
+   },
+   {
+    "do": "Create config.yaml with: receivers otlp (protocols http endpoint 0.0.0.0:4318); processors transform/scrub with one log_statements entry (context: log) and three statements: delete_matching_keys(attributes, \"^(prompt|full_command|file_path)$\"), set(attributes[\"user.hash\"], SHA256(Concat([attributes[\"user.email\"], \"lab-salt\"], \"\"))) where attributes[\"user.email\"] != nil, delete_key(attributes, \"user.email\"); exporters debug (verbosity: detailed); service pipelines logs with receivers [otlp], processors [transform/scrub], exporters [debug].",
+    "see": "(file saved)"
+   },
+   {
+    "do": "docker run --rm --name otel -p 4318:4318 -v \"$PWD/config.yaml:/etc/otelcol-contrib/config.yaml\" otel/opentelemetry-collector-contrib:latest",
+    "see": "info  service@... Everything is ready. Begin running and processing data."
+   },
+   {
+    "do": "In a second terminal, create log.json: {\"resourceLogs\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"lab\"}}]},\"scopeLogs\":[{\"logRecords\":[{\"body\":{\"stringValue\":\"tool_decision\"},\"attributes\":[{\"key\":\"tool_name\",\"value\":{\"stringValue\":\"Bash\"}},{\"key\":\"prompt\",\"value\":{\"stringValue\":\"SECRET PROMPT TEXT\"}},{\"key\":\"user.email\",\"value\":{\"stringValue\":\"sean@example.com\"}}]}]}]}]}",
+    "see": "(file saved; jq . log.json prints it without error)"
+   },
+   {
+    "do": "curl -s -o /dev/null -w '%{http_code}\\n' -X POST http://localhost:4318/v1/logs -H 'Content-Type: application/json' --data @log.json",
+    "see": "200"
+   },
+   {
+    "do": "Read the collector terminal.",
+    "see": "LogRecord #0\nBody: Str(tool_decision)\nAttributes:\n     -> tool_name: Str(Bash)\n     -> user.hash: Str(3c9d...)\n(no prompt, no user.email)"
+   }
+  ],
+  "faded": "Add a team mapping: one more statement set(attributes[\"team\"], \"fe\") where attributes[\"user.email\"] == \"sean@example.com\", placed before the hash line. Restart the container and send log.json again. The debug output should now show team: Str(fe) next to user.hash. Where exactly the new line goes in the statements list is yours to decide; the lesson's part 2 shows the order.",
+  "alone": "Add the bearertokenauth extension with token lab-token. Attach it to the http receiver with auth: { authenticator: bearertokenauth }, and list it under service extensions. Send log.json without a header and then with -H 'Authorization: Bearer lab-token'. Record both status codes.",
+  "done": "A record that went in with a prompt and an email came out with neither, but with a user.hash and a team. The receiver answered 401 without the token and 200 with it."
+ },
+ "quiz": [
+  {
+   "q": "A laptop sets OTEL_LOG_USER_PROMPTS=1 by mistake. Does the prompt reach VictoriaLogs?",
+   "options": [
+    {
+     "text": "Yes; the collector only forwards.",
+     "correct": false,
+     "why": "transform/scrub deletes the prompt attribute on every record before any exporter sees it."
+    },
+    {
+     "text": "No; the collector's transform/scrub deletes prompt, prompt_text and the other content keys.",
+     "correct": true,
+     "why": "That is why scrubbing lives in the collector and not only in client settings. G1-02 tests exactly this case."
+    },
+    {
+     "text": "Only if the WAF lets the request through.",
+     "correct": false,
+     "why": "The WAF checks the request shape, not attribute names; the scrub is the collector's job."
+    }
+   ]
+  },
+  {
+   "q": "Which signal answers 'how many Bash calls did Nova's reject hook block this week, per tool'?",
+   "options": [
+    {
+     "text": "A metric: ai_agents_llm_tokens_total.",
+     "correct": false,
+     "why": "Tokens are a number over time; they do not carry which tool was rejected."
+    },
+    {
+     "text": "An event: tool_decision with decision=reject, counted in VictoriaLogs with stats by (tool_name).",
+     "correct": true,
+     "why": "Rejections are records with attributes; G1-09's panel is a LogsQL count over them."
+    },
+    {
+     "text": "A trace of the run.",
+     "correct": false,
+     "why": "There is no trace store, and a count over a week is a query over events, not one request's path."
+    }
+   ]
+  },
+  {
+   "q": "Why does the collector keep user.hash after deleting user.email?",
+   "options": [
+    {
+     "text": "To count distinct weekly users without storing a name.",
+     "correct": true,
+     "why": "SHA-256 of email plus a Vault-only salt is stable per person and cannot be reversed; it feeds the utilization lens."
+    },
+    {
+     "text": "So Grafana can show spend per person.",
+     "correct": false,
+     "why": "No dashboard has a person dimension; spend is per team and per agent only."
+    },
+    {
+     "text": "Because OTLP requires a user field.",
+     "correct": false,
+     "why": "OTLP has no required user attribute at all."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p1-8: why does a service image run as a non-root user with a read-only root filesystem?",
+  "From p2-4: who holds the GitHub App's private key, and what does the VM get instead?"
+ ],
+ "videos": [
+  {
+   "title": "What is OTel? | OTel for Beginners - The JavaScript Journey",
+   "url": "https://www.youtube.com/watch?v=iEEIabOha8U",
+   "channel": "OpenTelemetry",
+   "minutes": 9,
+   "why": "Official OpenTelemetry intro aimed at JavaScript developers."
+  },
+  {
+   "title": "OpenTelemetry Collector: EVERYTHING you need to know [to get started]",
+   "url": "https://www.youtube.com/watch?v=_CJrFW_yjRo",
+   "channel": "Adam Gardner",
+   "minutes": 10,
+   "why": "Receivers, processors, exporters and pipelines of the Collector in ten minutes."
+  }
+ ],
+ "words": [
+  {
+   "term": "metric",
+   "plain": "A named number with labels, reported over time; you query how it changes, not one value."
+  },
+  {
+   "term": "event (log)",
+   "plain": "One record with a timestamp, a body and attributes, such as tool_decision with tool_name and decision."
+  },
+  {
+   "term": "span / trace",
+   "plain": "A span is one timed step with a parent; a trace is the tree of spans for one request. We store none yet."
+  },
+  {
+   "term": "OTLP",
+   "plain": "The OpenTelemetry wire format; we use it over HTTP with protobuf bodies, on /v1/metrics and /v1/logs."
+  },
+  {
+   "term": "collector",
+   "plain": "The program that receives OTLP, runs processors in order, and exports to the stores."
+  },
+  {
+   "term": "transform processor",
+   "plain": "A processor that runs statements on each record: delete keys, set attributes, hash values."
+  },
+  {
+   "term": "resource attributes",
+   "plain": "Labels attached to every signal from one process, set with OTEL_RESOURCE_ATTRIBUTES."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G1-02",
+   "why": "The collector module and its scrub statements are the pipeline you ran on your laptop."
+  },
+  {
+   "key": "G1-04",
+   "why": "The public route with bearer auth and two paths is the extension you added in the alone step."
+  },
+  {
+   "key": "G1-05",
+   "why": "The managed settings file is the client side of the same pipeline, content flags off."
+  },
+  {
+   "key": "G1-14",
+   "why": "Per-step resource attributes are what make agent signals splittable by step and harness version."
+  }
+ ],
+ "remember": "Count it as a metric, describe it as an event. One collector in the middle deletes content and turns an email into a team and a hash before anything is stored."
+}

@@ -1,0 +1,427 @@
+{
+ "id": "p1-4",
+ "title": "Secrets in code",
+ "minutes": 45,
+ "youNeed": [
+  "p1-3"
+ ],
+ "bridge": "A capability is like the session cookie an API hands out after login. Whoever holds it may act, so you store only its hash and compare it carefully. Except: there is no login behind it. The orchestrator mints one per run, it opens one narrow scope, and it dies with the run.",
+ "intro": "The VM never holds a key, but it must still prove which run it is. It does that with a random capability for the broker and a signed run token for the gateway. This lesson builds both with node:crypto, and the habits that keep secrets out of logs.",
+ "picture": {
+  "caption": "The broker hands out a capability once, keeps only its hash, and checks every call against it.",
+  "nodes": [
+   {
+    "id": "orch",
+    "label": "Orchestrator",
+    "kind": "service"
+   },
+   {
+    "id": "broker",
+    "label": "Broker",
+    "kind": "service"
+   },
+   {
+    "id": "store",
+    "label": "sha256 digests (Postgres)",
+    "kind": "file"
+   },
+   {
+    "id": "vm",
+    "label": "Sandbox VM",
+    "kind": "machine"
+   },
+   {
+    "id": "check",
+    "label": "timingSafeEqual",
+    "kind": "check"
+   },
+   {
+    "id": "log",
+    "label": "Logs",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "orch",
+    "to": "broker",
+    "text": "opens a run scope; the broker makes randomBytes(32) and returns it once"
+   },
+   {
+    "from": "broker",
+    "to": "store",
+    "text": "stores only sha256(capability) next to the scope"
+   },
+   {
+    "from": "orch",
+    "to": "vm",
+    "text": "writes the capability to /run/nova/ (mode 0600)"
+   },
+   {
+    "from": "vm",
+    "to": "broker",
+    "text": "every call: Authorization: Bearer <capability>"
+   },
+   {
+    "from": "broker",
+    "to": "check",
+    "text": "hashes what it got and compares digests in constant time"
+   },
+   {
+    "from": "check",
+    "to": "log",
+    "text": "the audit line names the run and the call, never the capability"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Random tokens: randomBytes",
+   "p": [
+    "A capability is a long random string that grants one scope. node:crypto's randomBytes(32) gives 32 bytes from the operating system's secure random source. As hex that is 64 characters. Byte's workflow makes the same thing with openssl rand -hex 32.",
+    "Math.random() is not for secrets. It is built for speed, and its output can be predicted."
+   ],
+   "because": "We use 32 random bytes because nobody can guess 256 bits, so the token needs no password behind it.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/capability.ts (part 1)",
+    "text": "import { createHash, randomBytes, timingSafeEqual } from \"node:crypto\";\n\nconst sha256 = (text: string): Buffer => createHash(\"sha256\").update(text).digest();\n\nexport const newCapability = (): { capability: string; digest: Buffer } => {\n  const capability = randomBytes(32).toString(\"hex\"); // 32 random bytes = 64 hex characters\n  return { capability, digest: sha256(capability) }; // keep the digest, hand out the capability once\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Built into Node. The ticket list: randomBytes, createHash, createHmac, timingSafeEqual."
+     },
+     {
+      "line": 3,
+      "text": "A hash turns any text into 32 bytes. The same input always gives the same digest."
+     },
+     {
+      "line": 6,
+      "text": "Secure random bytes. toString(\"hex\") makes them safe to put in a header."
+     },
+     {
+      "line": 7,
+      "text": "The caller hands the capability to the VM once and stores only the digest."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Store a hash, not the token",
+   "p": [
+    "A hash is one-way: from the digest you cannot get the capability back. The broker stores only sha256(capability) in Postgres. If that table leaks, nobody can call the broker with what they found.",
+    "Passwords need slow hashes like bcrypt, because people pick guessable ones. A 256-bit random token cannot be guessed, so a plain sha256 is enough."
+   ],
+   "because": "We look a scope up by digest because then the database never holds anything a thief could replay.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/scopes.ts (G3-07, scopeFor)",
+    "text": "// Byte compares its one capability with timingSafeEqual; here there is one per run, so we look up its sha256.\nexport const scopeFor = async (authorization: string | undefined, db: Pool): Promise<RunScope | null> => {\n  if (!authorization?.startsWith(\"Bearer \")) return null; // -> 401\n  const digest = createHash(\"sha256\").update(authorization.slice(\"Bearer \".length)).digest(\"hex\"); // only digests are stored\n  const { rows } = await db.query<{ scope: RunScope }>(\"SELECT scope FROM run_scopes WHERE capability_sha256 = $1\", [digest]);\n  const scope = rows[0]?.scope;\n  return scope && new Date(scope.expiresAt) > new Date() ? scope : null; // missing or expired -> 401\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Byte has one capability per job and compares it directly. Nova's broker has many, so it looks up the digest."
+     },
+     {
+      "line": 3,
+      "text": "The standard header form: Authorization: Bearer <token>. Anything else is 401."
+     },
+     {
+      "line": 4,
+      "text": "The digest of what the VM sent. Only digests ever reach the database."
+     },
+     {
+      "line": 5,
+      "text": "A query parameter: pg sends the value apart from the SQL, so it can never change the query."
+     },
+     {
+      "line": 7,
+      "text": "A scope dies with its run. An expired one is the same as a missing one."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Compare with timingSafeEqual",
+   "p": [
+    "a === b on strings stops at the first character that differs. A wrong guess with a right first half takes slightly longer. Over many tries an attacker can measure that and find the token piece by piece.",
+    "timingSafeEqual always compares every byte, so the time says nothing. It takes two Buffers of the same length and throws a RangeError otherwise. Comparing two sha256 digests avoids that: both are always 32 bytes."
+   ],
+   "because": "We compare digests with timingSafeEqual because === leaks through timing and timingSafeEqual needs equal lengths.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/capability.ts (part 2)",
+    "text": "export const matches = (presented: string, digest: Buffer): boolean =>\n  timingSafeEqual(sha256(presented), digest); // both sides are 32-byte digests, so lengths always match\n\n// What happens with different lengths:\n// timingSafeEqual(Buffer.from(\"ab\"), Buffer.from(\"abc\"))\n// -> RangeError: Input buffers must have the same byte length",
+    "notes": [
+     {
+      "line": 1,
+      "text": "presented is what came in the header; digest is what we stored."
+     },
+     {
+      "line": 2,
+      "text": "Hash first, so even a 3-character guess becomes 32 bytes and no RangeError is thrown."
+     },
+     {
+      "line": 6,
+      "text": "Comparing raw strings of different lengths throws. Check lengths first, or compare digests."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Signed tokens with createHmac",
+   "p": [
+    "The gateway's run token carries claims: agent, Jira key, run, expiry and a per-agent epoch. The orchestrator signs them with an HMAC, a hash mixed with a secret key. Only a holder of the key can make a valid signature.",
+    "The claims are base64url, which is an encoding, not encryption. Anyone can read them. So a claim may say which run this is, but never hold a secret. The signing key lives in Vault at infrastructure/ai-agents/gateway.",
+    "To check a token, the gateway splits it at the dot into claims and signature. It computes the HMAC of the claims again with the same key, and compares the two with timingSafeEqual. If anyone changed one claim, the signatures differ and the answer is 401. Only then does it check the expiry and the epoch."
+   ],
+   "because": "We sign instead of storing because the gateway can then check a token with no database call.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/token.ts",
+    "text": "import { createHmac, timingSafeEqual } from \"node:crypto\";\n\nexport interface Claims { agent: string; jira: string; run: string; exp: number }\nconst sign = (body: string, key: string) => createHmac(\"sha256\", key).update(body).digest(\"base64url\");\n\nexport const signToken = (claims: Claims, key: string): string => {\n  const body = Buffer.from(JSON.stringify(claims)).toString(\"base64url\");\n  return `${body}.${sign(body, key)}`; // anyone can read the claims; only the key holder can sign them\n};\n\nexport const verifyToken = (token: string, key: string, now = Date.now()): Claims | null => {\n  const [body = \"\", mac = \"\"] = token.split(\".\");\n  const want = Buffer.from(sign(body, key)), got = Buffer.from(mac);\n  if (got.length !== want.length || !timingSafeEqual(got, want)) return null; // check the length first\n  const claims = JSON.parse(Buffer.from(body, \"base64url\").toString(\"utf8\")) as Claims;\n  return claims.exp * 1000 > now ? claims : null; // exp is in seconds\n};",
+    "notes": [
+     {
+      "line": 3,
+      "text": "The gateway's real claims also carry an epoch: bumping it kills every live token of that agent."
+     },
+     {
+      "line": 1,
+      "text": "HMAC-SHA256 of the body with the key. Change one character of the body and the signature changes."
+     },
+     {
+      "line": 8,
+      "text": "Token = claims, a dot, the signature."
+     },
+     {
+      "line": 11,
+      "text": "The clock is a parameter, so a test can pass a fake time (lesson p1-6)."
+     },
+     {
+      "line": 14,
+      "text": "Length first, then timingSafeEqual. A wrong length is a wrong token anyway."
+     },
+     {
+      "line": 16,
+      "text": "exp is in seconds like other tokens; Date.now() is in milliseconds."
+     }
+    ]
+   },
+   "see": "verify: { agent: 'nova', jira: 'RH-1', run: 'lab-1', exp: 1791907305 }\ntampered: null other key: null"
+  },
+  {
+   "h": "Never log a secret",
+   "p": [
+    "A secret in a log is a secret for everyone who can read logs. So no token, key or capability goes into a log line, an error message, a URL or a test snapshot. The gateway logs method, path, status and latency only, and a test fails if request text reaches the logs.",
+    "Byte's broker has a secret guard. Before it returns any output, it checks that the token and the capability are not in it. Here is the idea as a lab file."
+   ],
+   "because": "We guard the output in code because a stray print in some later PR is the usual way a secret leaks.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/guard.ts (the idea of Byte's src/secret-guard.ts)",
+    "text": "export class SecretInOutput extends Error {}\n\nexport const guard = (text: string, secrets: string[]): string => {\n  for (const secret of secrets) {\n    if (secret && text.includes(secret)) throw new SecretInOutput(\"refused: output contains a secret\");\n  }\n  return text; // safe to log or return\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "A named error, so a test can expect exactly this refusal."
+     },
+     {
+      "line": 5,
+      "text": "Skip empty strings: every text includes the empty string."
+     },
+     {
+      "line": 5,
+      "text": "Refuse, and never print the secret in the error message itself."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "No keys in the VM. The capability and the run token are not keys. They open one run's scope, our services check them, and they die with the run."
+   }
+  },
+  {
+   "h": "The server asks for a capability",
+   "p": [
+    "Now the notes service from p1-3 checks a capability, like the broker. server.ts exports createApp(digest) instead of a ready server. main.ts makes a capability, prints it once, and passes the digest in.",
+    "/health still needs no auth, so probes work. Everything else without the right capability gets 401 before any body is read."
+   ],
+   "because": "We pass in the digest, so the server never sees the capability and tests can give it their own.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/server.ts (what changes)",
+    "text": "import { createServer, type IncomingMessage, type ServerResponse } from \"node:http\";\nimport { matches } from \"./capability.js\";\n\nconst bearer = (req: IncomingMessage) => req.headers.authorization?.replace(/^Bearer /, \"\") ?? \"\";\n\nexport const createApp = (digest: Buffer) => {\n  const notes: string[] = [];\n  return createServer(async (req, res) => {\n    // ...url and route as before\n    if (route === \"GET /health\") return void res.end(\"ok\"); // no auth, for probes\n    if (!matches(bearer(req), digest)) return send(res, 401, { error: \"unauthorized\" });\n    // ...the GET and POST /v1/notes routes as before\n  });\n};",
+    "notes": [
+     {
+      "line": 4,
+      "text": "The token from the header, or an empty string when there is none."
+     },
+     {
+      "line": 6,
+      "text": "A function that builds a server for one digest. Each test can make its own."
+     },
+     {
+      "line": 7,
+      "text": "The list now lives inside createApp, so two servers never share notes."
+     },
+     {
+      "line": 11,
+      "text": "Checked before the body is read: an unknown caller costs us almost nothing."
+     }
+    ]
+   }
+  }
+ ],
+ "lab": {
+  "title": "Capabilities and signed tokens in ~/p1-lab",
+  "youNeed": [
+   "~/p1-lab from p1-3",
+   "curl",
+   "Two terminals"
+  ],
+  "worked": [
+   {
+    "do": "Create svc/src/capability.ts (parts 1 and 2, without the comment lines about RangeError) and svc/src/token.ts.",
+    "see": "(no output)"
+   },
+   {
+    "do": "Create svc/src/try-secrets.ts that calls newCapability, matches, signToken and verifyToken and prints the results (one console.log each). Then: npx tsx svc/src/try-secrets.ts",
+    "see": "capability length: 64 digest: d8aa60dcf810...\nright one: true wrong one: false\nverify: { agent: 'nova', jira: 'RH-1', run: 'lab-1', exp: 1791907305 }\ntampered: null other key: null"
+   },
+   {
+    "do": "npx tsx -e 'import { timingSafeEqual } from \"node:crypto\"; try { timingSafeEqual(Buffer.from(\"ab\"), Buffer.from(\"abc\")) } catch (e) { console.log(String(e)) }'",
+    "see": "RangeError: Input buffers must have the same byte length"
+   },
+   {
+    "do": "Change server.ts to createApp(digest) as shown, keeping the old routes inside. Change main.ts: const { capability, digest } = newCapability(); print it once; const server = createApp(digest).",
+    "see": "(no output)"
+   },
+   {
+    "do": "Terminal 1: npx tsx svc/src/main.ts",
+    "see": "capability (shown once): 52b8312417896fc12c29d036d23c6aa2f122486320fa0e089cff44b4bf1ed63e\nlistening on :8080"
+   },
+   {
+    "do": "Terminal 2: curl -s -w ' [%{http_code}]\\n' localhost:8080/v1/notes && curl -s -w ' [%{http_code}]\\n' -H 'Authorization: Bearer wrong' localhost:8080/v1/notes",
+    "see": "{\"error\":\"unauthorized\"} [401]\n{\"error\":\"unauthorized\"} [401]"
+   },
+   {
+    "do": "CAP=<the hex from terminal 1>; curl -s -w ' [%{http_code}]\\n' -H \"Authorization: Bearer $CAP\" -X POST localhost:8080/v1/notes -d '{\"text\":\"with a capability\"}'",
+    "see": "{\"count\":1} [201]"
+   }
+  ],
+  "faded": "Forge a token. Split a valid token at the dot. Build a new body with agent set to admin, and glue it to the old signature. Left to you: print verifyToken of the forged token and explain in one sentence why it is null.",
+  "alone": "Add an epoch to the claims, like the gateway. verifyToken gets a map of current epochs per agent and refuses a token whose epoch is lower. Bump nova's epoch from 1 to 2 and show that a token with epoch 1 now fails. A fresh token with epoch 2 passes.",
+  "done": "The service answers 401 without the capability and 201 with it, and a token with one changed claim verifies as null."
+ },
+ "quiz": [
+  {
+   "q": "Why compare secrets with timingSafeEqual instead of ===?",
+   "options": [
+    {
+     "text": "=== can return sooner on the first wrong character, so timing leaks how much of a guess was right",
+     "correct": true,
+     "why": "timingSafeEqual always compares every byte, so the time says nothing."
+    },
+    {
+     "text": "=== does not work on strings that long",
+     "correct": false,
+     "why": "It works; it is the timing that leaks."
+    },
+    {
+     "text": "timingSafeEqual is faster for 64 characters",
+     "correct": false,
+     "why": "It is not about speed; it is deliberately constant."
+    }
+   ]
+  },
+  {
+   "q": "The broker's run_scopes table leaks. What can an attacker do with the sha256 digests?",
+   "options": [
+    {
+     "text": "Send a digest as the Bearer token and act as that run",
+     "correct": false,
+     "why": "The broker hashes what it receives; a digest of a digest matches nothing."
+    },
+    {
+     "text": "Reverse a digest to get the capability back",
+     "correct": false,
+     "why": "sha256 is one-way, and 256 random bits cannot be guessed."
+    },
+    {
+     "text": "Nothing useful: they cannot turn a digest into a working capability",
+     "correct": true,
+     "why": "That is why only digests are stored."
+    }
+   ]
+  },
+  {
+   "q": "Which may go inside a gateway run token's claims?",
+   "options": [
+    {
+     "text": "The run id and the expiry time",
+     "correct": true,
+     "why": "Claims are readable by anyone; they say who and until when, nothing secret."
+    },
+    {
+     "text": "The workload's Anthropic key, so the gateway need not look it up",
+     "correct": false,
+     "why": "Claims are base64url, not encrypted. The key would reach the VM."
+    },
+    {
+     "text": "The HMAC signing key, so the gateway can verify the token",
+     "correct": false,
+     "why": "The gateway has the key from Vault; putting it in the token lets anyone sign."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p1-3: which status does the notes service answer for a body over 1 MiB, and where is that decided?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "capability",
+   "plain": "A random per-run token that opens one scope in the broker; it is not a key and dies with the run."
+  },
+  {
+   "term": "randomBytes",
+   "plain": "node:crypto's secure random source; randomBytes(32) gives 256 bits."
+  },
+  {
+   "term": "sha256 digest",
+   "plain": "A one-way 32-byte fingerprint of a text; we store it instead of the token."
+  },
+  {
+   "term": "timingSafeEqual",
+   "plain": "Compares two equal-length Buffers in constant time; throws on different lengths."
+  },
+  {
+   "term": "HMAC",
+   "plain": "A hash mixed with a secret key; only a key holder can make a valid signature."
+  },
+  {
+   "term": "run token",
+   "plain": "The gateway's signed token with agent, Jira key, run, expiry and epoch; readable, not secret."
+  },
+  {
+   "term": "secret guard",
+   "plain": "Code that refuses to output any text containing a known secret, like Byte's broker has."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-07",
+   "why": "The broker makes capabilities with randomBytes(32), stores only sha256 digests, and never logs a token."
+  },
+  {
+   "key": "G0-13",
+   "why": "The gateway's run tokens are HMAC-signed and checked with timingSafeEqual; access logs hold no content."
+  },
+  {
+   "key": "G3-18",
+   "why": "The claim activity mints both per run and writes them to /run/nova/ with mode 0600."
+  }
+ ],
+ "remember": "Make secrets with randomBytes, store only a hash, compare with timingSafeEqual, sign with HMAC, and never log one."
+}

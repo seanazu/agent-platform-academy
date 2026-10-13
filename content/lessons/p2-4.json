@@ -1,0 +1,415 @@
+{
+ "id": "p2-4",
+ "title": "GitHub Apps, tokens and rulesets",
+ "minutes": 50,
+ "youNeed": [
+  "p2-3"
+ ],
+ "bridge": "A GitHub App installation token is like a one-hour API key that acts as the bot. Except: it is minted from a private key each time, so there is nothing static to paste. Each token can be narrowed to one repo and to fewer permissions than the App has.",
+ "intro": "Every agent pushes and opens PRs as the rhino-ai-agents App, and a ruleset on fcp's main decides what may merge. This lesson covers both halves: the identity (App, private key, short tokens) and the rule book (rulesets, required checks, bypass).",
+ "picture": {
+  "caption": "The broker turns the App's private key into a one-hour, one-repo token. The ruleset on main checks approvals and required checks before a person merges.",
+  "nodes": [
+   {
+    "id": "vault",
+    "label": "Vault: infrastructure/ai-agents/github-app",
+    "kind": "file"
+   },
+   {
+    "id": "broker",
+    "label": "broker",
+    "kind": "service"
+   },
+   {
+    "id": "gh",
+    "label": "GitHub (App rhino-ai-agents)",
+    "kind": "service"
+   },
+   {
+    "id": "run",
+    "label": "agent run in a VM",
+    "kind": "agent"
+   },
+   {
+    "id": "ruleset",
+    "label": "ruleset main-branch-protection",
+    "kind": "check"
+   },
+   {
+    "id": "person",
+    "label": "a teammate",
+    "kind": "person"
+   }
+  ],
+  "steps": [
+   {
+    "from": "vault",
+    "to": "broker",
+    "text": "the pod reads app_id and the private key; the VM never does"
+   },
+   {
+    "from": "broker",
+    "to": "gh",
+    "text": "signs a JWT with the key and asks for an installation token for fcp only"
+   },
+   {
+    "from": "gh",
+    "to": "broker",
+    "text": "returns a token that lives one hour with the narrowed permissions"
+   },
+   {
+    "from": "run",
+    "to": "broker",
+    "text": "asks the broker to push the branch and open the PR as rhino-ai-agents[bot]"
+   },
+   {
+    "from": "ruleset",
+    "to": "gh",
+    "text": "requires 1 independent approval, green required checks, no force-push"
+   },
+   {
+    "from": "person",
+    "to": "gh",
+    "text": "approves and merges; the App is not a bypass actor and the broker refuses merge"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Who is rhino-ai-agents?",
+   "p": [
+    "A GitHub App is an identity that is not a person. It has an id and a private key.",
+    "It has a list of permissions it may ever use, and a list of repos it is installed on. When it acts, commits and PRs show rhino-ai-agents[bot] as the author. That lets rules treat its work differently from a person's.",
+    "G0-08 creates the App from the manifest below. Read the permission list slowly. contents and pull_requests write let it push and open PRs.",
+    "checks and actions read let it see CI results. metadata read is always required. Not in the list: workflows, administration, members."
+   ],
+   "because": "We give the App exactly these permissions for one reason. Without the workflows permission, GitHub refuses any push from it that changes .github/workflows, and that refusal is a wall we want.",
+   "code": {
+    "lang": "json",
+    "file": "ai-agents/settings/github-app.json (from G0-08)",
+    "text": "{\n  \"name\": \"rhino-ai-agents\",\n  \"description\": \"Identity for Rhino's AI agents (Nova and the routines). The broker mints a 1-hour token per run for one repo.\",\n  \"url\": \"https://github.com/RhinoHealth/ai-agents\",\n  \"public\": false,\n  \"hook_attributes\": { \"active\": false },\n  \"default_events\": [],\n  \"default_permissions\": {\n    \"metadata\": \"read\",\n    \"contents\": \"write\",\n    \"pull_requests\": \"write\",\n    \"checks\": \"read\",\n    \"actions\": \"read\"\n  }\n}",
+    "notes": [
+     {
+      "line": 5,
+      "text": "Private: only RhinoHealth can install it. It is installed on fcp only, with 'Only select repositories'."
+     },
+     {
+      "line": 6,
+      "text": "No webhook. Agents are triggered by Jira polling, Slack and small Actions, not by GitHub calling us."
+     },
+     {
+      "line": 8,
+      "text": "This is the ceiling. A token minted later can ask for less, never for more."
+     },
+     {
+      "line": 10,
+      "text": "contents: write lets the App push branches. It still cannot merge into main past the ruleset."
+     },
+     {
+      "line": 13,
+      "text": "No workflows permission on purpose: a push that touches .github/workflows is refused by GitHub itself."
+     }
+    ]
+   }
+  },
+  {
+   "h": "A token for one hour and one repo",
+   "p": [
+    "The App's private key never leaves the server side. It is stored in Vault at kvv2 infrastructure/ai-agents/github-app and read by the broker's pod. A pod is the running container of a service on our Kubernetes cluster (p5-1). To act, the broker signs a small JWT with the key and asks GitHub for an installation token. That token is a normal bearer token, valid for one hour.",
+    "At that moment you can narrow it: which repos, which permissions. A run that only needs to push and open a PR on fcp gets a token for fcp. It has contents and pull_requests write, and nothing else. The VM only ever sees this short token, through the broker."
+   ],
+   "because": "We mint a narrowed token per run because a leaked token should be useless an hour later. It should also be useless on any other repo.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/github-token.ts (from the stack cheat sheet)",
+    "text": "import { createAppAuth } from \"@octokit/auth-app\";\n\n// appId and privateKey come from the pod's secret (Vault via ExternalSecrets), never from the VM\nconst auth = createAppAuth({ appId, privateKey });\n\nexport const tokenForRun = async (installationId: number) => {\n  const { token, expiresAt } = await auth({\n    type: \"installation\",\n    installationId,\n    repositoryNames: [\"fcp\"],\n    permissions: { contents: \"write\", pull_requests: \"write\", checks: \"read\", actions: \"read\" }, // never \"workflows\"\n  });\n  return { token, expiresAt }; // one hour; the broker uses it, the VM never holds it\n};",
+    "notes": [
+     {
+      "line": 4,
+      "text": "createAppAuth holds the key in memory and signs the JWT for you."
+     },
+     {
+      "line": 8,
+      "text": "type: installation asks for a token that acts on the installed repos, as the bot."
+     },
+     {
+      "line": 10,
+      "text": "repositoryNames narrows the token to fcp even if the App is installed on more repos later."
+     },
+     {
+      "line": 11,
+      "text": "permissions narrows further. Asking for more than the App has fails; asking for less is the point."
+     },
+     {
+      "line": 13,
+      "text": "expiresAt is about one hour out. The broker mints a fresh one for the next run."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "Inside a workflow the same thing is one step: actions/create-github-app-token with app-id, private-key and permission-contents: read. G1-03 and G2-09 use it for read-only tokens from a separate small App, so the agents' key stays with the broker alone."
+   }
+  },
+  {
+   "h": "Rulesets: the rule book for main",
+   "p": [
+    "A ruleset is a set of rules attached to branches that match a pattern. It replaces the older 'branch protection'. fcp already has one, main-branch-protection, id 5937570, but it is disabled. G0-02 turns it on with the API call below, run once by an org admin.",
+    "The call is a PUT with a JSON body. Read it as three parts: which branches, who may bypass, and the rules. This first block has the first two."
+   ],
+   "because": "We apply the ruleset with the API instead of clicking. The JSON can then be exported, reviewed and kept with the review-rules page.",
+   "code": {
+    "lang": "bash",
+    "file": "run once by an org admin (from G0-02, part 1)",
+    "text": "# Run by an org admin. Agents never change rulesets.\n# 5937570 is the existing, disabled \"main-branch-protection\" ruleset on fcp.\nTEAM_ID=$(gh api orgs/RhinoHealth/teams/fcp-break-glass --jq .id)   # Tal and Nir\n\ngh api -X PUT repos/RhinoHealth/fcp/rulesets/5937570 --input - <<EOF\n{\n  \"name\": \"main-branch-protection\",\n  \"target\": \"branch\",\n  \"enforcement\": \"active\",\n  \"conditions\": { \"ref_name\": { \"include\": [\"refs/heads/main\"], \"exclude\": [] } },\n  \"bypass_actors\": [\n    { \"actor_type\": \"Team\", \"actor_id\": ${TEAM_ID}, \"bypass_mode\": \"pull_request\" }\n  ],",
+    "notes": [
+     {
+      "line": 3,
+      "text": "Rulesets cannot name single people as bypass actors, so G0-02 creates a team with Tal and Nir first."
+     },
+     {
+      "line": 5,
+      "text": "PUT replaces the whole ruleset. --input - reads the JSON body from the heredoc that follows."
+     },
+     {
+      "line": 9,
+      "text": "active turns it on. The other value, evaluate, only logs what would have been blocked."
+     },
+     {
+      "line": 10,
+      "text": "Only main. Other branches stay free, which is where agents work."
+     },
+     {
+      "line": 12,
+      "text": "pull_request mode: the team may bypass only through a PR, and GitHub logs every bypass."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The rules themselves",
+   "p": [
+    "The second block lists the rules. deletion and non_fast_forward stop anyone from deleting main or force-pushing over it. pull_request requires one approving review, drops approvals when new commits arrive, and requires the last push to be approved by someone else. required_status_checks names the checks that must be green."
+   ],
+   "because": "We require exactly one approval, with stale approvals dismissed. It is the smallest rule that makes a second person look at every change, from people and agents alike.",
+   "code": {
+    "lang": "bash",
+    "file": "run once by an org admin (from G0-02, part 2)",
+    "text": "  \"rules\": [\n    { \"type\": \"deletion\" },\n    { \"type\": \"non_fast_forward\" },\n    { \"type\": \"pull_request\", \"parameters\": {\n        \"required_approving_review_count\": 1,\n        \"dismiss_stale_reviews_on_push\": true,\n        \"require_last_push_approval\": true,\n        \"require_code_owner_review\": false,\n        \"required_review_thread_resolution\": false,\n        \"allowed_merge_methods\": [\"squash\"] } },\n    { \"type\": \"required_status_checks\", \"parameters\": {\n        \"strict_required_status_checks_policy\": false,\n        \"required_status_checks\": [\n          { \"context\": \"Cloud Unit Tests\" },\n          { \"context\": \"Client Unit Tests\" },\n          { \"context\": \"Frontend Unit Tests\" } ] } }\n  ]\n}\nEOF",
+    "notes": [
+     {
+      "line": 3,
+      "text": "non_fast_forward is the force-push block. History on main can only grow."
+     },
+     {
+      "line": 6,
+      "text": "A new commit after an approval needs a new approval. Otherwise an agent could push after the review."
+     },
+     {
+      "line": 7,
+      "text": "Whoever pushed last cannot be the approver. G0-09 adds the stronger version for agent PRs."
+     },
+     {
+      "line": 8,
+      "text": "No CODEOWNERS: fcp has none and the design keeps it that way; the one approval is the rule."
+     },
+     {
+      "line": 12,
+      "text": "strict: false means the branch need not be rebased on the newest main before merge."
+     },
+     {
+      "line": 14,
+      "text": "The context is the check's name exactly as GitHub shows it. Today all three jobs are called 'Unit Tests'; G0-02 renames them."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Required checks: names must match, and skipped passes",
+   "p": [
+    "A required check is matched by name. If the job is named 'Unit Tests' in three workflows, the ruleset cannot tell them apart. Say the workflow has a paths: filter and the PR does not touch those paths. Then the workflow never runs and the check stays pending forever, so the PR can never merge.",
+    "G0-02 fixes both: rename the jobs to 'Cloud Unit Tests', 'Client Unit Tests' and 'Frontend Unit Tests', and remove paths: filters. The check-changes job still skips the work with if:, and a skipped job counts as passing. For a reusable workflow the name is 'workflow name / job id', for example 'independent-approval / check'."
+   ],
+   "callout": {
+    "kind": "gotcha",
+    "text": "The I&T gate e2e_tests and sdk-ci stay optional for now. The per-cloud QA locks make them too slow to require on every PR."
+   }
+  },
+  {
+   "h": "Who merges, and who never does",
+   "p": [
+    "Bypass actors are the only ones who can get past the rules, and only in the mode given. The App is deliberately not in the list, so even with contents: write it cannot merge an unapproved PR. G0-08 proves it: mint a test token and try; the merge must fail. The broker refuses the merge endpoint as well, so a person always merges.",
+    "Export the ruleset to JSON afterwards (gh api repos/RhinoHealth/fcp/rulesets/5937570). Keep it next to the review-rules page, so a change to it is a reviewed diff, not a click."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Agents never change rulesets, never merge, and the App has no bypass. The requester never approves their own agent's PR; exactly one independent approval is the rule."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Make a bot, mint a token, lock a branch",
+  "youNeed": [
+   "actions-lab (public, so rulesets work on the free plan)",
+   "gh CLI",
+   "Node 24 and npm"
+  ],
+  "worked": [
+   {
+    "do": "In the browser: Settings, Developer settings, GitHub Apps, New GitHub App. Name lab-bot-<yourname>, any homepage URL, webhook off, permissions Contents: read and write, Pull requests: read and write. Create it, note the App ID, generate a private key (a .pem downloads).",
+    "see": "App ID shown on the App's page; a file like lab-bot.2026-10-13.private-key.pem in Downloads"
+   },
+   {
+    "do": "On the App's page: Install App, your account, Only select repositories, actions-lab. Then note the installation id from the URL (…/installations/<id>).",
+    "see": "URL ends with /settings/installations/12345678"
+   },
+   {
+    "do": "mkdir app-lab && cd app-lab && npm init -y && npm install @octokit/auth-app@8.1.0 @octokit/rest@22.0.1 tsx@4.20.5 && mv ~/Downloads/*.private-key.pem key.pem && echo key.pem >> .gitignore",
+    "see": "added N packages"
+   },
+   {
+    "do": "Write mint.ts: import createAppAuth; read process.env.APP_ID, INSTALLATION_ID and the key with readFileSync('key.pem','utf8'); call auth({ type: 'installation', installationId, repositoryNames: ['actions-lab'], permissions: { contents: 'write', pull_requests: 'write' } }); print expiresAt and the token's first 8 characters only.",
+    "see": "(file saved)"
+   },
+   {
+    "do": "APP_ID=<id> INSTALLATION_ID=<id> npx tsx mint.ts",
+    "see": "expires 2026-10-13T11:02:14Z  token ghs_AbCd..."
+   },
+   {
+    "do": "Extend mint.ts to call new Octokit({ auth: token }).rest.apps.listReposAccessibleToInstallation() and print the repo names.",
+    "see": "[ 'actions-lab' ]"
+   },
+   {
+    "do": "gh api -X POST repos/seanazu/actions-lab/rulesets --input - <<'EOF'\n{\"name\":\"main\",\"target\":\"branch\",\"enforcement\":\"active\",\"conditions\":{\"ref_name\":{\"include\":[\"refs/heads/main\"],\"exclude\":[]}},\"rules\":[{\"type\":\"deletion\"},{\"type\":\"non_fast_forward\"},{\"type\":\"pull_request\",\"parameters\":{\"required_approving_review_count\":1,\"dismiss_stale_reviews_on_push\":true,\"require_last_push_approval\":true,\"require_code_owner_review\":false,\"required_review_thread_resolution\":false,\"allowed_merge_methods\":[\"squash\"]}},{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":false,\"required_status_checks\":[{\"context\":\"hello\"}]}}]}\nEOF",
+    "see": "{ \"id\": 98765, \"name\": \"main\", \"enforcement\": \"active\", ... }"
+   },
+   {
+    "do": "cd ../actions-lab && git switch -c try-merge && echo x >> README.md && git commit -am 'Try' && git push -u origin try-merge && gh pr create --fill && gh pr merge --squash",
+    "see": "X Pull request #N is not mergeable: the base branch policy prohibits the merge.\n(1 approving review required; required status check 'hello' …)"
+   }
+  ],
+  "faded": "Export your ruleset with gh api repos/seanazu/actions-lab/rulesets/<id> > ruleset.json and read it. Then change required_approving_review_count to 0 in the file and send it back with gh api -X PUT … --input ruleset.json. The merge command from the last step should now wait only for the hello check; run it and watch.",
+  "alone": "Take the bot token from mint.ts. Use Octokit to open a PR from a new branch (pulls.create), then try pulls.merge on it. Read the error, then add the App as a bypass actor (actor_type Integration, actor_id = your App ID) and try again. Remove the bypass afterwards and delete key.pem; our real App never has a bypass.",
+  "done": "You minted a one-hour token that lists only actions-lab. A ruleset blocked an unapproved squash merge, and you saw the error text that an agent would see."
+ },
+ "quiz": [
+  {
+   "q": "The App has contents: write. Can a run with its token merge a PR into fcp's main?",
+   "options": [
+    {
+     "text": "Yes, write permission includes merging.",
+     "correct": false,
+     "why": "The ruleset applies to the App like to anyone else. Without an approval and green checks GitHub refuses the merge."
+    },
+    {
+     "text": "No: the ruleset needs an approval and the App is not a bypass actor; the broker also refuses the merge endpoint.",
+     "correct": true,
+     "why": "Two walls, one in GitHub and one in the broker, so a person always merges."
+    },
+    {
+     "text": "Only if the PR was opened by the same App.",
+     "correct": false,
+     "why": "Who opened the PR changes nothing about merge rights."
+    }
+   ]
+  },
+  {
+   "q": "Why does G0-02 rename the three 'Unit Tests' jobs and remove paths: filters?",
+   "options": [
+    {
+     "text": "To make the Actions tab easier to read.",
+     "correct": false,
+     "why": "Nice, but not the reason. The ruleset matches checks by name and cannot tell three identical names apart."
+    },
+    {
+     "text": "Because required checks are matched by name, and a workflow filtered out by paths: never reports, so the PR stays blocked.",
+     "correct": true,
+     "why": "Unique names make the check requirable; dropping paths: makes it always report, with if: skipping the work when nothing changed."
+    },
+    {
+     "text": "Because rulesets only allow three required checks.",
+     "correct": false,
+     "why": "There is no such limit; the three are the unit-test jobs that are fast enough to require."
+    }
+   ]
+  },
+  {
+   "q": "Where does the rhino-ai-agents private key live, and who reads it?",
+   "options": [
+    {
+     "text": "In the sandbox VM, so the agent can push on its own.",
+     "correct": false,
+     "why": "No keys in the VM is a wall. The VM gets only a one-hour token through the broker."
+    },
+    {
+     "text": "In a repo secret in fcp.",
+     "correct": false,
+     "why": "fcp's workflows must not be able to act as the agents' identity; that key belongs to the broker alone."
+    },
+    {
+     "text": "In Vault at infrastructure/ai-agents/github-app, read by the broker's pod.",
+     "correct": true,
+     "why": "The broker signs the JWT and mints narrowed installation tokens from there; the downloaded .pem is deleted."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p2-3: which permission must a job declare before it can get an OIDC token?",
+  "From p2-2: how does GitHub name the check of a job called check in a reusable workflow called independent-approval?"
+ ],
+ "videos": [
+  {
+   "title": "Working with GitHub Apps instead of a PAT",
+   "url": "https://www.youtube.com/watch?v=xtXnIV20XQw",
+   "channel": "Rob Bos",
+   "minutes": 20,
+   "why": "Creates a GitHub App and generates installation tokens, compared to PATs."
+  }
+ ],
+ "words": [
+  {
+   "term": "GitHub App",
+   "plain": "A non-person identity with an id, a private key, a permission ceiling and a list of repos it is installed on."
+  },
+  {
+   "term": "installation token",
+   "plain": "A one-hour bearer token minted from the App's key for one installation, narrowable to fewer repos and permissions."
+  },
+  {
+   "term": "installation id",
+   "plain": "The number GitHub gives when the App is installed on an account; the broker needs it to mint tokens."
+  },
+  {
+   "term": "ruleset",
+   "plain": "Rules attached to branches that match a pattern: approvals, required checks, no force-push, no delete."
+  },
+  {
+   "term": "required check",
+   "plain": "A check named in the ruleset that must be green (or skipped) before merge."
+  },
+  {
+   "term": "bypass actor",
+   "plain": "A team, role or App allowed past the ruleset, in a given mode, with every bypass logged."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G0-08",
+   "why": "Creating the App from the manifest, storing the key in Vault and proving the App cannot merge is this lesson's first half."
+  },
+  {
+   "key": "G0-02",
+   "why": "Turning on the ruleset with required unit-test checks and the break-glass team is the second half."
+  },
+  {
+   "key": "G0-09",
+   "why": "The independent-approval check becomes a required check by its exact 'independent-approval / check' name."
+  },
+  {
+   "key": "G1-03",
+   "why": "The metrics job reads GitHub with a separate read-only App through create-github-app-token."
+  }
+ ],
+ "remember": "Agents act as an App with one-hour, one-repo tokens minted by the broker. A ruleset on main needs one independent approval and green named checks, and the App has no bypass."
+}

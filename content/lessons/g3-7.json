@@ -1,0 +1,492 @@
+{
+ "id": "g3-7",
+ "title": "Warm pools, Spot and the sweeper",
+ "minutes": 50,
+ "youNeed": [
+  "g3-6",
+  "p3-4",
+  "p3-7"
+ ],
+ "bridge": "A warm pool is like keeping a few laptops set up and asleep in a cupboard. Opening one takes a minute, not an afternoon. Except a laptop that served one run is never put back. It is destroyed, and a fresh one is set up and put to sleep in its place.",
+ "intro": "A fresh VM from the image still needs minutes to boot and warm up FCP Lab. This lesson keeps a few stopped VMs ready per size, so a run gets one in about a minute. It adds cheaper Spot groups for routines that can retry. Then it adds the sweeper, which destroys anything no live run owns.",
+ "picture": {
+  "caption": "VMs are set up once, stopped, claimed by one run, detached, and later destroyed. The sweeper catches whatever the normal path missed.",
+  "nodes": [
+   {
+    "id": "asg",
+    "label": "ASG ai-agents-sandbox-full (desired 0)",
+    "kind": "service"
+   },
+   {
+    "id": "hook",
+    "label": "lifecycle hook finish-setup + sandbox-warm unit",
+    "kind": "check"
+   },
+   {
+    "id": "pool",
+    "label": "warm pool: stopped VMs",
+    "kind": "machine"
+   },
+   {
+    "id": "claim",
+    "label": "acquireSandbox activity",
+    "kind": "service"
+   },
+   {
+    "id": "vm",
+    "label": "claimed VM, tagged with its run",
+    "kind": "machine"
+   },
+   {
+    "id": "spot",
+    "label": "Spot group (no warm pool)",
+    "kind": "service"
+   },
+   {
+    "id": "sweeper",
+    "label": "sweeper Lambda, every 15 minutes",
+    "kind": "service"
+   }
+  ],
+  "steps": [
+   {
+    "from": "asg",
+    "to": "hook",
+    "text": "a new VM boots; sandbox-warm starts FCP Lab once, then completes the hook"
+   },
+   {
+    "from": "hook",
+    "to": "pool",
+    "text": "the VM stops and waits in the pool, costing only its disk"
+   },
+   {
+    "from": "claim",
+    "to": "asg",
+    "text": "a run raises desired by 1; a pool VM starts and is InService in about a minute"
+   },
+   {
+    "from": "claim",
+    "to": "vm",
+    "text": "detaches it from the group; Temporal owns it now, and the pool refills"
+   },
+   {
+    "from": "claim",
+    "to": "spot",
+    "text": "a retryable routine claims from the Spot group instead"
+   },
+   {
+    "from": "sweeper",
+    "to": "vm",
+    "text": "lease expired, or stopped over 72 h: terminate"
+   },
+   {
+    "from": "sweeper",
+    "to": "pool",
+    "text": "warm VM older than 24 h: recycle, so the pool tracks the newest image"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "A minute instead of ten",
+   "p": [
+    "An Auto Scaling group (ASG) keeps a number of VMs from a launch template. You set the desired count, and it starts or stops VMs to match. A warm pool is a set of VMs the group has already booted and set up, then stopped. When the group needs one more VM, it starts a stopped one instead of building a new one.",
+    "A stopped VM costs only its disk, about $8 to $10 a month. A full VM costs about $0.42 an hour while it runs. So a few warm VMs per size are cheap, and they turn a cold start of many minutes into about one minute.",
+    "G3-15 makes one ASG per size. The steady state is all-warm: desired 0, nothing in service until a run claims a VM. The pools start at lite 2, full 2, wide 0. max_size is 3, because only claims in flight live in the group."
+   ]
+  },
+  {
+   "h": "The ASG, part 1: the group and its pool",
+   "p": [
+    "The group sits in the sandbox subnets and uses the size's launch template from lesson g3-6. The warm_pool block says how many stopped VMs to keep."
+   ],
+   "because": "We set reuse_on_scale_in = false, because a VM that served a run holds that run's files and must never serve another one.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/aws-sandbox-pool/asg.tf (part 1 of 2)",
+    "text": "resource \"aws_autoscaling_group\" \"sandbox\" {\n  for_each = var.sizes\n\n  name                = \"${var.name_prefix}-sandbox-${each.key}\"\n  vpc_zone_identifier = var.subnet_ids\n  min_size            = 0\n  max_size            = 3 # only claims in flight live here; claimed VMs are detached\n  desired_capacity    = 0\n\n  launch_template {\n    id      = aws_launch_template.sandbox[each.key].id\n    version = \"$Latest\"\n  }\n\n  warm_pool {\n    pool_state                  = \"Stopped\" # a stopped VM costs only its disk\n    min_size                    = var.warm_pool_size[each.key] # lite 2, full 2, wide 0 to start\n    max_group_prepared_capacity = var.warm_pool_size[each.key]\n    instance_reuse_policy {\n      reuse_on_scale_in = false # a used VM never goes back to the pool\n    }\n  }",
+    "notes": [
+     {
+      "line": 2,
+      "text": "One group per size, like the launch templates."
+     },
+     {
+      "line": 5,
+      "text": "The three private sandbox subnets, one per availability zone."
+     },
+     {
+      "line": 7,
+      "text": "At most 3 VMs in service: only claims in flight. A claimed VM is detached at once, so it no longer counts."
+     },
+     {
+      "line": 8,
+      "text": "Desired 0: nothing runs until a claim raises it."
+     },
+     {
+      "line": 12,
+      "text": "$Latest: the group always launches from the newest version of the template."
+     },
+     {
+      "line": 16,
+      "text": "Pool VMs are stopped, not running. Only the disk is billed."
+     },
+     {
+      "line": 17,
+      "text": "How many to keep, per size: lite 2, full 2, wide 0 to start."
+     },
+     {
+      "line": 18,
+      "text": "Cap the pool at the same number, so it never grows on its own."
+     },
+     {
+      "line": 20,
+      "text": "A VM leaving service is terminated, never returned to the pool."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "One fresh VM per run. A claimed VM is detached from its group, used by one run, and destroyed. Nothing goes back to the pool."
+   }
+  },
+  {
+   "h": "The ASG, part 2: finish setup before stopping",
+   "p": [
+    "A VM that joins the warm pool should do its slow first-boot work before it stops. It starts FCP Lab once, pulls images and reads the disk. A lifecycle hook pauses the VM at a point in its life until something says 'continue'.",
+    "The other half is a systemd unit in the image role, sandbox-warm. On boot it reads /latest/meta-data/autoscaling/target-lifecycle-state from the metadata service. Warmed:Stopped means 'going to the pool': start FCP Lab once, stop it, complete the hook. InService means a run is waiting: complete the hook at once."
+   ],
+   "because": "We hold every new VM at launch until it reports ready, because a half-set-up warm VM breaks the next run.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/aws-sandbox-pool/asg.tf (part 2 of 2)",
+    "text": "  # The VM finishes setup (FCP Lab started once, images pulled, disk warmed) before it is stopped.\n  initial_lifecycle_hook {\n    name                 = \"finish-setup\"\n    lifecycle_transition = \"autoscaling:EC2_INSTANCE_LAUNCHING\"\n    heartbeat_timeout    = 1800\n    default_result       = \"ABANDON\"\n  }\n\n  # + dynamic \"tag\" blocks (propagate_at_launch) for var.tags, ai-agents:managed=true, ai-agents:size\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "What the hook waits for: FCP Lab started once, images pulled, disk warmed."
+     },
+     {
+      "line": 4,
+      "text": "The hook fires when a VM launches, for the warm pool or straight into service."
+     },
+     {
+      "line": 5,
+      "text": "The VM has 1800 seconds (30 minutes) to complete the hook."
+     },
+     {
+      "line": 6,
+      "text": "If it never does, ABANDON: the group terminates that VM and tries a new one."
+     },
+     {
+      "line": 9,
+      "text": "Tags on the group copy to each VM: the account's tags, ai-agents:managed=true and the size."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Claimed VMs leave the group",
+   "p": [
+    "The claim activity (lesson g3-8) raises desired by 1. The group starts a warm VM and waits for its hook. When the VM is InService, the activity calls DetachInstances with ShouldDecrementDesiredCapacity. The VM leaves the group, and desired goes back down.",
+    "From then on Temporal owns the VM, not the group. The group sees its pool is one short and boots a replacement, which goes through the hook and stops. The completed hook is why the instance role has autoscaling:CompleteLifecycleAction, and why the VPC has an autoscaling endpoint (lesson g3-2).",
+    "There is one more cap above all of this. The account's On-Demand and Spot vCPU quotas limit how many VMs can run at once. Check them and request what we need; runs above the cap wait in Temporal's slot queues (G3-25)."
+   ]
+  },
+  {
+   "h": "Spot groups for retryable routines",
+   "p": [
+    "Spot VMs are spare EC2 capacity sold about 56% cheaper. AWS can take one back with a two-minute warning. A routine that can retry, such as a CI fixer, does not mind. spot-watch writes /run/nova/preempt and the harness saves its work. Then the workflow retries the step on a fresh VM (lesson g3-8).",
+    "Nova and the bug fixers stay on the on-demand groups. They wait on people, and a lost VM costs a person's time. Spot groups have no warm pool. lite and full each get one, named ai-agents-sandbox-<size>-spot."
+   ],
+   "because": "We let the group pick among three instance families, because Spot capacity runs out per type.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/modules/aws-sandbox-pool/spot.tf (a sketch built from G3-15's steps)",
+    "text": "resource \"aws_autoscaling_group\" \"spot\" {\n  for_each = { for k, v in var.sizes : k => v if k != \"wide\" }\n  name                = \"${var.name_prefix}-sandbox-${each.key}-spot\"\n  vpc_zone_identifier = var.subnet_ids\n  min_size            = 0\n  max_size            = 3\n  desired_capacity    = 0\n  mixed_instances_policy {\n    instances_distribution {\n      on_demand_percentage_above_base_capacity = 0\n      spot_allocation_strategy                 = \"price-capacity-optimized\"\n    }\n    launch_template {\n      launch_template_specification {\n        launch_template_id = aws_launch_template.sandbox[each.key].id\n        version            = \"$Latest\"\n      }\n      dynamic \"override\" {\n        for_each = [for family in [\"m8i\", \"m7i\", \"m6i\"] : replace(each.value, \"m8i\", family)]\n        content { instance_type = override.value }\n      }\n    }\n  }\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "lite and full only. wide has no Spot group."
+     },
+     {
+      "line": 3,
+      "text": "The name acquireSandbox builds when spot is true: ai-agents-sandbox-full-spot."
+     },
+     {
+      "line": 8,
+      "text": "A mixed instances policy lets one group use several instance types and buying options."
+     },
+     {
+      "line": 10,
+      "text": "0% on-demand above the base: every VM in this group is Spot."
+     },
+     {
+      "line": 11,
+      "text": "price-capacity-optimized picks the cheapest Spot pools that are least likely to be taken back."
+     },
+     {
+      "line": 15,
+      "text": "The same launch template as the on-demand group: same image, role and walls."
+     },
+     {
+      "line": 19,
+      "text": "One override per family: m8i, m7i and m6i of the same size, for example m7i.2xlarge."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The sweeper, part 1: the rules",
+   "p": [
+    "Throw-away machines must really be thrown away, even when the orchestrator is down or a run crashed. G3-22 adds a Lambda in the ai-agents account that runs every 15 minutes and works only from tags. It does not ask Temporal anything, so it keeps working when Temporal does not.",
+    "It is a copy of modules/aws-vm-autostop: an EventBridge rule rate(15 minutes), a Python Lambda and tag-scoped IAM. It stays Python although the platform is TypeScript: the infrastructure repo builds its Lambdas in Python with uv, and DevOps owns them. It is not attached to the VPC, so it needs no endpoints."
+   ],
+   "because": "We decide from tags alone, because the cleaner must not depend on the system whose failures it cleans up after.",
+   "code": {
+    "lang": "python",
+    "file": "infrastructure/modules/aws-sandbox-sweeper/lambda/handler.py (part 1 of 2)",
+    "text": "\"\"\"Sandbox sweeper: every 15 minutes, remove VMs and disks that no live run owns. Based on aws-vm-autostop.\"\"\"\nimport datetime as dt\nimport json\nimport os\n\nimport boto3\n\nec2, autoscaling = boto3.client(\"ec2\"), boto3.client(\"autoscaling\")\nDRY_RUN = os.environ.get(\"DRY_RUN\", \"true\") == \"true\"  # start dry, like dev-vm-autostop\n\n\ndef handler(event, context):\n    now = dt.datetime.now(dt.UTC)\n    for inst in managed_instances(states=[\"running\", \"stopped\"]):  # tag ai-agents:managed=true only\n        tags = {t[\"Key\"]: t[\"Value\"] for t in inst.get(\"Tags\", [])}\n        if \"ai-agents:run-id\" in tags and parse(tags.get(\"ai-agents:lease-until\")) < now:\n            act(\"terminate\", inst[\"InstanceId\"], \"lease expired: no live run owns this VM\")\n        elif inst[\"State\"][\"Name\"] == \"stopped\" and stopped_since(inst) < now - dt.timedelta(hours=72):\n            act(\"terminate\", inst[\"InstanceId\"], \"stopped for over 72 h; its work is already saved\")\n        elif \"aws:autoscaling:groupName\" in tags and inst[\"LaunchTime\"] < now - dt.timedelta(hours=24):\n            act(\"recycle\", inst[\"InstanceId\"], \"warm VM older than 24 h; the pool refills from the newest image\")\n    for vol in managed_volumes(status=\"available\"):\n        act(\"delete-volume\", vol[\"VolumeId\"], \"orphaned disk\")",
+    "notes": [
+     {
+      "line": 6,
+      "text": "boto3 is the AWS SDK for Python, the Python twin of the SDK v3 clients in TypeScript."
+     },
+     {
+      "line": 9,
+      "text": "Dry by default: it only logs what it would do, until DevOps sets DRY_RUN=false."
+     },
+     {
+      "line": 13,
+      "text": "One 'now' for the whole run, in UTC."
+     },
+     {
+      "line": 14,
+      "text": "Only instances tagged ai-agents:managed=true. Nothing else in the account is touched."
+     },
+     {
+      "line": 15,
+      "text": "Turn AWS's tag list into a dict, so tags[\"ai-agents:run-id\"] works."
+     },
+     {
+      "line": 16,
+      "text": "A claimed VM has a run-id. If its lease time has passed, no live run renewed it, so nobody owns it."
+     },
+     {
+      "line": 18,
+      "text": "Stopped for over 72 hours. A parked VM is retired by its workflow at 72 h; this rule is the backstop."
+     },
+     {
+      "line": 20,
+      "text": "A warm VM (still in a group) launched over 24 hours ago is recycled, so the pool refills from the newest image."
+     },
+     {
+      "line": 22,
+      "text": "Available volumes are attached to nothing. A managed one is an orphaned disk."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The sweeper, part 2: act, but dry first",
+   "p": [
+    "Every decision goes through act. It always prints one JSON line, so a dry run shows exactly what a real run would do. The IAM role allows ec2:TerminateInstances and ec2:DeleteVolume only when aws:ResourceTag/ai-agents:managed is true, and autoscaling:TerminateInstanceInAutoScalingGroup on the sandbox ASGs only."
+   ],
+   "because": "We start with dry_run = true, because a cleaner with a wrong rule destroys the wrong things every 15 minutes.",
+   "code": {
+    "lang": "python",
+    "file": "infrastructure/modules/aws-sandbox-sweeper/lambda/handler.py (part 2 of 2)",
+    "text": "def act(action: str, resource_id: str, reason: str) -> None:\n    print(json.dumps({\"action\": action, \"id\": resource_id, \"reason\": reason, \"dry_run\": DRY_RUN}))\n    if DRY_RUN:\n        return\n    if action == \"terminate\":\n        ec2.terminate_instances(InstanceIds=[resource_id])\n    elif action == \"recycle\":\n        autoscaling.terminate_instance_in_auto_scaling_group(InstanceId=resource_id, ShouldDecrementDesiredCapacity=False)\n    else:\n        ec2.delete_volume(VolumeId=resource_id)",
+    "notes": [
+     {
+      "line": 2,
+      "text": "One JSON line per action: what, which id, why, and whether it was dry. CloudWatch Logs keeps it."
+     },
+     {
+      "line": 3,
+      "text": "Dry: stop after logging."
+     },
+     {
+      "line": 6,
+      "text": "terminate: an orphan whose lease passed, or a VM stopped too long."
+     },
+     {
+      "line": 8,
+      "text": "recycle: terminate inside the group without lowering desired, so the group launches a new VM from the current image."
+     },
+     {
+      "line": 10,
+      "text": "The only other action: delete an orphaned volume."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "The Lambda also publishes CloudWatch metrics in AIAgents/Sweeper (OrphansTerminated, VolumesDeleted) for G3-34's alerts. Ask DevOps where the CloudWatch exporter config lives, and add the namespace there."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Plan the warm-pool groups with a local backend",
+  "youNeed": [
+   "The ~/academy/sandbox-pool folder from the g3-6 lab (its plan said 8 to add)",
+   "OpenTofu; no AWS account"
+  ],
+  "worked": [
+   {
+    "do": "cd ~/academy/sandbox-pool. Add to variables.tf:\n\nvariable \"subnet_ids\" {\n  type    = list(string)\n  default = [\"subnet-0lab1\", \"subnet-0lab2\", \"subnet-0lab3\"]\n}\nvariable \"warm_pool_size\" {\n  type    = map(number)\n  default = { lite = 2, full = 2, wide = 0 }\n}",
+    "see": "(no output)"
+   },
+   {
+    "do": "Save asg.tf: parts 1 and 2 from sections 2 and 3, as one resource (the last comment line can stay).",
+    "see": "(a file)"
+   },
+   {
+    "do": "tofu plan -input=false -no-color | grep -E 'autoscaling_group|Plan:' | grep -v resource",
+    "see": "  # aws_autoscaling_group.sandbox[\"full\"] will be created\n  # aws_autoscaling_group.sandbox[\"lite\"] will be created\n  # aws_autoscaling_group.sandbox[\"wide\"] will be created\nPlan: 11 to add, 0 to change, 0 to destroy."
+   },
+   {
+    "do": "Read the warm pools: tofu plan -input=false -no-color | grep -E '^\\s+# aws_autoscaling_group|pool_state|reuse_on_scale_in|default_result' | sed 's/^ *//'",
+    "see": "# aws_autoscaling_group.sandbox[\"full\"] will be created\n+ default_result       = \"ABANDON\"\n+ pool_state                  = \"Stopped\"\n+ reuse_on_scale_in = false\n(the same three lines for lite and wide)"
+   },
+   {
+    "do": "Find the pool sizes: tofu plan -input=false -no-color | grep -A3 'warm_pool {' | grep '+ min_size' | sed 's/^ *//'",
+    "see": "+ min_size                    = 2\n+ min_size                    = 2\n+ min_size                    = 0"
+   },
+   {
+    "do": "echo 'var.warm_pool_size' | tofu console",
+    "see": "tomap({\n  \"full\" = 2\n  \"lite\" = 2\n  \"wide\" = 0\n})"
+   }
+  ],
+  "faded": "Add spot.tf with the Spot groups from section 5. Plan: expect 13 to add. The last step is yours. List the override instance types with one grep on the plan. Say why you see six lines, not nine.",
+  "alone": "Write the sweeper's IAM rule as a data \"aws_iam_policy_document\" \"sweeper\" in sweeper_iam.tf. Allow ec2:TerminateInstances and ec2:DeleteVolume on * with a condition: StringEquals on aws:ResourceTag/ai-agents:managed = \"true\". Add output \"sweeper_policy\" { value = data.aws_iam_policy_document.sweeper.json }. Run the plan and find the StringEquals block in the output. Then say what the policy would allow if you forgot the condition.",
+  "done": "The plan shows three groups with Stopped pools of 2, 2 and 0 and the ABANDON hook. It also shows two Spot groups and a tag-conditioned sweeper policy."
+ },
+ "quiz": [
+  {
+   "q": "A full VM finished run-42. Its group has reuse_on_scale_in = false. What happens to that VM?",
+   "options": [
+    {
+     "text": "It is stopped and returned to the warm pool for the next run.",
+     "correct": false,
+     "why": "It was detached when it was claimed, and a used VM never goes back. It holds run-42's files."
+    },
+    {
+     "text": "releaseSandbox terminates it; the group already refilled its pool when the VM was detached.",
+     "correct": true,
+     "why": "One fresh VM per run. The pool refills from the image, never from used VMs."
+    },
+    {
+     "text": "The sweeper keeps it 24 hours in case run-42 is resumed.",
+     "correct": false,
+     "why": "A resume uses a fresh VM and the session store. Nothing waits for a finished run."
+    }
+   ]
+  },
+  {
+   "q": "Why do Nova and the bug fixers use on-demand groups instead of Spot?",
+   "options": [
+    {
+     "text": "Spot VMs cannot run Docker.",
+     "correct": false,
+     "why": "They are ordinary EC2 VMs from the same launch template."
+    },
+    {
+     "text": "Spot is not allowed in the ai-agents account.",
+     "correct": false,
+     "why": "Routines use Spot groups in the same account."
+    },
+    {
+     "text": "They wait on people, so a VM taken back by AWS costs a person's time, not only a retry.",
+     "correct": true,
+     "why": "Spot fits work that can retry on its own. A run waiting for an answer is not that."
+    }
+   ]
+  },
+  {
+   "q": "The orchestrator was down for a day. A parked VM has been stopped for 80 hours. What does the sweeper do?",
+   "options": [
+    {
+     "text": "Terminates it: stopped for over 72 h. Its work was saved at every checkpoint, and the next answer resumes on a fresh VM.",
+     "correct": true,
+     "why": "The 72-hour rule is the backstop for retireSandbox, and it needs nothing from Temporal."
+    },
+    {
+     "text": "Nothing, because its lease (now + 73 h when parked) has not expired.",
+     "correct": false,
+     "why": "The rules are checked in order. The lease rule does not match, but the stopped-over-72-h rule does."
+    },
+    {
+     "text": "Starts it and runs nova-worker checkpoint first.",
+     "correct": false,
+     "why": "That is what retireSandbox does in the workflow. The sweeper only terminates and deletes."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From g3-6: which two permissions does the instance role ai-agent-sandbox have, and why so few?",
+  "From p3-7: what triggers a Lambda every 15 minutes?"
+ ],
+ "videos": [
+  {
+   "title": "AWS EC2 Auto Scaling - How it Works",
+   "url": "https://www.youtube.com/watch?v=rcWgcFMlwFw",
+   "channel": "Digital Cloud Training",
+   "minutes": 8,
+   "why": "Short, clear overview of Auto Scaling groups and scaling policies."
+  }
+ ],
+ "words": [
+  {
+   "term": "Auto Scaling group",
+   "plain": "An AWS group that keeps a desired number of VMs from a launch template."
+  },
+  {
+   "term": "warm pool",
+   "plain": "VMs a group has booted, set up and stopped, ready to start in about a minute."
+  },
+  {
+   "term": "lifecycle hook",
+   "plain": "A pause in a VM's launch until something completes it, or a timeout decides."
+  },
+  {
+   "term": "detach",
+   "plain": "Take a VM out of its group, so the group no longer counts or replaces it."
+  },
+  {
+   "term": "Spot",
+   "plain": "Spare EC2 capacity, about 56% cheaper, that AWS can take back with two minutes' warning."
+  },
+  {
+   "term": "lease tag",
+   "plain": "ai-agents:lease-until on a claimed VM; a live run renews it, and the sweeper ends VMs whose lease passed."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-15",
+   "why": "This lesson explained the warm-pool groups line by line, the setup hook, detaching on claim, and the Spot groups.",
+   "walk": [
+    "In modules/aws-sandbox-pool add asg.tf (code above): one group per size, desired 0, min 0, max 3, plus the tag blocks.",
+    "Set warm_pool from var.warm_pool_size (lite 2, full 2, wide 0) with pool_state Stopped and reuse_on_scale_in = false.",
+    "Add the initial_lifecycle_hook (EC2_INSTANCE_LAUNCHING, 1800 s, ABANDON). Add the sandbox-warm systemd unit to the image role: Warmed:Stopped warms FCP Lab first; InService completes at once.",
+    "Hand G3-18 the claim rule: raise desired by 1, wait for InService, DetachInstances with ShouldDecrementDesiredCapacity.",
+    "Add Spot groups for lite and full: 0% on-demand, price-capacity-optimized, overrides m8i, m7i and m6i of the same size, no warm pool.",
+    "Check the account's On-Demand and Spot vCPU quotas and request what we need."
+   ]
+  },
+  {
+   "key": "G3-22",
+   "why": "This lesson explained the four sweeper rules and act() line by line, the tag-scoped IAM and the dry-run start.",
+   "walk": [
+    "Copy modules/aws-vm-autostop to modules/aws-sandbox-sweeper (EventBridge rate(15 minutes), Python Lambda built with uv), not attached to the VPC. Add the unit terraform/accounts/ai-agents/aws/us-east-1/sandboxes/sweeper/.",
+    "Write lambda/handler.py (code above) with managed_instances, managed_volumes, parse and stopped_since helpers.",
+    "IAM: ec2:TerminateInstances and ec2:DeleteVolume only with aws:ResourceTag/ai-agents:managed = true; autoscaling:TerminateInstanceInAutoScalingGroup on the sandbox ASGs only.",
+    "Start with DRY_RUN=true, read the JSON lines for a while, then switch it off in a PR a person approves.",
+    "Publish CloudWatch metrics AIAgents/Sweeper (OrphansTerminated, VolumesDeleted) and add the namespace to the CloudWatch exporter with DevOps.",
+    "Set the On-Demand and Spot vCPU quotas as the final cap; above it, runs wait in the Temporal slot queues (G3-25)."
+   ]
+  }
+ ],
+ "remember": "A VM is set up once, claimed by one run, then destroyed; the sweeper catches what that path missed."
+}

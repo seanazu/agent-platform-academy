@@ -1,0 +1,386 @@
+{
+  "id": "p7-5",
+  "title": "Schedules and polling",
+  "minutes": 40,
+  "youNeed": [
+    "p7-4"
+  ],
+  "bridge": "A Temporal schedule is like the schedule: trigger of a GitHub Actions workflow. Except: it lives in the Temporal Service and starts a workflow, not a script. It also has policies for the two hard cases: the last run is still going, and ticks were missed during an outage.",
+  "intro": "Nova learns about new tickets by asking Jira every minute. Nothing on the internet calls us, so there is no public webhook to protect. This lesson builds that poll from Temporal schedules and one small registry. The bug fixers and the daily routines use the same mechanism.",
+  "picture": {
+    "caption": "Every minute the schedule starts pollJira. Its activity runs the JQL and calls startRun per match, and the ID turns repeats into no-ops.",
+    "nodes": [
+      {
+        "id": "sched",
+        "label": "schedule poll-jira-nova (every 1 min, SKIP)",
+        "kind": "service"
+      },
+      {
+        "id": "poll",
+        "label": "pollJira workflow",
+        "kind": "service"
+      },
+      {
+        "id": "act",
+        "label": "startMatches activity",
+        "kind": "service"
+      },
+      {
+        "id": "jira",
+        "label": "Jira (REST v3)",
+        "kind": "cloud"
+      },
+      {
+        "id": "start",
+        "label": "startRun: nova:RH-1234, USE_EXISTING",
+        "kind": "service"
+      },
+      {
+        "id": "run",
+        "label": "ticketToPr run",
+        "kind": "service"
+      }
+    ],
+    "steps": [
+      {
+        "from": "sched",
+        "to": "poll",
+        "text": "a tick starts pollJira(\"nova\") on ai-agents-orchestrator, unless the last one still runs"
+      },
+      {
+        "from": "poll",
+        "to": "act",
+        "text": "calls startMatches with SHORT timeouts and PEOPLE_APIS retries"
+      },
+      {
+        "from": "act",
+        "to": "jira",
+        "text": "runs the JQL as the Nova service account; we call Jira, Jira never calls us"
+      },
+      {
+        "from": "act",
+        "to": "start",
+        "text": "for each match: toStart gives the workflow and input; startRun starts it"
+      },
+      {
+        "from": "start",
+        "to": "run",
+        "text": "a new ticket starts a run; a ticket found last minute joins its open run"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "h": "Why we poll instead of a webhook",
+      "p": [
+        "Jira can send webhooks: it calls a URL of ours when something changes. That URL would be a public door into the orchestrator, and every caller would need checking. Polling turns it around: we call Jira, and nothing on the internet calls us.",
+        "A poll every minute is cheap, and Temporal gives it retries and a history for free. When Jira is down, the activity retries with back-off and nothing else breaks. The cost is up to a minute of delay, which nobody notices on a ticket that runs for hours."
+      ],
+      "callout": {
+        "kind": "why",
+        "text": "G3-28: polling keeps Jira access one-way. One mechanism means Nova, the bug fixers and the schedules all start runs the same safe way."
+      }
+    },
+    {
+      "h": "A schedule and its two policies",
+      "p": [
+        "client.schedule.create takes a scheduleId, a spec (when), an action (which workflow to start) and policies. The spec is intervals, such as every 1 minute, or cron expressions with a time zone.",
+        "The overlap policy says what happens when a tick comes and the last run is still going. SKIP drops the tick. The catchup window says how old a missed tick may be and still run after an outage. With a window as long as the interval, a two-hour outage does not replay 120 polls.",
+        "Each run a schedule starts gets the action's workflowId plus the tick time, for example poll-jira-lab-2026-10-13T15:05:00Z."
+      ],
+      "because": "We create schedules at worker start because then the registry in git is the truth, and a deploy fixes any drift.",
+      "code": {
+        "lang": "typescript",
+        "file": "ai-agents/orchestrator/src/triggers/schedules.ts (part 2)",
+        "text": "// ai-agents/orchestrator/src/triggers/schedules.ts (part 2): at worker start; safe to run twice\nexport const ensureSchedules = async (client: Client): Promise<void> => {\n  for (const q of QUERIES.values()) {\n    const scheduleId = `poll-jira-${q.name}`;\n    const action = { type: \"startWorkflow\" as const, workflowType: pollJira, args: [q.name],\n      workflowId: scheduleId, taskQueue: \"ai-agents-orchestrator\" };\n    const spec = { intervals: [{ every: q.every }] };\n    const policies = { overlap: ScheduleOverlapPolicy.SKIP, catchupWindow: q.every }; // an outage doesn't replay a backlog\n    await client.schedule.create({ scheduleId, action, spec, policies }).catch(async (err: unknown) => {\n      if (!(err instanceof ScheduleAlreadyRunning)) throw err;\n      await client.schedule.getHandle(scheduleId).update((prev) => ({ ...prev, action, spec, policies }));\n    });\n  }\n};",
+        "notes": [
+          {
+            "line": 3,
+            "text": "One schedule per registered query: Nova, bugfix-fe, bugfix-be."
+          },
+          {
+            "line": 6,
+            "text": "Housekeeping runs on ai-agents-orchestrator, never on an agent's queue."
+          },
+          {
+            "line": 7,
+            "text": "every comes from the registry: 1 minute for Nova, 5 minutes for bugs."
+          },
+          {
+            "line": 8,
+            "text": "SKIP plus a short catchup window: no stacked polls, no backlog after an outage."
+          },
+          {
+            "line": 9,
+            "text": "create throws ScheduleAlreadyRunning when the ID exists, as it will on every later deploy."
+          },
+          {
+            "line": 11,
+            "text": "Then update it to the current registry. Running this twice is safe."
+          }
+        ]
+      }
+    },
+    {
+      "h": "The registry: one entry per Jira query",
+      "p": [
+        "G3-28 keeps a map of JiraQuery entries. Each has a name, the agent, the JQL, how often to run, and toStart. toStart turns a matching issue into a workflow and its input, or undefined to skip it.",
+        "The schedule starts pollJira, a one-line workflow. It calls the activity startMatches, which does the real work: search Jira, then startRun for each match. A ticket that was found a minute ago is found again, and startRun joins its open run (p7-4)."
+      ],
+      "because": "We put the search and the starts in an activity because both are network calls, and workflow code does no I/O.",
+      "code": {
+        "lang": "typescript",
+        "file": "ai-agents/orchestrator/src/triggers/schedules.ts (part 1)",
+        "text": "// ai-agents/orchestrator/src/triggers/schedules.ts (part 1): one mechanism for every Jira trigger\nexport interface JiraQuery {\n  name: string; agent: string; jql: string; every: string;\n  toStart: (issue: JiraIssue) => Promise<[Workflow, unknown] | undefined>; // workflow + input, or skip\n}\nexport const QUERIES = new Map<string, JiraQuery>();\n\n/** Activity: one poll of one query. startRun refuses a stopped agent (G3-25). */\nexport const startMatches = async (name: string): Promise<number> => {\n  const q = QUERIES.get(name)!;\n  const issues = await jira.searchAll(q.jql);\n  for (const issue of issues) {\n    const start = await q.toStart(issue);\n    if (!start) continue; // e.g. no requester found yet (G4-04)\n    const [wf, input] = start;\n    await startRun(await temporalClient(), q.agent, issue.key, wf, input); // the ID makes repeats no-ops\n  }\n  return issues.length;\n};\n\n// workflows/poll-jira.ts: workflow code; peopleApis = SHORT + PEOPLE_APIS retries (G3-29)\nexport async function pollJira(name: string): Promise<number> {\n  return peopleApis.startMatches(name);\n}",
+        "notes": [
+          {
+            "line": 4,
+            "text": "async, and undefined skips a match: G4-04 asks for these two changes to the first sketch."
+          },
+          {
+            "line": 6,
+            "text": "The registry. Each trigger file adds its entry when it is imported."
+          },
+          {
+            "line": 11,
+            "text": "searchAll pages through every match (p9-2 shows the Jira calls)."
+          },
+          {
+            "line": 14,
+            "text": "Skipping is normal: a ticket with no owner must never start a run."
+          },
+          {
+            "line": 16,
+            "text": "startRun builds nova:RH-1234 and uses USE_EXISTING, so the 60th poll of a ticket changes nothing."
+          },
+          {
+            "line": 22,
+            "text": "The workflow only calls the activity. It is short, so its history stays tiny."
+          }
+        ]
+      }
+    },
+    {
+      "h": "Nova's entry: the 1-minute poll",
+      "p": [
+        "G4-04 adds Nova's entry. The JQL runs as the Nova service account, so currentUser() means Nova. Any open RH ticket assigned to Nova matches.",
+        "toStart finds the requester: the person who assigned the ticket to Nova. If there is none, it skips, because a run without an owner has nobody to approve its plan."
+      ],
+      "because": "We register Nova as data in the same map because then its schedule, retries and duplicate guard come for free.",
+      "code": {
+        "lang": "typescript",
+        "file": "ai-agents/orchestrator/src/triggers/nova.ts (part)",
+        "text": "// ai-agents/orchestrator/src/triggers/nova.ts (part of G4-04): Nova's entry in the registry\n// Runs as the Nova service account, so currentUser() is Nova.\nconst NOVA_JQL = \"project = RH AND assignee = currentUser() AND statusCategory != Done ORDER BY updated ASC\";\n\nQUERIES.set(\"nova\", {\n  name: \"nova\", agent: \"nova\", jql: NOVA_JQL, every: \"1 minute\",\n  toStart: async (issue) => {\n    const requester = await requesterOf(issue.key); // who assigned it to Nova (p9-2)\n    if (!requester) return undefined; // no owner found: log it, start nothing\n    const handoff: Handoff = { key: issue.key, requester };\n    return [ticketToPr, handoff]; // a second poll joins the open run\n  },\n});",
+        "notes": [
+          {
+            "line": 3,
+            "text": "statusCategory != Done ignores closed tickets. ORDER BY updated ASC handles the oldest first."
+          },
+          {
+            "line": 6,
+            "text": "every: 1 minute. ensureSchedules turns this into the schedule poll-jira-nova."
+          },
+          {
+            "line": 8,
+            "text": "Read from the changelog or an issue property; the Jira calls are in p9-2."
+          },
+          {
+            "line": 10,
+            "text": "The Handoff type from the shared package: { key, requester }."
+          }
+        ]
+      }
+    },
+    {
+      "h": "Cron schedules for routines",
+      "p": [
+        "The daily and weekly crews start from cron schedules (G5-13). A cron expression has five fields: minute, hour, day of month, month, day of week. \"17 4 * * 0-4\" means 04:17 Sunday to Thursday, our working week.",
+        "Times are in Asia/Jerusalem. The minutes are odd on purpose, so our jobs do not all start at 04:00 with everyone else's. Overlap is SKIP here too: a slow run never stacks a second one."
+      ],
+      "because": "We set the time zone in the spec because a cron in UTC would shift by an hour twice a year.",
+      "code": {
+        "lang": "typescript",
+        "file": "ai-agents/orchestrator/src/triggers/schedules.ts (G5-13, trimmed)",
+        "text": "// ai-agents/orchestrator/src/triggers/schedules.ts (G5-13's part): cron schedules for routines\nconst CRON: Record<string, [cron: string, workflow: Workflow, args: unknown[]]> = { // odd minutes; 0-4 = Sun-Thu\n  \"fe-dead-code\": [\"17 4 * * 0-4\", routineRun, [{ routine: \"fe-dead-code\" }]],\n  \"kb-ingest\": [\"41 6 * * 1\", routineRun, [{ routine: \"kb-ingest\" }]],\n  \"team-digest\": [\"37 6 * * 0-4\", teamDigest, []],\n};\n\nexport async function ensureCronSchedules(client: Client): Promise<void> {\n  for (const [name, [cron, workflowType, args]] of Object.entries(CRON)) {\n    const scheduleId = `sched:${name}`;\n    const schedule = {\n      spec: { cronExpressions: [cron], timezone: \"Asia/Jerusalem\" },\n      action: { type: \"startWorkflow\" as const, workflowType, args, workflowId: scheduleId, taskQueue: queueFor(name) },\n      policies: { overlap: ScheduleOverlapPolicy.SKIP }, // a slow run never stacks a second one\n    };\n    // create, or update when it exists: the same catch as ensureSchedules\n  }\n}",
+        "notes": [
+          {
+            "line": 2,
+            "text": "One row per job: cron, workflow function, arguments. The full table has six rows."
+          },
+          {
+            "line": 3,
+            "text": "Dead-code sweep at 04:17, Sunday to Thursday."
+          },
+          {
+            "line": 10,
+            "text": "sched:<name> is the schedule ID and the workflow ID prefix."
+          },
+          {
+            "line": 12,
+            "text": "cronExpressions plus timezone instead of intervals."
+          },
+          {
+            "line": 14,
+            "text": "SKIP again: if yesterday's run still works, today's tick is dropped."
+          }
+        ]
+      }
+    },
+    {
+      "h": "Operating schedules from the CLI",
+      "p": [
+        "temporal schedule list shows every schedule and its next run. describe shows the policies and ActionCounts, including SkippedOverlap: how many ticks were dropped. toggle --pause stops a schedule with a reason, and --unpause starts it again.",
+        "Pausing a schedule is how DevOps stops new polls in an incident. The kill switch in startRun is still the wall: a stopped agent gets no new runs even if a poll runs."
+      ],
+      "see": "  OverlapPolicy     Skip\n  CatchupWindow     1m 0s\n  RunningWorkflows  [poll-jira-lab-2026-10-13T15:05:00Z]\n  ActionCounts      {\"Total\":1,\"MissedCatchupWindow\":0,\"SkippedOverlap\":1}   (output trimmed)"
+    }
+  ],
+  "lab": {
+    "title": "A schedule that skips",
+    "youNeed": [
+      "~/temporal-lab from p7-4, worker running",
+      "hello waits for approval with \"1 day\""
+    ],
+    "worked": [
+      {
+        "do": "Create src/schedule.ts:\n// ~/temporal-lab/src/schedule.ts: create or update one schedule; run it twice\nimport { Client, Connection, ScheduleAlreadyRunning, ScheduleOverlapPolicy } from \"@temporalio/client\";\nimport { hello } from \"./workflows.js\";\n\nconst client = new Client({ connection: await Connection.connect({ address: \"localhost:7233\" }), namespace: \"ai-agents\" });\nconst scheduleId = \"poll-jira-lab\";\nconst action = { type: \"startWorkflow\" as const, workflowType: hello, args: [\"poll\"], workflowId: scheduleId, taskQueue: \"ai-agents-lab\" };\nconst spec = { intervals: [{ every: \"1 minute\" }] };\nconst policies = { overlap: ScheduleOverlapPolicy.SKIP, catchupWindow: \"1 minute\" };\nawait client.schedule.create({ scheduleId, action, spec, policies }).then(() => console.log(\"created\")).catch(async (err: unknown) => {\n  if (!(err instanceof ScheduleAlreadyRunning)) throw err;\n  await client.schedule.getHandle(scheduleId).update((prev) => ({ ...prev, action, spec, policies }));\n  console.log(\"updated\");\n});",
+        "see": "(no output)"
+      },
+      {
+        "do": "npx tsx src/schedule.ts, then run it a second time",
+        "see": "created\n(second time) updated"
+      },
+      {
+        "do": "temporal schedule list --namespace ai-agents",
+        "see": "   ScheduleId           Action         Paused      NextRunTime\n  poll-jira-lab  {\"Workflow\":\"hello\"}  false   35 seconds from now"
+      },
+      {
+        "do": "Wait 2 to 3 minutes, then: temporal schedule describe --namespace ai-agents --schedule-id poll-jira-lab",
+        "see": "  RunningWorkflows  [poll-jira-lab-<time>]\n  ActionCounts      {\"Total\":1,...,\"SkippedOverlap\":1}"
+      },
+      {
+        "do": "Approve the running one: temporal workflow signal --namespace ai-agents --workflow-id poll-jira-lab-<time> --name approve --input '\"sean\"'",
+        "see": "Signal workflow succeeded"
+      },
+      {
+        "do": "Wait for the next tick and describe again",
+        "see": "Total goes up by one: the tick after the approval was free to start"
+      },
+      {
+        "do": "temporal schedule toggle --namespace ai-agents --schedule-id poll-jira-lab --pause --reason \"lab done\"",
+        "see": "Schedule updated   (describe now shows Paused true)"
+      }
+    ],
+    "faded": "Write a fake poll. Create fake-jira.json with [\"RH-1\", \"RH-2\"]. Add an activity startMatchesFake that reads it and starts hello per key with workflowId lab-poll:<key> and USE_EXISTING. Add a workflow pollFake that calls it. Left to you: the schedule for pollFake every minute with SKIP, and checking after three ticks that only two hello runs exist.",
+    "alone": "Add a cron schedule sched:lab-digest that starts hello at minute 7 of every hour, Sunday to Thursday. Use time zone Asia/Jerusalem and overlap SKIP. Check its NextRunTime with temporal schedule list, then delete it with temporal schedule delete.",
+    "done": "Your schedule was created then updated without error, skipped a tick while its run was still open, and paused on command."
+  },
+  "quiz": [
+    {
+      "q": "A tick arrives while the previous pollJira run is still going, with overlap SKIP. What happens?",
+      "options": [
+        {
+          "text": "The tick is dropped and counted as SkippedOverlap",
+          "correct": true,
+          "why": "SKIP never stacks runs; describe shows the count."
+        },
+        {
+          "text": "A second pollJira starts next to the first",
+          "correct": false,
+          "why": "That is ALLOW_ALL, which we never use for polls."
+        },
+        {
+          "text": "The running poll is cancelled and a new one starts",
+          "correct": false,
+          "why": "That is CANCEL_OTHER; a poll in the middle of starts should finish."
+        }
+      ]
+    },
+    {
+      "q": "Jira was down for two hours. The schedule runs every minute with catchupWindow 1 minute. What happens when it comes back?",
+      "options": [
+        {
+          "text": "120 missed polls run one after another",
+          "correct": false,
+          "why": "Missed ticks older than the window are dropped; that is the point of the window."
+        },
+        {
+          "text": "The schedule is paused and needs a person",
+          "correct": false,
+          "why": "Nothing pauses it; the next tick runs normally."
+        },
+        {
+          "text": "At most one late tick runs, then normal polling continues",
+          "correct": true,
+          "why": "Ticks older than the window are not replayed, so there is no backlog."
+        }
+      ]
+    },
+    {
+      "q": "The poll finds RH-1234 every minute for three hours. Why does that not start 180 runs?",
+      "options": [
+        {
+          "text": "startMatches remembers which keys it saw",
+          "correct": false,
+          "why": "It keeps no memory; every poll is fresh."
+        },
+        {
+          "text": "startRun uses the ID nova:RH-1234 with USE_EXISTING, so later starts join the open run",
+          "correct": true,
+          "why": "The workflow ID is the duplicate guard, enforced by Temporal."
+        },
+        {
+          "text": "The JQL filters out tickets that already have a run",
+          "correct": false,
+          "why": "The JQL only checks assignee and status; the ID does the guarding."
+        }
+      ]
+    }
+  ],
+  "recall": [
+    "In p7-4, what is the difference between a conflict policy and a reuse policy?",
+    "In p7-3, what does a durable timer cost while it waits?"
+  ],
+  "videos": [],
+  "words": [
+    {
+      "term": "schedule",
+      "plain": "An object in the Temporal Service that starts a workflow on intervals or cron times."
+    },
+    {
+      "term": "overlap policy",
+      "plain": "What a tick does if the last scheduled run is still going; we always use SKIP."
+    },
+    {
+      "term": "catchup window",
+      "plain": "How old a missed tick may be and still run after an outage."
+    },
+    {
+      "term": "cron expression",
+      "plain": "Five fields (minute, hour, day, month, weekday) that say when something runs."
+    },
+    {
+      "term": "query registry",
+      "plain": "G3-28's map of JiraQuery entries; each becomes one poll-jira-<name> schedule."
+    },
+    {
+      "term": "polling",
+      "plain": "Asking another system for changes on a timer, instead of letting it call us."
+    }
+  ],
+  "tickets": [
+    {
+      "key": "G3-28",
+      "why": "ensureSchedules, the JiraQuery registry, startMatches and pollJira are the code in this lesson."
+    },
+    {
+      "key": "G4-04",
+      "why": "Nova's 1-minute poll is one registry entry with an async toStart that finds the requester."
+    },
+    {
+      "key": "G5-13",
+      "why": "Bug polls join the registry every 5 minutes, and routines start from cron schedules in Asia/Jerusalem."
+    }
+  ],
+  "remember": "Schedules start a tiny workflow with overlap SKIP; its activity searches, and the workflow ID makes repeats harmless."
+}

@@ -1,0 +1,451 @@
+{
+ "id": "p10-3",
+ "title": "Django and DRF in one lesson",
+ "minutes": 50,
+ "youNeed": [
+  "p10-1",
+  "p10-2"
+ ],
+ "bridge": "A Django model, a DRF serializer and a viewset are like a Prisma model, a zod schema and an API route handler. Except: Django generates the migrations and the admin from the model. A viewset gives you all the CRUD routes at once through a router, so you never write the route table by hand.",
+ "intro": "fcp's cloud is a Django project with Django REST Framework (DRF) on top. Every API test in G7 posts JSON into a viewset, which runs a serializer, which saves a model. This lesson follows one request through those three layers and shows how pytest-django gives each test a clean database.",
+ "picture": {
+  "caption": "One POST travels through the router, the viewset and the serializer into a model row, and comes back as JSON.",
+  "nodes": [
+   {
+    "id": "test",
+    "label": "test with APIClient",
+    "kind": "check"
+   },
+   {
+    "id": "router",
+    "label": "router (urls.py)",
+    "kind": "service"
+   },
+   {
+    "id": "viewset",
+    "label": "NoteViewSet",
+    "kind": "service"
+   },
+   {
+    "id": "serializer",
+    "label": "NoteSerializer",
+    "kind": "service"
+   },
+   {
+    "id": "model",
+    "label": "Note model",
+    "kind": "file"
+   },
+   {
+    "id": "db",
+    "label": "test database",
+    "kind": "machine"
+   }
+  ],
+  "steps": [
+   {
+    "from": "test",
+    "to": "router",
+    "text": "client.post(\"/api/notes/\", {title: ...}) sends JSON"
+   },
+   {
+    "from": "router",
+    "to": "viewset",
+    "text": "the router maps POST /api/notes/ to the viewset's create action"
+   },
+   {
+    "from": "viewset",
+    "to": "serializer",
+    "text": "the viewset hands the body to the serializer, which validates it"
+   },
+   {
+    "from": "serializer",
+    "to": "model",
+    "text": "a valid body becomes Note.objects.create(...)"
+   },
+   {
+    "from": "model",
+    "to": "db",
+    "text": "the ORM writes one row inside the test's transaction"
+   },
+   {
+    "from": "viewset",
+    "to": "test",
+    "text": "the response is 201 with the saved note as JSON"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "The project on disk",
+   "p": [
+    "A Django project is a folder with manage.py (the CLI), a settings module and one or more apps. An app is a package with models.py, views.py and migrations/. settings.py lists the apps in INSTALLED_APPS. An app that is not listed does not exist for Django, and its models fail with an app_label error.",
+    "In fcp the project is cloud/rhinoCloud/, and the settings module is rhinoCloud.rhinoDjango.settings. The main app is rhinoCore/. It has models/, views/, serializers/, services/, celery_tasks/, migrations/ and tests/ as folders instead of single files. The names are the same as in the tiny project below, only bigger."
+   ],
+   "because": "When a ticket says rhinoCore/serializers or rhinoDjango/urls.py, you should see the Django shape behind the path.",
+   "see": "lab3/\n  manage.py\n  mysite/settings.py   INSTALLED_APPS, DATABASES\n  mysite/urls.py       the router\n  notes/models.py\n  notes/serializers.py\n  notes/views.py\n  notes/migrations/0001_initial.py"
+  },
+  {
+   "h": "Models and migrations",
+   "p": [
+    "A model is a class whose fields describe a table. Django's ORM (object-relational mapper) turns Note.objects.create(title=\"x\") into an INSERT and Note.objects.filter(title=\"x\") into a SELECT. You never write SQL.",
+    "A migration is a Python file that describes one change to the schema. makemigrations compares your models with the last migration and writes the next file; migrate applies it to the database. Migrations are committed and numbered: rhinoCore has 228 of them. fcp's cloud CI runs makemigrations --check --dry-run to fail when someone changed a model and forgot the migration."
+   ],
+   "because": "Agents will change models, and G7-15 lints the migrations they produce. So you need to know what a migration is and where it comes from.",
+   "code": {
+    "lang": "python",
+    "file": "lab3/notes/models.py",
+    "text": "from django.db import models\n\n\nclass Note(models.Model):\n    title = models.CharField(max_length=120)\n    body = models.TextField(blank=True)\n    created_at = models.DateTimeField(auto_now_add=True)",
+    "notes": [
+     {
+      "line": 4,
+      "text": "Subclassing models.Model makes this a table called notes_note (app name, underscore, class name)."
+     },
+     {
+      "line": 5,
+      "text": "A field is a class attribute with a field type. Django adds an id primary key by itself."
+     },
+     {
+      "line": 6,
+      "text": "blank=True means the API may send an empty string. It is validation, not a database rule."
+     },
+     {
+      "line": 7,
+      "text": "auto_now_add fills the value on insert, so the serializer marks it read-only."
+     }
+    ]
+   },
+   "see": "$ uv run python manage.py makemigrations notes\nMigrations for 'notes':\n  notes/migrations/0001_initial.py\n    + Create model Note\n$ uv run python manage.py sqlmigrate notes 0001\nCREATE TABLE \"notes_note\" (\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"title\" varchar(120) NOT NULL, ...);",
+   "ifInstead": "If instead you see RuntimeError: Model class notes.models.Note doesn't declare an explicit app_label, the app is missing from INSTALLED_APPS in settings.py."
+  },
+  {
+   "h": "Serializers validate and convert",
+   "p": [
+    "A serializer is the zod schema of DRF. It turns JSON into validated Python values on the way in, and a model instance into JSON on the way out. A ModelSerializer reads the field list from the model, so you list which fields to expose and which are read-only.",
+    "When the body is invalid, serializer.is_valid() is false and the viewset returns 400 with a dict of field errors. This is why G7-06 wants test data created through the API: a factory writes rows and skips all of this."
+   ],
+   "because": "Most API bugs live in serializers (a renamed field, a new required one), and G7-11's OpenAPI check reads its schema from them.",
+   "code": {
+    "lang": "python",
+    "file": "lab3/notes/serializers.py",
+    "text": "from rest_framework import serializers\n\nfrom .models import Note\n\n\nclass NoteSerializer(serializers.ModelSerializer):\n    class Meta:\n        model = Note\n        fields = [\"id\", \"title\", \"body\", \"created_at\"]\n        read_only_fields = [\"id\", \"created_at\"]",
+    "notes": [
+     {
+      "line": 3,
+      "text": "A relative import: the models module next to this file."
+     },
+     {
+      "line": 7,
+      "text": "Meta is an inner class Django and DRF use for configuration; it is not a type annotation."
+     },
+     {
+      "line": 9,
+      "text": "The fields the API shows and accepts. Removing one here is a breaking API change."
+     },
+     {
+      "line": 10,
+      "text": "Shown in responses, rejected in requests. A field that becomes required would also be a breaking change."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Viewsets and the router",
+   "p": [
+    "A viewset is a class with one method per action: list, retrieve, create, update, partial_update, destroy. ModelViewSet gives you all six from a queryset and a serializer class. A router takes the viewset and registers the URL patterns: GET and POST on /api/notes/, GET, PUT, PATCH and DELETE on /api/notes/<id>/.",
+    "fcp's URLs are versioned under /api/v2/ (and a connect API). The router lives in rhinoDjango/urls.py together with the OpenAPI schema view at /docs/v2/openapi/ that G7-11 exports."
+   ],
+   "because": "When a test calls GET /api/v2/projects/, you need to know which class answers and how the path was built.",
+   "code": {
+    "lang": "python",
+    "file": "lab3/notes/views.py and lab3/mysite/urls.py",
+    "text": "from rest_framework import viewsets\n\nfrom .models import Note\nfrom .serializers import NoteSerializer\n\n\nclass NoteViewSet(viewsets.ModelViewSet):\n    queryset = Note.objects.order_by(\"-created_at\")\n    serializer_class = NoteSerializer\n\n\n# mysite/urls.py\nfrom django.urls import include, path\nfrom rest_framework.routers import DefaultRouter\n\nfrom notes.views import NoteViewSet\n\nrouter = DefaultRouter()\nrouter.register(\"notes\", NoteViewSet)\n\nurlpatterns = [path(\"api/\", include(router.urls))]",
+    "notes": [
+     {
+      "line": 7,
+      "text": "Six CRUD actions for free. Override one method (for example create) when you need custom behaviour."
+     },
+     {
+      "line": 8,
+      "text": "The queryset is the base query every action starts from; permissions usually filter it further."
+     },
+     {
+      "line": 18,
+      "text": "A DefaultRouter also serves an index page at /api/ that lists the endpoints."
+     },
+     {
+      "line": 19,
+      "text": "The prefix notes becomes /notes/ and /notes/<pk>/."
+     },
+     {
+      "line": 21,
+      "text": "Mounted under api/, so the final paths are /api/notes/ and /api/notes/<id>/."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Testing with APIClient and pytest-django",
+   "p": [
+    "DRF's APIClient is a fake browser: client.post(path, data, format=\"json\") runs the whole stack in-process and returns a response with status_code and .json(). No server, no network. pytest-django wires Django into pytest.",
+    "It reads DJANGO_SETTINGS_MODULE from pytest.ini and creates a test database. It wraps every test marked django_db in a transaction that is rolled back at the end. Each test starts clean.",
+    "Authentication: client.force_authenticate(user) skips login for a unit test. G7-06 does the opposite on purpose: its in-process client fetches a real JWT from auth/obtain_token, so the auth path is tested too."
+   ],
+   "because": "This is the shape of every test in tests_api: a client, a call, an assert on what the caller sees.",
+   "code": {
+    "lang": "python",
+    "file": "lab3/tests/test_notes_api.py",
+    "text": "import pytest\nfrom rest_framework.test import APIClient\n\npytestmark = pytest.mark.django_db\n\n\n@pytest.fixture\ndef client() -> APIClient:\n    return APIClient()\n\n\ndef test_create_note(client):\n    response = client.post(\"/api/notes/\", {\"title\": \"Buy milk\", \"body\": \"\"}, format=\"json\")\n    assert response.status_code == 201\n    assert response.json()[\"title\"] == \"Buy milk\"\n\n\ndef test_list_is_empty_in_a_fresh_test(client):\n    assert client.get(\"/api/notes/\").json() == []",
+    "notes": [
+     {
+      "line": 4,
+      "text": "pytestmark applies a marker to every test in the file. Without django_db, any database access raises an error."
+     },
+     {
+      "line": 13,
+      "text": "format=\"json\" sends a JSON body. The call runs the router, viewset, serializer and model in this process."
+     },
+     {
+      "line": 14,
+      "text": "Assert on what the caller sees: status code, then fields. Not on which internal function ran."
+     },
+     {
+      "line": 18,
+      "text": "The note from the previous test is gone: its transaction was rolled back."
+     }
+    ]
+   },
+   "see": "$ uv run pytest -q\n..                                                                       [100%]\n2 passed in 0.18s",
+   "ifInstead": "If instead you see Database access not allowed, use the \"django_db\" mark. Add pytestmark = pytest.mark.django_db to the file, or the marker to the test."
+  },
+  {
+   "h": "The test database and the template trick",
+   "p": [
+    "pytest-django creates a database named test_<name>, runs every migration into it, runs the tests, and drops it. --reuse-db keeps it between runs. With xdist each worker gets its own copy, test_<name>_gw0, test_<name>_gw1, so workers never see each other's rows.",
+    "Running 228 migrations per worker is slow. G7-02 overrides the django_db_setup fixture. One worker migrates into a template database once.",
+    "Then every worker gets CREATE DATABASE test_api_gw1 TEMPLATE api_tpl_<hash>, a Postgres copy that takes seconds. The template name is a hash of the migration file names, so a new migration builds a new template. This is a Postgres feature; SQLite in the lab has no templates, which is why the lab uses --reuse-db instead."
+   ],
+   "because": "The 3-minute target for the whole API layer depends on this fixture. You will read it when something about the database setup breaks.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/conftest.py (G7-02, shortened)",
+    "text": "@pytest.fixture(scope=\"session\")\ndef django_db_setup(django_db_blocker, worker_id):\n    db = settings.DATABASES[\"default\"]\n    worker_db = f\"test_api_{worker_id}\"  # worker_id is \"master\" when xdist is off\n    with django_db_blocker.unblock(), connection._nodb_cursor() as cur:\n        cur.execute(\"SELECT pg_advisory_lock(7007)\")  # one worker builds the template\n        cur.execute(\"SELECT 1 FROM pg_database WHERE datname = %s\", [TEMPLATE_DB])\n        if cur.fetchone() is None:\n            cur.execute(f'CREATE DATABASE \"{TEMPLATE_DB}\"')\n            db[\"NAME\"] = TEMPLATE_DB\n            call_command(\"migrate\", verbosity=0)\n            call_command(\"loaddata\", str(CORE / \"fixtures\" / \"initial_data_prod_aws.json\"), verbosity=0)\n            connections.close_all()\n        cur.execute(f'DROP DATABASE IF EXISTS \"{worker_db}\"')\n        cur.execute(f'CREATE DATABASE \"{worker_db}\" TEMPLATE \"{TEMPLATE_DB}\"')\n    db[\"NAME\"] = worker_db\n    yield",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Same name as pytest-django's own fixture, so this one replaces it. Session scope: once per worker process."
+     },
+     {
+      "line": 2,
+      "text": "worker_id comes from xdist (p10-2). django_db_blocker is pytest-django's guard against database access outside tests."
+     },
+     {
+      "line": 5,
+      "text": "A cursor on the postgres maintenance database, because you cannot create a database from inside itself."
+     },
+     {
+      "line": 6,
+      "text": "An advisory lock: a named lock in Postgres. Four workers start at once; only one builds the template, the others wait."
+     },
+     {
+      "line": 11,
+      "text": "The 228 migrations run here, once, into the template."
+     },
+     {
+      "line": 15,
+      "text": "The Postgres copy: a new database with the template's tables and rows, in seconds."
+     },
+     {
+      "line": 16,
+      "text": "From here on, this worker's Django connection points at its own copy."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "The full G7-02 sketch also runs createcachetable (fcp's settings use a database cache table). The lines here are the ones that explain the mechanism."
+   }
+  },
+  {
+   "h": "What stays outside this lesson",
+   "p": [
+    "fcp's cloud also runs Celery (a background job queue) and talks to on-prem clients over gRPC. Both are faked in p10-4. The existing 1,900 unit tests use Django's runner and factory_boy; they keep running as they are. The new API layer uses what you saw here: APIClient, pytest-django and the template database."
+   ]
+  }
+ ],
+ "lab": {
+  "title": "A tiny Django project with DRF and pytest-django",
+  "youNeed": [
+   "uv",
+   "the pytest words from p10-2"
+  ],
+  "worked": [
+   {
+    "do": "uv init --python 3.13 --bare lab3 && cd lab3 && uv add django djangorestframework && uv add --dev pytest pytest-django pytest-xdist",
+    "see": " + django==6.1.2\n + djangorestframework==3.18.3\n + pytest-django==4.14.0"
+   },
+   {
+    "do": "uv run django-admin startproject mysite . && uv run python manage.py startapp notes && ls",
+    "see": "manage.py  mysite  notes  pyproject.toml  uv.lock"
+   },
+   {
+    "do": "Add 'rest_framework' and 'notes' to INSTALLED_APPS in mysite/settings.py. Create notes/models.py, notes/serializers.py, notes/views.py and mysite/urls.py from the code blocks above.",
+    "see": "Four edited files."
+   },
+   {
+    "do": "uv run python manage.py makemigrations notes",
+    "see": "Migrations for 'notes':\n  notes/migrations/0001_initial.py\n    + Create model Note"
+   },
+   {
+    "do": "Create pytest.ini with [pytest], DJANGO_SETTINGS_MODULE = mysite.settings and python_files = test_*.py. Create tests/test_notes_api.py from the APIClient block.",
+    "see": "Two new files."
+   },
+   {
+    "do": "uv run pytest -q",
+    "see": "..                                                                       [100%]\n2 passed in 0.18s"
+   },
+   {
+    "do": "uv run pytest -n 2",
+    "see": "2 workers [2 items]\n..                                                                       [100%]\n============================== 2 passed in 1.26s ==============================="
+   },
+   {
+    "do": "uv run python manage.py makemigrations --check --dry-run; echo exit $?",
+    "see": "No changes detected\nexit 0"
+   }
+  ],
+  "faded": "Add a field done = models.BooleanField(default=False) to Note and to the serializer's fields. Write a test that creates a note, sends PATCH /api/notes/<id>/ with {\"done\": true} and asserts the response shows done as true. Run the tests: they fail until you create the migration. Creating it is the step left for you; makemigrations --check tells you when you are done.",
+  "alone": "Add a second model Tag(name) with its own serializer and viewset registered as \"tags\". Write two tests. POST creates a tag and returns 201. GET /api/tags/ returns one row after that POST, and zero rows in a fresh test. Run them with -n 2 and with --reuse-db.",
+  "done": "pytest -n 2 passes with both models, makemigrations --check --dry-run prints No changes detected, and a fresh test sees an empty list."
+ },
+ "quiz": [
+  {
+   "q": "You add a field to a model, run the tests, and they fail with no such column. What did you forget?",
+   "options": [
+    {
+     "text": "Restarting the test database with --create-db.",
+     "correct": false,
+     "why": "A fresh database would still lack the column, because no migration adds it."
+    },
+    {
+     "text": "Running makemigrations to write the migration that adds the column.",
+     "correct": true,
+     "why": "Models describe the schema, migrations change it. fcp's CI runs makemigrations --check to catch exactly this."
+    },
+    {
+     "text": "Adding the field to the serializer.",
+     "correct": false,
+     "why": "That controls the API shape; the database error comes from the missing migration."
+    }
+   ]
+  },
+  {
+   "q": "Why does G7-06 create test data through the API instead of writing rows with a factory?",
+   "options": [
+    {
+     "text": "Factories are slower than HTTP calls.",
+     "correct": false,
+     "why": "Factories are faster; speed is not the reason."
+    },
+    {
+     "text": "Rows written through the API pass the serializer validation and the permission checks that a factory skips.",
+     "correct": true,
+     "why": "A factory can create a state the API would never allow, and tests on that state prove little."
+    },
+    {
+     "text": "pytest-django forbids factories.",
+     "correct": false,
+     "why": "rhinoCore/tests use factory_boy and keep doing so."
+    }
+   ]
+  },
+  {
+   "q": "With pytest -n 4 and the G7-02 conftest, how many times do the 228 migrations run?",
+   "options": [
+    {
+     "text": "Four times, once per worker.",
+     "correct": false,
+     "why": "That is the slow default this fixture replaces."
+    },
+    {
+     "text": "Once, into the template database; each worker then copies the template with CREATE DATABASE ... TEMPLATE.",
+     "correct": true,
+     "why": "The advisory lock makes one worker build it; the others wait and copy."
+    },
+    {
+     "text": "Zero times; the tests use SQLite.",
+     "correct": false,
+     "why": "The API layer runs on Postgres, like CI and production."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p10-2: what does a session-scoped fixture mean under xdist, and which fixture tells you the worker's name?",
+  "From p10-1: what does uv add --group api-tests change in pyproject.toml?"
+ ],
+ "videos": [
+  {
+   "title": "Testing APIs with Django REST Framework",
+   "url": "https://www.youtube.com/watch?v=sRluxnmZ-H8",
+   "channel": "BugBytes",
+   "minutes": 19,
+   "why": "Recent, focused DRF testing with APIClient and force_authenticate."
+  },
+  {
+   "title": "Django DRF Project | API Client End to End Testing | 25",
+   "url": "https://www.youtube.com/watch?v=r8Fk_rcqdbs",
+   "channel": "Very Academy",
+   "minutes": 27,
+   "why": "APIClient end-to-end tests inside a realistic DRF project."
+  }
+ ],
+ "words": [
+  {
+   "term": "model",
+   "plain": "A Python class whose fields describe a database table; the ORM turns calls on it into SQL."
+  },
+  {
+   "term": "migration",
+   "plain": "A numbered Python file that describes one schema change; makemigrations writes it, migrate applies it."
+  },
+  {
+   "term": "serializer",
+   "plain": "The DRF class that validates incoming JSON and renders model instances as JSON; the zod schema of the API."
+  },
+  {
+   "term": "viewset",
+   "plain": "A class with one method per CRUD action; ModelViewSet gives all six from a queryset and a serializer."
+  },
+  {
+   "term": "router",
+   "plain": "The DRF object that turns a viewset into URL patterns like /api/notes/ and /api/notes/<id>/."
+  },
+  {
+   "term": "APIClient",
+   "plain": "DRF's in-process test client: it runs a request through the whole stack with no server."
+  },
+  {
+   "term": "template database",
+   "plain": "A Postgres database that other databases are copied from with CREATE DATABASE ... TEMPLATE; migrated once, copied per worker."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G7-02",
+   "why": "The tests_api layer is pytest-django, APIClient and the template-database conftest explained here."
+  },
+  {
+   "key": "G7-03",
+   "why": "The CI job runs that layer with a throw-away Postgres service. So you need to know what the tests need from the database."
+  },
+  {
+   "key": "G7-06",
+   "why": "The in-process RhinoAPI swaps requests for APIClient.generic and fetches a real JWT; this lesson shows what APIClient does."
+  },
+  {
+   "key": "G7-21",
+   "why": "The SDK smoke test uses pytest-django's live_server, a real HTTP server over the same test database."
+  }
+ ],
+ "remember": "Model is the table, serializer is the schema, and viewset plus router is the route. APIClient runs it all in-process, and pytest-django rolls each test back."
+}

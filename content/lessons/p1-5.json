@@ -1,0 +1,426 @@
+{
+ "id": "p1-5",
+ "title": "Checking data with zod",
+ "minutes": 45,
+ "youNeed": [
+  "p1-4"
+ ],
+ "bridge": "A zod schema is like a TypeScript interface that also runs: it checks real data at the edge of your program. Except: TypeScript types vanish when the code runs. Without a schema, JSON from a request or a model is whatever was sent, whatever your types claim.",
+ "intro": "Data reaches our services from outside: HTTP bodies, YAML charters, and model output. This lesson describes that data once with zod and gets the TypeScript type for free. Then it turns the same schema into JSON Schema for the model.",
+ "picture": {
+  "caption": "One schema does three jobs: checks data at the edge, gives the type, and tells the model what shape to answer in.",
+  "nodes": [
+   {
+    "id": "schema",
+    "label": "RunScope / Readiness (zod)",
+    "kind": "file"
+   },
+   {
+    "id": "input",
+    "label": "request body or model output",
+    "kind": "file"
+   },
+   {
+    "id": "parse",
+    "label": "safeParse",
+    "kind": "check"
+   },
+   {
+    "id": "typed",
+    "label": "typed data",
+    "kind": "file"
+   },
+   {
+    "id": "err",
+    "label": "400 with the problems",
+    "kind": "file"
+   },
+   {
+    "id": "model",
+    "label": "model (structured output)",
+    "kind": "agent"
+   }
+  ],
+  "steps": [
+   {
+    "from": "schema",
+    "to": "typed",
+    "text": "z.infer gives the TypeScript type, with no second definition"
+   },
+   {
+    "from": "input",
+    "to": "parse",
+    "text": "unknown data comes in at the edge"
+   },
+   {
+    "from": "parse",
+    "to": "typed",
+    "text": "valid: the data, with defaults filled in"
+   },
+   {
+    "from": "parse",
+    "to": "err",
+    "text": "invalid: a list of problems, each with its path"
+   },
+   {
+    "from": "schema",
+    "to": "model",
+    "text": "z.toJSONSchema tells the model the shape to answer in"
+   },
+   {
+    "from": "model",
+    "to": "parse",
+    "text": "the answer is parsed again, because a schema in a prompt is not a check"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Types vanish at run time",
+   "p": [
+    "In p1-3 the server did JSON.parse(body) as { text: string }. The as tells tsc to trust us; nothing checks it when the code runs. Send {\"txt\":\"hi\"} and the server stores undefined, which comes back as null.",
+    "Every place where data enters from outside needs a real check. In the platform that is every HTTP body, every YAML file we load, and every answer from a model."
+   ],
+   "see": "$ curl -s -X POST localhost:8080/v1/notes -H \"Authorization: Bearer $CAP\" -d '{\"txt\":\"hi\"}'\n{\"count\":1}\n$ curl -s localhost:8080/v1/notes -H \"Authorization: Bearer $CAP\"\n{\"notes\":[null]}"
+  },
+  {
+   "h": "A schema and its type",
+   "p": [
+    "A zod schema describes data with functions: z.string(), z.enum([...]), z.object({...}). Rules sit on the fields: min, max, regex, startsWith. z.infer reads the schema and gives the TypeScript type, so the type and the check can never drift apart.",
+    "In ai-agents every shared shape lives in shared/src/schemas.ts: RunScope, Plan, the charter and more. A type and its schema use the same name."
+   ],
+   "because": "We write the schema first and infer the type, because two definitions of one shape always drift apart.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/shared/src/schemas.ts",
+    "text": "import { z } from \"zod\";\n\nexport const RunScope = z.object({\n  runId: z.string().min(1),\n  agent: z.enum([\"nova\", \"cifix\", \"upgrade\", \"flaky\", \"bugfix\"]),\n  repo: z.string().regex(/^RhinoHealth\\/[\\w.-]+$/), // one repo, in our org\n  branch: z.string().startsWith(\"nova/\"),\n  readRepos: z.array(z.string()).default([]),\n  jiraKey: z.string().regex(/^RH-\\d+$/).nullable(),\n  expiresAt: z.iso.datetime(),\n});\nexport type RunScope = z.infer<typeof RunScope>; // the type, for free\n\nexport const Note = z.object({ text: z.string().min(1).max(400) });",
+    "notes": [
+     {
+      "line": 3,
+      "text": "An object with exactly these fields. Unknown extra fields are dropped from the result."
+     },
+     {
+      "line": 5,
+      "text": "One of these strings. The type becomes \"nova\" | \"cifix\" | ..."
+     },
+     {
+      "line": 6,
+      "text": "The broker's RunScope says repo is one RhinoHealth repo; the schema makes that a check."
+     },
+     {
+      "line": 8,
+      "text": "If readRepos is missing, the parsed data has an empty array."
+     },
+     {
+      "line": 9,
+      "text": "jiraKey may be null (a routine with no ticket) but must be present."
+     },
+     {
+      "line": 10,
+      "text": "An ISO date-time string such as 2026-10-13T18:00:00Z."
+     },
+     {
+      "line": 12,
+      "text": "The same name for value and type is fine in TypeScript; this is how ai-agents writes it."
+     }
+    ]
+   }
+  },
+  {
+   "h": "parse and safeParse",
+   "p": [
+    "Schema.parse(data) returns the typed data or throws a ZodError. Schema.safeParse(data) never throws: it returns { success: true, data } or { success: false, error }.",
+    "Use parse where bad data is a bug and a crash is right. Use safeParse at the edge, where bad data is normal and you answer with an error. z.prettifyError turns the error into lines a person can read."
+   ],
+   "because": "We use safeParse at the edge because a wrong request is the caller's mistake, not a reason to crash.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/try-zod.ts",
+    "text": "import { z } from \"zod\";\nimport { RunScope } from \"@lab/shared/schemas\";\n\nconst good = { runId: \"run-1\", agent: \"nova\", repo: \"RhinoHealth/fcp\", branch: \"nova/RH-1234\",\n  jiraKey: \"RH-1234\", expiresAt: \"2026-10-13T18:00:00Z\" };\nconst scope = RunScope.parse(good); // typed as RunScope\nconsole.log(scope.readRepos); // the default filled in\n\nconst bad = RunScope.safeParse({ ...good, repo: \"evil/fcp\", agent: \"root\" });\nif (!bad.success) console.log(z.prettifyError(bad.error));",
+    "notes": [
+     {
+      "line": 2,
+      "text": "A second entry in shared's exports map: \"./schemas\": \"./src/schemas.ts\"."
+     },
+     {
+      "line": 6,
+      "text": "Valid, so it returns the data. Hover scope in your editor: its type is RunScope."
+     },
+     {
+      "line": 7,
+      "text": "Not in the input, so the default [] is in the output."
+     },
+     {
+      "line": 9,
+      "text": "Two problems, and safeParse reports both, each with the field it belongs to."
+     }
+    ]
+   },
+   "see": "[]\n✖ Invalid option: expected one of \"nova\"|\"cifix\"|\"upgrade\"|\"flaky\"|\"bugfix\"\n  → at agent\n✖ Invalid string: must match pattern /^RhinoHealth\\/[\\w.-]+$/\n  → at repo",
+   "ifInstead": "If instead you see ERR_PACKAGE_PATH_NOT_EXPORTED, add \"./schemas\": \"./src/schemas.ts\" to the exports of shared/package.json."
+  },
+  {
+   "h": "Check at the edge: the server",
+   "p": [
+    "Now the POST route parses its body with Note.safeParse. A bad body gets 400 with the problems. A good one gives parsed.data.text, typed as string, and the cast is gone.",
+    "The broker parses its POST /internal/runs body the same way, against RunScope. Nothing unchecked reaches the database."
+   ],
+   "because": "We replace the cast with safeParse because the cast promised a shape and nothing kept the promise.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/server.ts (the POST route)",
+    "text": "import { z } from \"zod\";\nimport { Note } from \"@lab/shared/schemas\";\n\nif (route === \"POST /v1/notes\") {\n  const parsed = Note.safeParse(JSON.parse(await readBody(req)));\n  if (!parsed.success) return send(res, 400, { error: z.prettifyError(parsed.error) });\n  notes.push(parsed.data.text);\n  return send(res, 201, { count: notes.length });\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The schema from shared. svc also needs zod itself: npm install -w svc zod@4.6.7."
+     },
+     {
+      "line": 5,
+      "text": "Bad JSON still throws SyntaxError and still becomes 400 in the catch."
+     },
+     {
+      "line": 6,
+      "text": "The problems as text, with the path of each one."
+     },
+     {
+      "line": 7,
+      "text": "Typed as string and at most 400 characters."
+     }
+    ]
+   },
+   "see": "$ curl -s ... -d '{\"text\":\"\"}'\n{\"error\":\"✖ Too small: expected string to have >=1 characters\\n  → at text\"} [400]\n$ curl -s ... -d '{\"txt\":\"hi\"}'\n{\"error\":\"✖ Invalid input: expected string, received undefined\\n  → at text\"} [400]"
+  },
+  {
+   "h": "Input and output types",
+   "p": [
+    "A default makes a field optional on the way in and present on the way out. So a schema has two types. z.input<typeof RunScope> is what callers may send; z.infer is what you get after parsing.",
+    "This matters most for JSON Schema. A model fills in the input shape, so the planner uses io: \"input\" (G4-07)."
+   ],
+   "because": "We name the input side when we hand a schema to a model, because the model writes input, not output.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/p1-lab/svc/src/try-io.ts",
+    "text": "import { z } from \"zod\";\nimport { RunScope } from \"@lab/shared/schemas\";\n\nconsole.log(\"output:\", z.toJSONSchema(RunScope).required);\nconsole.log(\"input: \", z.toJSONSchema(RunScope, { io: \"input\" }).required);",
+    "notes": [
+     {
+      "line": 4,
+      "text": "By default the output shape: readRepos is required, because parsing always fills it."
+     },
+     {
+      "line": 5,
+      "text": "The input shape: readRepos may be left out."
+     },
+     {
+      "line": 4,
+      "text": "JSON Schema lists required fields in an array; we print only that."
+     }
+    ]
+   },
+   "see": "output: [ 'runId', 'agent', 'repo', 'branch', 'readRepos', 'jiraKey', 'expiresAt' ]\ninput:  [ 'runId', 'agent', 'repo', 'branch', 'jiraKey', 'expiresAt' ]"
+  },
+  {
+   "h": "Schemas for the model: z.toJSONSchema",
+   "p": [
+    "The Agent SDK can make the model answer in a fixed shape. You pass outputFormat: { type: \"json_schema\", schema } and read msg.structured_output from the result. zod 4 writes that schema for you with z.toJSONSchema.",
+    "The readiness check (G4-06) does this: a small schema, a cheap model, no tools. Then it parses the answer again with Readiness.parse. JSON Schema cannot say everything zod can, and a model can still answer off-shape, so the second check stays."
+   ],
+   "because": "We parse the model's answer again because a shape we asked for is not a shape we checked.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/activities/readiness.ts (G4-06, shortened)",
+    "text": "export const Readiness = z.object({\n  verdict: z.enum([\"ready\", \"ask\", \"hand_back\"]), reason: z.string(),\n  size: z.enum([\"small\", \"bigger\", \"fuzzy\"]),  // bigger → grill; fuzzy → grill + 2–3 plans\n  how_to_check: z.string(),  // empty = Nova sees no way to check it\n  questions: z.array(z.string()).max(5),\n});\nexport type Readiness = z.infer<typeof Readiness>;\n\nfor await (const msg of query({ prompt: ticket, options: {\n  model: \"claude-sonnet-5-5\", effort: \"low\", tools: [], settingSources: [],  // routing table; no repo, no VM\n  outputFormat: { type: \"json_schema\", schema: z.toJSONSchema(Readiness) },\n} })) {\n  if (msg.type === \"result\" && msg.subtype === \"success\") return Readiness.parse(msg.structured_output);\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Three answers only. The orchestrator branches on this field."
+     },
+     {
+      "line": 5,
+      "text": "At most five questions; JSON Schema carries this as maxItems: 5."
+     },
+     {
+      "line": 9,
+      "text": "One Agent SDK session (part p8). Here it has no tools and no repo: it only reads the ticket text."
+     },
+     {
+      "line": 11,
+      "text": "The same schema, turned into JSON Schema for the model."
+     },
+     {
+      "line": 13,
+      "text": "Checked again on the way back. A bad answer throws, and Temporal retries the activity."
+     }
+    ]
+   },
+   "see": "{\n  \"type\": \"object\",\n  \"properties\": { \"verdict\": { \"type\": \"string\", \"enum\": [\"ready\", \"ask\", \"hand_back\"] }, ... },\n  \"required\": [\"verdict\", \"reason\", \"questions\"],\n  \"additionalProperties\": false\n}\n(the lab's three-field Readiness; output trimmed)"
+  }
+ ],
+ "lab": {
+  "title": "Schemas at the edge of ~/p1-lab",
+  "youNeed": [
+   "~/p1-lab from p1-4 (zod is already in shared since p1-1)",
+   "curl"
+  ],
+  "worked": [
+   {
+    "do": "Create shared/src/schemas.ts from the section above. In shared/package.json set \"exports\": { \".\": \"./src/index.ts\", \"./schemas\": \"./src/schemas.ts\" }.",
+    "see": "(no output)"
+   },
+   {
+    "do": "Create svc/src/try-zod.ts, then: npx tsx svc/src/try-zod.ts",
+    "see": "[]\n✖ Invalid option: expected one of \"nova\"|\"cifix\"|\"upgrade\"|\"flaky\"|\"bugfix\"\n  → at agent\n✖ Invalid string: must match pattern /^RhinoHealth\\/[\\w.-]+$/\n  → at repo"
+   },
+   {
+    "do": "Add to try-zod.ts a Readiness schema with verdict, reason and questions (max 5), and console.log(JSON.stringify(z.toJSONSchema(Readiness), null, 2)). Run it again.",
+    "see": "\"required\": [\n    \"verdict\",\n    \"reason\",\n    \"questions\"\n  ],\n  \"additionalProperties\": false\n(output trimmed)"
+   },
+   {
+    "do": "Create svc/src/try-io.ts, then: npx tsx svc/src/try-io.ts",
+    "see": "output: [ 'runId', 'agent', 'repo', 'branch', 'readRepos', 'jiraKey', 'expiresAt' ]\ninput:  [ 'runId', 'agent', 'repo', 'branch', 'jiraKey', 'expiresAt' ]"
+   },
+   {
+    "do": "npm install -w svc zod@4.6.7. Change the POST route in server.ts to use Note.safeParse as shown. Start the server: npx tsx svc/src/main.ts",
+    "see": "capability (shown once): <64 hex characters>\nlistening on :8080"
+   },
+   {
+    "do": "In terminal 2, with CAP set: curl -s -w ' [%{http_code}]\\n' -H \"Authorization: Bearer $CAP\" -X POST localhost:8080/v1/notes -d '{\"txt\":\"hi\"}'",
+    "see": "{\"error\":\"✖ Invalid input: expected string, received undefined\\n  → at text\"} [400]"
+   },
+   {
+    "do": "Stop the server and run npm run typecheck",
+    "see": "(no errors)"
+   }
+  ],
+  "faded": "Make RunScope refuse a branch that does not match its Jira key: add .superRefine((s, ctx) => { ... }) after z.object, so jiraKey RH-1234 needs branch nova/RH-1234. Left to you: the ctx.addIssue({ code: \"custom\", message: ... }) line and a safeParse that shows it failing.",
+  "alone": "Write a Charter schema in shared/src/schemas.ts. Fields: owner (string), trigger (red_main, renovate_failed, jira_bug or schedule), paths (at least one), size (lite, full or wide, default lite). Parse one good and one bad object, and print the input-side JSON Schema's required list.",
+  "done": "A bad note gets 400 with the field's path. try-io shows readRepos only on the output side, and typecheck is clean."
+ },
+ "quiz": [
+  {
+   "q": "const body = JSON.parse(text) as Note; What does as Note check when the code runs?",
+   "options": [
+    {
+     "text": "That body has a text field that is a string",
+     "correct": false,
+     "why": "as is only a promise to tsc; it disappears from the built code."
+    },
+    {
+     "text": "Nothing at all",
+     "correct": true,
+     "why": "Only a schema's parse or safeParse checks the data at run time."
+    },
+    {
+     "text": "That body is valid JSON",
+     "correct": false,
+     "why": "JSON.parse checks that; as checks nothing."
+    }
+   ]
+  },
+  {
+   "q": "What does z.infer<typeof RunScope> give you?",
+   "options": [
+    {
+     "text": "The TypeScript type of the parsed data, from the schema",
+     "correct": true,
+     "why": "One definition, so the type and the check cannot drift apart."
+    },
+    {
+     "text": "A JSON Schema you can send to a model",
+     "correct": false,
+     "why": "That is z.toJSONSchema."
+    },
+    {
+     "text": "A function that validates data",
+     "correct": false,
+     "why": "The schema itself validates; z.infer exists only for tsc."
+    }
+   ]
+  },
+  {
+   "q": "The planner got the JSON Schema of Plan. Why does the harness still run Plan.safeParse on structured_output?",
+   "options": [
+    {
+     "text": "Because the SDK returns structured_output as a string",
+     "correct": false,
+     "why": "It is an object; the reason is about rules and trust."
+    },
+    {
+     "text": "JSON Schema cannot hold every zod rule, such as superRefine. A model can also answer off-shape; the errors go back to the planner",
+     "correct": true,
+     "why": "Asking for a shape is not checking it."
+    },
+    {
+     "text": "To fill in TypeScript types at run time",
+     "correct": false,
+     "why": "Types do not exist at run time; parse returns checked data."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p1-4: why does the broker store sha256(capability) instead of the capability?",
+  "From p1-3: which status code means 'your request is wrong', and which means 'body too large'?"
+ ],
+ "videos": [
+  {
+   "title": "Learn Zod In 30 Minutes",
+   "url": "https://www.youtube.com/watch?v=L6BE-U3oy80",
+   "channel": "Web Dev Simplified",
+   "minutes": 31,
+   "why": "Covers schemas, parse/safeParse and z.infer step by step, very clear English."
+  },
+  {
+   "title": "Zod 4 is out, and it is CRAZY",
+   "url": "https://www.youtube.com/watch?v=xcm53k0ePmY",
+   "channel": "Matt Pocock",
+   "minutes": 11,
+   "why": "Short update on Zod 4 changes from a top TypeScript educator."
+  }
+ ],
+ "words": [
+  {
+   "term": "zod schema",
+   "plain": "A runtime description of data, built from z.string(), z.object() and friends."
+  },
+  {
+   "term": "z.infer",
+   "plain": "Gives the TypeScript type of a schema's parsed output, so you never write the type twice."
+  },
+  {
+   "term": "parse / safeParse",
+   "plain": "parse returns data or throws; safeParse returns success with data, or failure with an error."
+  },
+  {
+   "term": "prettifyError",
+   "plain": "zod 4's function that turns a ZodError into readable lines with field paths."
+  },
+  {
+   "term": "z.toJSONSchema",
+   "plain": "Turns a zod schema into JSON Schema, for a model's structured output."
+  },
+  {
+   "term": "structured output",
+   "plain": "An Agent SDK answer in a fixed JSON shape, read from msg.structured_output."
+  },
+  {
+   "term": "input vs output type",
+   "plain": "What callers may send (defaults optional) versus what parsing returns (defaults filled)."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G4-06",
+   "why": "The readiness check is a zod schema, z.toJSONSchema for the model, and Readiness.parse on the answer."
+  },
+  {
+   "key": "G4-07",
+   "why": "The Plan schema lives in shared/src/schemas.ts, uses io: \"input\" for the model, and superRefine rules."
+  },
+  {
+   "key": "G3-07",
+   "why": "RunScope's zod schema lives in the shared package and checks every scope the orchestrator opens."
+  }
+ ],
+ "remember": "Describe outside data once with zod: safeParse at the edge, z.infer for types, z.toJSONSchema for the model."
+}

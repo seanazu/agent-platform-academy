@@ -1,0 +1,604 @@
+{
+ "id": "g3-4",
+ "title": "The broker",
+ "minutes": 60,
+ "youNeed": [
+  "p11-2",
+  "p1-3",
+  "p1-6"
+ ],
+ "bridge": "The broker is like the API routes of a web app that call Stripe for the browser. The secret key stays on the server. Except every caller is a sandbox we do not trust. So each route first finds the caller's run scope, and refuses anything outside it. One family of routes even speaks git instead of JSON.",
+ "intro": "Lesson p11-2 explained why a broker exists. This lesson builds all of it, in three tickets. G3-07 gives runs their capability and their one-repo GitHub token. G3-10 adds the git proxy that checks every push. G3-13 adds one Jira issue, one Slack thread and one S3 prefix per run, plus the audit log.",
+ "picture": {
+  "caption": "The orchestrator opens a scope and the VM gets only a capability. The broker adds the real credentials to each allowed call.",
+  "nodes": [
+   {
+    "id": "orch",
+    "label": "orchestrator worker",
+    "kind": "service"
+   },
+   {
+    "id": "broker",
+    "label": "broker (scopes in Postgres)",
+    "kind": "service"
+   },
+   {
+    "id": "vm",
+    "label": "nova-worker in the VM",
+    "kind": "agent"
+   },
+   {
+    "id": "github",
+    "label": "GitHub (one repo, one branch)",
+    "kind": "cloud"
+   },
+   {
+    "id": "jira",
+    "label": "Jira (one issue)",
+    "kind": "cloud"
+   },
+   {
+    "id": "slack",
+    "label": "Slack (one thread)",
+    "kind": "cloud"
+   },
+   {
+    "id": "s3",
+    "label": "runs bucket: runs/<run_id>/",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "orch",
+    "to": "broker",
+    "text": "POST /internal/runs with the scope; gets back a random capability"
+   },
+   {
+    "from": "orch",
+    "to": "vm",
+    "text": "writes the capability to /run/nova/capability over SSM"
+   },
+   {
+    "from": "vm",
+    "to": "broker",
+    "text": "every call carries Bearer <capability>; the broker finds the scope or answers 401"
+   },
+   {
+    "from": "broker",
+    "to": "github",
+    "text": "a push is checked ref by ref, then forwarded with a 1-hour token"
+   },
+   {
+    "from": "broker",
+    "to": "jira",
+    "text": "reads or comments on the run's one issue, never attachments"
+   },
+   {
+    "from": "broker",
+    "to": "slack",
+    "text": "posts into the run's one thread, never a new message or a DM"
+   },
+   {
+    "from": "broker",
+    "to": "s3",
+    "text": "presigns a 15-minute URL under the run's own prefix"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start from Byte, add scopes",
+   "p": [
+    "G3-07 does not start from an empty file. It moves the core of RhinoHealth/byte src/broker.ts and its tests (test/broker.test.ts) into ai-agents/broker/. That core is already security-reviewed. It has the capability check, the 1 MiB body limit, and /health without auth with 401 for the rest. It also has the audit log, refused writes and the secret guard.",
+    "It stays on node:http with a small router, like Byte (lesson p1-3). Byte keeps its own copy until it can import the package; no Byte change this quarter. What is new is the scope: many runs at once, each with its own repo, branch, issue, thread and prefix.",
+    "The broker listens on two ports. The internal port is for the orchestrator only (a NetworkPolicy, lesson g3-3). POST /internal/runs takes {run_id, agent, repo, branch, read_repos, jira_key, slack_channel, slack_thread_ts} and returns a capability: randomBytes(32) as hex. DELETE /internal/runs/{id} revokes it.",
+    "The sandbox port is what PrivateLink exposes. Every route there starts by turning the caller's capability into a scope. The broker stores only sha256(capability) and the scope, in Postgres through pg, in a database called broker on the ai-agents RDS."
+   ]
+  },
+  {
+   "h": "scopes.ts, part 1: what a run may touch",
+   "p": [
+    "The scope is the whole contract between the orchestrator and the broker. The orchestrator writes it once. Nothing in the VM can widen it, because the VM never talks to the internal port."
+   ],
+   "because": "We write the scope type first, because every route on the sandbox port checks one of its fields before it does anything.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/scopes.ts (part 1 of 2)",
+    "text": "// ai-agents/broker/src/scopes.ts: sketch. Byte's capability pattern (src/broker.ts), as a shared service on inf.\nimport { createHash } from \"node:crypto\";\nimport { createAppAuth } from \"@octokit/auth-app\";\nimport type { Pool } from \"pg\";\nimport { config } from \"./config.js\";\n\nexport interface RunScope { // the zod schema lives in shared/src/schemas.ts\n  runId: string;\n  agent: string; // \"nova\", \"cifix\", ...\n  repo: string; // \"RhinoHealth/fcp\": the one repo this run may write\n  branch: string; // \"nova/RH-1234\": the one ref the git proxy lets it push\n  readRepos: string[]; // read-only, e.g. [\"RhinoHealth/rnd-kb\"]\n  jiraKey: string | null; slackChannel: string | null; slackThreadTs: string | null;\n  expiresAt: string;\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "A one-line summary: Byte's pattern, turned into a shared service on inf."
+     },
+     {
+      "line": 2,
+      "text": "node:crypto gives us sha256 (lesson p1-4)."
+     },
+     {
+      "line": 3,
+      "text": "@octokit/auth-app mints GitHub App installation tokens (lesson p2-4)."
+     },
+     {
+      "line": 4,
+      "text": "import type: only the Pool type from pg, so nothing extra is loaded at run time."
+     },
+     {
+      "line": 7,
+      "text": "The TypeScript shape. The zod schema in shared/ checks the same shape at the internal port."
+     },
+     {
+      "line": 10,
+      "text": "The one repo this run may write."
+     },
+     {
+      "line": 11,
+      "text": "The one branch the git proxy lets it push, for example nova/RH-1234."
+     },
+     {
+      "line": 12,
+      "text": "Repos it may only read, such as rnd-kb for kb_search."
+     },
+     {
+      "line": 13,
+      "text": "The one Jira issue and the one Slack thread. null means this run has none, and those routes refuse."
+     },
+     {
+      "line": 14,
+      "text": "When the scope dies. After this time the capability is worth nothing."
+     }
+    ]
+   }
+  },
+  {
+   "h": "scopes.ts, part 2: one-repo tokens and the lookup",
+   "p": [
+    "Part 2 has two functions. mintToken asks GitHub for an installation token for one repo. scopeFor turns an Authorization header into a scope, or into null, which the router answers with 401.",
+    "Tokens are cached per run and refreshed at 50 minutes, because they live one hour. read_repos get separate read-only tokens. The App's private key reaches the pod through an ExternalSecret (lesson g3-3) and never leaves it."
+   ],
+   "because": "We mint a token per run, because a token scoped to one repo cannot hurt other repos if it leaks.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/scopes.ts (part 2 of 2)",
+    "text": "// Never \"workflows\": without it GitHub refuses any push that changes .github/workflows/.\nconst WRITE_PERMISSIONS = { contents: \"write\", pull_requests: \"write\", checks: \"read\", actions: \"read\" };\nconst auth = createAppAuth({ appId: config.githubAppId, privateKey: config.githubAppPrivateKey }); // from Vault, never in a VM\n\nexport const mintToken = async (scope: RunScope): Promise<string> => { // 1 hour, one repo; it never leaves the broker\n  const { token } = await auth({\n    type: \"installation\", installationId: config.installationId,\n    repositoryNames: [scope.repo.split(\"/\")[1] ?? \"\"], permissions: WRITE_PERMISSIONS,\n  });\n  return token;\n};\n\n// Byte compares its one capability with timingSafeEqual; here there is one per run, so we look up its sha256.\nexport const scopeFor = async (authorization: string | undefined, db: Pool): Promise<RunScope | null> => {\n  if (!authorization?.startsWith(\"Bearer \")) return null; // -> 401\n  const digest = createHash(\"sha256\").update(authorization.slice(\"Bearer \".length)).digest(\"hex\"); // only digests are stored\n  const { rows } = await db.query<{ scope: RunScope }>(\"SELECT scope FROM run_scopes WHERE capability_sha256 = $1\", [digest]);\n  const scope = rows[0]?.scope;\n  return scope && new Date(scope.expiresAt) > new Date() ? scope : null; // missing or expired -> 401\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The workflows permission is never asked for. Without it, GitHub itself refuses any push that changes .github/workflows."
+     },
+     {
+      "line": 2,
+      "text": "Write code and PRs; read checks and Actions runs. Nothing else: no issues, no admin."
+     },
+     {
+      "line": 3,
+      "text": "The App's id and private key come from the pod's environment, filled from Vault. They never enter a VM."
+     },
+     {
+      "line": 5,
+      "text": "The comment is the rule: one hour, one repo, and the token stays inside the broker."
+     },
+     {
+      "line": 8,
+      "text": "repositoryNames takes the name without the owner: RhinoHealth/fcp becomes fcp."
+     },
+     {
+      "line": 13,
+      "text": "Byte has one capability per job and compares it with timingSafeEqual. We have one per run, so we look up its hash."
+     },
+     {
+      "line": 15,
+      "text": "No header, or not a Bearer header: null, and the router answers 401 with no hint."
+     },
+     {
+      "line": 16,
+      "text": "Hash first. The capability string itself is never written to the database or a log."
+     },
+     {
+      "line": 17,
+      "text": "A parameterised query ($1), so the value can never change the SQL."
+     },
+     {
+      "line": 19,
+      "text": "Unknown and expired both give null. A run that is over cannot act."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "Two more routes come with G3-07. GET /v1/scope tells the harness what this run may do. POST /v1/gh is a small allow-list like Byte's /v1/command. It can create a draft PR, mark the run's own PR ready, view, diff, list checks and comment on that PR. Body edits keep the <!-- ai-agents:locked-checks --> block (G0-18). There is no merge, approve or settings call."
+   }
+  },
+  {
+   "h": "The git proxy, part 1: check the refs",
+   "p": [
+    "Byte's model has no git at all. Nova must push its branch, so G3-10 adds a git smart-HTTP proxy inside the broker. Smart HTTP is how git talks to GitHub over HTTPS. GET .../info/refs shows what exists. POST .../git-upload-pack fetches, and POST .../git-receive-pack pushes.",
+    "A push body starts with pkt-lines: short text lines, each prefixed by its length as four hex digits. Each command line says '<old sha> <new sha> <ref>'. A flush line, 0000, ends the commands. The packfile with the actual objects follows. The broker reads only the commands, decides, then streams the whole body on."
+   ],
+   "because": "We check every ref before any byte reaches GitHub, because after the forward the push has happened and cannot be refused.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/git-proxy.ts (part 1 of 2)",
+    "text": "// ai-agents/broker/src/git-proxy.ts: sketch. The token is added here, after the checks, never in the VM.\nimport type { IncomingMessage, ServerResponse } from \"node:http\";\nimport { Readable } from \"node:stream\";\n\nconst ZERO = \"0\".repeat(40);\nexport class Refused extends Error {}\n\n/** Refuse anything but a normal push to this run's own branch. */\nexport const checkReceivePack = (commands: RefUpdate[], scope: RunScope, lastPushed: string | null): void => {\n  for (const cmd of commands) { // parsed from the pkt-lines before the packfile\n    if (cmd.ref !== `refs/heads/${scope.branch}`) throw new Refused(`Only ${scope.branch} can be pushed from this run, not ${cmd.ref}.`);\n    if (cmd.newSha === ZERO) throw new Refused(\"Deleting the branch is not allowed.\");\n    if (lastPushed && cmd.oldSha !== lastPushed) throw new Refused(\"The branch moved since your last push: someone else pushed. Stop and ask.\");\n  }\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The token is added in this file, after the checks. The VM never holds one."
+     },
+     {
+      "line": 2,
+      "text": "Node's request and response types, for the routes in part 2."
+     },
+     {
+      "line": 5,
+      "text": "Forty zeros means 'no commit'. As the new sha it means delete the ref."
+     },
+     {
+      "line": 6,
+      "text": "Our own error type, so the route can tell a refusal from a crash."
+     },
+     {
+      "line": 9,
+      "text": "Input: the commands from the pkt-lines, the run's scope, and the last sha this run pushed."
+     },
+     {
+      "line": 11,
+      "text": "Only refs/heads/<scope.branch>. main, another branch or a tag is refused, with the allowed name in the message."
+     },
+     {
+      "line": 12,
+      "text": "No deletes, not even of the run's own branch."
+     },
+     {
+      "line": 13,
+      "text": "The old sha must be the one Nova last pushed. If not, a person pushed to Nova's branch, and Nova must stop and ask (the playbook)."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The git proxy, part 2: forward with the token",
+   "p": [
+    "Pushes go only to the scope's repo. Fetches may come from the scope's repo or its read_repos. In the image, a git credential helper reads /run/nova/capability, and the remote is https://broker.ai-agents.example.com/git/RhinoHealth/fcp.git. No other git credentials exist in the VM."
+   ],
+   "because": "We stream the push instead of buffering it, because a packfile can be large. The 1 MiB limit stays for JSON bodies.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/git-proxy.ts (part 2 of 2)",
+    "text": "// POST /git/{owner}/{repo}.git/git-receive-pack\nexport const receivePack = async (req: IncomingMessage, res: ServerResponse, scope: RunScope, repo: string): Promise<void> => {\n  if (repo !== scope.repo) return deny(res, scope, \"git.push\", `this run may push only to ${scope.repo}`);\n  const { head, rest } = await readCommands(req); // pkt-lines, then the rest of the stream\n  try {\n    checkReceivePack(parsePktLines(head), scope, await pushes.last(scope.runId));\n  } catch (why) {\n    if (why instanceof Refused) return deny(res, scope, \"git.push\", why.message);\n    throw why;\n  }\n  const token = await tokens.forScope(scope); // 1 hour, one repo\n  const upstream = await fetch(`https://github.com/${scope.repo}.git/git-receive-pack`, {\n    method: \"POST\", duplex: \"half\", // a streamed request body\n    body: Readable.toWeb(Readable.from(chain(head, rest))),\n    headers: { Authorization: basic(\"x-access-token\", token), \"Content-Type\": req.headers[\"content-type\"] ?? \"\" },\n  });\n  await pushes.record(scope, head, upstream.status); // audit + last pushed sha\n  res.writeHead(upstream.status, { \"Content-Type\": upstream.headers.get(\"content-type\") ?? \"\" });\n  if (upstream.body) Readable.fromWeb(upstream.body).pipe(res);\n};",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The route gets the raw request and response, the scope already found, and the repo from the URL."
+     },
+     {
+      "line": 3,
+      "text": "Wrong repo: refused before anything is read. deny writes the audit line and the refusal."
+     },
+     {
+      "line": 4,
+      "text": "readCommands reads up to the flush line and returns those bytes as head, and the untouched rest of the stream."
+     },
+     {
+      "line": 6,
+      "text": "The check from part 1, with the last sha this run pushed."
+     },
+     {
+      "line": 8,
+      "text": "A refusal becomes a clear message for Nova. Any other error is a real bug and is thrown."
+     },
+     {
+      "line": 11,
+      "text": "Only now is the token fetched: one hour, one repo, cached per run."
+     },
+     {
+      "line": 12,
+      "text": "Forward to GitHub's own receive-pack URL for the scope's repo."
+     },
+     {
+      "line": 13,
+      "text": "duplex: \"half\" is how Node's fetch accepts a streamed request body."
+     },
+     {
+      "line": 14,
+      "text": "chain glues head and rest back together, so GitHub receives exactly the bytes git sent."
+     },
+     {
+      "line": 15,
+      "text": "Basic auth with user x-access-token and the token as password, the form GitHub expects for App tokens."
+     },
+     {
+      "line": 17,
+      "text": "Record the push: run, ref, old and new sha, bytes, the result. The new sha becomes lastPushed."
+     },
+     {
+      "line": 19,
+      "text": "Stream GitHub's answer back to git in the VM, so Nova sees GitHub's own messages."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "The token is added after the checks and never travels to the VM. github.com is not on the proxy allow-list, so the broker is the only way Nova's code reaches GitHub."
+   }
+  },
+  {
+   "h": "People routes, part 1: one Slack thread",
+   "p": [
+    "G3-13 adds the rest of the sandbox API. The harness must talk to people and save its work without holding Jira, Slack or AWS credentials. Each route is narrowed to the scope: one issue, one thread, one prefix."
+   ],
+   "because": "We parse every body with zod before acting, because the caller is a sandbox and its JSON is untrusted input.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/people.ts (part 1 of 2)",
+    "text": "// ai-agents/broker/src/people.ts: sketch. One issue, one thread, one prefix per run.\nimport { GetObjectCommand, PutObjectCommand, S3Client } from \"@aws-sdk/client-s3\";\nimport { getSignedUrl } from \"@aws-sdk/s3-request-presigner\";\nimport { WebClient } from \"@slack/web-api\";\nimport { z } from \"zod\";\n\nconst s3 = new S3Client({});\nconst slack = new WebClient(config.slackBotToken); // the bot token stays in the broker\nconst SlackPost = z.object({ text: z.string().min(1) });\nconst JiraComment = z.object({ issue_key: z.string(), text: z.string().min(1) }); // wire names don't change\nconst ArtifactRequest = z.object({ name: z.string(), write: z.boolean() });\n\nexport const peopleRoutes: Record<string, (body: unknown, scope: RunScope) => Promise<Reply>> = {\n  \"POST /v1/slack/post\": async (body, scope) => {\n    if (!scope.slackChannel || !scope.slackThreadTs) return deny(scope, \"slack.post\", \"this run has no Slack thread\");\n    const text = guard(SlackPost.parse(body).text, scope); // refuses token-like strings: Byte's secret guard\n    const resp = await slack.chat.postMessage({ channel: scope.slackChannel, thread_ts: scope.slackThreadTs, text, unfurl_links: false });\n    return allow(scope, \"slack.post\", { ts: resp.ts }); // never a new top-level message, never a DM\n  },",
+    "notes": [
+     {
+      "line": 2,
+      "text": "AWS SDK v3 S3 commands. The broker signs URLs; it never moves the bytes itself."
+     },
+     {
+      "line": 3,
+      "text": "getSignedUrl makes a presigned URL: a link with its own short-lived permission."
+     },
+     {
+      "line": 8,
+      "text": "The Slack bot token stays in the broker. config is filled from Vault."
+     },
+     {
+      "line": 10,
+      "text": "Field names on the wire stay snake_case (issue_key), as the ticket contracts say."
+     },
+     {
+      "line": 13,
+      "text": "A map from 'METHOD path' to a handler. The router finds the scope first, then calls the handler with it."
+     },
+     {
+      "line": 15,
+      "text": "A run with no thread cannot post at all."
+     },
+     {
+      "line": 16,
+      "text": "guard is Byte's secret guard. It refuses any text that looks like a token or contains the capability."
+     },
+     {
+      "line": 17,
+      "text": "Always the scope's channel and thread_ts, so the post is a reply in the run's thread. unfurl_links: false stops link previews."
+     },
+     {
+      "line": 18,
+      "text": "The reply's ts goes back to the harness. There is no route for a new top-level message or a DM."
+     }
+    ]
+   }
+  },
+  {
+   "h": "People routes, part 2: one issue, one prefix",
+   "p": [
+    "GET /v1/jira/issue returns the summary, description and comments of scope.jiraKey only, never attachments: screenshots and logs may hold customer data. Jira calls use the Nova service account token from Vault (infrastructure/ai-agents/jira-nova, G4-04).",
+    "GET /v1/artifacts?prefix= lists the run's own objects, which a resumed run needs. POST /v1/heartbeat {step, progress, checkpoint} stores last_seen; the orchestrator reads it on the internal port (lesson g3-8)."
+   ],
+   "because": "We build the S3 key from the scope's run id, because the caller must never be able to name another run's prefix.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/broker/src/people.ts (part 2 of 2)",
+    "text": "  \"POST /v1/jira/comment\": async (body, scope) => {\n    const { issue_key, text } = JiraComment.parse(body);\n    if (issue_key !== scope.jiraKey) return deny(scope, \"jira.comment\", `only ${scope.jiraKey} can be commented on`);\n    await jira.addComment(scope.jiraKey, guard(text, scope));\n    return allow(scope, \"jira.comment\");\n  },\n  \"POST /v1/artifacts/url\": async (body, scope) => {\n    const { name, write } = ArtifactRequest.parse(body);\n    const key = `runs/${scope.runId}/${safeName(name)}`; // never another run's prefix\n    const params = { Bucket: RUNS_BUCKET, Key: key };\n    const url = await getSignedUrl(s3, write ? new PutObjectCommand(params) : new GetObjectCommand(params), { expiresIn: 900 });\n    return allow(scope, \"artifacts.url\", { key, url });\n  },\n};",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Parse the body. A bad body throws, and the router answers 400."
+     },
+     {
+      "line": 3,
+      "text": "Only the run's own issue. Any other key is denied and recorded."
+     },
+     {
+      "line": 4,
+      "text": "The text passes the secret guard before it reaches Jira."
+     },
+     {
+      "line": 9,
+      "text": "runs/<run_id>/<name>. safeName strips slashes and dots, so ../other-run/ cannot be built."
+     },
+     {
+      "line": 11,
+      "text": "expiresIn: 900 seconds, so every URL dies after 15 minutes. PUT to write, GET to read."
+     },
+     {
+      "line": 12,
+      "text": "The key and URL go back. The VM uploads straight to S3 through the gateway endpoint from lesson g3-2."
+     }
+    ]
+   },
+   "see": "Every call writes one JSON audit line to stdout, which Vector ships to VictoriaLogs. An example:\n{\"run_id\":\"run-1\",\"agent\":\"nova\",\"jira_key\":\"RH-1234\",\"endpoint\":\"jira.comment\",\"decision\":\"deny\",\"reason\":\"only RH-1234 can be commented on\",\"bytes\":214}\nand counts ai_agents_broker_requests_total{agent,endpoint,decision} on /metrics."
+  },
+  {
+   "h": "The container and the tests",
+   "p": [
+    "The broker ships like Byte's broker container (lesson p1-8). It uses node:24-bookworm-slim pinned by digest and non-root user 10001. The root filesystem is read-only, all capabilities are dropped, and no-new-privileges is set.",
+    "The tests start from Byte's broker tests and add the scope cases. A wrong or expired capability gets 401. A scope for repo A cannot read repo B. The token never appears in a response or a log line.",
+    "The git proxy is tested against a local bare repo behind a fake upstream, a node:http server standing in for GitHub. A push to main is refused, to another repo refused, a delete refused, a moved branch refused. The run's own branch is accepted."
+   ]
+  }
+ ],
+ "lab": {
+  "title": "Test the broker's capability check with node:test",
+  "youNeed": [
+   "Node 24 (node -v prints v24.x)",
+   "An empty folder; no database: a fake Pool stands in for Postgres"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/academy/broker-lab/src ~/academy/broker-lab/test && cd ~/academy/broker-lab && npm init -y >/dev/null && npm pkg set type=module",
+    "see": "(no output)"
+   },
+   {
+    "do": "npm i --save-exact -D tsx@4.20.3 typescript@5.9.3 @types/node@24.12.2 @types/pg@8.15.6",
+    "see": "added 15 packages, and audited 16 packages in 8s\nfound 0 vulnerabilities"
+   },
+   {
+    "do": "Save src/scopes.ts: the RunScope interface and scopeFor from sections 2 and 3, without the Octokit parts (no token minting in this lab):\n\nimport { createHash } from \"node:crypto\";\nimport type { Pool } from \"pg\";\n\nexport interface RunScope {\n  runId: string;\n  agent: string;\n  repo: string;\n  branch: string;\n  readRepos: string[];\n  jiraKey: string | null; slackChannel: string | null; slackThreadTs: string | null;\n  expiresAt: string;\n}\n\nexport const scopeFor = async (authorization: string | undefined, db: Pool): Promise<RunScope | null> => {\n  if (!authorization?.startsWith(\"Bearer \")) return null; // -> 401\n  const digest = createHash(\"sha256\").update(authorization.slice(\"Bearer \".length)).digest(\"hex\"); // only digests are stored\n  const { rows } = await db.query<{ scope: RunScope }>(\"SELECT scope FROM run_scopes WHERE capability_sha256 = $1\", [digest]);\n  const scope = rows[0]?.scope;\n  return scope && new Date(scope.expiresAt) > new Date() ? scope : null; // missing or expired -> 401\n};",
+    "see": "(a 20-line file)"
+   },
+   {
+    "do": "Save test/scopes.test.ts. fakeDb is a Pool with only a query method, backed by a Map, that also records every value it was asked about:\n\nimport test from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { createHash } from \"node:crypto\";\nimport type { Pool } from \"pg\";\nimport { scopeFor, type RunScope } from \"../src/scopes.js\";\n\nconst sha = (s: string) => createHash(\"sha256\").update(s).digest(\"hex\");\nconst CAP = \"a\".repeat(64); // a made-up capability\nconst scope = (expiresAt: string): RunScope => ({ runId: \"run-1\", agent: \"nova\", repo: \"RhinoHealth/fcp\",\n  branch: \"nova/RH-1234\", readRepos: [], jiraKey: \"RH-1234\", slackChannel: null, slackThreadTs: null, expiresAt });\n\n// A fake Pool: a Map from sha256(capability) to a scope, and a list of every value the \"database\" was asked about.\nconst fakeDb = (rows: Map<string, RunScope>) => {\n  const seen: unknown[] = [];\n  const db = { query: async (_sql: string, params: unknown[]) => {\n    seen.push(...params);\n    const found = rows.get(params[0] as string);\n    return { rows: found ? [{ scope: found }] : [] };\n  } } as unknown as Pool;\n  return { db, seen };\n};\nconst inAnHour = () => new Date(Date.now() + 3_600_000).toISOString();\n\ntest(\"no header, or a header that is not Bearer, gets no scope\", async () => {\n  const { db } = fakeDb(new Map());\n  assert.equal(await scopeFor(undefined, db), null);\n  assert.equal(await scopeFor(`Basic ${CAP}`, db), null);\n});\n\ntest(\"a wrong capability gets no scope\", async () => {\n  const { db } = fakeDb(new Map([[sha(CAP), scope(inAnHour())]]));\n  assert.equal(await scopeFor(`Bearer ${\"b\".repeat(64)}`, db), null);\n});\n\ntest(\"the run's own capability gets its scope\", async () => {\n  const { db } = fakeDb(new Map([[sha(CAP), scope(inAnHour())]]));\n  assert.equal((await scopeFor(`Bearer ${CAP}`, db))?.repo, \"RhinoHealth/fcp\");\n});\n\ntest(\"an expired scope behaves like an unknown one\", async () => {\n  const { db } = fakeDb(new Map([[sha(CAP), scope(\"2026-01-01T00:00:00Z\")]]));\n  assert.equal(await scopeFor(`Bearer ${CAP}`, db), null);\n});\n\ntest(\"the database only ever sees the digest, never the capability\", async () => {\n  const { db, seen } = fakeDb(new Map());\n  await scopeFor(`Bearer ${CAP}`, db);\n  assert.deepEqual(seen, [sha(CAP)]);\n});",
+    "see": "(a 49-line file)"
+   },
+   {
+    "do": "node --import tsx --test test/*.test.ts",
+    "see": "✔ no header, or a header that is not Bearer, gets no scope (1.0955ms)\n✔ a wrong capability gets no scope (1.833459ms)\n✔ the run's own capability gets its scope (0.2565ms)\n✔ an expired scope behaves like an unknown one (0.169375ms)\n✔ the database only ever sees the digest, never the capability (1.205834ms)\nℹ tests 5\nℹ pass 5\nℹ fail 0"
+   },
+   {
+    "do": "Break the wall on purpose. In src/scopes.ts change [digest] in the query to [authorization.slice(\"Bearer \".length)], so the raw capability is sent to the database. Run the tests again.",
+    "see": "✔ a wrong capability gets no scope\n✖ the run's own capability gets its scope\n✖ the database only ever sees the digest, never the capability\nℹ pass 3\nℹ fail 2"
+   },
+   {
+    "do": "Put [digest] back and run the tests once more.",
+    "see": "ℹ pass 5\nℹ fail 0"
+   }
+  ],
+  "faded": "Write openRun(scope, db) in src/runs.ts for POST /internal/runs. It makes the capability with randomBytes(32).toString(\"hex\") and returns it. Before that it runs INSERT INTO run_scopes (capability_sha256, scope) VALUES ($1, $2) with the digest and the scope. Test it with a fakeDb that records params: the capability is 64 hex characters, and params[0] equals its sha256. The last assertion is yours: prove the raw capability is not anywhere in the recorded params.",
+  "alone": "Write slackPost(body, scope, post) in src/people.ts, where post is a function you pass in (the fake Slack client). It returns { decision: \"deny\" } when scope.slackChannel or scope.slackThreadTs is null. Otherwise it calls post({ channel, thread_ts, text, unfurl_links: false }) and returns { decision: \"allow\" }. Write two tests. A scope with no thread is denied and post is never called (use t.mock.fn()). A scope with a thread posts exactly once, into that thread.",
+  "done": "The five scope tests pass again, with your openRun and slackPost tests. The break-it step failed exactly two tests."
+ },
+ "quiz": [
+  {
+   "q": "Nova runs `git push origin HEAD:main` from the VM. Where is it stopped?",
+   "options": [
+    {
+     "text": "In the broker, by checkReceivePack: the ref is not refs/heads/nova/RH-1234, so it is refused before anything reaches GitHub.",
+     "correct": true,
+     "why": "The proxy reads the commands first. A refused push is recorded and Nova gets the allowed branch name."
+    },
+    {
+     "text": "At GitHub, by the ruleset on main.",
+     "correct": false,
+     "why": "The ruleset would also refuse it, but the push never gets there: the broker refuses first, with a clear message."
+    },
+    {
+     "text": "On the VM, by git, because the token only allows one branch.",
+     "correct": false,
+     "why": "The VM has no token. GitHub tokens are per repo, not per branch; the branch rule lives in the broker."
+    }
+   ]
+  },
+  {
+   "q": "Why does the broker store sha256(capability) instead of the capability?",
+   "options": [
+    {
+     "text": "sha256 values are shorter, so the index is smaller.",
+     "correct": false,
+     "why": "Both are 64 hex characters. Size is not the point."
+    },
+    {
+     "text": "So a person or bug that reads the database or its logs still cannot act as any run.",
+     "correct": true,
+     "why": "Like a password hash: the broker can check a capability, but nobody can get one back from the table."
+    },
+    {
+     "text": "Because Postgres cannot store random bytes.",
+     "correct": false,
+     "why": "It can. We avoid storing the secret at all."
+    }
+   ]
+  },
+  {
+   "q": "A run asks POST /v1/artifacts/url for name \"../run-2/notes.md\". What does it get?",
+   "options": [
+    {
+     "text": "A URL for runs/run-2/notes.md, because S3 resolves the dots.",
+     "correct": false,
+     "why": "S3 keys are plain strings, and the broker sanitizes the name before it builds the key."
+    },
+    {
+     "text": "A 403 from S3 when it uses the URL.",
+     "correct": false,
+     "why": "The URL it gets is for its own prefix, so S3 would accept it. The refusal is in the key, not in S3."
+    },
+    {
+     "text": "A URL under runs/<its own run_id>/, because safeName strips the path and the prefix comes from the scope.",
+     "correct": true,
+     "why": "The run id comes from the scope, never from the body, so another run's prefix cannot be named."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From g3-3: which three ports does the PrivateLink NLB forward, and to which services?",
+  "From p1-4: why do we compare secrets with timingSafeEqual instead of ===?"
+ ],
+ "videos": [
+  {
+   "title": "Working with GitHub Apps instead of a PAT",
+   "url": "https://www.youtube.com/watch?v=xtXnIV20XQw",
+   "channel": "Rob Bos",
+   "minutes": 20,
+   "why": "Creates a GitHub App and generates installation tokens, compared to PATs."
+  }
+ ],
+ "words": [
+  {
+   "term": "run scope",
+   "plain": "Everything one run may touch: repo, branch, read repos, Jira issue, Slack thread, expiry. The orchestrator writes it once."
+  },
+  {
+   "term": "capability",
+   "plain": "A random string that means 'this run, until it expires'. The broker looks it up; by itself it opens nothing."
+  },
+  {
+   "term": "installation token",
+   "plain": "A one-hour GitHub App token, minted for chosen repos and permissions."
+  },
+  {
+   "term": "git smart HTTP",
+   "plain": "How git fetches and pushes over HTTPS: info/refs, then upload-pack or receive-pack."
+  },
+  {
+   "term": "pkt-line",
+   "plain": "git's wire format: each line starts with its length in four hex digits; 0000 ends a section."
+  },
+  {
+   "term": "presigned URL",
+   "plain": "A link that carries its own short-lived permission to read or write one S3 object."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-07",
+   "why": "This lesson explained the scope, the capability lookup, one-repo tokens and the two ports, with scopes.ts line by line.",
+   "walk": [
+    "Move the core of RhinoHealth/byte src/broker.ts, src/secret-guard.ts and test/broker.test.ts into ai-agents/broker/. Keep node:http and the small router.",
+    "Add the internal port. POST /internal/runs returns randomBytes(32) as hex and stores sha256 plus the scope in Postgres (database broker, through pg). DELETE /internal/runs/{id} revokes.",
+    "Write src/scopes.ts (code above): RunScope, mintToken with @octokit/auth-app (one repo, no workflows permission), and scopeFor. Cache tokens per run and refresh at 50 minutes; read-only tokens for read_repos.",
+    "Add GET /v1/scope and POST /v1/gh: draft PR, mark the run's own PR ready, view, diff, checks, comment on its own PR. Keep the locked-checks block in body edits. No merge, approve or settings.",
+    "Ship the hardened image: node:24-bookworm-slim by digest, user 10001, read-only root FS, all capabilities dropped, no-new-privileges.",
+    "Write node:test cases. A wrong or expired capability gets 401. A scope for repo A cannot read repo B. The token never appears in a response or a log."
+   ]
+  },
+  {
+   "key": "G3-10",
+   "why": "This lesson explained smart HTTP, pkt-lines, and git-proxy.ts line by line: check the refs, then stream with the token.",
+   "walk": [
+    "Add routes GET /git/{owner}/{repo}.git/info/refs?service=git-upload-pack|git-receive-pack and POST .../git-upload-pack and .../git-receive-pack. Push only to the scope's repo; fetch from it or read_repos.",
+    "Write checkReceivePack and receivePack in src/git-proxy.ts (code above), with readCommands, parsePktLines and chain helpers.",
+    "Store the last pushed sha per run; refuse a push whose old sha differs, with the 'stop and ask' message.",
+    "In the image (G3-14), add a git credential helper that reads /run/nova/capability, and set the remote to https://broker.ai-agents.example.com/git/RhinoHealth/fcp.git.",
+    "Audit every push: run, ref, old and new sha, bytes, allowed or refused and why.",
+    "Test with node:test against a local bare repo behind a fake node:http upstream. main, another repo, a delete and a moved branch are refused. The run's own branch is accepted."
+   ]
+  },
+  {
+   "key": "G3-13",
+   "why": "This lesson explained the Slack, Jira and artifact routes line by line, plus heartbeats and the audit line.",
+   "walk": [
+    "Write src/people.ts (code above): Slack post, Jira comment and artifact URL routes. Each is narrowed to the scope and passes the secret guard.",
+    "Add GET /v1/jira/issue returning summary, description and comments only, with the Nova service account token from Vault infrastructure/ai-agents/jira-nova.",
+    "Add GET /v1/artifacts?prefix= listing only runs/<run_id>/ objects, with sanitized names.",
+    "Add POST /v1/heartbeat {step, progress, checkpoint} storing last_seen, readable by the orchestrator on the internal port.",
+    "Log one JSON audit line per call (run_id, agent, jira_key, endpoint, allow or deny, reason, bytes) and count ai_agents_broker_requests_total{agent,endpoint,decision} on /metrics.",
+    "Ask a Slack admin for the bot token early (G3-30 builds the app), and G4 for the Nova Jira service account."
+   ]
+  }
+ ],
+ "remember": "The VM holds only a capability. The broker finds the scope, checks the call, and adds the real credential itself."
+}

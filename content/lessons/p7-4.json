@@ -1,0 +1,421 @@
+{
+  "id": "p7-4",
+  "title": "Starting runs",
+  "minutes": 40,
+  "youNeed": [
+    "p7-3"
+  ],
+  "bridge": "A workflow ID is like a primary key: two inserts with the same key cannot both succeed. Except: you choose what the second start does with a conflict policy, fail or join the open run. And once the run closes, a reuse policy decides whether the same ID may run again.",
+  "intro": "The fastest way to burn money is many agents doing the same job. This lesson shows how the platform starts every run the same safe way. The workflow ID is the thing itself, and each agent has its own queue. Search attributes let us find and stop runs in bulk.",
+  "picture": {
+    "caption": "Three triggers for the same ticket give one run: the ID nova:RH-1234 with USE_EXISTING makes every later start join it.",
+    "nodes": [
+      {
+        "id": "poll",
+        "label": "Jira poll",
+        "kind": "service"
+      },
+      {
+        "id": "slack",
+        "label": "/nova RH-1234 in Slack",
+        "kind": "person"
+      },
+      {
+        "id": "start",
+        "label": "startRun()",
+        "kind": "service"
+      },
+      {
+        "id": "server",
+        "label": "Temporal Service",
+        "kind": "service"
+      },
+      {
+        "id": "run",
+        "label": "run nova:RH-1234 on ai-agents-nova",
+        "kind": "service"
+      },
+      {
+        "id": "worker",
+        "label": "worker polling ai-agents-nova",
+        "kind": "machine"
+      }
+    ],
+    "steps": [
+      {
+        "from": "poll",
+        "to": "start",
+        "text": "finds RH-1234 assigned to Nova"
+      },
+      {
+        "from": "start",
+        "to": "server",
+        "text": "start ticketToPr with ID nova:RH-1234, USE_EXISTING, Agent=nova"
+      },
+      {
+        "from": "server",
+        "to": "run",
+        "text": "no open run has this ID, so a new run starts"
+      },
+      {
+        "from": "slack",
+        "to": "start",
+        "text": "a minute later someone types /nova RH-1234"
+      },
+      {
+        "from": "start",
+        "to": "run",
+        "text": "same ID, run open: the start joins it; still one run"
+      },
+      {
+        "from": "run",
+        "to": "worker",
+        "text": "only workers on ai-agents-nova run it; cifix work cannot crowd it out"
+      }
+    ]
+  },
+  "sections": [
+    {
+      "h": "The workflow ID is the thing",
+      "p": [
+        "Every run has a workflow ID, and only one open run may hold an ID at a time. We do not use random IDs. We use the thing the run is about. A ticket is nova:RH-1234 and a red main is cifix:fcp:<fingerprint>. A broken Renovate PR is upgrade:fcp:pr-<n>, and a bug is bugfix:RH-1240.",
+        "Then a duplicate trigger cannot make a duplicate run. The Jira poll runs every minute and finds RH-1234 every time. Slack, Jira comments and the poll can all fire for one ticket. All of them name the same run."
+      ],
+      "callout": {
+        "kind": "why",
+        "text": "One run per thing is a wall enforced by Temporal, not a prompt. G3-25 calls it the first wall against agent storms."
+      }
+    },
+    {
+      "h": "startRun: the one way to start",
+      "p": [
+        "G3-25 puts every start behind one function, startRun. It builds the ID and the queue from the agent name. It sets the conflict policy and tags the run with a search attribute. The Jira poll, the Slack app and the schedules all call it.",
+        "WorkflowIdConflictPolicy decides what happens when a run with this ID is already open. FAIL is the default: the start throws. USE_EXISTING returns a handle to the open run instead. We never use TERMINATE_EXISTING, which kills the open run."
+      ],
+      "because": "We start every run through one function because then the ID, queue, policy and tag can never differ between triggers.",
+      "code": {
+        "lang": "typescript",
+        "file": "ai-agents/orchestrator/src/fanout.ts",
+        "text": "// ai-agents/orchestrator/src/fanout.ts (part of G3-25). Only the orchestrator starts runs.\nimport type { Client, Workflow } from \"@temporalio/client\";\nimport { defineSearchAttributeKey, SearchAttributeType, TypedSearchAttributes, WorkflowIdConflictPolicy } from \"@temporalio/common\";\n\nconst AGENT = defineSearchAttributeKey(\"Agent\", SearchAttributeType.KEYWORD);\n\nexport const startRun = (client: Client, agent: string, thing: string, wf: string | Workflow, ...args: unknown[]) =>\n  client.workflow.start(wf, {\n    workflowId: `${agent}:${thing}`, // nova:RH-1234 | cifix:fcp:<fingerprint> | upgrade:fcp:pr-<n> | bugfix:RH-1240\n    taskQueue: `ai-agents-${agent}`, // one queue per agent: nobody starves anybody\n    workflowIdConflictPolicy: WorkflowIdConflictPolicy.USE_EXISTING, // a second trigger joins the open run\n    typedSearchAttributes: new TypedSearchAttributes([{ key: AGENT, value: agent }]),\n    args,\n  });",
+        "notes": [
+          {
+            "line": 5,
+            "text": "A typed key for the Agent search attribute. Keyword means exact match, like a tag."
+          },
+          {
+            "line": 7,
+            "text": "wf may be the function or its name as a string; the Slack app uses the name."
+          },
+          {
+            "line": 9,
+            "text": "The ID is agent plus thing. This line is the whole duplicate guard."
+          },
+          {
+            "line": 10,
+            "text": "The queue is derived from the agent too: ai-agents-nova, ai-agents-cifix and so on."
+          },
+          {
+            "line": 11,
+            "text": "USE_EXISTING: a second trigger joins instead of failing or starting another."
+          },
+          {
+            "line": 12,
+            "text": "Every run carries Agent, so we can list and stop one agent's runs."
+          }
+        ]
+      }
+    },
+    {
+      "h": "What a second start does",
+      "p": [
+        "Try both policies on your laptop. With USE_EXISTING, the second start returns the same run. With the default, it throws WorkflowExecutionAlreadyStartedError.",
+        "Both policies only look at open runs. After a run closes, the ID is free again by default. So a parked ticket that is assigned again gets a fresh run with the same ID. That is the behaviour G3-38 wants."
+      ],
+      "because": "We test the policies in the lab because a wrong policy either duplicates runs or loses triggers, and both fail quietly.",
+      "code": {
+        "lang": "typescript",
+        "file": "~/temporal-lab/src/start2.ts",
+        "text": "// ~/temporal-lab/src/start2.ts: what a second start does\nimport { Client, Connection } from \"@temporalio/client\";\nimport { WorkflowIdConflictPolicy } from \"@temporalio/common\";\nimport { hello } from \"./workflows.js\";\n\nconst client = new Client({ connection: await Connection.connect({ address: \"localhost:7233\" }), namespace: \"ai-agents\" });\nconst opts = { taskQueue: \"ai-agents-lab\", workflowId: \"lab:RH-5\", args: [\"Sean\"] as [string] };\nconst join = { ...opts, workflowIdConflictPolicy: WorkflowIdConflictPolicy.USE_EXISTING };\nconst a = await client.workflow.start(hello, join);\nconst b = await client.workflow.start(hello, join); // same ID, run still open\nconsole.log(\"same run:\", a.firstExecutionRunId === b.firstExecutionRunId);\ntry { await client.workflow.start(hello, opts); } // the default policy: FAIL\ncatch (e) { console.log(\"default policy:\", (e as Error).constructor.name); }",
+        "notes": [
+          {
+            "line": 8,
+            "text": "The join options: same as opts plus USE_EXISTING."
+          },
+          {
+            "line": 10,
+            "text": "The run from line 9 is still waiting for approval, so it is open."
+          },
+          {
+            "line": 11,
+            "text": "firstExecutionRunId identifies the run. Equal means one run."
+          },
+          {
+            "line": 12,
+            "text": "No policy given: the default FAIL applies."
+          }
+        ]
+      },
+      "see": "same run: true\ndefault policy: WorkflowExecutionAlreadyStartedError",
+      "ifInstead": "If instead 'same run' prints false, the first run had already finished. hello must still be waiting for its approve signal; start lab:RH-5 fresh and run again."
+    },
+    {
+      "h": "signalWithStart: join with news",
+      "p": [
+        "Sometimes the second trigger carries information. When main is red, every push fails the same way, and each failure is a new trigger for the same root cause. signalWithStart sends a signal to the open run, or starts the run and then delivers the signal to it.",
+        "routineRun receives it with an addTrigger handler that pushes the trigger onto a list. The CI fixer waits 7 minutes before it starts work, so the triggers of a storm gather in one run (G5-08).",
+        "G5-09 also sets workflowIdReusePolicy REJECT_DUPLICATE. A root cause whose run already closed may not start again. It goes to a person in #ai-agents-alerts, because it is probably ping-pong."
+      ],
+      "because": "We use signalWithStart because one call covers both cases, run open or not, with no race between checking and starting.",
+      "code": {
+        "lang": "typescript",
+        "file": "ai-agents/orchestrator/src/triggers/github-events.ts (part)",
+        "text": "// ai-agents/orchestrator/src/triggers/github-events.ts (part of G5-09): one routineRun per root cause\nawait temporal.workflow.signalWithStart(routineRun, {\n  workflowId, // cifix:fcp:<fingerprint>: the root cause is the ID\n  taskQueue: queueFor(routine), // ai-agents-cifix\n  args: [{ routine }],\n  signal: addTrigger, // sent to the open run, or to the run this call starts\n  signalArgs: [Trigger.fromRun(run)],\n  typedSearchAttributes: agentAttribute(routine), // Agent=cifix, as startRun sets it\n  workflowIdReusePolicy: WorkflowIdReusePolicy.REJECT_DUPLICATE, // a closed root cause never starts again\n}).catch(async (err: unknown) => {\n  if (!(err instanceof WorkflowExecutionAlreadyStartedError)) throw err;\n  await alerts.post(`${workflowId} came back after its run closed; a person should look (ping-pong?)`);\n});",
+        "notes": [
+          {
+            "line": 3,
+            "text": "The fingerprint: last green commit plus each failing job's normalized first error."
+          },
+          {
+            "line": 6,
+            "text": "The signal goes to the open run, or to the run this call starts."
+          },
+          {
+            "line": 8,
+            "text": "Same Agent attribute as startRun, so the batch stop finds these runs too."
+          },
+          {
+            "line": 9,
+            "text": "Reuse policy: about closed runs. Conflict policy is about open runs."
+          },
+          {
+            "line": 11,
+            "text": "Thrown when the ID was used by a closed run. Anything else is a real error."
+          },
+          {
+            "line": 12,
+            "text": "A person decides; the platform never loops on the same failure."
+          }
+        ]
+      }
+    },
+    {
+      "h": "Task queues: one per agent",
+      "p": [
+        "A run only reaches workers that poll its task queue. If all agents shared one queue, a storm of CI fixes could fill every worker while a person waits for Nova. So each agent family has its own queue: ai-agents-nova, ai-agents-cifix, ai-agents-upgrade, ai-agents-flaky, ai-agents-bugfix, ai-agents-health, ai-agents-security. Housekeeping like the Jira polls runs on ai-agents-orchestrator.",
+        "The queue limits who runs the workflow code, not how many VMs run. VM slots are a separate wall. A slots workflow per agent hands out a fixed number (nova 3, cifix 2), and extra work waits."
+      ],
+      "because": "We give each agent its own queue so that one agent can never starve another's workers.",
+      "code": {
+        "lang": "typescript",
+        "file": "ai-agents/orchestrator/src/main.ts (sketch)",
+        "text": "// ai-agents/orchestrator/src/main.ts (sketch): one worker per task queue\nconst QUEUES = [\"nova\", \"cifix\", \"upgrade\", \"flaky\", \"bugfix\", \"health\", \"security\", \"orchestrator\"];\nconst connection = await NativeConnection.connect({ address: config.temporalAddress });\nconst workers = await Promise.all(QUEUES.map((q) => Worker.create({\n  connection, namespace: \"ai-agents\", taskQueue: `ai-agents-${q}`,\n  workflowsPath: fileURLToPath(new URL(\"./workflows/index.js\", import.meta.url)), activities,\n})));\nawait Promise.all(workers.map((w) => w.run())); // each polls only its own queue",
+        "notes": [
+          {
+            "line": 2,
+            "text": "The queue names from ts_platform.md. A charter's queue key names the queue of a routine."
+          },
+          {
+            "line": 4,
+            "text": "One Worker per queue. They can share one connection and one process."
+          },
+          {
+            "line": 6,
+            "text": "In production the bundle path points at compiled .js. Ask the G3-25 owner whether queues share a pod."
+          },
+          {
+            "line": 8,
+            "text": "Each worker polls only its queue, so a full cifix queue cannot block Nova."
+          }
+        ]
+      }
+    },
+    {
+      "h": "Search attributes: find and stop runs",
+      "p": [
+        "A search attribute is an indexed field on a run, like a column you can filter on. They must be registered on the namespace first. On inf, G3-06 registers Agent, JiraKey and RunKind; G5-08 adds Routine, RoutineOutcome and Stage. On the laptop, start-dev's --search-attribute flag does it.",
+        "A visibility query filters runs by these fields with a SQL-like text. The kill switch uses it to signal stop to every running Nova run at once. The CLI asks for confirmation before a batch; --yes skips the question. A workflow can also change its own attributes with upsertSearchAttributes; check the docs for the typed form."
+      ],
+      "because": "We tag every run with Agent because in an incident the first question is: stop everything this agent is doing.",
+      "code": {
+        "lang": "bash",
+        "file": "temporal CLI: visibility queries",
+        "text": "# every running Nova run, found by its search attribute\ntemporal workflow list --namespace ai-agents --query 'Agent=\"nova\" AND ExecutionStatus=\"Running\"'\n\n# the kill switch's batch stop (G3-25); add --input with the stop signal's argument\ntemporal workflow signal --namespace ai-agents \\\n  --query 'Agent=\"nova\" AND ExecutionStatus=\"Running\"' --name stop --input '\"sean\"'\n\n# open Nova runs, as the Jira poll finds them for @Nova commands (G4-05)\ntemporal workflow list --namespace ai-agents --query 'WorkflowType=\"ticketToPr\" AND ExecutionStatus=\"Running\"'",
+        "notes": [
+          {
+            "line": 2,
+            "text": "List by attribute. ExecutionStatus and WorkflowType are built in; Agent is ours."
+          },
+          {
+            "line": 5,
+            "text": "--query turns one signal into a batch job over every match."
+          },
+          {
+            "line": 6,
+            "text": "The ticket's command has no --input; stop takes a by argument, so add one."
+          },
+          {
+            "line": 9,
+            "text": "The same query, from code, is how the poll finds tickets with an open run."
+          }
+        ]
+      },
+      "see": "Start batch against approximately 1 workflow(s)? y/N yes\nStarted batch for job ID: 6b4d07ce-...",
+      "callout": {
+        "kind": "wall",
+        "text": "Only the orchestrator starts runs. The VM has no route to Temporal and no broker endpoint that starts runs, so an agent can never start another agent."
+      }
+    }
+  ],
+  "lab": {
+    "title": "One ID, one run",
+    "youNeed": [
+      "~/temporal-lab from p7-3",
+      "The dev server started with --search-attribute Agent=Keyword"
+    ],
+    "worked": [
+      {
+        "do": "Make sure hello waits for approval with \"1 day\" again, and restart the worker",
+        "see": "[INFO] Worker state changed { ... state: 'RUNNING' }"
+      },
+      {
+        "do": "Create src/start2.ts from the block above and run: npx tsx src/start2.ts",
+        "see": "same run: true\ndefault policy: WorkflowExecutionAlreadyStartedError"
+      },
+      {
+        "do": "Add to start2.ts: typedSearchAttributes: new TypedSearchAttributes([{ key: AGENT, value: \"nova\" }]) in opts, with AGENT from defineSearchAttributeKey. Change the ID to lab:RH-6 and run it again.",
+        "see": "same run: true\ndefault policy: WorkflowExecutionAlreadyStartedError"
+      },
+      {
+        "do": "temporal workflow list --namespace ai-agents --query 'Agent=\"nova\" AND ExecutionStatus=\"Running\"'",
+        "see": "  Status   WorkflowId  Type   StartTime\n  Running  lab:RH-6    hello  1 second ago"
+      },
+      {
+        "do": "temporal workflow signal --namespace ai-agents --query 'Agent=\"nova\" AND ExecutionStatus=\"Running\"' --name approve --input '\"batch\"' --yes",
+        "see": "Started batch for job ID: <uuid>"
+      },
+      {
+        "do": "temporal workflow result --namespace ai-agents --workflow-id lab:RH-6",
+        "see": "  Result          \"Hello, Sean! (approved by batch)\""
+      },
+      {
+        "do": "Add a signalWithStart call to start2.ts: ID lab:RH-7, signal approve, signalArgs [\"dana\"]. Print await handle.result().",
+        "see": "Hello, Sean! (approved by dana)"
+      }
+    ],
+    "faded": "Write startRun from the lesson into src/fanout.ts and use it to start lab:RH-8 twice with agent \"lab\". Left to you: which task queue the run lands on, and why your worker on ai-agents-lab picks it up.",
+    "alone": "Start two runs tagged Agent=nova and one tagged Agent=cifix (all waiting). Write one visibility query that lists only the Nova runs, and one batch signal that approves only the cifix run. Check each result.",
+    "done": "Two starts with one ID gave one run and the default policy threw. A batch signal reached exactly the runs your query matched."
+  },
+  "quiz": [
+    {
+      "q": "The Jira poll and /nova both start nova:RH-1234 within a minute, with USE_EXISTING. How many runs exist?",
+      "options": [
+        {
+          "text": "Two, one per trigger",
+          "correct": false,
+          "why": "The ID is the ticket, and only one open run may hold an ID."
+        },
+        {
+          "text": "One; the second start returns a handle to the open run",
+          "correct": true,
+          "why": "USE_EXISTING joins the open run instead of failing."
+        },
+        {
+          "text": "None; the second start makes both fail",
+          "correct": false,
+          "why": "The first run is untouched; only the second start is affected."
+        }
+      ]
+    },
+    {
+      "q": "RH-1234 was parked, so its run closed. Next week it is assigned to Nova again. What happens with the default reuse policy?",
+      "options": [
+        {
+          "text": "A fresh run starts with the same ID nova:RH-1234",
+          "correct": true,
+          "why": "Conflict policies look at open runs; a closed ID may be used again by default."
+        },
+        {
+          "text": "The start fails because the ID was used before",
+          "correct": false,
+          "why": "That is REJECT_DUPLICATE, which only the root-cause triggers (G5-09) set."
+        },
+        {
+          "text": "The old run wakes up from where it parked",
+          "correct": false,
+          "why": "A closed run never resumes; a new run starts from the top."
+        }
+      ]
+    },
+    {
+      "q": "Why does each agent get its own task queue?",
+      "options": [
+        {
+          "text": "Because Temporal allows only one workflow type per queue",
+          "correct": false,
+          "why": "A queue can carry any number of workflow types."
+        },
+        {
+          "text": "To limit how many VMs an agent may use",
+          "correct": false,
+          "why": "VM limits come from the slots workflow, not from queues."
+        },
+        {
+          "text": "So a storm of one agent's work cannot take every worker another agent needs",
+          "correct": true,
+          "why": "Separate queues mean separate pollers: nobody starves anybody."
+        }
+      ]
+    }
+  ],
+  "recall": [
+    "In p7-3, why can a signal be sent while no worker runs, while a query cannot?",
+    "In p7-2, what does nonRetryable: true on an ApplicationFailure change?"
+  ],
+  "videos": [],
+  "words": [
+    {
+      "term": "workflow ID",
+      "plain": "The name of a run; only one open run may hold it. Ours is the thing, like nova:RH-1234."
+    },
+    {
+      "term": "conflict policy",
+      "plain": "WorkflowIdConflictPolicy: what a start does when a run with the ID is open (FAIL, USE_EXISTING)."
+    },
+    {
+      "term": "reuse policy",
+      "plain": "WorkflowIdReusePolicy: whether an ID may start again after its run closed."
+    },
+    {
+      "term": "signalWithStart",
+      "plain": "One call that signals the open run, or starts it and then delivers the signal."
+    },
+    {
+      "term": "search attribute",
+      "plain": "An indexed field on a run, such as Agent, that visibility queries filter on."
+    },
+    {
+      "term": "visibility query",
+      "plain": "A SQL-like filter over runs, used by workflow list and batch signals."
+    }
+  ],
+  "tickets": [
+    {
+      "key": "G3-25",
+      "why": "startRun, the per-agent queues, the Agent attribute and the batch stop are this lesson."
+    },
+    {
+      "key": "G5-09",
+      "why": "One routineRun per root cause uses signalWithStart with REJECT_DUPLICATE."
+    },
+    {
+      "key": "G5-08",
+      "why": "routineRun's addTrigger signal and its Routine, RunKind, RoutineOutcome and Stage attributes."
+    },
+    {
+      "key": "G4-05",
+      "why": "The poll finds open runs with WorkflowType = 'ticketToPr' AND ExecutionStatus = 'Running'."
+    }
+  ],
+  "remember": "Name the run after the thing, start it only through startRun with USE_EXISTING, and tag it so you can stop it."
+}

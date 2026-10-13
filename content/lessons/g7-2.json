@@ -1,0 +1,630 @@
+{
+ "id": "g7-2",
+ "title": "The fakes",
+ "minutes": 60,
+ "youNeed": [
+  "p10-4",
+  "g7-1"
+ ],
+ "bridge": "The three fakes are like MSW handlers for the backend: small real stand-ins that keep state and answer like the real service. Except: each fake sits behind the real interface (a real gRPC socket, the real storage base class, the real Celery send path). And each one has a contract suite that runs the same checks against the real client, MinIO or a Celery worker.",
+ "intro": "The cloud talks to three things a test cannot run: on-prem clients over gRPC, an object store and Celery workers. This lesson builds the three fakes that replace mocks in tests_api/, one ticket each. It also builds the contract suites that keep them honest. It is Python because the code it stands in for is fcp's Django backend.",
+ "picture": {
+  "caption": "Cloud code under test reaches each fake through its real seam; a contract suite checks each fake against the real thing.",
+  "nodes": [
+   {
+    "id": "test",
+    "label": "A tests_api test",
+    "kind": "check"
+   },
+   {
+    "id": "cloud",
+    "label": "Cloud code (views, services)",
+    "kind": "service"
+   },
+   {
+    "id": "rpc",
+    "label": "FakeOnPremClient on 127.0.0.1",
+    "kind": "service"
+   },
+   {
+    "id": "store",
+    "label": "InMemoryStorageProvider",
+    "kind": "service"
+   },
+   {
+    "id": "queue",
+    "label": "FakeTaskQueue",
+    "kind": "service"
+   },
+   {
+    "id": "real",
+    "label": "Real client, MinIO, Celery worker",
+    "kind": "machine"
+   },
+   {
+    "id": "contract",
+    "label": "tests_api/contracts (marker contract)",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "test",
+    "to": "cloud",
+    "text": "calls an endpoint through the API client"
+   },
+   {
+    "from": "cloud",
+    "to": "rpc",
+    "text": "AgentRpcClient sends real protobuf bytes over a real socket"
+   },
+   {
+    "from": "cloud",
+    "to": "store",
+    "text": "StorageService builds the provider, and the fixture hands it the fake"
+   },
+   {
+    "from": "cloud",
+    "to": "queue",
+    "text": "apply_async ends in app.send_task, which the fixture replaced"
+   },
+   {
+    "from": "test",
+    "to": "queue",
+    "text": "calls drain() when it wants the tasks to run, oldest first"
+   },
+   {
+    "from": "contract",
+    "to": "real",
+    "text": "runs the same checks against the real services, in CI and in FCP Lab"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Three seams, three fakes",
+   "p": [
+    "Lesson p10-4 taught the idea. A fake is a small real implementation behind the real interface, swapped in at the seam and pinned by a contract suite. G7 applies it three times. Each fake replaces mocks counted in G7-01: 69 on AgentRpcClient, 24 on StorageService, 11 eager Celery classes.",
+    "The fakes live in tests_api/fakes/, one module each. Their fixtures live in tests_api/conftest.py: onprem_client, object_store and task_queue. The contract suites live in tests_api/contracts/ and carry the contract marker, so pytest tests_api -m contract runs only them.",
+    "Leave the existing mocks in rhinoCore/tests alone. New tests in tests_api use the fakes; old tests move only when someone ports them (lesson g7-3)."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "The fakes are Python because they stand in for parts of fcp's Django backend and run inside its pytest process. The TypeScript platform never imports them."
+   }
+  },
+  {
+   "h": "FakeOnPremClient, part 1: the real contract (G7-04)",
+   "p": [
+    "The cloud reaches every Rhino client through one proxy gRPC service, RhinoCloudInternalRpcProxy. Its one method, AgentRpc, carries the agent id, a method name such as HealthCheck, and the request as protobuf bytes. AgentRpcClient wraps that call in cloud code.",
+    "The fake subclasses the generated servicer. So cloud code under test goes through the real AgentRpcClient, the real encoding and a real socket. A mock skips all three, which is where the 69 mocks drift."
+   ],
+   "because": "We subclass the generated servicer and use the real method table, because the fake must accept what the real proxy accepts.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/fakes/onprem_client.py (part 1 of 2)",
+    "text": "from fcp_common.rhinoAgentRpc import agent_rpc_onprem_side_pb2 as onprem\nfrom fcp_common.rhinoAgentRpc.agent_rpc_internal_cloud_proxy_pb2 import AgentRpcResponse\nfrom fcp_common.rhinoAgentRpc.agent_rpc_internal_cloud_proxy_pb2_grpc import RhinoCloudInternalRpcProxyServicer\nfrom rhinoCloud.rhinoTaskServices.rhinoTaskResponseService.handle_task_response import handle_task_response\n\nMETHODS = onprem.RhinoAgentRpc.GetDescriptor().methods_by_name  # the same lookup AgentRpcClient uses\n\n\nclass FakeOnPremClient(RhinoCloudInternalRpcProxyServicer):\n    \"\"\"In-memory Rhino clients behind the real cloud->agent gRPC contract. Pinned by tests_api/contracts/ (also run on FCP Lab).\"\"\"\n\n    def __init__(self):\n        self.calls: list[tuple[str, str]] = []  # (rhino_agent_id, method_name)\n        self.offline_agents: set[str] = set()\n        self.scheduled: list[onprem.ScheduleTaskRequest] = []  # more handlers: SystemStatus, GetEnvironmentVariable, ...",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The generated messages of the client side: HealthCheckRequest, ScheduleTaskRequest and so on. We call the module onprem."
+     },
+     {
+      "line": 2,
+      "text": "The proxy's reply message: response bytes, or an error message and type."
+     },
+     {
+      "line": 3,
+      "text": "The generated server base class for the proxy service (lesson p10-4 calls it a servicer)."
+     },
+     {
+      "line": 4,
+      "text": "The production function that records a client's answer to a task. complete_task() calls it below."
+     },
+     {
+      "line": 6,
+      "text": "The service descriptor lists every RPC by name with its input type. AgentRpcClient uses the same lookup."
+     },
+     {
+      "line": 9,
+      "text": "The fake is a servicer, so a real grpc.server can serve it."
+     },
+     {
+      "line": 13,
+      "text": "Every call as (agent id, method name). Tests may read it, but they assert on outcomes first."
+     },
+     {
+      "line": 14,
+      "text": "Agent ids the test marks as offline."
+     },
+     {
+      "line": 15,
+      "text": "Every ScheduleTask request, so a test or builder can finish the task later."
+     }
+    ]
+   }
+  },
+  {
+   "h": "FakeOnPremClient, part 2: dispatch and finish a task",
+   "p": [
+    "The fixture onprem_client starts grpc.server on 127.0.0.1:0; port 0 means any free port. It registers the fake with add_RhinoCloudInternalRpcProxyServicer_to_server. Then it monkeypatches AGENT_RPC_INTERNAL_CLOUD_PROXY_DNS and AGENT_RPC_INTERNAL_CLOUD_PROXY_PORT. AgentRpcClient reads those two settings every time it is created, so no production code changes.",
+    "The first scenarios need seven handlers: HealthCheck, SystemStatus, ScheduleTask, GetEnvironmentVariable, GetAgentGcpProjectId, ValidateDatasetImportPaths and GetTensorBoardLogsMetadata. The sketch shows two; the rest follow the same shape."
+   ],
+   "because": "We return an error that names a missing method, because a quiet default would let a test pass on an unbuilt path.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/fakes/onprem_client.py (part 2 of 2)",
+    "text": "    def AgentRpc(self, request, context):  # runs on a gRPC server thread: never touch the database here\n        self.calls.append((request.rhino_agent_id, request.method_name))\n        if request.rhino_agent_id in self.offline_agents:\n            return AgentRpcResponse(error_message=\"agent not connected\", error_type=AgentRpcResponse.ErrorType.TIMEOUT)\n        handler = getattr(self, f\"_{request.method_name}\", None)\n        if handler is None:  # loud on purpose: add the method here and a case to the contract suite\n            return AgentRpcResponse(error_message=f\"FakeOnPremClient does not implement {request.method_name}\")\n        request_type = getattr(onprem, METHODS[request.method_name].input_type.name)\n        return AgentRpcResponse(response_data=handler(request_type.FromString(request.request_data)).SerializeToString())\n\n    def _HealthCheck(self, request):\n        return onprem.HealthCheckResponse(is_healthy=True)\n    def _ScheduleTask(self, request):\n        self.scheduled.append(request)\n        return onprem.EmptyMessage()\n\n    def complete_task(self, task_uid: str, status: str, output: dict) -> None:\n        \"\"\"Call from the test thread: runs the same handler as task_response_job (the RQ task-response worker).\"\"\"\n        handle_task_response(task_uid=task_uid, task_status_str=status, task_output=output)",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The one RPC of the proxy. gRPC calls it on a server thread with the request and a context."
+     },
+     {
+      "line": 2,
+      "text": "Record the call first, even when it fails below."
+     },
+     {
+      "line": 3,
+      "text": "An offline agent gets the TIMEOUT error type, the same answer the real proxy gives when a client is not connected."
+     },
+     {
+      "line": 5,
+      "text": "Find a method named _<RPC name> on the fake, or None."
+     },
+     {
+      "line": 6,
+      "text": "A loud gap: an error that names the missing method. Add the method and a contract case."
+     },
+     {
+      "line": 8,
+      "text": "Look up the input message class for this RPC, for example ScheduleTaskRequest."
+     },
+     {
+      "line": 9,
+      "text": "Decode the bytes into that message, call the handler, and encode its reply into the response."
+     },
+     {
+      "line": 11,
+      "text": "The simplest handler: the client says it is healthy."
+     },
+     {
+      "line": 13,
+      "text": "Remember the request, so the test can finish the task later."
+     },
+     {
+      "line": 15,
+      "text": "The real client answers ScheduleTask with an empty message."
+     },
+     {
+      "line": 17,
+      "text": "Called by the test, on the test's thread, when it wants the client to report a result."
+     },
+     {
+      "line": 19,
+      "text": "Runs the same handler that task_response_job runs in production, with the task uid, status and output."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "Handlers run on a gRPC server thread, outside the test's database transaction. So they never touch the database. Anything that writes rows happens in complete_task(), on the test's own thread."
+   }
+  },
+  {
+   "h": "InMemoryStorageProvider, part 1: a dict shaped like S3 (G7-05)",
+   "p": [
+    "StorageService in rhinoCore/services/cloud_services/storage_service.py picks a provider class. When CLOUD_PROVIDER is AWS, which it is in the test env, its __init__ builds AWSStorageServiceProvider() at call time. The fixture object_store replaces that name: monkeypatch.setattr(storage_service, \"AWSStorageServiceProvider\", lambda: store). Production code does not change.",
+    "The fake implements every abstract method of CloudStorageServiceProviderBase, plus upload_file_from_bytes and storage_service_prefix. A bucket is a dict from object key to (bytes, last-modified time)."
+   ],
+   "because": "We let a missing bucket raise, because the real store raises too and the contract suite pins that behaviour.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/fakes/object_store.py (part 1 of 2)",
+    "text": "import datetime\nfrom pathlib import Path\n\nfrom rhinoCloud.rhinoCore.services.cloud_services.storage_service import CloudStorageServiceProviderBase, FileMetadata\n\nFAKE_HOST = \"http://object-store.fake\"  # the fixture patches storage_service.requests.get to serve this host\n\n\nclass InMemoryStorageProvider(CloudStorageServiceProviderBase):\n    \"\"\"S3-shaped store in a dict. Pinned by tests_api/contracts/test_object_store_contract.py, which also runs on MinIO.\"\"\"\n\n    storage_service_prefix = \"s3://\"  # same as AWSStorageServiceProvider; check before relying on it\n\n    def __init__(self):\n        self.buckets: dict[str, dict[str, tuple[bytes, datetime.datetime]]] = {}\n\n    def list_objects(self, *, bucket_name, prefix=None, filter_non_files=False) -> list[str]:\n        objects = self.buckets[bucket_name]  # a missing bucket raises; the contract suite pins what MinIO does\n        keys = [key for key in objects if key.startswith(prefix or \"\")]\n        return [key for key in keys if not filter_non_files or (not key.endswith(\"/\") and objects[key][0])]",
+    "notes": [
+     {
+      "line": 1,
+      "text": "For the last-modified time of each object."
+     },
+     {
+      "line": 4,
+      "text": "The real base class and the metadata type that providers return."
+     },
+     {
+      "line": 6,
+      "text": "Presigned links point at this made-up host. The fixture teaches requests.get to serve it."
+     },
+     {
+      "line": 9,
+      "text": "Same base class as the AWS and GCP providers, so StorageService cannot tell the difference."
+     },
+     {
+      "line": 12,
+      "text": "Copied from the AWS provider. The comment says to check it before relying on it."
+     },
+     {
+      "line": 15,
+      "text": "Bucket name to a dict of key to (bytes, time)."
+     },
+     {
+      "line": 17,
+      "text": "Keyword-only arguments (the * means the caller must name them), like the base class."
+     },
+     {
+      "line": 18,
+      "text": "A missing bucket raises KeyError. The contract suite pins what MinIO does in the same case."
+     },
+     {
+      "line": 19,
+      "text": "Keys that start with the prefix, or all keys when there is none."
+     },
+     {
+      "line": 20,
+      "text": "With filter_non_files, drop folder markers: keys ending in / or with empty content."
+     }
+    ]
+   }
+  },
+  {
+   "h": "InMemoryStorageProvider, part 2: write, link, describe",
+   "p": [
+    "A presigned URL is a link with a signature that lets anyone download one object for a limited time. StorageService.get_file downloads it with requests.get. So the fixture also patches storage_service.requests.get to answer for http://object-store.fake from memory. That is the one extra seam, and the fake's docstring says so."
+   ],
+   "because": "We store the upload time with the bytes, because get_file_metadata must return a last-modified date like S3 does.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/fakes/object_store.py (part 2 of 2)",
+    "text": "    def upload_file_from_bytes(self, *, bucket_name: str, object_key: str, file_bytes: bytes) -> None:\n        self.buckets[bucket_name][object_key] = (file_bytes, datetime.datetime.now(datetime.UTC))\n\n    def upload_file(self, *, bucket_name: str, object_key: str, file_path: str) -> None:\n        self.upload_file_from_bytes(bucket_name=bucket_name, object_key=object_key, file_bytes=Path(file_path).read_bytes())\n\n    def generate_presigned_download_url(self, *, bucket_name, object_key, expires_in, response_disposition=None) -> str:\n        return f\"{FAKE_HOST}/{bucket_name}/{object_key}?expires_in={expires_in}\"\n\n    def get_file_metadata(self, *, bucket_name: str, object_key: str) -> FileMetadata:\n        data, modified = self.buckets[bucket_name][object_key]\n        return FileMetadata(last_modified=modified, size_bytes=len(data))\n\n    # bucket_exists, create_bucket, get_bucket, list_bucket_names, download_file, delete_file, ...: same style",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Store bytes under a key with the current UTC time. A missing bucket raises here too."
+     },
+     {
+      "line": 4,
+      "text": "Read a file from disk and reuse the method above."
+     },
+     {
+      "line": 7,
+      "text": "Return a fake link with the bucket, the key and the expiry, the shape the code passes on."
+     },
+     {
+      "line": 10,
+      "text": "Unpack the stored tuple."
+     },
+     {
+      "line": 12,
+      "text": "Return the real metadata type: last-modified time and size in bytes."
+     },
+     {
+      "line": 14,
+      "text": "The remaining abstract methods follow the same style; the class cannot be created until all exist."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "The contract suite tests_api/contracts/test_object_store_contract.py is parametrized over memory and minio. The minio side runs when MINIO_S3_ENDPOINT_URL is set. It covers a missing bucket, list with prefix and filter_non_files, overwrite, delete, metadata size and a presigned download."
+   }
+  },
+  {
+   "h": "FakeTaskQueue, part 1: record through the real serializer (G7-07)",
+   "p": [
+    "CELERY_TASK_ALWAYS_EAGER runs a task inside the caller at send time. Celery's docs say it is not suitable for testing: nothing waits in a queue, so order and timing differ from production. The fake records instead. Nothing runs until the test calls drain().",
+    "The seam is app.send_task on the app in rhinoCore/celery_tasks/app.py. Task.apply_async ends in that method, so RhinoTask's header injection still runs before the fake sees the task. The fixture does monkeypatch.setattr(app, \"send_task\", queue.send_task)."
+   ],
+   "because": "We push the arguments through kombu's dumps and loads, because an argument a broker cannot carry must fail in the test.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/fakes/task_queue.py (part 1 of 2)",
+    "text": "import uuid\nfrom collections import namedtuple\n\nfrom celery.canvas import maybe_signature\nfrom kombu.serialization import dumps, loads\n\nfrom rhinoCloud.rhinoCore.celery_tasks.app import app\n\nSentTask = namedtuple(\"SentTask\", \"name args kwargs options task_id\")\n\n\nclass FakeTaskQueue:\n    \"\"\"Stands in for the broker: send_task() records, drain() runs, oldest first. Unlike CELERY_TASK_ALWAYS_EAGER,\n    arguments go through our serializer (pickle) as on Redis, and nothing runs until the test asks.\"\"\"\n\n    def __init__(self):\n        self.sent: list[SentTask] = []\n        self.ran: list[SentTask] = []\n\n    def send_task(self, name, args=None, kwargs=None, task_id=None, **options):  # replaces app.send_task\n        content_type, encoding, body = dumps((args or (), kwargs or {}), serializer=app.conf.task_serializer)\n        args, kwargs = loads(body, content_type, encoding, accept=app.conf.accept_content)\n        self.sent.append(SentTask(name, tuple(args), kwargs, options, task_id or str(uuid.uuid4())))\n        return app.AsyncResult(self.sent[-1].task_id)  # callers read .id; tests call drain(), never .get()",
+    "notes": [
+     {
+      "line": 1,
+      "text": "To make a task id when the caller gave none."
+     },
+     {
+      "line": 2,
+      "text": "A small immutable record type, like a readonly TypeScript tuple with names."
+     },
+     {
+      "line": 4,
+      "text": "Turns a stored chain entry back into a Celery signature (a task plus its arguments)."
+     },
+     {
+      "line": 5,
+      "text": "kombu is the messaging library under Celery; these two do the broker's serialization."
+     },
+     {
+      "line": 7,
+      "text": "fcp's Celery app; its conf holds the serializer settings."
+     },
+     {
+      "line": 9,
+      "text": "One recorded task: name, args, kwargs, the send options, and the task id."
+     },
+     {
+      "line": 12,
+      "text": "Stands in for the broker."
+     },
+     {
+      "line": 17,
+      "text": "Tasks waiting to run, oldest first."
+     },
+     {
+      "line": 18,
+      "text": "Tasks that ran, so a test can read the order."
+     },
+     {
+      "line": 20,
+      "text": "Same signature shape as app.send_task; extra options (headers, chain) land in options."
+     },
+     {
+      "line": 21,
+      "text": "Serialize the arguments with the app's serializer, pickle in fcp."
+     },
+     {
+      "line": 22,
+      "text": "Deserialize them, as a worker would. See the gotcha below about accept."
+     },
+     {
+      "line": 23,
+      "text": "Record the task with a fresh id when the caller gave none."
+     },
+     {
+      "line": 24,
+      "text": "Return a result handle. Callers read .id; tests call drain(), never .get()."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "In this lesson's lab, kombu's loads refused accept=[\"json\"] with ContentDisallowed: it wants content types such as application/json. If fcp's accept_content lists names like pickle and json, wrap it: accept=prepare_accept_content(app.conf.accept_content), imported from kombu.serialization."
+   }
+  },
+  {
+   "h": "FakeTaskQueue, part 2: drain, errors and chains",
+   "p": [
+    "drain() runs the recorded tasks in-process with Task.apply. A chain is a list of tasks where each one starts after the previous finished and gets its result. Celery stores the rest of a chain in the chain option, reversed, so the next task is the last entry. vocabulary_indexing.index_large_vocabulary and the NVFlare inference flow use chains."
+   ],
+   "because": "We re-raise each task's own error in the test, because a swallowed exception would turn a broken task into a green test.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/fakes/task_queue.py (part 2 of 2)",
+    "text": "    def drain(self) -> list[SentTask]:\n        while self.sent:\n            task = self.sent.pop(0)\n            result = app.tasks[task.name].apply(task.args, task.kwargs, task_id=task.task_id, headers=task.options.get(\"headers\"))\n            result.get(propagate=True)  # the task's own exception, raised in the test\n            if chain := list(task.options.get(\"chain\") or []):\n                next_sig = maybe_signature(chain.pop(), app=app)  # Celery keeps the rest of a chain reversed\n                next_sig.apply_async(() if next_sig.immutable else (result.result,), chain=chain or None)\n            self.ran.append(task)\n        return self.ran",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Run everything that was sent, including tasks sent by the tasks themselves."
+     },
+     {
+      "line": 2,
+      "text": "Loop until the queue is empty; a chain adds new entries while we drain."
+     },
+     {
+      "line": 3,
+      "text": "Take the oldest task first, like a queue."
+     },
+     {
+      "line": 4,
+      "text": "Run the registered task in this process with its args, id and recorded headers. RhinoTask restores its metadata context from the headers."
+     },
+     {
+      "line": 5,
+      "text": "Raise the task's own exception here, in the test."
+     },
+     {
+      "line": 6,
+      "text": "The walrus operator assigns and tests in one step: is there a chain to continue?"
+     },
+     {
+      "line": 7,
+      "text": "The next task is the last entry, because Celery keeps the rest of a chain reversed."
+     },
+     {
+      "line": 8,
+      "text": "Send it the normal way, which lands in our send_task again. An immutable signature takes no result; otherwise pass the previous result."
+     },
+     {
+      "line": 9,
+      "text": "Remember the order the tasks ran in."
+     }
+    ]
+   },
+   "see": "tests_api/contracts/test_task_queue_contract.py::test_chain[fake] PASSED\ntests_api/contracts/test_task_queue_contract.py::test_chain[worker] PASSED"
+  },
+  {
+   "h": "Contract suites in CI and in the Lab",
+   "p": [
+    "Each fake gets a contract file in tests_api/contracts/ with the contract marker. The on-prem one checks a health call, an unknown agent id, a scheduled task with its response, and the timeout error type. The task-queue one checks a plain task, a chain, an error and the metadata context kept.",
+    "The real sides need real services. MinIO (public.ecr.aws/u7h0g2s9/rhinofcp/minio:2025.2.7) and Redis (public.ecr.aws/u7h0g2s9/rhinofcp/redis:7.4.3) join the API Tests job as services. They are the same images the test job uses, and the job runs pytest tests_api -m contract. The Celery side starts a worker with celery.contrib.testing.worker.start_worker. It needs a transactional database, because results go to the django-db result backend.",
+    "The on-prem suite has a --target option: fake by default, lab against FCP Lab. With lab, the proxy settings point at the Lab's agent-rpc-cloud-side-service and the Lab's client id. Lesson g7-6 (G7-26) runs it there."
+   ],
+   "callout": {
+    "kind": "gotcha",
+    "text": "RQ jobs such as task_response_job are not in FakeTaskQueue's scope. FakeOnPremClient.complete_task reaches that code directly instead. Note too: in the lab, Celery 5.6.3 eager mode also refused an argument JSON cannot carry. Check fcp's pinned Celery version before you repeat the serialization argument; the order argument holds either way."
+   }
+  }
+ ],
+ "lab": {
+  "title": "A record-then-drain fake for Celery, with a contract test against a real worker",
+  "youNeed": [
+   "Python 3.13 and uv",
+   "No Docker: the real side uses Celery's in-memory broker and a worker thread"
+  ],
+  "worked": [
+   {
+    "do": "mkdir lab72 && cd lab72 && uv init --python 3.13 --bare . && uv add celery pytest",
+    "see": "Initialized project `lab72`\nResolved ... packages\n + celery==5.6.3\n + pytest==...\n(output trimmed)"
+   },
+   {
+    "do": "Create tasks.py:\n\nfrom celery import Celery\n\napp = Celery(\"lab\", broker=\"memory://\", backend=\"cache+memory://\")\napp.conf.update(task_serializer=\"json\", accept_content=[\"json\"], result_serializer=\"json\")\n\n\n@app.task\ndef add(x, y):\n    return x + y",
+    "see": "(no output; uv run python -c \"from tasks import add; print(add.name)\" prints tasks.add)"
+   },
+   {
+    "do": "Create fake_queue.py, a smaller copy of the G7-07 fake with the accept fix:\n\nimport uuid\nfrom collections import namedtuple\n\nfrom kombu.serialization import dumps, loads, prepare_accept_content\n\nfrom tasks import app\n\nSentTask = namedtuple(\"SentTask\", \"name args kwargs task_id\")\n\n\nclass FakeTaskQueue:\n    def __init__(self):\n        self.sent: list[SentTask] = []\n\n    def send_task(self, name, args=None, kwargs=None, task_id=None, **options):\n        content_type, encoding, body = dumps((args or (), kwargs or {}), serializer=app.conf.task_serializer)\n        args, kwargs = loads(body, content_type, encoding, accept=prepare_accept_content(app.conf.accept_content))\n        self.sent.append(SentTask(name, tuple(args), kwargs, task_id or str(uuid.uuid4())))\n        return app.AsyncResult(self.sent[-1].task_id)\n\n    def drain(self) -> list:\n        results = []\n        while self.sent:\n            task = self.sent.pop(0)\n            results.append(app.tasks[task.name].apply(task.args, task.kwargs, task_id=task.task_id).get(propagate=True))\n        return results",
+    "see": "(no output)"
+   },
+   {
+    "do": "mkdir tests && printf '[pytest]\\npythonpath = .\\n' > pytest.ini. Then create tests/conftest.py with a fixture that yields the fake or a real worker:\n\nimport pytest\nfrom celery.contrib.testing.worker import start_worker\n\nfrom fake_queue import FakeTaskQueue\nfrom tasks import app\n\n\n@pytest.fixture(params=[\"fake\", \"real\"])\ndef queue(request, monkeypatch):\n    if request.param == \"fake\":\n        fake = FakeTaskQueue()\n        monkeypatch.setattr(app, \"send_task\", fake.send_task)\n        yield lambda results: fake.drain()\n    else:\n        with start_worker(app, perform_ping_check=False):\n            yield lambda results: [r.get(timeout=10) for r in results]",
+    "see": "(no output)"
+   },
+   {
+    "do": "Create tests/test_queue_contract.py, the contract suite:\n\nimport pytest\nfrom kombu.exceptions import EncodeError\n\nfrom tasks import add\n\n\ndef test_a_task_returns_its_result(queue):\n    results = [add.delay(2, 3), add.delay(10, 1)]\n    assert queue(results) == [5, 11]\n\n\ndef test_an_argument_json_cannot_carry_fails_at_send_time(queue):\n    with pytest.raises(EncodeError):\n        add.delay({1, 2}, 3)",
+    "see": "(no output)"
+   },
+   {
+    "do": "uv run pytest -v",
+    "see": "tests/test_queue_contract.py::test_a_task_returns_its_result[fake] PASSED\ntests/test_queue_contract.py::test_a_task_returns_its_result[real] PASSED\ntests/test_queue_contract.py::test_an_argument_json_cannot_carry_fails_at_send_time[fake] PASSED\ntests/test_queue_contract.py::test_an_argument_json_cannot_carry_fails_at_send_time[real] PASSED\n4 passed in 10.46s"
+   },
+   {
+    "do": "Break the fake: delete the two lines in send_task that call dumps and loads, so it records the raw arguments. Run uv run pytest -q again.",
+    "see": "FAILED tests/test_queue_contract.py::test_an_argument_json_cannot_carry_fails_at_send_time[fake]\n1 failed, 3 passed"
+   },
+   {
+    "do": "Put the two lines back and run uv run pytest -q.",
+    "see": "4 passed"
+   }
+  ],
+  "faded": "Add a third contract test: add.delay(\"a\", 1) makes the task itself fail with TypeError (a string plus a number). Send it, then call queue([...]) with the result. The assertion is left to you: both the fake and the real worker must raise TypeError, so the test passes twice.",
+  "alone": "Write a test that is not a contract test. Add a task remember(x) that appends x to a module-level list SEEN. With the fake patched in, call remember.delay(1) and assert SEEN is still empty; then drain and assert SEEN == [1]. In a second test, set app.conf.task_always_eager = True with monkeypatch and no fake. Show that SEEN is filled at send time.",
+  "done": "uv run pytest -q prints 8 passed: four contract cases, two faded ones and your two tests."
+ },
+ "quiz": [
+  {
+   "q": "Why do FakeOnPremClient's handlers never write to the database?",
+   "options": [
+    {
+     "text": "Because the fake has no Django settings loaded.",
+     "correct": false,
+     "why": "It runs inside the same pytest process with the same settings."
+    },
+    {
+     "text": "Because they run on a gRPC server thread, outside the test's transaction.",
+     "correct": true,
+     "why": "Rows written there would not be rolled back with the test; complete_task() runs on the test's own thread instead."
+    },
+    {
+     "text": "Because the real client also never writes to the cloud database.",
+     "correct": false,
+     "why": "True, but that is not the reason; the thread and transaction are."
+    }
+   ]
+  },
+  {
+   "q": "A test marks an agent as offline and calls an endpoint that health-checks it. What does the fake return?",
+   "options": [
+    {
+     "text": "It raises a Python exception in the view.",
+     "correct": false,
+     "why": "The real proxy does not raise; it answers with an error type, and the fake does the same."
+    },
+    {
+     "text": "An empty HealthCheckResponse.",
+     "correct": false,
+     "why": "That would hide the offline case; the agent is in offline_agents."
+    },
+    {
+     "text": "An AgentRpcResponse with error_type TIMEOUT, as the real proxy answers for a client that is not connected.",
+     "correct": true,
+     "why": "The contract suite pins this error type against FCP Lab too."
+    }
+   ]
+  },
+  {
+   "q": "Why does FakeTaskQueue.send_task serialize and deserialize the arguments?",
+   "options": [
+    {
+     "text": "So an argument the broker could not carry fails in the test, as it would on Redis.",
+     "correct": true,
+     "why": "That is the point of recording through the real serializer."
+    },
+    {
+     "text": "Because Task.apply requires bytes as input.",
+     "correct": false,
+     "why": "apply takes Python args and kwargs; the round trip is our choice."
+    },
+    {
+     "text": "To copy the arguments so later changes in the test cannot affect them.",
+     "correct": false,
+     "why": "A side effect at most; the reason is to behave like the broker."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From g7-1: why does tests_api have its own pytest.ini instead of using cloud/rhinoCloud/pytest.ini?",
+  "From p10-4: where exactly do you patch a seam, on the module that reads the name or on the test's import?"
+ ],
+ "videos": [
+  {
+   "title": "Unit Tests and Test Doubles like Mocks, Stubs & Fakes",
+   "url": "https://www.youtube.com/watch?v=NPp2pvhGbkM",
+   "channel": "The Theory Of Code",
+   "minutes": 18,
+   "why": "Patient explanation of each test double and when to use it."
+  }
+ ],
+ "words": [
+  {
+   "term": "AgentRpc",
+   "plain": "The one method of the cloud's gRPC proxy; it carries an agent id, a method name and the request as bytes."
+  },
+  {
+   "term": "loud gap",
+   "plain": "A missing fake method that answers with an error naming itself, so a test fails instead of passing quietly."
+  },
+  {
+   "term": "presigned URL",
+   "plain": "A signed link that lets anyone download one object for a limited time."
+  },
+  {
+   "term": "kombu",
+   "plain": "The messaging library under Celery; its dumps and loads do what the broker does to task arguments."
+  },
+  {
+   "term": "Celery chain",
+   "plain": "Tasks linked so each starts after the previous one finished and receives its result."
+  },
+  {
+   "term": "contract target",
+   "plain": "The --target option (fake or lab) that decides which side the on-prem contract suite runs against."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G7-04",
+   "why": "This lesson walked through FakeOnPremClient line by line, its fixture, the loud gap and complete_task().",
+   "walk": [
+    "Create tests_api/fakes/onprem_client.py from the two blocks above, then add SystemStatus, GetEnvironmentVariable, GetAgentGcpProjectId, ValidateDatasetImportPaths and GetTensorBoardLogsMetadata.",
+    "Add the onprem_client fixture: grpc.server on 127.0.0.1:0, add_RhinoCloudInternalRpcProxyServicer_to_server, and monkeypatch of the two proxy settings.",
+    "Write tests_api/contracts/test_onprem_client_contract.py (marker contract): health check, unknown agent id, a scheduled task and its response, the timeout error type.",
+    "Add the --target option (fake by default; lab points the proxy at the Lab's agent-rpc-cloud-side-service). G7-26 runs the lab side.",
+    "Leave the mocks in rhinoCore/tests alone."
+   ]
+  },
+  {
+   "key": "G7-05",
+   "why": "This lesson walked through InMemoryStorageProvider, the provider seam and the extra requests.get seam for presigned links.",
+   "walk": [
+    "Create tests_api/fakes/object_store.py from the two blocks above with every abstract method of CloudStorageServiceProviderBase.",
+    "Add the object_store fixture: patch storage_service.AWSStorageServiceProvider and storage_service.requests.get for http://object-store.fake.",
+    "Write tests_api/contracts/test_object_store_contract.py, parametrized over memory and minio (minio when MINIO_S3_ENDPOINT_URL is set).",
+    "Add the MinIO service (public.ecr.aws/u7h0g2s9/rhinofcp/minio:2025.2.7) to the API Tests job and run pytest tests_api -m contract there."
+   ]
+  },
+  {
+   "key": "G7-07",
+   "why": "This lesson walked through FakeTaskQueue, the send_task seam, drain() and chains, and the lab built a smaller copy.",
+   "walk": [
+    "Create tests_api/fakes/task_queue.py from the two blocks above; wrap accept with prepare_accept_content if accept_content holds names.",
+    "Add the task_queue fixture: monkeypatch.setattr(app, \"send_task\", queue.send_task) on the app in rhinoCore/celery_tasks/app.py.",
+    "Write tests_api/contracts/test_task_queue_contract.py (marker contract): a plain task, a chain, an error, the metadata context kept.",
+    "Run the real side with celery.contrib.testing.worker.start_worker, the Redis service and a transactional database.",
+    "Add the Redis service (public.ecr.aws/u7h0g2s9/rhinofcp/redis:7.4.3) to the API Tests job for the contract run."
+   ]
+  }
+ ],
+ "remember": "Each fake sits behind the real seam, and its contract suite runs the same checks against the real thing."
+}

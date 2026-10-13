@@ -1,0 +1,380 @@
+{
+ "id": "p8-3",
+ "title": "Your own tools with MCP",
+ "minutes": 40,
+ "youNeed": [
+  "p8-2"
+ ],
+ "bridge": "An MCP tool is like an API route you expose to the model. It has a name, a zod input schema and a handler that returns a result. Except: the model decides when to call it, so the description is the real API. The result goes back into the model's context, not to a browser.",
+ "intro": "Nova needs three things the built-in tools cannot do: ask the requester a question, post progress, and search the brain. This lesson gives a session a function of yours. The SDK does it through MCP, with tool() and createSdkMcpServer(). At the end you know how the Playwright browser server plugs in the same way.",
+ "picture": {
+  "caption": "The model calls mcp__nova__kb_search; the SDK runs your handler in the same process; the text you return goes back to the model.",
+  "nodes": [
+   {
+    "id": "model",
+    "label": "the model",
+    "kind": "agent"
+   },
+   {
+    "id": "server",
+    "label": "MCP server 'nova' (in your process)",
+    "kind": "service"
+   },
+   {
+    "id": "handler",
+    "label": "your handler kbSearch()",
+    "kind": "service"
+   },
+   {
+    "id": "broker",
+    "label": "broker / kb CLI",
+    "kind": "service"
+   },
+   {
+    "id": "content",
+    "label": "content: [{ type: text }]",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "model",
+    "to": "server",
+    "text": "calls mcp__nova__kb_search with { question }"
+   },
+   {
+    "from": "server",
+    "to": "handler",
+    "text": "checks the input against the zod shape, then calls the handler"
+   },
+   {
+    "from": "handler",
+    "to": "broker",
+    "text": "does the real work (in Nova: through the broker, never with a key)"
+   },
+   {
+    "from": "broker",
+    "to": "content",
+    "text": "the handler wraps the answer as text content"
+   },
+   {
+    "from": "content",
+    "to": "model",
+    "text": "the text becomes the tool result in the model's context"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "What MCP is",
+   "p": [
+    "MCP, the Model Context Protocol, is a standard way for a program to offer tools to a model. Each tool has a name, a description, and an input schema. The model reads the description, decides to call the tool, and sends input that matches the schema. The program runs it and returns content.",
+    "An MCP server is any program that offers tools this way. It can run as a separate process (over stdio), or inside your own process. The SDK lets you build the in-process kind in a few lines, which is what Nova uses for its own tools."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "The model never calls your TypeScript directly. It calls a named tool; the SDK routes the call to your function. That is why the name and description matter so much."
+   }
+  },
+  {
+   "h": "tool(): name, description, zod shape, handler",
+   "p": [
+    "tool() takes four things. They are the name the model sees, the description it reads, a zod shape for the input, and an async handler. The shape is an object of zod fields, not z.object(). The SDK turns it into a schema and checks every call before your handler runs.",
+    "The handler gets the parsed input, typed from the shape. It returns { content: [...] }, an array of blocks. For us that is one text block."
+   ],
+   "because": "We describe the input with zod so the SDK rejects a bad call before our code sees it. TypeScript then knows the argument type too.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/sdk-lab/src/lab3-tools.ts (part 1)",
+    "text": "import { createSdkMcpServer, query, tool } from \"@anthropic-ai/claude-agent-sdk\";\nimport { z } from \"zod\";\n\nconst kbSearch = tool(\n  \"kb_search\", // the model sees this name as mcp__nova__kb_search\n  \"Search the R&D knowledge base. Returns the best page and one key fact.\", // the model reads this to decide when to call\n  { question: z.string().describe(\"what you want to know\") }, // zod shape: the SDK checks the input for you\n  async ({ question }) => {\n    console.log(\"tool called with:\", question);\n    return { content: [{ type: \"text\", text: \"brain/sandbox-sizes.md@a1b2c3: lite VMs have 4 vCPU\" }] };\n  },\n);",
+    "notes": [
+     {
+      "line": 5,
+      "text": "Short, snake_case, like the ticket names them: ask_human, post_progress, kb_search."
+     },
+     {
+      "line": 6,
+      "text": "Write it for the model: when to call it and what comes back. This line is the API."
+     },
+     {
+      "line": 7,
+      "text": "A plain object of zod fields. describe() adds a hint the model sees next to the field."
+     },
+     {
+      "line": 8,
+      "text": "The handler is an arrow function with the parsed, typed input. question is a string here."
+     },
+     {
+      "line": 10,
+      "text": "content is an array of blocks. A fixed answer for the lab; Nova runs the kb CLI here."
+     }
+    ]
+   }
+  },
+  {
+   "h": "createSdkMcpServer() and the tool's full name",
+   "p": [
+    "createSdkMcpServer() bundles tools under a server name. You pass the result in mcpServers, keyed by the same name. From then on each tool is called mcp__<server>__<tool>: our tool is mcp__nova__kb_search.",
+    "That full name must be in allowedTools, or dontAsk refuses it. The lab prints the model's final answer, which should contain the fact from the handler."
+   ],
+   "because": "We put the full mcp__ name in allowedTools because to the permission check an MCP tool is a tool like any other.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/sdk-lab/src/lab3-tools.ts (part 2)",
+    "text": "const nova = createSdkMcpServer({ name: \"nova\", tools: [kbSearch] }); // runs inside this process\n\nfor await (const msg of query({\n  prompt: \"Use kb_search to find how many vCPUs a lite VM has. Answer in one line.\",\n  options: {\n    model: \"claude-haiku-5-5\",\n    effort: \"low\",\n    settingSources: [],\n    mcpServers: { nova }, // the key is the server name\n    allowedTools: [\"mcp__nova__kb_search\"], // mcp__<server>__<tool>\n    permissionMode: \"dontAsk\",\n  },\n})) {\n  if (msg.type === \"result\" && msg.subtype === \"success\") console.log(\"answer:\", msg.result);\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "name 'nova' becomes the middle part of every tool name. tools is the list from tool()."
+     },
+     {
+      "line": 9,
+      "text": "mcpServers takes in-process servers and external ones (next section) in the same map."
+     },
+     {
+      "line": 10,
+      "text": "Without this line the call is refused under dontAsk and the model answers from memory."
+     },
+     {
+      "line": 4,
+      "text": "Naming the tool in the prompt is fine for a lab. In Nova the description and the guide do that job."
+     }
+    ]
+   },
+   "see": "tool called with: how many vCPUs does a lite VM have\nanswer: A lite VM has 4 vCPUs (brain/sandbox-sizes.md@a1b2c3).",
+   "ifInstead": "If instead 'tool called with' never prints and the answer guesses, the tool was refused. Check that allowedTools has the full name mcp__nova__kb_search, and that mcpServers uses the key nova."
+  },
+  {
+   "h": "Nova's three tools (G3-19)",
+   "p": [
+    "ask_human posts the question to the ticket's Slack thread through the broker and ends the turn with status needs_answer. The run waits for a person; Temporal resumes it with the answer. post_progress posts a short update. kb_search runs the kb search CLI from rnd-kb-tooling over the local brain mirror in $KB_DIR.",
+    "Every handler talks to the broker, never to Slack or GitHub with a key. The VM has no credentials. The CLI call in kb_search is the boundary between our TypeScript and Shai's Python."
+   ],
+   "because": "We route every handler through the broker because the broker holds the credentials and decides what this run may do.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/tools.ts (sketch)",
+    "text": "import { createSdkMcpServer, tool } from \"@anthropic-ai/claude-agent-sdk/core\";\nimport { z } from \"zod\";\n\nexport const askHuman = tool(\"ask_human\", \"Ask the requester one question in the ticket's thread.\",\n  { question: z.string() },\n  async ({ question }) => ({ content: [{ type: \"text\", text: await broker.ask(question) }] }));\n\nexport const postProgress = tool(\"post_progress\", \"Post a short progress update to the ticket's thread.\",\n  { text: z.string().max(400) },\n  async ({ text }) => { await broker.post(text); return { content: [{ type: \"text\", text: \"posted\" }] }; });\n\nexport const kbSearch = tool(\"kb_search\", \"Search the R&D brain. Returns path@sha and the key fact per page.\",\n  { query: z.string() },\n  async ({ query }) => ({ content: [{ type: \"text\", text: await runKbCli(query) }] })); // `kb search` over $KB_DIR\n\nexport const nova = createSdkMcpServer({ name: \"nova\", tools: [askHuman, postProgress, kbSearch] });",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The harness is bundled, so it imports from /core (p8-1)."
+     },
+     {
+      "line": 6,
+      "text": "broker.ask posts to Slack and returns the answer, or the harness ends the turn with needs_answer and waits."
+     },
+     {
+      "line": 9,
+      "text": "max(400) keeps updates short; the SDK rejects a longer text before the handler runs."
+     },
+     {
+      "line": 14,
+      "text": "runKbCli calls the kb CLI with execFile (never a shell string). Nova ranks pages like people and BRAIN-QA."
+     },
+     {
+      "line": 16,
+      "text": "This is the object session.ts passes as mcpServers: { nova }."
+     }
+    ]
+   }
+  },
+  {
+   "h": "External servers: the browser for the QA agent (G4-24)",
+   "p": [
+    "Some tools already exist as separate programs. The Playwright MCP server is one: it drives a browser and offers tools like navigate and click. You add it to mcpServers as a stdio server: a command, its args, and the SDK starts it as a child process.",
+    "strictMcpConfig: true means only the servers in this options object load, not .mcp.json from the repo or user settings. The QA agent allows the whole server with a server-level rule. The ticket says to check that rule's exact form in the docs."
+   ],
+   "because": "We pin the browser server in the image and load only it. A repo's .mcp.json must never add tools to a QA run.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/qa.ts (the browser server)",
+    "text": "mcpServers: { playwright: {  // pinned in the image; flags per the pinned version (check --save-video)\n  type: \"stdio\",\n  command: \"/opt/ai-agents/bin/playwright-mcp\",\n  args: [\"--isolated\", \"--save-video=1280x720\", \"--output-dir=/work/.nova/qa/videos\"],\n} },\nstrictMcpConfig: true,\nallowedTools: [\"Read\", \"mcp__playwright\"],  // check the server-level allow rule\ndisallowedTools: [\"Bash\", \"Grep\", \"Glob\", \"Edit\", \"Write\", \"WebFetch\", \"WebSearch\", \"Read(/work/fcp/**)\"],",
+    "notes": [
+     {
+      "line": 2,
+      "text": "stdio: the SDK starts the command and talks MCP over its stdin and stdout."
+     },
+     {
+      "line": 4,
+      "text": "One isolated browser context per check with video on; the flags belong to the pinned version."
+     },
+     {
+      "line": 6,
+      "text": "Only this map counts. The repo's .mcp.json and the user's settings are ignored."
+     },
+     {
+      "line": 7,
+      "text": "mcp__playwright with no tool part means every tool of that server. Confirm the form in the docs before shipping."
+     },
+     {
+      "line": 8,
+      "text": "A path-scoped deny: the tester may read its QA folder but never the checkout."
+     }
+    ]
+   }
+  },
+  {
+   "h": "When a handler fails",
+   "p": [
+    "If your handler throws, the SDK reports a tool error to the model, and the model decides what to do next. It does not crash the session. For a tool like ask_human, a throw is the wrong answer: the harness should end the turn and record needs_answer.",
+    "Keep handlers small and boring. They validate nothing (zod did that), call the broker, and return text. Logic about what the answer means belongs to the model or the harness, not the tool."
+   ],
+   "callout": {
+    "kind": "tip",
+    "text": "Test a handler like any function: call it with an input object and assert on content[0].text. No session needed."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Give the model a kb_search of your own",
+  "youNeed": [
+   "The ~/sdk-lab project",
+   "A Claude Code login"
+  ],
+  "worked": [
+   {
+    "do": "Create src/lab3-tools.ts with part 1 and part 2 from above",
+    "see": "A 28-line file that defines kbSearch, builds the nova server, and runs one query"
+   },
+   {
+    "do": "npx tsx src/lab3-tools.ts",
+    "see": "tool called with: how many vCPUs does a lite VM have\nanswer: A lite VM has 4 vCPUs (brain/sandbox-sizes.md@a1b2c3)."
+   },
+   {
+    "do": "Remove the allowedTools line and run again",
+    "see": "No 'tool called with' line; the answer is a guess or says it cannot search."
+   },
+   {
+    "do": "Put allowedTools back. Change the handler to throw new Error('kb offline') and run again",
+    "see": "The answer says the search failed or was unavailable; the script did not crash."
+   }
+  ],
+  "faded": "Add a second tool, post_progress, with the shape { text: z.string().max(80) }. Its handler appends the text to a file progress.log and returns the text 'posted'. Add it to the server and to allowedTools, and ask the model to post one update after the search. Left to you: the exact allowedTools name for the new tool.",
+  "alone": "Write src/alone3.ts: a server named lab with one tool, add_numbers. It takes { a: z.number(), b: z.number() } and returns the sum as text. Ask the model for 17 + 25 and print its answer. Then call the handler directly with { a: 1, b: 2 } in a small node:test and assert on content[0].text.",
+  "done": "You see your handler's console.log before the model's answer, and the answer contains the handler's fact. Removing the allow entry makes the call disappear."
+ },
+ "quiz": [
+  {
+   "q": "What is the tool name the permission check sees for tool('kb_search', ...) on a server named nova?",
+   "options": [
+    {
+     "text": "kb_search",
+     "correct": false,
+     "why": "The short name is for tool(); the model and allowedTools use the full name."
+    },
+    {
+     "text": "mcp__nova__kb_search",
+     "correct": true,
+     "why": "mcp__<server>__<tool> is the full name; put it in allowedTools."
+    },
+    {
+     "text": "nova.kb_search",
+     "correct": false,
+     "why": "Dots are not used; the separator is a double underscore."
+    }
+   ]
+  },
+  {
+   "q": "Why does Nova's kb_search handler call a CLI instead of reimplementing the search in TypeScript?",
+   "options": [
+    {
+     "text": "Because TypeScript cannot read markdown files",
+     "correct": false,
+     "why": "It can; the reason is about ranking, not file reading."
+    },
+    {
+     "text": "So Nova ranks pages exactly like people and BRAIN-QA, with the CLI as the boundary to Shai's Python",
+     "correct": true,
+     "why": "One ranking code path for everyone; the CLI is the agreed boundary between the languages."
+    },
+    {
+     "text": "Because MCP handlers cannot be async",
+     "correct": false,
+     "why": "Handlers are async functions; the lab's handler awaits nothing but could."
+    }
+   ]
+  },
+  {
+   "q": "Your handler throws. What happens to the session?",
+   "options": [
+    {
+     "text": "The session crashes with the error",
+     "correct": false,
+     "why": "The SDK turns the throw into a tool error the model sees; the loop continues."
+    },
+    {
+     "text": "The model is told the tool failed and decides what to do next",
+     "correct": true,
+     "why": "That is the normal path; for ask_human the harness should instead end the turn with needs_answer."
+    },
+    {
+     "text": "The SDK retries the handler three times",
+     "correct": false,
+     "why": "There is no automatic retry for in-process tool handlers."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "In p8-2, what does disallowedTools do that allowedTools cannot?",
+  "From p0-2: Why does the VM have no credentials, and which service does the calling to GitHub, Jira and Slack?"
+ ],
+ "videos": [
+  {
+   "title": "What is MCP? Integrate AI Agents with Databases & APIs",
+   "url": "https://www.youtube.com/watch?v=eur8dUO9mvE",
+   "channel": "IBM Technology",
+   "minutes": 4,
+   "why": "Four-minute whiteboard explanation of MCP clients, servers and tools."
+  },
+  {
+   "title": "MCP Explained Simply: What It Is and Why It Exists",
+   "url": "https://www.youtube.com/watch?v=oblaHqULUHk",
+   "channel": "TechWorld with Nana",
+   "minutes": 30,
+   "why": "Deeper, recent explanation with demos, in Nana's clear style."
+  }
+ ],
+ "words": [
+  {
+   "term": "MCP",
+   "plain": "The Model Context Protocol: a standard way for a program to offer named tools to a model."
+  },
+  {
+   "term": "MCP server",
+   "plain": "A program that offers tools over MCP, in your process (createSdkMcpServer) or as a child process (stdio)."
+  },
+  {
+   "term": "tool()",
+   "plain": "The SDK function that builds one tool from a name, a description, a zod shape and a handler."
+  },
+  {
+   "term": "input schema",
+   "plain": "The zod shape of a tool's input; the SDK checks every call against it before your handler runs."
+  },
+  {
+   "term": "handler",
+   "plain": "Your async function that does the work and returns { content: [{ type: 'text', text }] }."
+  },
+  {
+   "term": "mcpServers",
+   "plain": "The option that maps server names to servers; the key becomes the middle of each tool's name."
+  },
+  {
+   "term": "strictMcpConfig",
+   "plain": "Load only the servers in the options object, never .mcp.json or user settings."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-19",
+   "why": "tools.ts is three tool() calls and one createSdkMcpServer(); every handler goes through the broker."
+  },
+  {
+   "key": "G4-24",
+   "why": "The QA agent's browser is an external stdio MCP server, loaded alone with strictMcpConfig."
+  }
+ ],
+ "remember": "tool() makes a named function the model can call; the server name goes in the middle: mcp__nova__kb_search, and it must be allowed."
+}

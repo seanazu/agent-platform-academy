@@ -1,0 +1,568 @@
+{
+ "id": "g3-5",
+ "title": "The sandbox image",
+ "minutes": 55,
+ "youNeed": [
+  "p4-4",
+  "g3-1",
+  "p3-3"
+ ],
+ "bridge": "The sandbox image is like a Docker image for a whole VM. Everything a run needs is baked in once, and every VM starts from it. Except there are no layers and no cache, so a rebuild takes a long time. So we build nightly, prove each image with a smoke test, and keep the previous one for rollback.",
+ "intro": "Every run starts from one machine image, so what is in it is what every sandbox can do. This lesson bakes it in three tickets. G3-08 adds the tools and the host rules. G3-14 adds the slow, heavy parts. G3-16 builds it nightly and promotes it only after a smoke test.",
+ "picture": {
+  "caption": "A new image is built every night, but VMs use it only after it passes the smoke test. The previous image stays one parameter away.",
+  "nodes": [
+   {
+    "id": "cron",
+    "label": "build-ai-agent-sandbox.yml (nightly)",
+    "kind": "service"
+   },
+   {
+    "id": "packer",
+    "label": "Packer + Ansible build in inf",
+    "kind": "service"
+   },
+   {
+    "id": "ami",
+    "label": "new AMI, channel testing",
+    "kind": "file"
+   },
+   {
+    "id": "smoke",
+    "label": "smoke VM: nova-worker --version + one Playwright spec",
+    "kind": "check"
+   },
+   {
+    "id": "param",
+    "label": "SSM parameter /ai-agents/sandbox/ami-id",
+    "kind": "file"
+   },
+   {
+    "id": "lt",
+    "label": "launch templates lite, full, wide",
+    "kind": "machine"
+   },
+   {
+    "id": "prev",
+    "label": "ami-id-previous",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "cron",
+    "to": "packer",
+    "text": "builds ai-agent-sandbox on the testing channel"
+   },
+   {
+    "from": "packer",
+    "to": "ami",
+    "text": "tools, host rules, caches, FCP Lab, Claude Code and the harness, baked in"
+   },
+   {
+    "from": "ami",
+    "to": "smoke",
+    "text": "boots one VM in the ai-agents account and runs the smoke test over SSM"
+   },
+   {
+    "from": "smoke",
+    "to": "prev",
+    "text": "on pass: the current image id is copied to ami-id-previous"
+   },
+   {
+    "from": "smoke",
+    "to": "param",
+    "text": "then the new image id is written; on fail nothing changes"
+   },
+   {
+    "from": "param",
+    "to": "lt",
+    "text": "launch templates read the parameter, so new VMs boot the promoted image"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "One image for every run",
+   "p": [
+    "The image is an AMI (Amazon Machine Image): a saved disk that EC2 boots new VMs from. Ours is called ai-agent-sandbox. It is built from our base image rhino-base-ubuntu-24, by Packer, which starts a VM, runs Ansible on it, and saves the disk.",
+    "One AMI serves all three sizes. The size is the instance type in the launch template (lesson g3-6), not a different image. The build itself runs on m8i.2xlarge with a 120 GiB disk, only for build speed.",
+    "The files follow the infrastructure repo's pattern: packer/images/ai-agent-sandbox/{packer_vars.hcl,playbook.yml,README.md} and an Ansible role in packer/ansible/roles/ai_agent_sandbox/. An Ansible role is a folder of tasks: small YAML steps such as 'create this user' or 'copy this file'.",
+    "The toolchain task installs Docker CE with compose, Node 24, Python 3.13 with uv, git and jq. Node 24, because fcp's frontend needs node >=24.15.0 and the harness runs on it. There is no gh CLI: GitHub calls go through the broker."
+   ]
+  },
+  {
+   "h": "Host rules, part 1: the agent user",
+   "p": [
+    "The harness runs as a normal user called agent, never as root. But agent is in the docker group, because FCP Lab runs in Docker. Anyone in the docker group can start a container that mounts the host's disk, so docker is root-equivalent."
+   ],
+   "because": "We give agent docker access and then assume it can reach root, because FCP Lab needs Docker.",
+   "code": {
+    "lang": "yaml",
+    "file": "infrastructure/packer/ansible/roles/ai_agent_sandbox/tasks/main.yml (part 1 of 2)",
+    "text": "---\n# ai-agent-sandbox: one fresh VM per agent run. No keys live here (the broker and LLM gateway hold them).\n- name: Install Docker, Node 24 (frontend + nova-worker), Python 3.13 and uv (fcp's backend), git and jq\n  ansible.builtin.include_tasks: toolchain.yml\n\n- name: Create the non-root user the harness runs as\n  ansible.builtin.user:\n    name: agent\n    uid: 1001\n    groups: [docker] # docker = root-equivalent, which is why the instance role holds almost nothing\n    shell: /bin/bash",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The rule for the whole image: no keys live here. The broker and the LLM gateway hold them."
+     },
+     {
+      "line": 3,
+      "text": "Each task has a name, which Ansible prints as it runs."
+     },
+     {
+      "line": 4,
+      "text": "include_tasks runs another file of tasks: toolchain.yml installs Docker, Node 24, Python 3.13, uv, git and jq."
+     },
+     {
+      "line": 7,
+      "text": "ansible.builtin.user creates the user, or does nothing if it already exists."
+     },
+     {
+      "line": 9,
+      "text": "A fixed uid, 1001, so files baked into the image belong to agent on every VM."
+     },
+     {
+      "line": 10,
+      "text": "The docker group. Because it is root-equivalent, the instance role holds almost nothing (lesson g3-6)."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "No keys in the VM. We treat VM root as reachable by the agent, so the wall cannot be 'root is safe'. It is that nothing on the VM, root included, holds a key worth stealing."
+   }
+  },
+  {
+   "h": "Host rules, part 2: metadata, Spot, upgrades",
+   "p": [
+    "IMDS, the instance metadata service, answers at 169.254.169.254 on every EC2 VM. It hands out the VM's role credentials. Only root needs it, for the SSM agent. So an iptables rule rejects it for every other user, and a DOCKER-USER rule drops it for containers. iptables is Linux's built-in packet filter.",
+    "A third guard comes from the launch template in lesson g3-6: hop limit 1. A metadata reply cannot cross the extra network hop into a container."
+   ],
+   "because": "We write each iptables rule as 'check, or else add', because Ansible may run twice.",
+   "code": {
+    "lang": "yaml",
+    "file": "infrastructure/packer/ansible/roles/ai_agent_sandbox/tasks/main.yml (part 2 of 2)",
+    "text": "- name: Only root (the SSM agent) may reach the instance metadata service\n  ansible.builtin.shell: |\n    iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j REJECT 2>/dev/null ||\n      iptables -A OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j REJECT\n    iptables -C DOCKER-USER -d 169.254.169.254 -j DROP 2>/dev/null ||\n      iptables -I DOCKER-USER -d 169.254.169.254 -j DROP\n    netfilter-persistent save\n\n- name: Install the Spot interruption watcher (writes /run/nova/preempt)\n  ansible.builtin.copy:\n    src: spot-watch.sh\n    dest: /usr/local/bin/spot-watch\n    mode: \"0755\"\n\n- name: Run spot-watch every 5 seconds\n  ansible.builtin.include_tasks: spot_watch_timer.yml\n\n- name: Turn off unattended upgrades (the image is rebuilt nightly instead)\n  ansible.builtin.systemd:\n    name: unattended-upgrades\n    enabled: false\n    state: stopped",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The SSM agent runs as root, so root keeps metadata access."
+     },
+     {
+      "line": 3,
+      "text": "iptables -C checks whether the rule exists; only if not (||) is it added. -m owner ! --uid-owner 0 matches every user except root (uid 0)."
+     },
+     {
+      "line": 5,
+      "text": "DOCKER-USER is the chain Docker leaves for our own rules. -I puts this drop first, for every container."
+     },
+     {
+      "line": 7,
+      "text": "netfilter-persistent save keeps the rules after a reboot. Warm VMs are stopped and started (lesson g3-7)."
+     },
+     {
+      "line": 9,
+      "text": "spot-watch is a small root script. It asks whether AWS is about to reclaim this Spot VM, and if so writes /run/nova/preempt (lesson g3-8)."
+     },
+     {
+      "line": 12,
+      "text": "Installed as a command, executable (mode 0755)."
+     },
+     {
+      "line": 16,
+      "text": "A systemd timer runs it every 5 seconds, defined in spot_watch_timer.yml."
+     },
+     {
+      "line": 18,
+      "text": "Ubuntu's automatic upgrades are off. A VM changing itself would break the rule 'what passed the smoke test is what runs'."
+     },
+     {
+      "line": 21,
+      "text": "enabled: false and state: stopped: off now and after every boot."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The heavy part, part 1: git and caches",
+   "p": [
+    "A run should spend its time on the ticket, not on downloads. So G3-14 does everything slow and identical once a night. That means a git mirror of fcp, the npm and uv caches and Playwright's browser. It also means FCP Lab with fake data, Claude Code, our plugins and the harness.",
+    "A bare mirror is a copy of the whole repository with no files checked out. The work checkout /work/fcp borrows its objects with --reference, so it costs almost no extra disk. At run time origin is the broker (lesson g3-4).",
+    "The same file also runs uv sync --frozen in cloud/ and client/, and installs the SDK into its own venv. node_modules stays in the image: freshen (lesson g3-8) reuses it unless a lockfile changed."
+   ],
+   "because": "We pass the build token through an environment variable, because a token in .git/config would be baked into every VM.",
+   "code": {
+    "lang": "yaml",
+    "file": "infrastructure/packer/ansible/roles/ai_agent_sandbox/tasks/bake_fcp.yml (part 1 of 2)",
+    "text": "---\n# Slow, identical-for-every-run work, done once per nightly image. Fake seed data only.\n- name: Bare mirror of fcp (token from the build job, never written to disk)\n  ansible.builtin.command: >-\n    git -c credential.helper='!f() { echo username=x-access-token; echo \"password=$GH_TOKEN\"; }; f'\n    clone --mirror https://github.com/RhinoHealth/fcp.git /var/cache/git/fcp.git\n  environment: { GH_TOKEN: \"{{ lookup('env', 'GH_BUILD_TOKEN') }}\" }\n  args: { creates: /var/cache/git/fcp.git }\n- name: Work checkout that borrows objects from the mirror\n  become_user: agent\n  ansible.builtin.command: git clone --reference /var/cache/git/fcp.git /var/cache/git/fcp.git /work/fcp\n  args: { creates: /work/fcp/.git }\n- name: Fill the npm cache and install Playwright's Chromium (system deps came from toolchain.yml)\n  become_user: agent\n  ansible.builtin.shell: npm ci && npx playwright install chromium\n  args: { chdir: /work/fcp/frontend }",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The rule for this file: slow, identical work, done once per image. Fake seed data only."
+     },
+     {
+      "line": 5,
+      "text": "An inline credential helper: a tiny shell function that prints the user and the token from $GH_TOKEN. Nothing is written to disk."
+     },
+     {
+      "line": 6,
+      "text": "--mirror clones every branch and tag, as a bare repository."
+     },
+     {
+      "line": 7,
+      "text": "GH_TOKEN comes from the build job's environment (GH_BUILD_TOKEN), a short-lived GitHub App token."
+     },
+     {
+      "line": 8,
+      "text": "creates: if the folder exists, Ansible skips the task. It makes the task safe to run twice."
+     },
+     {
+      "line": 10,
+      "text": "become_user: agent, so the checkout and caches belong to the user the harness runs as."
+     },
+     {
+      "line": 11,
+      "text": "--reference borrows objects from the mirror instead of copying them."
+     },
+     {
+      "line": 15,
+      "text": "npm ci fills node_modules from the lockfile; Playwright downloads Chromium. The system libraries came from toolchain.yml, as root."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "git clone --reference leaves origin pointing at the local mirror, not at the broker. The G3-14 ticket does not fix that. freshenSandbox (lesson g3-8) must run git remote set-url origin to the broker's git URL before the first fetch or push."
+   }
+  },
+  {
+   "h": "The heavy part, part 2: Lab, Claude Code, harness",
+   "p": [
+    "FCP Lab comes from RhinoHealth/fcp-local-lab at a pinned tag, into /opt/fcp-lab. The task starts it once to build its images and seed fake data. It checks the lab is ready, then stops it. Never a prod or staging dump."
+   ],
+   "because": "We pin Claude Code and run that exact binary, because then the smoke test proves the binary every run uses.",
+   "code": {
+    "lang": "yaml",
+    "file": "infrastructure/packer/ansible/roles/ai_agent_sandbox/tasks/bake_fcp.yml (part 2 of 2)",
+    "text": "- name: Build FCP Lab's images and seed its fake data, then stop it (images and data are kept)\n  become_user: agent\n  ansible.builtin.shell: |\n    lab up --source /work/fcp --id sandbox --mode snapshot --refreshable\n    lab status sandbox --json | jq -e '.state == \"ready\"'\n    lab stop sandbox\n  environment: { FCP_LAB_HOME: /var/lib/fcp-lab }\n  # `lab` = fcp-local-lab's CLI (python3 /opt/fcp-lab/lab), pinned by tag in group_vars/all.yml\n- name: Claude Code, pinned and never self-updating (/usr/local/bin/claude, the binary the harness runs)\n  ansible.builtin.command: npm install -g --prefix /usr/local @anthropic-ai/claude-code@{{ claude_code_version }}\n- name: nova-worker, one bundled file from the ai-agents release (downloaded by the build job; no npm or pip install)\n  ansible.builtin.shell: |\n    mkdir -p /opt/ai-agents/harness && cd /opt/ai-agents/harness\n    tar -xzf /tmp/ai-agents-harness-{{ harness_version }}.tgz --strip-components=1   # nova-worker.mjs, workflows/, prompts/, settings/\n    chmod 0755 nova-worker.mjs && ln -sf /opt/ai-agents/harness/nova-worker.mjs /usr/local/bin/nova-worker   # Node 24\n    install -d -o agent -g agent /home/agent/.claude /home/agent/.claude/workflows\n    install -o agent -g agent -m 0644 workflows/*.js /home/agent/.claude/workflows/",
+    "notes": [
+     {
+      "line": 4,
+      "text": "--mode snapshot --refreshable: a lab that freshen can later bring to a new commit (lesson g3-8)."
+     },
+     {
+      "line": 5,
+      "text": "jq -e exits non-zero unless the state is ready, so the build fails on a broken lab."
+     },
+     {
+      "line": 6,
+      "text": "Stop it: images and data stay on disk, memory is free."
+     },
+     {
+      "line": 8,
+      "text": "lab is fcp-local-lab's Python CLI, pinned by tag in group_vars/all.yml."
+     },
+     {
+      "line": 10,
+      "text": "Claude Code pinned to claude_code_version, at /usr/local/bin/claude. The harness passes that path as pathToClaudeCodeExecutable."
+     },
+     {
+      "line": 14,
+      "text": "Unpack the harness tarball from the ai-agents release (lesson g3-1): one bundled file plus workflows/, prompts/ and settings/."
+     },
+     {
+      "line": 15,
+      "text": "nova-worker becomes a command. Its #!/usr/bin/env node line runs it on Node 24."
+     },
+     {
+      "line": 17,
+      "text": "Workflow tool scripts go to the agent user's ~/.claude/workflows/. Skip this until the first release exists."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "Two more files come with G3-14. /etc/claude-code/managed-settings.json turns OTel on to otel.ai-agents.example.com, with content flags, Fable and agent teams off. DISABLE_UPDATES=1 and CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 are set. /etc/ai-agent-sandbox/manifest.json records the mirror sha, lockfile hashes and every version."
+   }
+  },
+  {
+   "h": "Nightly: build, then a smoke test",
+   "p": [
+    "G3-16 adds .github/workflows/build-ai-agent-sandbox.yml to the infrastructure repo. A cron starts it every night at an odd minute (not :00, when every scheduled job in the world starts). It runs on infrastructure-runner-set with every action pinned by SHA. A person owns it; agents never dispatch workflows.",
+    "The build job runs ./build.sh ai-agent-sandbox infrastructure/aws-us-east-1 testing. Testing-channel AMIs expire after 72 hours, so an image that is never promoted cleans itself up. A smoke test is a short check that the most important path works at all."
+   ],
+   "because": "We boot the new image with the real full launch template, because the test must prove what a real run gets.",
+   "code": {
+    "lang": "yaml",
+    "file": "infrastructure/.github/workflows/build-ai-agent-sandbox.yml (smoke job, part 1 of 2)",
+    "text": "  smoke:\n    needs: build\n    runs-on: infrastructure-runner-set\n    environment: ai-agents\n    env:\n      AMI: ${{ needs.build.outputs.ami_id }}\n    steps:\n      - uses: aws-actions/configure-aws-credentials@<sha> # v6\n        with: { role-to-assume: \"${{ vars.AWS_ROLE_ARN }}\", aws-region: us-east-1 }\n      - name: Boot the new image and run the smoke test over SSM\n        run: |\n          id=$(aws ec2 run-instances --launch-template LaunchTemplateName=ai-agents-sandbox-full \\\n            --image-id \"$AMI\" --query 'Instances[0].InstanceId' --output text)\n          echo \"VM=$id\" >> \"$GITHUB_ENV\"\n          aws ec2 wait instance-status-ok --instance-ids \"$id\"\n          # the harness loads, then resume the baked, stopped lab (check the lab resume command with Nave)\n          .github/scripts/ssm-run.sh \"$id\" \"sudo -iu agent sh -c 'nova-worker --version && lab start sandbox && \\\n            lab test sandbox --suite frontend-e2e --spec not-found-page.spec.ts'\"",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The smoke job waits for the build job and reads its output, the new AMI id."
+     },
+     {
+      "line": 4,
+      "text": "The GitHub environment ai-agents from lesson g3-2: its AWS_ROLE_ARN is the OIDC role in the sandbox account."
+     },
+     {
+      "line": 8,
+      "text": "Log in to AWS with OIDC: GitHub vouches for the job, AWS hands out short-lived credentials (lesson p2-3)."
+     },
+     {
+      "line": 12,
+      "text": "Start one VM from the full launch template, but with the new image instead of the promoted one."
+     },
+     {
+      "line": 14,
+      "text": "Save the VM id for the clean-up step, which runs even if this one fails."
+     },
+     {
+      "line": 15,
+      "text": "Wait until EC2 says the VM passed its status checks."
+     },
+     {
+      "line": 17,
+      "text": "ssm-run.sh, a small new script, sends a command over SSM and waits for it (lesson p3-5). As agent: the harness loads, the lab resumes..."
+     },
+     {
+      "line": 18,
+      "text": "...and one small Playwright spec passes against FCP Lab. Check the lab resume command with Nave."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Promote, roll back, always clean up",
+   "p": [
+    "Promotion is two parameter writes. The launch templates read /ai-agents/sandbox/ami-id when they launch a VM, so changing the parameter changes every new VM. Rollback is the reverse: write ami-id-previous back into ami-id."
+   ],
+   "because": "We copy the current id to ami-id-previous first, because a rollback must be one command with no searching.",
+   "code": {
+    "lang": "yaml",
+    "file": "infrastructure/.github/workflows/build-ai-agent-sandbox.yml (smoke job, part 2 of 2)",
+    "text": "      - name: Promote (the previous image stays for rollback)\n        run: |\n          prev=$(aws ssm get-parameter --name /ai-agents/sandbox/ami-id --query Parameter.Value --output text)\n          aws ssm put-parameter --name /ai-agents/sandbox/ami-id-previous --value \"$prev\" --overwrite\n          aws ssm put-parameter --name /ai-agents/sandbox/ami-id --value \"$AMI\" --overwrite\n          # with the inf role (the AMI's owner): disable-image-deprecation + tag channel=release\n      - name: Always remove the smoke VM\n        if: always()\n        run: aws ec2 terminate-instances --instance-ids \"$VM\"",
+    "notes": [
+     {
+      "line": 1,
+      "text": "This step runs only if the smoke step passed, because a failed step stops the job."
+     },
+     {
+      "line": 3,
+      "text": "Read the image every VM uses today."
+     },
+     {
+      "line": 4,
+      "text": "Keep it as the previous image, for rollback."
+     },
+     {
+      "line": 5,
+      "text": "Point the launch templates at the new image."
+     },
+     {
+      "line": 6,
+      "text": "Two calls need the inf role, because the AMI belongs to inf: disable its deprecation and tag it channel=release."
+     },
+     {
+      "line": 8,
+      "text": "if: always() runs the clean-up even after a failure, so no smoke VM is left behind."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "packer_image_cleaner keeps the two newest release images, so only promoted images count. On a failed smoke test the image stays on testing and expires, and a post goes to #ai-agents-alerts with the lab report. After a rollback, warm VMs keep the bad image until the sweeper recycles them within a day (lesson g3-7). A person can also terminate them."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Validate the sandbox template with Packer",
+  "youNeed": [
+   "Packer (brew install hashicorp/tap/packer; packer version prints 1.x)",
+   "uv (to run ansible-core with uvx, nothing installed globally)",
+   "No AWS account: validate and syntax-check never build or call AWS"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/academy/packer-lab/ansible/roles/ai_agent_sandbox/tasks && cd ~/academy/packer-lab",
+    "see": "(no output)"
+   },
+   {
+    "do": "Save sandbox.pkr.hcl, a small template in the shape of packer/packer/packer.pkr.hcl, amazon-ebs only:\n\npacker {\n  required_plugins {\n    amazon  = { source = \"github.com/hashicorp/amazon\", version = \"~> 1\" }\n    ansible = { source = \"github.com/hashicorp/ansible\", version = \"~> 1\" }\n  }\n}\n\nvariable \"image_name\" { type = string }\nvariable \"channel\" {\n  type = string\n  validation {\n    condition     = contains([\"testing\", \"release\"], var.channel)\n    error_message = \"The channel is testing or release.\"\n  }\n}\nvariable \"instance_type\" { type = string }\nvariable \"volume_size\" { type = number }\n\nsource \"amazon-ebs\" \"sandbox\" {\n  region        = \"us-east-1\"\n  ami_name      = \"rhino-${var.image_name}-v1-${var.channel}-${formatdate(\"YYYYMMDDhhmm\", timestamp())}\"\n  instance_type = var.instance_type\n  ssh_username  = \"ubuntu\"\n  source_ami_filter {\n    owners      = [\"self\"]\n    most_recent = true\n    filters     = { name = \"rhino-base-ubuntu-24-v1-release-*\" }\n  }\n  launch_block_device_mappings {\n    device_name           = \"/dev/sda1\"\n    volume_size           = var.volume_size\n    volume_type           = \"gp3\"\n    delete_on_termination = true\n  }\n  tags = { channel = var.channel, image = var.image_name }\n}\n\nbuild {\n  sources = [\"source.amazon-ebs.sandbox\"]\n  provisioner \"ansible\" {\n    playbook_file = \"./playbook.yml\"\n    user          = \"ubuntu\"\n  }\n}",
+    "see": "(a file)"
+   },
+   {
+    "do": "Save ai-agent-sandbox.pkrvars.hcl. It plays the role of packer_vars.hcl:\n\nimage_name    = \"ai-agent-sandbox\"\nchannel       = \"testing\"\ninstance_type = \"m8i.2xlarge\" # build speed; the size at run time is the launch template's instance type\nvolume_size   = 120",
+    "see": "(a file)"
+   },
+   {
+    "do": "packer fmt -check . && echo formatted",
+    "see": "formatted"
+   },
+   {
+    "do": "packer validate -syntax-only -var-file=ai-agent-sandbox.pkrvars.hcl .",
+    "see": "Syntax-only check passed. Everything looks okay."
+   },
+   {
+    "do": "packer init .",
+    "see": "Installed plugin github.com/hashicorp/amazon v1.x.y in \"~/.config/packer/plugins/...\"\nInstalled plugin github.com/hashicorp/ansible v1.x.y in \"~/.config/packer/plugins/...\"\n(output trimmed; nothing is printed if they are already installed)"
+   },
+   {
+    "do": "packer validate -var-file=ai-agent-sandbox.pkrvars.hcl .",
+    "see": "The configuration is valid."
+   },
+   {
+    "do": "packer validate -var-file=ai-agent-sandbox.pkrvars.hcl -var channel=prod .",
+    "see": "Error: Invalid value for cmd variable\n\nThe channel is testing or release.\n\nThis was checked by the validation rule at sandbox.pkr.hcl:11,3-13."
+   },
+   {
+    "do": "Save playbook.yml and the role's tasks/main.yml. The tasks are two from sections 2 and 3:\n\n---\n- hosts: all\n  become: true\n  roles:\n    - ai_agent_sandbox\n\n---\n- name: Create the non-root user the harness runs as\n  ansible.builtin.user:\n    name: agent\n    uid: 1001\n    groups: [docker]\n    shell: /bin/bash\n\n- name: Turn off unattended upgrades (the image is rebuilt nightly instead)\n  ansible.builtin.systemd:\n    name: unattended-upgrades\n    enabled: false\n    state: stopped\n\nThen: ANSIBLE_ROLES_PATH=./ansible/roles uvx --from ansible-core ansible-playbook playbook.yml --syntax-check -i localhost,",
+    "see": "playbook: playbook.yml"
+   }
+  ],
+  "faded": "Add the metadata task from section 3 (the iptables shell task) to the role's tasks/main.yml, between the two tasks already there. Then add the spot-watch copy task with src: spot-watch.sh and an empty files/spot-watch.sh in the role. The last step is yours: run the syntax check again, and say which line of output means it passed.",
+  "alone": "Add a harness_version variable to sandbox.pkr.hcl with a validation block: can(regex(\"^v[0-9]+\\\\.[0-9]+\\\\.[0-9]+$\", var.harness_version)), and the message 'harness_version is a release tag like v0.3.0'. Set it in the var file and add it to the AMI's tags. Show that packer validate fails with -var harness_version=0.3.0 and passes with v0.3.0.",
+  "done": "packer validate prints The configuration is valid, a bad channel is refused by your validation rule, and ansible-playbook --syntax-check prints playbook: playbook.yml."
+ },
+ "quiz": [
+  {
+   "q": "iptables already stops the agent user reaching the metadata service. Why must the instance role still hold almost nothing?",
+   "options": [
+    {
+     "text": "Because iptables rules are lost on every reboot.",
+     "correct": false,
+     "why": "netfilter-persistent save keeps them. The problem is who can change them."
+    },
+    {
+     "text": "Because agent is in the docker group, which is root-equivalent, and root may read metadata.",
+     "correct": true,
+     "why": "We assume the agent can reach root. Then the only safe role is one with nothing worth stealing."
+    },
+    {
+     "text": "Because the SSM agent shares its credentials with every user.",
+     "correct": false,
+     "why": "It does not. The risk is a user becoming root, not SSM sharing."
+    }
+   ]
+  },
+  {
+   "q": "The nightly smoke test fails at 02:10. What do runs get at 09:00?",
+   "options": [
+    {
+     "text": "The new image, with a warning in Slack.",
+     "correct": false,
+     "why": "Nothing is promoted without a pass. The parameter still points at the old image."
+    },
+    {
+     "text": "No VMs until a person fixes the build.",
+     "correct": false,
+     "why": "The old image is still promoted and the warm pools still hold it."
+    },
+    {
+     "text": "VMs from yesterday's promoted image. The new one stays on testing and expires after 72 hours.",
+     "correct": true,
+     "why": "Promotion only happens after the smoke step passes, and #ai-agents-alerts gets the lab report."
+    }
+   ]
+  },
+  {
+   "q": "Why does the image have no gh CLI?",
+   "options": [
+    {
+     "text": "Every GitHub call goes through the broker, and the VM has no GitHub token for gh to use.",
+     "correct": true,
+     "why": "gh would have nothing to log in with. Leaving it out also removes a tool an injected prompt might try."
+    },
+    {
+     "text": "gh does not run on Ubuntu 24.",
+     "correct": false,
+     "why": "It does. The reason is the design, not the platform."
+    },
+    {
+     "text": "It is installed later by the harness at run time.",
+     "correct": false,
+     "why": "Nothing is installed at run time. What passed the smoke test is what runs."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From g3-4: what does the git credential helper in the image read, and where does the remote point?",
+  "From g3-1: what is inside ai-agents-harness-<version>.tgz?"
+ ],
+ "videos": [
+  {
+   "title": "HashiCorp Packer Tutorial: Building Custom Images for AWS, Azure, and Docker",
+   "url": "https://www.youtube.com/watch?v=OmQRpi3CSjU",
+   "channel": "KodeKloud",
+   "minutes": 29,
+   "why": "Beginner Packer course: templates, builders, provisioners, AMIs."
+  }
+ ],
+ "words": [
+  {
+   "term": "AMI",
+   "plain": "Amazon Machine Image: a saved disk that EC2 boots new VMs from."
+  },
+  {
+   "term": "Ansible role",
+   "plain": "A folder of YAML tasks (create a user, copy a file) that Packer runs on the build VM."
+  },
+  {
+   "term": "IMDS",
+   "plain": "The instance metadata service at 169.254.169.254, which hands a VM its role credentials."
+  },
+  {
+   "term": "bare mirror",
+   "plain": "A full copy of a git repository with no files checked out, used as a local source of objects."
+  },
+  {
+   "term": "smoke test",
+   "plain": "A short check that the most important path works at all, run before an image is promoted."
+  },
+  {
+   "term": "promote",
+   "plain": "Point /ai-agents/sandbox/ami-id at a new image, so new VMs boot it; keep the old id for rollback."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-08",
+   "why": "This lesson explained the base image, the toolchain, the agent user, the metadata rules and spot-watch, line by line.",
+   "walk": [
+    "Add packer/images/ai-agent-sandbox/{packer_vars.hcl,playbook.yml,README.md}: source owner self, rhino-base-ubuntu-24-v1-release-*, instance_type m8i.2xlarge, volume_size 120.",
+    "Add the role packer/ansible/roles/ai_agent_sandbox/ with tasks/main.yml (code above) and toolchain.yml: Docker CE with compose, Node 24, Python 3.13 and uv, git, jq. No gh CLI.",
+    "Write files/spot-watch.sh (poll the Spot interruption notice every 5 s, write /run/nova/preempt) and spot_watch_timer.yml.",
+    "Build in inf: ./build.sh ai-agent-sandbox infrastructure/aws-us-east-1 testing. Add the image to build-packer.yml's choices.",
+    "Share the AMI with the ai-agents account through open PR #1724 (aws_ami_users). Ask Nave to review the toolchain."
+   ]
+  },
+  {
+   "key": "G3-14",
+   "why": "This lesson explained the mirror, the caches, FCP Lab, the pinned Claude Code and the harness unpack in bake_fcp.yml line by line.",
+   "walk": [
+    "Write tasks/bake_fcp.yml (code above): the fcp mirror with the build job's token, the --reference checkout, npm ci and Playwright Chromium as agent.",
+    "Add uv sync --frozen in cloud/ and client/ and the SDK in its own venv.",
+    "Install fcp-local-lab at a pinned tag into /opt/fcp-lab, FCP_LAB_HOME=/var/lib/fcp-lab; lab up, check ready, lab stop. Needs fcp-local-lab in the RhinoHealth org (Nave, G0).",
+    "Install Claude Code pinned into /usr/local; set DISABLE_UPDATES=1 and CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; write /etc/claude-code/managed-settings.json with the G0 and G1 values.",
+    "Copy plugins from RhinoHealth/claude-plugins at a pinned ref into /opt/claude-plugins (G8).",
+    "In the build job, download ai-agents-harness-<version>.tgz from the latest ai-agents release; unpack, link /usr/local/bin/nova-worker and install workflows/*.js.",
+    "Write /etc/ai-agent-sandbox/manifest.json with the mirror sha, lockfile hashes and the lab, Claude Code and harness versions."
+   ]
+  },
+  {
+   "key": "G3-16",
+   "why": "This lesson explained the nightly build, the smoke job, promotion through the SSM parameter, rollback and clean-up line by line.",
+   "walk": [
+    "Add .github/workflows/build-ai-agent-sandbox.yml: nightly cron at an odd minute, runs-on infrastructure-runner-set, actions pinned by SHA. A person owns it.",
+    "Build job: ./build.sh ai-agent-sandbox infrastructure/aws-us-east-1 testing, output ami_id.",
+    "Add .github/scripts/ssm-run.sh, which sends a command over SSM and waits for its result.",
+    "Smoke job (code above) in environment ai-agents: boot with the full launch template, run nova-worker --version and one Playwright spec, always terminate.",
+    "Promote on pass: ami-id to ami-id-previous, the new id to ami-id; with the inf role disable deprecation and tag channel=release.",
+    "On failure, leave the image on testing and post to #ai-agents-alerts with the lab report. Document rollback in the README."
+   ]
+  }
+ ],
+ "remember": "Every run starts from the image that last passed the smoke test; promotion and rollback are one parameter write each."
+}

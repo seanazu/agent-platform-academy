@@ -1,0 +1,415 @@
+{
+ "id": "p8-5",
+ "title": "Subagents and judges",
+ "minutes": 45,
+ "youNeed": [
+  "p8-2"
+ ],
+ "bridge": "A judge is like a code reviewer from another team: it sees the ticket and the diff, never your reasoning. Except: it is a model. You fix what it sees (its own session, no tools) and what it returns (a JSON shape you declared). Otherwise its answer is prose you cannot act on.",
+ "intro": "Models grade their own work too kindly. The platform fixes that with fresh contexts. A reviewer never saw Nova's notes, a scope judge sees only ticket and diff, and a QA agent co-signs the checks. This lesson shows the two ways to make one: AgentDefinition and a separate query(). It also shows how to get a typed answer back with structured output.",
+ "picture": {
+  "caption": "Two kinds of fresh context. Nova delegates to a subagent, or the harness starts a judge in its own session and parses its JSON.",
+  "nodes": [
+   {
+    "id": "nova",
+    "label": "Nova's session",
+    "kind": "agent"
+   },
+   {
+    "id": "sub",
+    "label": "subagent (from an AgentDefinition)",
+    "kind": "agent"
+   },
+   {
+    "id": "harness",
+    "label": "harness (TypeScript)",
+    "kind": "service"
+   },
+   {
+    "id": "judge",
+    "label": "judge: its own query()",
+    "kind": "agent"
+   },
+   {
+    "id": "inputs",
+    "label": "ticket + diff only",
+    "kind": "file"
+   },
+   {
+    "id": "json",
+    "label": "structured_output (JSON)",
+    "kind": "file"
+   },
+   {
+    "id": "parse",
+    "label": "zod parse",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "nova",
+    "to": "sub",
+    "text": "delegates a task with the Agent tool; the subagent has its own context and tools"
+   },
+   {
+    "from": "sub",
+    "to": "nova",
+    "text": "returns text; Nova decides what to do with it"
+   },
+   {
+    "from": "harness",
+    "to": "inputs",
+    "text": "writes the diff; collects the ticket text"
+   },
+   {
+    "from": "harness",
+    "to": "judge",
+    "text": "starts a session with no tools and an outputFormat schema"
+   },
+   {
+    "from": "judge",
+    "to": "json",
+    "text": "answers in the declared shape"
+   },
+   {
+    "from": "json",
+    "to": "parse",
+    "text": "Schema.parse(structured_output) gives a typed verdict"
+   },
+   {
+    "from": "parse",
+    "to": "harness",
+    "text": "pass or veto, with file and lines"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Two ways to get a fresh context",
+   "p": [
+    "A fresh context is a model that starts with an empty conversation and sees only what you give it. There are two ways to make one.",
+    "A subagent is started by the model inside a session, through the Agent tool, from an AgentDefinition you declared. The model decides when to delegate; the subagent returns text into the model's context. Good for helpers: read this, search that.",
+    "A judge is started by the harness, as its own query() call, with a fixed prompt and no tools. The model never sees it and cannot pass its reasoning along. Good for verdicts: readiness, scope, co-sign, review."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "G4-18 says it plainly: the reviewer runs in its own query() session, not as a subagent through Nova's Agent tool. So Nova can't pass its reasoning along."
+   }
+  },
+  {
+   "h": "AgentDefinition: a helper Nova may call",
+   "p": [
+    "An AgentDefinition has a description (when to use it), a prompt (its system prompt), and optional tools, model and effort. You pass a map of them in the agents option. The model sees the descriptions and calls the Agent tool with the name.",
+    "Helpers run on Haiku 5.5 at medium per the routing table and return file:line pointers. Never set maxTurns on a definition; it is a limit like any other."
+   ],
+   "because": "We declare helpers in code so the harness fixes their model, effort and tools. They do not depend on what the model feels like.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/session.ts (agents option, sketch)",
+    "text": "agents: {\n  reader: {\n    description: \"Finds where code lives. Use it to locate files and tests for a ticket.\",\n    prompt: \"You read and search. Return file:line pointers, most relevant first. Never edit.\",\n    tools: [\"Read\", \"Grep\", \"Glob\"],\n    model: \"claude-haiku-5-5\", // routing table: helper\n    effort: \"medium\",\n  },\n},",
+    "notes": [
+     {
+      "line": 3,
+      "text": "The model reads this to decide when to delegate. Write it like a tool description."
+     },
+     {
+      "line": 4,
+      "text": "The helper's own system prompt. It does not see Nova's conversation."
+     },
+     {
+      "line": 5,
+      "text": "tools limits the helper; omit it and it inherits everything the parent has."
+     },
+     {
+      "line": 6,
+      "text": "A full model id, or 'inherit' for the parent's model. effort takes the same levels as the session."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1 in the harness env means helpers cannot start helpers (p8-8)."
+   }
+  },
+  {
+   "h": "Structured output: declare the shape, get JSON",
+   "p": [
+    "outputFormat: { type: 'json_schema', schema } makes the session end with JSON that matches the schema. The SDK retries if the model's JSON does not validate; after the retries the result has subtype error_max_structured_output_retries.",
+    "We write the schema in zod and convert it with z.toJSONSchema(). The result message carries structured_output as unknown. Parse it again with the same zod schema and you have a typed object."
+   ],
+   "because": "We declare the output shape because a judge's prose is useless to a program. A parsed verdict with file and lines is something the harness can act on.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/sdk-lab/src/lab5-judge.ts (schema)",
+    "text": "import { query } from \"@anthropic-ai/claude-agent-sdk\";\nimport { z } from \"zod\";\n\nconst Item = z.object({ path: z.string(), lines: z.string(), why: z.string() });\nexport const ScopeVerdict = z.object({\n  verdict: z.enum([\"pass\", \"veto\"]),\n  unrelated: z.array(Item),\n  weakened_tests: z.array(Item),\n  note: z.string(),\n});\nexport type ScopeVerdict = z.infer<typeof ScopeVerdict>;",
+    "notes": [
+     {
+      "line": 4,
+      "text": "One item: where (path, lines) and why. The judge must cite; a finding without a place is dropped."
+     },
+     {
+      "line": 6,
+      "text": "An enum keeps the verdict to two words the harness can switch on."
+     },
+     {
+      "line": 11,
+      "text": "Same name for the schema and the type, like the tickets do: ScopeVerdict.parse() returns a ScopeVerdict."
+     }
+    ]
+   },
+   "see": "z.toJSONSchema(ScopeVerdict) prints:\n{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"verdict\":{\"type\":\"string\",\"enum\":[\"pass\",\"veto\"]}, ... },\"required\":[\"verdict\",\"unrelated\",\"weakened_tests\",\"note\"],\"additionalProperties\":false}"
+  },
+  {
+   "h": "The judge session",
+   "p": [
+    "The judge gets a plain system prompt, no tools, no settings, and the ticket plus the diff as its prompt. Sonnet 5.5 at medium: a rubric judge does not need Opus.",
+    "The lab diff has a weakened test: an it() turned into it.skip(). A good judge vetoes it and cites the test file and lines."
+   ],
+   "because": "We give the judge nothing but ticket and diff. Every extra input is a way for the builder's reasoning to leak into the verdict.",
+   "code": {
+    "lang": "typescript",
+    "file": "~/sdk-lab/src/lab5-judge.ts (session)",
+    "text": "for await (const msg of query({\n  prompt: `Ticket:\\n${ticket}\\n\\nDiff:\\n${diff}`,\n  options: {\n    model: \"claude-sonnet-5-5\",\n    effort: \"medium\",\n    tools: [], // a judge reads what it is given; it never looks around\n    settingSources: [],\n    systemPrompt: \"You review a diff for scope. Veto unrelated changes and weakened tests. Cite file and lines.\",\n    outputFormat: { type: \"json_schema\", schema: z.toJSONSchema(ScopeVerdict) }, // zod -> JSON Schema\n  },\n})) {\n  if (msg.type === \"result\" && msg.subtype === \"success\") {\n    const verdict = ScopeVerdict.parse(msg.structured_output); // parse again: now it is typed\n    console.log(verdict.verdict, verdict.weakened_tests.map((t) => `${t.path}:${t.lines}`), verdict.note);\n  }\n}",
+    "notes": [
+     {
+      "line": 6,
+      "text": "tools: [] removes every built-in tool. The judge cannot read the repo even if the prompt asks."
+     },
+     {
+      "line": 8,
+      "text": "A plain string replaces the Claude Code preset. The judge needs no tool guidance."
+     },
+     {
+      "line": 9,
+      "text": "The schema is JSON Schema, not zod. z.toJSONSchema() converts it at call time."
+     },
+     {
+      "line": 13,
+      "text": "structured_output is typed unknown. parse() validates and types it; a mismatch throws, which is what you want."
+     }
+    ]
+   },
+   "see": "veto [ 'frontend/test/unit/ProjectForm.test.tsx:4-5' ] The fix is in scope, but the test was skipped instead of updated; restore it.",
+   "ifInstead": "If instead the result subtype is error_max_structured_output_retries, the model could not produce valid JSON for the schema. Simplify the schema or raise MAX_STRUCTURED_OUTPUT_RETRIES; check the docs for that variable."
+  },
+  {
+   "h": "The scope judge (G4-17)",
+   "p": [
+    "The real judge is the lab with a longer prompt and one more input. That input is a mechanical list of test changes (removed assertions, .skip, .only, longer timeouts) computed by testChanges(diff). The model does not have to find them; it has to judge them.",
+    "On a veto, Nova reverts the unrelated change or explains why the ticket needs it, and the explanation goes into the PR. A weakened test is never explained away: Nova restores it. A second veto on the same item goes to a person."
+   ],
+   "because": "We hand the judge a mechanical list of test changes. A regex finds .skip every time; a model finds it most of the time.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/judges/scope.ts (prompt and schema)",
+    "text": "import { query } from \"@anthropic-ai/claude-agent-sdk/core\";\nimport { z } from \"zod\";\nimport { testChanges } from \"./test-changes.js\";  // mechanical: removed assertions, .skip/.only, @skip, longer timeouts\n\nconst SCOPE_PROMPT = `You review a pull request for scope, as a careful reviewer from another team would.\nYou get the ticket and the diff, nothing else. Decide whether every change serves the ticket.\n\nVeto when you see:\n- a change the ticket does not need: refactors, renames, reformatting or \"while I was here\" fixes in other code;\n- a test made weaker: removed or loosened assertions, skipped tests, longer timeouts, fewer cases, lower thresholds.\n\nSmall supporting changes the ticket clearly needs are fine (a new test ID, a helper the fix uses, a type).\nWhen you are unsure, say so in the note and pass. Cite the file and lines for every item.`;\n\nconst Item = z.object({ path: z.string(), lines: z.string(), why: z.string() });\nexport const ScopeVerdict = z.object({\n  verdict: z.enum([\"pass\", \"veto\"]), unrelated: z.array(Item), weakened_tests: z.array(Item), note: z.string(),\n});\nexport type ScopeVerdict = z.infer<typeof ScopeVerdict>;",
+    "notes": [
+     {
+      "line": 3,
+      "text": "A pure function over the diff text, tested with node:test. Its output is appended to the prompt."
+     },
+     {
+      "line": 5,
+      "text": "The rubric: what to veto, what is fine, and 'unsure: say so and pass'. Calm wording, like all our prompts."
+     },
+     {
+      "line": 13,
+      "text": "Every item needs file and lines. That is what makes the verdict checkable by a person."
+     },
+     {
+      "line": 16,
+      "text": "The same schema as the lab; the lab was this ticket with a short prompt."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The judge function",
+   "p": [
+    "scopeJudge() is an async function that builds the prompt, runs the session, and returns the parsed verdict. If no success result arrives it throws, and the caller (a Temporal activity) retries.",
+    "Readiness (G4-06) and the QA co-sign (G4-13) have the same shape with other schemas. Readiness has verdict ready, ask or hand_back. Cosign has sign and a list of changes. Learn this one function and you can write all three."
+   ],
+   "because": "We wrap the session in one function that returns a typed value. The rest of the harness should not know what a result message is.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/judges/scope.ts (scopeJudge)",
+    "text": "export async function scopeJudge(ticket: string, diff: string): Promise<ScopeVerdict> {\n  const prompt = `Ticket:\\n${ticket}\\n\\nDiff:\\n${diff}\\n\\nTest changes:\\n${testChanges(diff)}`;\n  for await (const msg of query({ prompt, options: {\n    model: \"claude-sonnet-5-5\", effort: \"medium\", tools: [], settingSources: [],  // a rubric judge in its own session\n    systemPrompt: SCOPE_PROMPT,\n    outputFormat: { type: \"json_schema\", schema: z.toJSONSchema(ScopeVerdict) },\n  } })) {\n    if (msg.type === \"result\" && msg.subtype === \"success\") return ScopeVerdict.parse(msg.structured_output);\n  }\n  throw new Error(\"the scope judge returned no verdict\");\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The ticket sketches use a function declaration for exported functions; the course keeps that."
+     },
+     {
+      "line": 2,
+      "text": "Three labelled blocks in the prompt. The judge sees nothing else: no plan, no transcript, no notes."
+     },
+     {
+      "line": 8,
+      "text": "Return on the first success result. parse() throws on a shape mismatch."
+     },
+     {
+      "line": 10,
+      "text": "No result at all is an error, not a pass. The activity fails and Temporal retries it."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The reviewer with a few tools (G4-18)",
+   "p": [
+    "The self-review reviewer is a judge that may read. It gets Read, Grep and Glob, and the fcp checkout as cwd with settingSources ['project'] (repo conventions still apply).",
+    "additionalDirectories adds Byte's lens files and the diff folder. No Bash, no Edit. Opus 5.5 at medium for logic and security.",
+    "It returns findings with a severity through the same outputFormat pattern. The harness adds a fingerprint per finding and appends it to .nova/review.jsonl. That feeds the PR's receipt: found 6, fixed 5, left 1, because."
+   ],
+   "callout": {
+    "kind": "tip",
+    "text": "A judge with tools is still a judge: fixed prompt, own session, structured output. The tools only widen what it may read."
+   }
+  }
+ ],
+ "lab": {
+  "title": "A scope judge on a planted diff",
+  "youNeed": [
+   "The ~/sdk-lab project",
+   "A Claude Code login"
+  ],
+  "worked": [
+   {
+    "do": "Create src/lab5-judge.ts with the schema, the ticket and diff constants, and the session from above",
+    "see": "A 40-line file; the diff contains it.skip("
+   },
+   {
+    "do": "npx tsx -e \"import('./src/lab5-judge.ts')\" is not needed; first print the schema: npx tsx -e \"import { z } from 'zod'; console.log(JSON.stringify(z.toJSONSchema(z.object({ verdict: z.enum(['pass','veto']) }))))\"",
+    "see": "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"type\":\"object\",\"properties\":{\"verdict\":{\"type\":\"string\",\"enum\":[\"pass\",\"veto\"]}},\"required\":[\"verdict\"],\"additionalProperties\":false}"
+   },
+   {
+    "do": "npx tsx src/lab5-judge.ts",
+    "see": "veto [ 'frontend/test/unit/ProjectForm.test.tsx:4-5' ] The fix is in scope, but the test was skipped instead of updated; restore it."
+   },
+   {
+    "do": "Remove the it.skip lines from the diff and run again",
+    "see": "pass [] All changes serve the ticket."
+   }
+  ],
+  "faded": "Add a planted unrelated change to the diff: a renamed variable in a second file the ticket never mentions. Run the judge and print verdict.unrelated. Left to you: the diff hunk header lines for the second file (copy the shape of the existing ones).",
+  "alone": "Write src/alone5.ts: the readiness check from G4-06 in small. Schema: verdict (ready, ask, hand_back), reason, questions (array of strings, max 5). No tools, no settings, Sonnet 5.5 at low. Feed it two ticket texts: one clear FE bug and one that says 'make the dashboard better'. Print both verdicts.",
+  "done": "The judge vetoes the skipped test with the right file and lines, and passes the clean diff. The parsed verdict is a typed object."
+ },
+ "quiz": [
+  {
+   "q": "Why does the harness start the reviewer with its own query() instead of letting Nova call it as a subagent?",
+   "options": [
+    {
+     "text": "Subagents cannot use Read and Grep",
+     "correct": false,
+     "why": "They can; tools are set per AgentDefinition."
+    },
+    {
+     "text": "So Nova cannot pass its reasoning along; the reviewer sees only ticket, plan and diff",
+     "correct": true,
+     "why": "A fresh context the builder does not control is the whole point of a judge."
+    },
+    {
+     "text": "Because subagents are slower",
+     "correct": false,
+     "why": "Speed is similar; independence is the reason."
+    }
+   ]
+  },
+  {
+   "q": "What is structured_output on the result message?",
+   "options": [
+    {
+     "text": "A typed object you can use directly",
+     "correct": false,
+     "why": "It is unknown; parse it with your zod schema to get a typed value."
+    },
+    {
+     "text": "JSON matching the outputFormat schema, typed unknown until you parse it",
+     "correct": true,
+     "why": "The SDK validated it against the JSON Schema; zod parse gives you the TypeScript type."
+    },
+    {
+     "text": "The model's final text, split into lines",
+     "correct": false,
+     "why": "The final text is result; structured_output is the JSON the schema asked for."
+    }
+   ]
+  },
+  {
+   "q": "The scope judge vetoes a weakened test. What does Nova do?",
+   "options": [
+    {
+     "text": "Explains in the PR why the test had to be skipped",
+     "correct": false,
+     "why": "A weakened test is never explained away; that is a wall."
+    },
+    {
+     "text": "Asks the judge again with more context",
+     "correct": false,
+     "why": "More context from the builder defeats the judge; a second veto goes to a person."
+    },
+    {
+     "text": "Restores the test",
+     "correct": true,
+     "why": "Agents never weaken the checks they are judged by."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "In p8-2, what does tools: [] do, and why does every judge set it?",
+  "From p2-4: Who approves a Nova PR, and how many approvals are there?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "fresh context",
+   "plain": "A model that starts with an empty conversation and sees only what you give it."
+  },
+  {
+   "term": "subagent",
+   "plain": "A helper the model starts from inside a session with the Agent tool, from an AgentDefinition."
+  },
+  {
+   "term": "AgentDefinition",
+   "plain": "The declaration of a subagent: description, prompt, and optional tools, model and effort."
+  },
+  {
+   "term": "judge",
+   "plain": "A session the harness starts with a fixed prompt, no tools and a schema, to return a verdict."
+  },
+  {
+   "term": "outputFormat",
+   "plain": "The option { type: 'json_schema', schema } that makes the session end with JSON in that shape."
+  },
+  {
+   "term": "JSON Schema",
+   "plain": "The standard schema format the API understands; z.toJSONSchema() makes one from a zod schema."
+  },
+  {
+   "term": "structured_output",
+   "plain": "The field on the result message that holds the JSON; parse it with zod to get a typed object."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G4-06",
+   "why": "checkReadiness is a judge session with the Readiness schema, no tools, Sonnet 5.5 at low."
+  },
+  {
+   "key": "G4-13",
+   "why": "cosign is the same function shape with the Cosign schema and the QA prompt."
+  },
+  {
+   "key": "G4-17",
+   "why": "scopeJudge is this lesson's code; testChanges feeds it a mechanical list."
+  },
+  {
+   "key": "G4-18",
+   "why": "reviewOnce is a judge with Read, Grep and Glob and additionalDirectories; same outputFormat pattern."
+  }
+ ],
+ "remember": "A judge is its own query() with a fixed prompt, no tools and a schema. Parse structured_output with zod and act on a typed verdict."
+}

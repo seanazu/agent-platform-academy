@@ -1,0 +1,164 @@
+{
+  "id": "p7-2",
+  "title": "Writing a workflow",
+  "minutes": 35,
+  "youNeed": ["p7-1", "p1-6"],
+  "bridge": "A Temporal workflow is like a React component as a state machine: a pure function re-run from its history. Except: it replays a stored event log, so no Date.now(), Math.random() or I/O inside it.",
+  "intro": "A workflow is the part of a long job that must never be lost. In this lesson you write one, give it activities that do the real work, and set timeouts that re-attach instead of restarting. This is the shape every Nova run uses.",
+  "picture": {
+    "caption": "The workflow only decides; activities do the work; the server remembers every step.",
+    "nodes": [
+      { "id": "you", "label": "You (tsx run.ts)", "kind": "person" },
+      { "id": "server", "label": "Temporal server", "kind": "service" },
+      { "id": "worker", "label": "Worker process", "kind": "machine" },
+      { "id": "wf", "label": "ticketToPr workflow", "kind": "service" },
+      { "id": "act", "label": "acquireSandbox activity", "kind": "service" },
+      { "id": "hist", "label": "Event history", "kind": "file" }
+    ],
+    "steps": [
+      { "from": "you", "to": "server", "text": "You start the workflow with a client call. The server writes 'WorkflowStarted' to the history." },
+      { "from": "server", "to": "worker", "text": "The worker polls the task queue and picks up the workflow task." },
+      { "from": "worker", "to": "wf", "text": "The worker runs your workflow function in a sandbox with no clock and no network." },
+      { "from": "wf", "to": "act", "text": "The workflow asks for an activity. This is a request, not a direct call." },
+      { "from": "act", "to": "hist", "text": "The activity runs on the worker and its result is written to the history." },
+      { "from": "hist", "to": "wf", "text": "If the worker dies, a new one replays the history and continues from the last result." }
+    ]
+  },
+  "sections": [
+    {
+      "h": "A workflow is a function that replays",
+      "p": [
+        "Temporal keeps an event log for every workflow run. When a worker crashes, another worker reads that log and runs your function again from the start.",
+        "This only works when the function makes the same decisions each time. So a workflow must not read the clock, roll dice or call the network. Those things happen in activities."
+      ],
+      "callout": { "kind": "why", "text": "Replay is what makes a run survive a deploy, a crash or a weekend. The price is a few rules inside the workflow function." }
+    },
+    {
+      "h": "Declare the activities the workflow may call",
+      "p": [
+        "An activity is a normal async function that may do anything: call AWS, run git, wait on a socket. The workflow does not import it. It asks the server to run it, through a proxy.",
+        "The proxy carries the timeouts. The two that matter most are how long one attempt may take, and how long the whole thing may take across retries."
+      ],
+      "because": "Because the workflow must never do I/O itself, it talks to activities only through a typed proxy with timeouts.",
+      "code": {
+        "lang": "typescript",
+        "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts",
+        "text": "import { proxyActivities } from \"@temporalio/workflow\";\nimport type * as activities from \"../activities/index.js\";\n\nconst { acquireSandbox, runAgent, releaseSandbox } = proxyActivities<typeof activities>({\n  startToCloseTimeout: \"6 hours\",\n  heartbeatTimeout: \"2 minutes\",\n  retry: { maximumAttempts: 3 },\n});\n\nexport async function ticketToPr(input: { ticketKey: string }): Promise<string> {\n  const vm = await acquireSandbox({ size: \"lite\" });\n  try {\n    return await runAgent({ vmId: vm.id, ticketKey: input.ticketKey });\n  } finally {\n    await releaseSandbox({ vmId: vm.id });\n  }\n}\n",
+        "notes": [
+          { "line": 2, "text": "A type-only import. The workflow learns the activity signatures but never runs their code." },
+          { "line": 4, "text": "proxyActivities returns functions with the same names and types as the real activities." },
+          { "line": 5, "text": "One attempt may run for six hours. An agent run is long, and the proxy must not cut it short." },
+          { "line": 6, "text": "If the activity stops sending heartbeats for two minutes, the server treats that attempt as dead and retries." },
+          { "line": 11, "text": "This looks like a function call. Under the hood it schedules a task and waits for the result in the history." },
+          { "line": 15, "text": "The finally block runs on replay too, so a VM is always released, even after a crash." }
+        ]
+      },
+      "ifInstead": "If instead you see 'Cannot find module ../activities/index.js', then the import path needs the .js ending even for a .ts file, because the project is ESM."
+    },
+    {
+      "h": "Heartbeats keep long activities alive",
+      "p": [
+        "A six-hour timeout alone is not safe. If the worker running the activity dies at minute two, the server would wait six hours to notice.",
+        "So a long activity sends a heartbeat every few seconds. The heartbeat can carry progress, which the next attempt reads to continue instead of restarting."
+      ],
+      "because": "Because a dead worker must be noticed in minutes, not hours, the activity reports that it is still alive.",
+      "code": {
+        "lang": "typescript",
+        "file": "ai-agents/orchestrator/src/activities/run-agent.ts",
+        "text": "import { Context } from \"@temporalio/activity\";\n\nexport async function runAgent(input: { vmId: string; ticketKey: string }): Promise<string> {\n  const ctx = Context.current();\n  const last = ctx.info.heartbeatDetails as { sessionId?: string } | undefined;\n  const session = last?.sessionId ?? (await startSession(input));\n  const timer = setInterval(() => ctx.heartbeat({ sessionId: session }), 10_000);\n  try {\n    return await waitForPr(session);\n  } finally {\n    clearInterval(timer);\n  }\n}\n",
+        "notes": [
+          { "line": 4, "text": "The activity context gives you heartbeat() and the details of the previous attempt." },
+          { "line": 5, "text": "On a retry, the last heartbeat details are here. The first attempt sees undefined." },
+          { "line": 6, "text": "Re-attach to the session that already runs on the VM instead of starting a second agent." },
+          { "line": 7, "text": "Every ten seconds, tell the server we are alive and which session we hold." }
+        ]
+      },
+      "callout": { "kind": "wall", "text": "No time, turn or budget limit cuts a run in the middle. Timeouts here exist to notice a dead worker, never to stop a healthy agent." }
+    },
+    {
+      "h": "Run the worker and start the workflow",
+      "p": [
+        "A worker is a Node process that registers your workflow and activity code with the server and polls a task queue. You run it with tsx, the same way you run any script."
+      ],
+      "because": "Because nothing runs until a worker polls the queue, you start the worker first and then the client.",
+      "code": {
+        "lang": "typescript",
+        "file": "ai-agents/orchestrator/src/worker.ts",
+        "text": "import { Worker } from \"@temporalio/worker\";\nimport * as activities from \"./activities/index.js\";\n\nconst worker = await Worker.create({\n  workflowsPath: new URL(\"./workflows/index.js\", import.meta.url).pathname,\n  activities,\n  taskQueue: \"nova\",\n});\nawait worker.run();\n",
+        "notes": [
+          { "line": 5, "text": "Workflows are bundled from a path, not imported, so the worker can run them in the sandbox." },
+          { "line": 6, "text": "Activities are plain functions, passed as an object." },
+          { "line": 7, "text": "The queue name must match the one the client uses to start the workflow." }
+        ]
+      },
+      "see": "2026-10-13T09:12:01.120Z [INFO] Worker state changed { state: 'RUNNING' }",
+      "callout": { "kind": "tip", "text": "Keep the task queue name in one shared constant. A typo here means the workflow waits forever with no error." }
+    },
+    {
+      "h": "What the UI shows",
+      "p": [
+        "Open http://localhost:8233 and find your run. Every activity call is one event. Click one to see its input and result.",
+        "Now kill the worker while an activity runs, start it again, and watch the run continue. That is replay."
+      ],
+      "callout": { "kind": "gotcha", "text": "Changing the order of activity calls in a workflow that is still running breaks replay. Lesson p7-6 shows how to change a running workflow safely." }
+    }
+  ],
+  "lab": {
+    "title": "Run a workflow on your laptop",
+    "youNeed": ["Node 24", "temporal CLI (brew install temporal)", "a scratch folder with npm init -y"],
+    "worked": [
+      { "do": "temporal server start-dev", "see": "Server:  localhost:7233\nUI:      http://localhost:8233" },
+      { "do": "npm i -E @temporalio/workflow @temporalio/activity @temporalio/worker @temporalio/client && npm i -D -E tsx typescript", "see": "added 41 packages" },
+      { "do": "npx tsx src/worker.ts", "see": "[INFO] Worker state changed { state: 'RUNNING' }" },
+      { "do": "npx tsx src/start.ts RH-1234", "see": "started ticketToPr-RH-1234\nresult: https://github.com/example/repo/pull/1" }
+    ],
+    "faded": "Do the same with a second activity, sendSlack, called after runAgent. The worker file and the proxy are given; you write the activity function and add it to the activities index.",
+    "alone": "Write a workflow called nightlyReport with one activity that returns the current date as text. Start it, kill the worker during the activity, restart the worker, and confirm the run finishes with the same date.",
+    "done": "The run shows Completed in the UI and the result printed by start.ts matches the activity's return value."
+  },
+  "quiz": [
+    {
+      "q": "Where may a workflow call fetch()?",
+      "options": [
+        { "text": "Inside the workflow function, as long as it is awaited", "correct": false, "why": "Replay would call fetch again and could get a different answer, so the run would not be deterministic." },
+        { "text": "Only inside an activity", "correct": true, "why": "Activities run outside the sandbox and their results are stored in the history." },
+        { "text": "Nowhere, Temporal has its own HTTP client", "correct": false, "why": "Temporal does not wrap your I/O. You use any library you like, inside activities." }
+      ]
+    },
+    {
+      "q": "A worker dies ten minutes into a two-hour activity. What notices it?",
+      "options": [
+        { "text": "The startToCloseTimeout, after two hours", "correct": false, "why": "That timeout fires too late. It is the ceiling for one attempt, not the way to notice a dead worker." },
+        { "text": "The client that started the workflow", "correct": false, "why": "The client is not involved after the start call. It may have exited already." },
+        { "text": "The heartbeatTimeout, after the next missed heartbeat window", "correct": true, "why": "The server expects a heartbeat every few seconds. Missing them for the heartbeat window marks the attempt as failed and retries." }
+      ]
+    },
+    {
+      "q": "What does proxyActivities import from the activities file?",
+      "options": [
+        { "text": "Only the types", "correct": true, "why": "The import is type-only. The workflow sandbox never loads activity code." },
+        { "text": "The functions, so they can be called directly", "correct": false, "why": "Calling them directly would run I/O inside the workflow, which breaks replay." },
+        { "text": "Nothing; the names are strings", "correct": false, "why": "The names are typed through the generic parameter, which is why the import exists." }
+      ]
+    }
+  ],
+  "recall": [
+    "From p7-1: what are the three parts of a Temporal setup, and which one holds the history?",
+    "From p1-6: how do you run only one test file with node:test?"
+  ],
+  "videos": [
+    { "title": "Temporal in 7 minutes", "url": "https://www.youtube.com/watch?v=2HjnQlnA5eY", "channel": "Temporal", "minutes": 7, "why": "The replay idea drawn on a whiteboard." }
+  ],
+  "words": [
+    { "term": "workflow", "plain": "The function that decides what happens next in a long job and is replayed from its history." },
+    { "term": "activity", "plain": "A normal function that does real work, such as a network call, and whose result is stored." },
+    { "term": "worker", "plain": "The process that runs your workflow and activity code and polls a task queue." },
+    { "term": "replay", "plain": "Running a workflow function again from its stored history to get back to where it was." },
+    { "term": "heartbeat", "plain": "A small message an activity sends so the server knows the attempt is still alive." }
+  ],
+  "tickets": [
+    { "key": "G3-24", "why": "The ticketToPr workflow is this lesson's shape with real activities." },
+    { "key": "G3-25", "why": "The sandbox activities need the heartbeat and re-attach pattern from here." }
+  ],
+  "remember": "The workflow decides, activities do, and the history remembers."
+}

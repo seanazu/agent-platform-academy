@@ -1,0 +1,965 @@
+[
+ {
+  "key": "G4-01",
+  "title": "[Platform] Spike: run a dynamic workflow from the harness in a VM",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G3 ai-agent-sandbox image and nova-worker harness; G0 LLM gateway",
+  "what": "A half-day spike that runs a small workflow through the Workflow tool from a harness session (the TypeScript Agent SDK, as nova-worker uses it) inside a lite sandbox VM, behind the gateway, and writes down what works and what doesn't.",
+  "why": "Research before planning, 2–3 plans with a judge, and the review panel all depend on the Workflow tool working headless inside the run's VM. The SDK reference documents the Workflow tool, so the question is no longer the language but our own setup: headless in a lite VM, behind the gateway, saved workflows and resume.",
+  "how": [
+   "On a lite VM from the ai-agent-sandbox image, run ai-agents/harness/spikes/workflow-spike.ts (sketch below) with `npx tsx`, using the harness's own settings: the pinned claude binary, the LLM gateway as ANTHROPIC_BASE_URL, and permissionMode \"dontAsk\", which refuses any tool that needs permission and isn't in allowedTools. G3-19's allowedTools names Workflow; confirm the tool works with that list under dontAsk. No Anthropic key in the VM.",
+   "Headless: check the session waits for the workflow and returns its result. If it exits early, try CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 (wait with no ceiling) and note it.",
+   "Gateway: check every workflow agent call reaches the gateway with the spike's run token (ticket SPIKE-1, G0-13) and step header, and shows up in the result's modelUsage, so it counts toward the ticket's cost tag and the far-away backstop.",
+   "Size: check CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS caps parallel agents (3 on lite, 6 on full, 12 on wide), and that a workflow agent has no way to start a new run (no orchestrator access; workflow() nests one level only).",
+   "Saved workflows: they live in ~/.claude/workflows/ of the VM user, baked in by Packer (not in fcp). Copy nova-research.js there and check it loads by name: `npx tsx spikes/workflow-spike.ts \"Run the saved workflow nova-research\"`.",
+   "Resume: kill the session mid-workflow, resume it (RESUME_SESSION_ID), and call Workflow with resumeFromRunId (the hook in the sketch prints the runId); note which agent calls come back cached.",
+   "Write a one-page result in ai-agents/docs/spikes/workflows-in-the-vm.md with a go / no-go for G4-09 and G4-19."
+  ],
+  "code": {
+   "file": "ai-agents/harness/spikes/workflow-spike.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/spikes/workflow-spike.ts — throw-away spike, not part of the harness build. On a lite VM:\n//   npx tsx spikes/workflow-spike.ts [\"<prompt>\"]      (RESUME_SESSION_ID=<id> to resume after a kill)\nimport { query, type HookCallback, type Options } from \"@anthropic-ai/claude-agent-sdk/core\";\n\nconst logWorkflowRun: HookCallback = async (input) => {  // prints the runId, the handle for resumeFromRunId\n  if (input.hook_event_name === \"PostToolUse\") console.log(\"Workflow:\", JSON.stringify(input.tool_response));\n  return {};\n};\n\nconst options: Options = {\n  model: \"claude-opus-5-5\",\n  effort: \"medium\",\n  cwd: \"/work/fcp\",\n  settingSources: [\"user\", \"project\"],                  // \"user\" so saved workflows in ~/.claude/workflows/ load\n  tools: { type: \"preset\", preset: \"claude_code\" },\n  permissionMode: \"dontAsk\", allowedTools: [\"Read\", \"Grep\", \"Glob\", \"Bash\", \"Workflow\"],  // as in G3-19; try once without Workflow\n  settings: JSON.stringify({ enableWorkflows: true, workflowSizeGuideline: \"small\" }),  // size is advice, not a cap\n  pathToClaudeCodeExecutable: \"/usr/local/bin/claude\",  // the pinned binary the harness uses\n  hooks: { PostToolUse: [{ matcher: \"Workflow\", hooks: [logWorkflowRun] }] },\n  resume: process.env.RESUME_SESSION_ID,                // resumeFromRunId works in the same session only\n  env: {\n    ...process.env,                                     // env replaces process.env, so spread it\n    ANTHROPIC_BASE_URL: process.env.GATEWAY_URL,        // the gateway adds the key; none in the VM\n    ANTHROPIC_AUTH_TOKEN: process.env.SPIKE_RUN_TOKEN,  // a G0-13 run token for ticket SPIKE-1: the ticket rides in it\n    ANTHROPIC_CUSTOM_HEADERS: \"x-ai-agents-step: spike\",  // G1-14's step header\n    CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS: \"3\",    // lite VM, 4 vCPU\n  },\n  // no maxTurns, no maxBudgetUsd, no taskBudget: limits never cut a run in the middle\n};\n\nconst prompt = process.argv[2] ??\n  \"Run a small workflow: 3 parallel Haiku readers each list 5 files in frontend/src/components. Merge the lists.\";\n\nfor await (const msg of query({ prompt, options })) {\n  if (msg.type === \"result\") console.log(msg.subtype, msg.total_cost_usd, JSON.stringify(msg.modelUsage, null, 2));\n}"
+  }
+ },
+ {
+  "key": "G4-02",
+  "title": "[Platform] TICKET-BENCH: mine merged 2025–26 fcp PRs into candidate tasks",
+  "team": [
+   "plat",
+   "be"
+  ],
+  "days": 1,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "Read-only Jira token for ticket text; a restricted golden-set repo (name to decide with Sean and Ronen)",
+  "what": "A script that lists merged fcp PRs from 2025–26 that had a Jira ticket and their own tests, and turns each one into a candidate task: ticket text, base commit, the PR's tests and the kind of change.",
+  "why": "TICKET-BENCH is how we tell whether a change to Nova helps. Real past tickets with real tests are the closest thing to pilot work, and mining them is much cheaper than writing tasks by hand.",
+  "how": [
+   "Write ai-agents/evals/ticket_bench/mine.py (sketch below; Python, in the evals uv project next to Harbor). It reads merged PRs with `gh pr list --repo RhinoHealth/fcp --state merged --search \"merged:2025-01-01..2026-09-30\"` and keeps those with an RH key in the title (about 740 of ~1,700 main commits since 2025 carry one).",
+   "Keep PRs that change tests: frontend/test/unit/**, frontend/e2e/pr/**, cloud/rhinoCloud/**/tests/**, client/rhinoOnPrem/**/tests/**.",
+   "Drop the areas the pilot leaves out: */migrations/**, auth (cloud/rhinoCloud/rhinoDjango/login/**, frontend/src/app/(auth)/**, frontend/src/app/api/auth/**), common/fcp_common/rhinoAgentRpc/**, .github/workflows/**.",
+   "Tag each with a kind (fe_bug, be_bug, add_tests, small_feature, dependency_bump) from the Jira issue type and the paths, and a multi_file flag (8+ files across 2+ top folders) for the big cases.",
+   "Pull ticket text (summary, description, comments up to the merge date) with a read-only Jira token. Never download attachments.",
+   "Write candidates.jsonl to the restricted golden-set repo (e.g. RhinoHealth/ai-agents-evals; name to decide), never to ai-agents or rnd-kb, so the brain never indexes it (G6 checks this)."
+  ],
+  "code": {
+   "file": "ai-agents/evals/ticket_bench/mine.py",
+   "lang": "python",
+   "text": "# ai-agents/evals/ticket_bench/mine.py — Python, in the evals uv project next to Harbor. Output goes to the restricted golden-set repo only.\nimport json, re, subprocess\nfrom pathlib import PurePath\n\nTESTS = re.compile(r\"^(frontend/test/unit/|frontend/e2e/pr/|cloud/rhinoCloud/.+/tests/|client/rhinoOnPrem/.+/tests/)\")\nEXCLUDED = re.compile(r\"/migrations/|^cloud/rhinoCloud/rhinoDjango/login/|^frontend/src/app/\\(auth\\)/\"\n                      r\"|^frontend/src/app/api/auth/|^common/fcp_common/rhinoAgentRpc/|^\\.github/workflows/\")\nJIRA_KEY = re.compile(r\"\\bRH-\\d+\\b\")\nLOCKFILES = {\"package.json\", \"package-lock.json\", \"pyproject.toml\", \"uv.lock\"}\n\n\ndef gh(*args: str) -> list[dict]:\n    return json.loads(subprocess.run([\"gh\", *args], check=True, capture_output=True, text=True).stdout)\n\ndef kind(issue_type: str, files: list[str]) -> str:\n    code = [f for f in files if not TESTS.match(f)]\n    if not code:\n        return \"add_tests\"\n    if all(PurePath(f).name in LOCKFILES for f in code):\n        return \"dependency_bump\"\n    side = \"fe\" if all(f.startswith(\"frontend/\") for f in code) else \"be\"\n    return f\"{side}_bug\" if issue_type == \"Bug\" else \"small_feature\"\n\nprs = gh(\"pr\", \"list\", \"--repo\", \"RhinoHealth/fcp\", \"--state\", \"merged\", \"--limit\", \"2000\",\n         \"--search\", \"merged:2025-01-01..2026-09-30\", \"--json\", \"number,title,files,mergeCommit\")\nfor pr in prs:\n    files = [f[\"path\"] for f in pr[\"files\"]]\n    key = JIRA_KEY.search(pr[\"title\"])\n    if not key or not any(TESTS.match(f) for f in files) or any(EXCLUDED.search(f) for f in files):\n        continue\n    merge = pr[\"mergeCommit\"][\"oid\"]\n    print(json.dumps({\"pr\": pr[\"number\"], \"jira\": key.group(), \"merge\": merge, \"base\": f\"{merge}^\",  # squash merges\n                      \"kind\": kind(jira_issue_type(key.group()), files),  # read-only Jira call (helper not shown)\n                      \"multi_file\": len(files) >= 8 and len({f.split(\"/\")[0] for f in files}) >= 2}))"
+  }
+ },
+ {
+  "key": "G4-03",
+  "title": "[Platform] TICKET-BENCH: Harbor task format and a Nova agent adapter",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G4-02"
+  ],
+  "needs": "G3 ai-agent-sandbox image, sandbox lifecycle and the harness tarball (nova-worker on Node 24); G3 broker (bench mode)",
+  "what": "Define how one TICKET-BENCH task looks in Harbor (the ticket text as the instruction, the PR's tests hidden until grading) and write a Harbor agent adapter (Python, like Harbor) that runs Nova's real TypeScript harness on the sandbox image.",
+  "why": "The bench has to test the same Nova that runs real tickets, on the same image. Otherwise its scores say nothing about the pilot.",
+  "how": [
+   "Add Harbor as a pinned dependency of the evals uv project (`uv add --project evals harbor`, in ai-agents/evals/pyproject.toml); the bench code lives in ai-agents/evals/ticket_bench/. It stays Python because Harbor and its agent adapters are Python.",
+   "One folder per task: instruction.md (the ticket text), task.toml (below), tests/test.sh plus tests/hidden/ (the PR's test files at their real paths), solution/solve.sh (applies the merged diff; only Harbor's oracle agent uses it).",
+   "Write ai-agents/evals/ticket_bench/convert.py: candidates.jsonl → task folders, using `git show <merge>:<path>` for the hidden tests and `git diff <base> <merge>` for the solution.",
+   "Write ai-agents/evals/ticket_bench/nova_agent.py, a Harbor custom agent in Python that starts the TypeScript harness CLI (`nova-worker run <task.json>`) inside the task container, on the task's base commit, with the instruction. So the task image needs Node 24 and the harness tarball (ai-agents-harness-<version>.tgz from release-harness.yml: one bundled file, nothing to install) next to fcp's own toolchain. No Jira, Slack or PR: the plan is auto-approved, questions get \"no answer, use your judgement\", and the result is the working tree.",
+   "Stop answer leaks: reset the checkout to base_sha and drop git mirror refs after it; in bench mode the broker refuses to read the source PR and anything merged after base, so the \"similar past PRs\" helper can't find the answer.",
+   "Decide where trials run and write it in ai-agents/evals/ticket_bench/README.md: a custom Harbor environment that claims a fresh full VM per trial (preferred: same AMI as Nova), or Harbor's docker environment inside one wide VM."
+  ],
+  "code": {
+   "file": "tasks/<task>/task.toml (restricted golden-set repo)",
+   "lang": "toml",
+   "text": "# tasks/fe-bug-1234/task.toml — in the restricted golden-set repo (name to decide). Field names per the pinned Harbor version.\nversion = \"1.0\"\n\n[metadata]\nkind = \"fe_bug\"                 # fe_bug | be_bug | add_tests | small_feature | dependency_bump\nmulti_file = false              # true for the 5 big cases that test workflows\nsource_repo = \"RhinoHealth/fcp\"\nsource_pr = 1234                # example values; convert.py fills them\njira = \"RH-1234\"\nbase_sha = \"<parent of the squash commit on main>\"\nhidden_tests = [\"frontend/test/unit/<file>.test.tsx\"]\nsmoke = false                   # true for the 15 tasks in the smoke set\ncurated_by = \"<BE or FE engineer>\"\n\n[agent]\n# A far-away eval backstop only, to free a stuck eval VM. Nova itself has no time limit:\n# minutes per task are measured and reported, and a timeout is reported as \"stuck\", not as a slow pass.\ntimeout_sec = 21600.0\n\n[verifier]\ntimeout_sec = 3600.0\n\n[environment]\n# the task image carries Node 24 and the nova-worker harness tarball next to fcp's toolchain;\n# the Python adapter runs `nova-worker run` inside it\n# full size (8 vCPU, 32 GB) with FCP Lab and browsers; see README for the environment decision\ncpus = 8\nmemory_mb = 32768"
+  }
+ },
+ {
+  "key": "G4-04",
+  "title": "[Platform] Hand-off: Nova Jira service account and a 1-minute JQL poll",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G3 Temporal (namespace ai-agents), G3-28's Jira query registry (its toStart must allow async and a skip) and the ticketToPr workflow; DevOps for the Vault path and ExternalSecret",
+  "what": "Create the \"Nova\" Jira service account and a Temporal schedule that, every minute, finds RH tickets assigned to Nova, records who assigned each one as the requester, and starts (or joins) that ticket's run.",
+  "why": "Assignment is how people hand work to Nova: it needs a permission, shows on boards and in \"my work\", and Jira records who did it. A 1-minute poll means no new public webhook.",
+  "how": [
+   "Ask a Jira site admin to create an Atlassian service account \"Nova\" (admin.atlassian.com → Directory → Service accounts), give it Jira access, and add it to the RH project role that makes it assignable. Create a scoped API token (read and write issues and comments, read users). Scoped tokens go through api.atlassian.com/ex/jira/<cloudId>; check this.",
+   "DevOps puts the token in Vault (kvv2, e.g. infrastructure/ai-agents/jira-nova, like infrastructure/n8n) and syncs it with an ExternalSecret into the orchestrator workers only. Sandbox VMs never get it; inside a run, the broker's one-issue Jira scope is used.",
+   "Add ai-agents/orchestrator/src/triggers/nova.ts (below): Nova's entry in G3-28's query registry. The JQL runs as Nova, so `assignee = currentUser()` means \"assigned to Nova\".",
+   "The requester is the author of the latest changelog entry that set the assignee to Nova (GET /rest/api/3/issue/{key}/changelog). A ticket started from Slack carries an issue property nova.requester instead (G4-05).",
+   "G3-28's startMatches starts ticketToPr through startRun (G3-25): workflowId nova:RH-1234 with workflowIdConflictPolicy USE_EXISTING, so a second poll joins the open run instead of starting another.",
+   "No schedule code here: G3-28's ensureSchedules turns the registry entry into the poll-jira-nova schedule (every 1 minute, overlap policy SKIP)."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/triggers/nova.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/triggers/nova.ts — Nova's entry in G3-28's query registry: the 1-minute poll.\nimport type { Handoff } from \"@rhinohealth/ai-agents-shared\";\nimport { jira } from \"../jira.js\";  // G3-28's client; Nova's token from the ExternalSecret, never in a VM\nimport { ticketToPr } from \"../workflows/ticket-to-pr.js\";\nimport { QUERIES } from \"./schedules.js\";\n\n// Runs as the Nova service account, so currentUser() is Nova.\nconst NOVA_JQL = \"project = RH AND assignee = currentUser() AND statusCategory != Done ORDER BY updated ASC\";\n\n/** Who handed the ticket to Nova: the property /nova sets in Slack, else the latest assignee change to Nova. */\nexport async function requesterOf(key: string): Promise<string | undefined> {\n  const fromSlack = await jira.issueProperty<string>(key, \"nova.requester\");  // set by /nova in Slack\n  if (fromSlack) return fromSlack;\n  const history = await jira.changelog(key);  // oldest first\n  const toNova = history.filter((h) => h.items.some((i) => i.field === \"assignee\" && i.to === jira.me));\n  return toNova.at(-1)?.author.accountId;\n}\n\n// ensureSchedules (G3-28) makes this the poll-jira-nova schedule: every minute, overlap SKIP. startMatches hands each\n// match to startRun (G3-25): queue ai-agents-nova, ID nova:<key>, USE_EXISTING, refuses a stopped agent.\nQUERIES.set(\"nova\", {\n  name: \"nova\", agent: \"nova\", jql: NOVA_JQL, every: \"1 minute\",\n  toStart: async (issue) => {  // async, and undefined skips a match: two small changes to G3-28's toStart\n    const requester = await requesterOf(issue.key);\n    if (!requester) return undefined;  // no assignment to Nova found: log it, don't start a run without an owner\n    const handoff: Handoff = { key: issue.key, requester };\n    return [ticketToPr, handoff];  // a second poll joins the open run\n  },\n});"
+  }
+ },
+ {
+  "key": "G4-05",
+  "title": "[Platform] Hand-off: @Nova commands, /nova in Slack, stop and assign-back",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G4-04"
+  ],
+  "needs": "G3 Slack app (Bolt, Socket Mode) with /nova; G3 ticketToPr signals and stop",
+  "what": "Let people steer a run from Jira (@Nova start, answer, retry, stop) and from Slack (/nova RH-1234), treat unassigning Nova as stop, and give the ticket back to the requester when Nova is done with it.",
+  "why": "People should talk to Nova where they already are. A person must always own the ticket, so it goes back to the requester when the PR is ready or the run stops.",
+  "how": [
+   "Add ai-agents/orchestrator/src/commands.ts (below): it walks the ADF comment body, finds a mention of Nova's accountId and reads the first word after it.",
+   "The poller (G4-04) also reads new comments on tickets with an open run (Temporal visibility: WorkflowType = 'ticketToPr' AND ExecutionStatus = 'Running') and sends each command as a signal. Test in a scratch Jira project whether JQL can find @Nova mentions on tickets Nova doesn't own yet; if not, \"start\" works by assigning only.",
+   "/nova RH-1234 in the G3 Slack app: map the Slack user to a Jira accountId with config/people.yaml (Slack ID, Jira accountId, GitHub login for ~25 people, kept by Sean), set issue property nova.requester, then assign the ticket to Nova. The poller does the rest.",
+   "Stop: an assignee change away from Nova made by someone other than Nova sends the stop signal (G3's Stop keeps the branch and notes and destroys the VM). Nova's own assign-back must not count as stop.",
+   "Assign back to the requester (PUT /rest/api/3/issue/{key}/assignee) when the PR is marked ready (G4-27), or when the run stops or hands back. The plan says \"when the PR opens\"; we use \"ready\" because that is when people are first pinged."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/commands.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/commands.ts — parse \"@Nova <command> [text]\" from a Jira comment (ADF body).\nexport const COMMANDS = [\"start\", \"answer\", \"retry\", \"stop\", \"approve\", \"change\"] as const;  // approve/change: G4-14\nexport type Command = (typeof COMMANDS)[number];\n\nexport interface NovaCommand {\n  command: Command;\n  text: string;  // the rest of the comment, e.g. an answer or a plan change\n  author: string;  // Jira accountId of the person who wrote it\n}\n\ninterface AdfNode { type: string; text?: string; attrs?: { id?: string }; content?: AdfNode[] }\ninterface JiraComment { author: { accountId: string }; body: AdfNode }\n\nconst flatten = (node: AdfNode): AdfNode[] => [node, ...(node.content ?? []).flatMap(flatten)];\nconst isCommand = (word: string): word is Command => (COMMANDS as readonly string[]).includes(word);\n\nexport function parseCommand(comment: JiraComment, novaAccountId: string): NovaCommand | undefined {\n  const author = comment.author.accountId;\n  if (author === novaAccountId) return undefined;  // never react to Nova's own comments\n  const nodes = flatten(comment.body);\n  const at = nodes.findIndex((n) => n.type === \"mention\" && n.attrs?.id === novaAccountId);\n  if (at === -1) return undefined;\n  const rest = nodes.slice(at + 1).filter((n) => n.type === \"text\").map((n) => n.text ?? \"\").join(\" \").trim();\n  const [word = \"\", ...words] = rest.split(\" \");\n  const command = word.toLowerCase();\n  if (isCommand(command)) return { command, text: words.join(\" \").trim(), author };\n  return { command: \"answer\", text: rest, author };  // a plain reply to Nova counts as an answer\n}"
+  }
+ },
+ {
+  "key": "G4-06",
+  "title": "[Platform] Readiness check: structured ready / ask / hand-back verdict",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G4-04"
+  ],
+  "needs": "G0 LLM gateway with per-ticket tags; G8 plan-and-grill skill (its heuristics feed the prompt)",
+  "what": "The first step of every run: one cheap model call, with no VM, that reads the ticket and answers in a fixed JSON shape whether Nova can do it well, what kind and size of work it is, and what it would need to ask.",
+  "why": "It is the cheapest place to stop a bad run. A clear goal, a way to check it and one reviewable change are what make a Nova PR mergeable; asking now costs cents, finding out on a VM costs an hour.",
+  "how": [
+   "Add ai-agents/orchestrator/src/activities/readiness.ts (below). Model per the routing table: Sonnet 5.5 at low effort, structured output (a zod schema through outputFormat), no tools, no repo.",
+   "Give it text only: summary, description, comments, linked issue titles. Never attachments or images. Pilot tickets use fake data; if the text looks like it holds real patient or customer data, the verdict is hand_back with that reason and nothing goes further.",
+   "Write the prompt in ai-agents/orchestrator/prompts/readiness.md as goals, reasons and 6–8 labelled examples (a clear FE bug, a fuzzy feature, a migration, a ticket with no way to check it, a ticket that is really two changes), in calm wording.",
+   "Pilot scope lives in PILOT_EXCLUDED. The model flags it from the text; during the run the same list makes Nova stop and ask if an edit lands there (G3's guard-rail hook in \"ask\" mode, not \"deny\").",
+   "hand_back only when the ticket can't be done as written; otherwise ask up to 5 specific questions. Verdict, kind and size go into workflow state and the Nova state field (G4-11).",
+   "Label 30 past RH tickets by hand (ready / ask / hand_back) and compare before turning it on."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/activities/readiness.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/activities/readiness.ts — first step of every run; no VM, ticket text only.\nimport { readFile } from \"node:fs/promises\";\nimport { query } from \"@anthropic-ai/claude-agent-sdk\";\nimport { JiraClient } from \"@rhinohealth/ai-agents-shared\";\nimport { z } from \"zod\";\n\nexport const PILOT_EXCLUDED = {  // a choice by people while we learn, not a wall: Nova stops and asks\n  migration: [\"cloud/rhinoCloud/rhinoCore/migrations/**\", \"client/rhinoOnPrem/*/migrations/**\"],\n  auth: [\"cloud/rhinoCloud/rhinoDjango/login/**\", \"frontend/src/app/(auth)/**\", \"frontend/src/app/api/auth/**\"],\n  grpc_contract: [\"common/fcp_common/rhinoAgentRpc/**\"],\n  infra: [\".github/workflows/**\", \"**/docker-compose*.yml\"],\n};\nexport const Readiness = z.object({\n  verdict: z.enum([\"ready\", \"ask\", \"hand_back\"]), reason: z.string(),\n  kind: z.enum([\"fe_bug\", \"be_bug\", \"add_tests\", \"small_feature\", \"dependency_bump\", \"docs\", \"other\"]),\n  size: z.enum([\"small\", \"bigger\", \"fuzzy\"]),  // bigger → grill; fuzzy → grill + 2–3 plans\n  how_to_check: z.string(),  // empty = Nova sees no way to check it\n  questions: z.array(z.string()).max(5),\n  out_of_scope: z.array(z.enum([\"migration\", \"auth\", \"grpc_contract\", \"infra\"])),  // the keys of PILOT_EXCLUDED\n});\nexport type Readiness = z.infer<typeof Readiness>;\n\nexport async function checkReadiness(key: string): Promise<Readiness> {\n  const ticket = await JiraClient.fromEnv().ticketText(key);  // summary, description, comments, link titles; no attachments\n  for await (const msg of query({ prompt: ticket, options: {\n    model: \"claude-sonnet-5-5\", effort: \"low\", tools: [], settingSources: [],  // routing table; no repo, no VM\n    systemPrompt: await readFile(new URL(\"../../prompts/readiness.md\", import.meta.url), \"utf8\"),\n    outputFormat: { type: \"json_schema\", schema: z.toJSONSchema(Readiness) },\n    env: { ...process.env, ANTHROPIC_AUTH_TOKEN: mintRunToken({ agent: \"nova\", jira: key, run: `readiness:${key}` }),\n      ANTHROPIC_CUSTOM_HEADERS: \"x-ai-agents-step: ticket\" },  // G0-13: the ticket rides in the run token\n  } })) {\n    if (msg.type === \"result\" && msg.subtype === \"success\") return Readiness.parse(msg.structured_output);\n  }\n  throw new Error(`readiness check for ${key} returned no result`);  // the activity fails and Temporal retries it\n}"
+  }
+ },
+ {
+  "key": "G4-07",
+  "title": "[Platform] Plan schema: done first, QA plan, steps, estimate and risk",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-06"
+  ],
+  "needs": "G3 harness on a lite VM and the routing table; G8 plan-and-grill skill and codebase skills",
+  "what": "The plan format every Nova run fills in before coding, and the planner step that writes it on a lite VM: the definition of done first, then a QA plan of 3–5 checks with an edge case (screen states for UI), steps with model and effort, Nova's own estimate and a risk guess.",
+  "why": "The plan is what the requester approves and what everything after it is judged by. Writing \"done\" and the checks first is the main reason Nova can prove its work instead of claiming it.",
+  "how": [
+   "Add the Plan zod schema to ai-agents/shared/src/schemas.ts (below), because the harness, the orchestrator and the Slack app all read plans. The planner step lives in ai-agents/harness/src/plan.ts: the planner session ends with outputFormat { type: \"json_schema\", schema: z.toJSONSchema(Plan, { io: \"input\" }) }; the harness then runs Plan.safeParse on the result's structured_output and sends any error back to the planner to fix.",
+   "Planner: Opus 5.5 at medium; high for fuzzy or cross-module tickets (readiness size). It loads plan-and-grill and the codebase skill, reads code on the lite VM, and on bigger tickets can run the research workflow (G4-09).",
+   "Each QA check says in plain words what a user does and sees, and what the test reads: test IDs, ARIA roles, visible text, row counts. Never class names (FE review rule) or snapshot dumps.",
+   "For a UI change the plan says how to reach each screen state: loading, empty, error, filled, bad data.",
+   "The estimate is Nova's own guess in minutes. It is measured and drives G3's check-ins; it is never a limit.",
+   "Save the plan as .nova/plan.json on the branch and in S3 next to the transcript; G4-14 renders it for Jira and Slack."
+  ],
+  "code": {
+   "file": "ai-agents/shared/src/schemas.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/shared/src/schemas.ts (the Plan part) — the plan Nova writes before any code. Harness, orchestrator\n// and Slack app all read it. Field names are the .nova/plan.json format, so they stay snake_case.\nimport { z } from \"zod\";\n\nexport const QACheck = z.object({\n  id: z.string().regex(/^QA-\\d$/),\n  user_sees: z.string(),  // \"With no projects, the table shows 'No projects yet'\"\n  reads: z.array(z.enum([\"test_id\", \"aria_role\", \"visible_text\", \"row_count\", \"api_response\"])).min(1),\n  level: z.enum([\"unit\", \"story\", \"e2e\", \"api\", \"browser_only\"]),\n  edge_case: z.boolean().default(false),\n  proof: z.enum([\"video\", \"screenshots_760_1440\", \"transcript\", \"test_output\"]),\n});\nexport const Step = z.object({\n  what: z.string(),\n  files: z.array(z.string()),\n  model: z.enum([\"claude-opus-5-5\", \"claude-sonnet-5-5\", \"claude-haiku-5-5\"]).default(\"claude-opus-5-5\"),\n  effort: z.enum([\"low\", \"medium\", \"high\", \"xhigh\"]).default(\"medium\"),\n});\nconst ScreenState = z.enum([\"loading\", \"empty\", \"error\", \"filled\", \"bad_data\"]);\nexport const Plan = z.object({\n  definition_of_done: z.array(z.string()).min(1).max(5),  // first, in the requester's words\n  qa_plan: z.array(QACheck).min(3).max(5),\n  screen_states: z.partialRecord(ScreenState, z.string()).optional(),  // UI only\n  steps: z.array(Step),\n  sandbox: z.enum([\"lite\", \"full\", \"wide\"]),  // plan small, build big\n  workflow: z.string().optional(),  // why a dynamic workflow helps here, and roughly how big\n  estimate_minutes: z.number().int(),  // Nova's own guess; measured, never a limit\n  risk: z.enum([\"low\", \"med\", \"high\"]),\n  risk_reason: z.string(),\n}).superRefine((p, ctx) => {  // the harness sends these errors back to the planner to fix\n  const ui = p.steps.some((s) => s.files.some((f) => f.startsWith(\"frontend/src/\")));\n  if (!p.qa_plan.some((c) => c.edge_case) || (ui && !p.screen_states))\n    ctx.addIssue({ code: \"custom\", message: \"the QA plan needs an edge case, and a UI change lists how to reach its screen states\" });\n});\nexport type Plan = z.infer<typeof Plan>;"
+  }
+ },
+ {
+  "key": "G4-08",
+  "title": "[Platform] Checking guide: where to start checking, when to look deeper",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G8 verify skill in rhino-core (RhinoHealth/claude-plugins); G7 verify commands and BE/DevOps checks",
+  "what": "Write the checking guide as a reference page inside the verify skill: for each kind of change, a good place to start, the signs that say look deeper, and the proof that fits.",
+  "why": "Nova should check as deeply as each change needs: a typo is quick, a risky change gets a careful look. Guidance with reasons works better than a fixed rulebook, and people read the same page.",
+  "how": [
+   "Add references/checking-guide.md to the verify skill in G8's rhino-core plugin in RhinoHealth/claude-plugins (path per G8's layout; confirm). Point to it from verify's SKILL.md in one line.",
+   "One short block per kind of change (docs, FE component, FE page flow, BE logic, BE API change, DB migration, infra/gitops, dependency bump), from the G4 plan's table, written as start / look deeper when / proof.",
+   "Use commands that exist today: npm run lint, check-types, test:unit and playwrightci in frontend/; ./scripts/local_run_backend_unit_tests.sh cloud <module path>; ./manage.py makemigrations --dry-run --check.",
+   "Say plainly which tools are not in fcp yet (npm run verify, poe verify, testmon, oasdiff, Squawk, kubeconform, zizmor, all from G7) and what to do until they land.",
+   "Add a short \"when a check fails\" part: never weaken a check; show main's run to prove a failure isn't yours; flag flaky tests with evidence. Calm wording, no ALL-CAPS MUSTs (G8 style guide).",
+   "Add 3 eval cases to the verify skill's evals/ (a CSS-only change, a shared component used on many pages, a serializer field rename) to check Nova starts small and goes deeper on the last two."
+  ],
+  "code": {
+   "file": "claude-plugins/plugins/rhino-core/skills/verify/references/checking-guide.md",
+   "lang": "markdown",
+   "text": "<!-- rhino-core/skills/verify/references/checking-guide.md in RhinoHealth/claude-plugins (path per G8's layout; confirm) -->\n# Checking guide: where to start, when to look deeper\n\nA starting point, not a rulebook or a timetable. Start from what fits the change, go deeper whenever you see\na reason, and take the time that needs. In the PR, say what you checked, why, and what you chose not to check.\n\n## FE component\n- Start: `npm run lint`, `npm run check-types`, the related vitest files, the component's stories in each screen state.\n- Look deeper when many pages use it or the layout changes: open those pages at 760 and 1440 (e2e/helpers/responsive.ts).\n- Proof: assertions on visible text and ARIA roles; a short video per QA check.\n\n## FE page flow\n- Start: the above, plus the Playwright spec for that flow (frontend/e2e/pr/*.spec.ts) on FCP Lab with seed data.\n- Look deeper when it touches permissions, data loading or forms: run the neighbouring specs, try the edge cases by hand.\n- Proof: the specs ran, a video per check, the Playwright trace.\n\n## BE logic\n- Start: pre-commit on the changed files, then `./scripts/local_run_backend_unit_tests.sh cloud rhinoCloud.rhinoCore.tests.<module>`.\n- Look deeper when the code is shared, checks permissions, or queries in a loop: run the wider suite and count queries.\n- Proof: a new test that failed before the fix and passes after.\n\n## When a check fails\nNever weaken it. If main fails the same way, link main's run and say so. A flaky test gets flagged with evidence.\n\n## Not in fcp yet (coming from G7)\n`npm run verify`, `poe verify`, testmon, oasdiff, Squawk, kubeconform, zizmor. Until they land, run the parts by hand\nand list what you could not run under \"What was not checked\"."
+  }
+ },
+ {
+  "key": "G4-09",
+  "title": "[Platform] Research workflow before planning; 3 plans and a judge if fuzzy",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-01",
+   "G4-07"
+  ],
+  "needs": "G6 kb skill for the brain helper (skipped until it exists); G3 wide VM size",
+  "what": "A saved workflow Nova can run on bigger tickets: cheap helpers search in parallel (where the code is, similar past PRs, the tests, the brain) and return file:line pointers. For fuzzy tickets, 3 plans from different angles and a judge that picks one.",
+  "why": "Research is where extra agents help most, unlike writing code. Parallel helpers give the planner a wider view for little cost, and for fuzzy work independent plans with a judge beat one plan polished on its own.",
+  "how": [
+   "Add ai-agents/harness/workflows/nova-research.js (below; plain JavaScript, which is what the Workflow tool runs) and bake it into ~/.claude/workflows/ of the VM user with Packer (the G4-01 spike checks it loads by name).",
+   "Helpers run on Haiku 5.5 at medium and return file:line pointers; each prompt stays under 100K tokens. The judge inherits the main loop (Opus 5.5) at medium.",
+   "\"Similar past PRs\" uses gh through the broker, read-only. \"The brain\" uses the kb skill once G6 ships; until then that helper says it skipped.",
+   "Fuzzy tickets: 3 planners (smallest safe change, risk first, user first) each return a Plan in the G4-07 schema, passed in as args.planSchema (z.toJSONSchema(Plan)); the judge picks one and grafts the best ideas from the others.",
+   "Nova decides when to use it, guided by one line in plan-and-grill (\"bigger or fuzzy ticket: research first\"). The plan says why and roughly how big. The harness never forces it.",
+   "Run 5 TICKET-BENCH tasks with and without it; keep it only if pass@1 holds or rises (G4-25)."
+  ],
+  "code": {
+   "file": "ai-agents/harness/workflows/nova-research.js",
+   "lang": "javascript",
+   "text": "// ai-agents/harness/workflows/nova-research.js — saved workflow for Nova (baked into ~/.claude/workflows/ by Packer). Plain JS.\nexport const meta = {\n  name: 'nova-research',\n  description: 'Parallel research before planning; for fuzzy tickets, 3 plans and a judge',\n  phases: [{ title: 'Research' }, { title: 'Plans' }, { title: 'Judge' }],\n}\n\nconst POINTERS = { type: 'object', required: ['pointers'], properties: { pointers: { type: 'array', items: {\n  type: 'object', required: ['where', 'why'], properties: { where: { type: 'string' }, why: { type: 'string' } } } } } }\nconst QUESTIONS = [\n  'Where is the code this ticket is about? Return file:line pointers, most relevant first.',\n  'Find up to 5 merged fcp PRs that changed the same area (gh, read-only). Return the PR number and what it teaches.',\n  'Which existing tests cover this area, and how are they run? Return file:line pointers.',\n  'Search the brain with the kb skill for pages about this area; return path@sha and the key fact. If there is no kb skill, say \"skipped\".',\n]\n\nphase('Research')\nconst found = await parallel(QUESTIONS.map((q) => () =>\n  agent(`${q}\\n\\nTicket:\\n${args.ticket}`, { schema: POINTERS, model: 'haiku', effort: 'medium', phase: 'Research' })))\nconst notes = found.filter(Boolean).flatMap((r) => r.pointers)\nif (!args.fuzzy) return { notes }\n\nphase('Plans')\nconst ANGLES = ['the smallest safe change', 'risk first: what could break', 'the user first: every screen state']\nconst plans = await parallel(ANGLES.map((angle) => () =>\n  agent(`Write a plan for this ticket, thinking ${angle}.\\nTicket:\\n${args.ticket}\\nNotes:\\n${JSON.stringify(notes)}`,\n    { schema: args.planSchema, phase: 'Plans' })))\n\nphase('Judge')\nconst plan = await agent(\n  `Pick the plan a reviewer and a tester would trust most; graft good ideas from the others. Return the final plan.\\n${JSON.stringify(plans.filter(Boolean))}`,\n  { schema: args.planSchema, effort: 'medium', phase: 'Judge' })\nreturn { notes, plan }"
+  }
+ },
+ {
+  "key": "G4-10",
+  "title": "[BE] TICKET-BENCH: curate 40 tasks and prove each hidden test",
+  "team": [
+   "be",
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-02",
+   "G4-03"
+  ],
+  "needs": "FCP Lab in the sandbox image (G3, G7) for the e2e-based FE tasks",
+  "what": "Pick 40 tasks from the candidates (35 typical ones across the kinds and 5 big multi-file cases), clean each ticket text, and prove each task's hidden tests fail on the base commit and pass with the merged fix.",
+  "why": "A task whose tests pass without the fix, or fail with it, only measures noise. BE engineers know which past tickets were clear and which tests really check the change.",
+  "how": [
+   "Pick by kind, e.g. 12 fe_bug, 9 be_bug, 6 add_tests, 5 small_feature, 3 dependency_bump, plus 5 multi_file cases. Prefer unit-level hidden tests (vitest, the Django runner); keep e2e ones to FE page flows that run on FCP Lab seed data.",
+   "Clean instruction.md: keep the ticket as people wrote it (that is the point), remove links to the PR, follow rnd-kb's DATA-SCOPE.md rules (no customer-identifying data).",
+   "For each task run Harbor with the nop agent (must score 0) and the oracle agent (must score 1). Fix or drop any task that fails either.",
+   "tests/test.sh (below) also runs the existing tests next to the change, so a \"fix\" that breaks its neighbours scores 0. convert.py writes /tests/base_sha and /tests/neighbour_modules.",
+   "Mark 15 tasks smoke = true, spread across the kinds.",
+   "Record per task: kind, size, whether the hidden test reads what the user sees, and who curated it, in tasks/INDEX.md in the restricted repo."
+  ],
+  "code": {
+   "file": "tasks/<task>/tests/test.sh (restricted golden-set repo)",
+   "lang": "bash",
+   "text": "#!/usr/bin/env bash\n# tasks/<task>/tests/test.sh — grades one TICKET-BENCH task. Harbor copies tests/ in only after the agent has finished.\n# Reward 1 only if the PR's own tests pass AND the existing tests next to the change still pass.\nset -uo pipefail\ncd /work/fcp\nBASE_SHA=\"$(cat /tests/base_sha)\"                 # written by convert.py\n\ncp -R /tests/hidden/. .                           # the PR's tests at their real paths; overwrites any edits to them\nstatus=0\n\nfe_tests=$(cd /tests/hidden && find frontend -name '*.test.*' 2>/dev/null | sed 's|^frontend/||')\nif [ -n \"$fe_tests\" ]; then\n  (cd frontend && npx vitest --run $fe_tests) || status=1\n  (cd frontend && npx vitest --run --changed \"$BASE_SHA\") || status=1      # tests related to the changed files\nfi\n\nbe_modules=$(cd /tests/hidden && find cloud -name 'test_*.py' 2>/dev/null | sed -e 's|^cloud/||' -e 's|\\.py$||' -e 's|/|.|g')\nif [ -n \"$be_modules\" ]; then\n  ./scripts/local_run_backend_unit_tests.sh cloud $be_modules || status=1\n  ./scripts/local_run_backend_unit_tests.sh cloud $(cat /tests/neighbour_modules) || status=1   # e.g. rhinoCloud.rhinoCore.tests.services\nfi\n# client/ tasks: the same with `local_run_backend_unit_tests.sh client`\n\nmkdir -p /logs/verifier\nif [ \"$status\" -eq 0 ]; then echo 1 > /logs/verifier/reward.txt; else echo 0 > /logs/verifier/reward.txt; fi"
+  }
+ },
+ {
+  "key": "G4-11",
+  "title": "[Platform] Live ticket status: one edited comment and a Nova state field",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-04"
+  ],
+  "needs": "A Jira site admin creates the field; G3 broker Jira scope and Slack app (status in the thread); G3 outages (Slack ↔ Jira fallback)",
+  "what": "Each ticket gets one Nova status comment that is edited in place as the run moves, and a \"Nova state\" field (Checking → Planning → Awaiting approval → Working → PR open, or Needs info / Stopped) for boards and filters.",
+  "why": "People should see where a ticket is without opening Slack or getting a new comment every few minutes. The field also gives the weekly review and a Jira board something to count.",
+  "how": [
+   "Ask a Jira site admin for a single-select custom field \"Nova state\" on the RH screens with the 7 options. Put its customfield id in ai-agents/orchestrator/src/jira-fields.ts.",
+   "Add ai-agents/orchestrator/src/activities/status.ts (below). The first call creates the comment and the workflow keeps its id (it survives restarts); later calls edit it with PUT .../comment/{id}?notifyUsers=false.",
+   "Notify people only for states that need them: Awaiting approval, Needs info, PR open. Field edits also notify watchers, and notifyUsers=false on issue edits needs admin rights; ask the admin for that, or accept one notification per state change.",
+   "Keep one fixed shape: the state, one plain line on what Nova is doing, links to the plan, the Slack thread and the trace, and the time of the last update.",
+   "Call setStatus from ticketToPr at every state change (G3 workflow) and post the same line in the ticket's Slack thread. If Jira is down, Slack only, and the other way round (G3 outages)."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/activities/status.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/activities/status.ts — one status comment per ticket, edited in place.\nimport { JiraClient } from \"@rhinohealth/ai-agents-shared\";\nimport { NOVA_STATE_FIELD } from \"../jira-fields.js\";  // \"customfield_XXXXX\": id from the Jira admin; not known yet\n\nexport type NovaState = \"Checking\" | \"Planning\" | \"Awaiting approval\" | \"Working\" | \"PR open\" | \"Needs info\" | \"Stopped\";\nconst NOTIFY = new Set<NovaState>([\"Awaiting approval\", \"Needs info\", \"PR open\"]);  // only the states that need a person\n\nexport interface Status {\n  key: string;\n  state: NovaState;\n  doing: string;  // one plain line: \"Writing the QA checks as tests\"\n  links: Record<string, string>;  // plan, slack thread, trace\n  commentId?: string;  // kept in workflow state\n}\n\nfunction adf(s: Status) {\n  const text = `Nova: ${s.state}. ${s.doing}  ` + Object.entries(s.links).map(([k, v]) => `${k}: ${v}`).join(\" · \");\n  return { type: \"doc\", version: 1, content: [{ type: \"paragraph\", content: [{ type: \"text\", text }] }] };\n}\n\nexport async function setStatus(s: Status): Promise<string> {\n  const jira = JiraClient.fromEnv();\n  await jira.updateIssue(s.key, { [NOVA_STATE_FIELD]: { value: s.state } });\n  if (s.commentId === undefined) return jira.addComment(s.key, adf(s));  // returns the new comment id\n  await jira.editComment(s.key, s.commentId, adf(s), { notifyUsers: NOTIFY.has(s.state) });\n  return s.commentId;\n}"
+  }
+ },
+ {
+  "key": "G4-12",
+  "title": "[Platform] Grill step: ask the requester open questions before planning",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-06",
+   "G4-11"
+  ],
+  "needs": "G3 waiting on people (reminders and parking) and Slack question threads; G8 plan-and-grill skill",
+  "what": "For bigger or fuzzy tickets, and whenever the readiness check says \"ask\", Nova posts its open questions to the requester in Jira and Slack and waits for answers before planning. No VM runs while it waits.",
+  "why": "Asking before planning is cheap and avoids plans built on guesses. A clear small fix skips this step, so it costs nothing where it doesn't help.",
+  "how": [
+   "Add the grill block (below) to G3's ticketToPr in ai-agents/orchestrator/src/workflows/ticket-to-pr.ts, right after readiness. It is workflow code, so it stays deterministic: no Node APIs and no fetch; model calls and Jira or Slack posts are activities (checkReadiness, writeGrillQuestions, postQuestions, recordAnswers, handBack).",
+   "For bigger or fuzzy tickets, write the questions with Opus 5.5 at medium from the ticket text and the plan-and-grill skill's \"how to ask\" part: specific, answerable, at most 5, each with Nova's default guess. No VM, no repo.",
+   "Post them as one Jira comment that mentions the requester, and in the ticket's Slack thread. Nova state: Needs info.",
+   "Answers come back as the answerQuestion signal from either place (G4-05 for Jira, G3's Slack app for Slack). Nova writes a short summary of the answers on the ticket, so the ticket stays the source of truth.",
+   "Run readiness again with the answers. If it's still unclear, ask once more; a question that keeps coming back is flagged to the requester, not looped on.",
+   "Reminders and parking come from G3: a reminder after 1 day, parked with a note after 2 days."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (grill block)",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/workflows/ticket-to-pr.ts — the grill block inside G3's ticketToPr (G3 owns the rest).\n// Workflow code: deterministic, no Node APIs, no fetch. Handoff, RunState: @rhinohealth/ai-agents-shared (G3-24); setState, flagToRequester: small helpers here.\nimport { proxyActivities } from \"@temporalio/workflow\";\nimport type * as activities from \"../activities/index.js\";\nimport type { Readiness } from \"../activities/readiness.js\";\nimport { waitForPerson } from \"../waiting.js\";  // G3: remind after 1 day, park after 2\nimport { LONG } from \"../policies.js\";  // G3-29: a 7-day safety net and 2-minute heartbeats, never a work limit\n\nconst { checkReadiness } = proxyActivities<typeof activities>({ startToCloseTimeout: \"5 minutes\" });\nconst { writeGrillQuestions } = proxyActivities<typeof activities>(LONG);  // an Opus session: never cut off\nconst { handBack, postQuestions, recordAnswers } = proxyActivities<typeof activities>({ startToCloseTimeout: \"2 minutes\" });\n\nasync function readinessAndGrill(h: Handoff, run: RunState): Promise<Readiness | undefined> {\n  let r = await checkReadiness(h.key);\n  if (r.verdict === \"hand_back\") {\n    await handBack(h.key, h.requester, r.reason);\n    return undefined;\n  }\n  let rounds = 0;\n  while (r.verdict === \"ask\" || (r.size !== \"small\" && rounds === 0)) {\n    const questions = r.questions.length ? r.questions : await writeGrillQuestions(h.key);  // Opus 5.5 medium, no VM\n    if (!questions.length) break;\n    await setState(run, \"Needs info\", `${questions.length} questions for the requester`);\n    run.answer = undefined;  // before posting, so a quick answer is not lost; the answerQuestion signal (G3) sets it\n    await postQuestions(h.key, h.requester, questions);\n    if (!(await waitForPerson(run, \"question\", () => run.answer !== undefined, h))) return undefined;  // parked or stopped\n    await recordAnswers(h.key, questions, run.answer!);\n    r = await checkReadiness(h.key);\n    rounds += 1;\n    if (rounds === 2 && r.verdict === \"ask\") {\n      await flagToRequester(run, \"The same questions are still open. Please edit the ticket or reply.\");\n      break;\n    }\n  }\n  return r;\n}"
+  }
+ },
+ {
+  "key": "G4-13",
+  "title": "[Platform] QA agent: co-sign the QA plan before any code is written",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-07"
+  ],
+  "needs": "",
+  "what": "Before the plan is posted, a separate QA agent reads only the ticket and the QA plan, and either signs it or asks for specific changes: a missing edge case, a check nobody can observe, a missing screen state, the wrong proof.",
+  "why": "Builder and tester should agree on \"done\" before the work starts. A tester who never saw Nova's reasoning catches checks that would still pass on a broken build.",
+  "how": [
+   "Add cosign() to ai-agents/harness/src/qa.ts (below): its own query() session on Sonnet 5.5 at medium, structured output from a zod schema, no tools. Input: the ticket text, qa_plan and screen_states only; not the rest of the plan, not Nova's notes.",
+   "Nova revises the plan once with the QA agent's changes. If they still disagree, both views go into the plan message and the requester decides (G4-14).",
+   "Store the signature (model, time, changes made) in plan.json; the plan message shows \"co-signed by the QA agent\".",
+   "Seed ai-agents/harness/prompts/qa-cosign.md with 4 examples of weak QA plans: no edge case, checks that read class names, \"the page loads\" as a check, a UI change with no error state."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/qa.ts (cosign)",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/qa.ts (part 1) — the QA agent co-signs the QA plan. It sees the ticket and the checks, nothing else.\nimport { readFile } from \"node:fs/promises\";\nimport { query } from \"@anthropic-ai/claude-agent-sdk/core\";\nimport { z } from \"zod\";\n\nconst PROBLEMS = [\"not_observable\", \"no_edge_case\", \"missing_screen_state\", \"reads_implementation\", \"wrong_proof\",\n  \"not_the_ticket\"] as const;\nexport const Cosign = z.object({\n  sign: z.boolean(),\n  changes: z.array(z.object({\n    check: z.string(),  // \"QA-2\", or \"new\" for a missing check\n    problem: z.enum(PROBLEMS),\n    suggestion: z.string(),\n  })),\n});\nexport type Cosign = z.infer<typeof Cosign>;\n\nexport async function cosign(ticketText: string, qaPlanJson: string): Promise<Cosign> {\n  const prompt = `Ticket:\\n${ticketText}\\n\\nProposed QA plan:\\n${qaPlanJson}\\n\\nWould these checks fail on a broken build?`;\n  for await (const msg of query({ prompt, options: {\n    model: \"claude-sonnet-5-5\", effort: \"medium\", tools: [], settingSources: [],  // its own session, not a Nova subagent\n    systemPrompt: await readFile(new URL(\"../prompts/qa-cosign.md\", import.meta.url), \"utf8\"),  // goals + 4 weak-plan examples\n    outputFormat: { type: \"json_schema\", schema: z.toJSONSchema(Cosign) },\n  } })) {\n    if (msg.type === \"result\" && msg.subtype === \"success\") return Cosign.parse(msg.structured_output);\n  }\n  throw new Error(\"the QA agent returned no co-sign result\");\n}"
+  }
+ },
+ {
+  "key": "G4-14",
+  "title": "[Platform] Plan approval in Jira and Slack: Approve / Change / Stop",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-07",
+   "G4-13",
+   "G4-11"
+  ],
+  "needs": "G3 Slack app (buttons, modals) and the ticketToPr decidePlan signal; G3 waiting on people (reminder 1 day, park 3 days)",
+  "what": "Post the plan (definition of done, the QA plan co-signed by the QA agent, files, estimate, risk) as a Jira comment and a Slack message with Approve, Change and Stop buttons. Only the requester's decision counts.",
+  "why": "A person approves the plan before any code is written. The requester approves \"done\" and the QA plan together, so the checks Nova will be judged by are agreed up front.",
+  "how": [
+   "Add ai-agents/harness/src/plan-render.ts: Plan → Jira ADF and Slack Block Kit (below). Keep it to one screen (done, checks, files, estimate, risk) and link the full plan.",
+   "The G3 Slack app handles action_ids plan_approve, plan_change and plan_stop. Approve and Stop count only from the requester (Slack ID from config/people.yaml); anyone else gets an ephemeral \"only <requester> can decide this plan\".",
+   "Change opens a modal for free text; the planner gets it and posts plan v2. The button value carries the plan version, so an old button can't approve a newer plan.",
+   "In Jira, \"@Nova approve\", \"@Nova change <text>\" and \"@Nova stop\" (G4-05) do the same.",
+   "Nova state is Awaiting approval while it waits. On approve, the workflow claims a full VM at once (G3: claim early) and moves to Working."
+  ],
+  "code": {
+   "file": "slack: plan message blocks (built by ai-agents/harness/src/plan-render.ts)",
+   "lang": "json",
+   "text": "{\n  \"text\": \"RH-1234: plan v2 is ready for your OK\",\n  \"blocks\": [\n    { \"type\": \"header\", \"text\": { \"type\": \"plain_text\", \"text\": \"RH-1234 · plan v2 for your OK\" } },\n    { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*Done means:* a workgroup with no projects shows \\\"No projects yet\\\" in the projects table.\" } },\n    { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*QA plan* (co-signed by the QA agent)\\n1. Empty workgroup → \\\"No projects yet\\\" card (video)\\n2. Filter with no match → \\\"No results\\\" card, not the empty card (video)\\n3. _Edge:_ 1,000 projects → first page shows 25 rows (test output)\" } },\n    { \"type\": \"context\", \"elements\": [ { \"type\": \"mrkdwn\", \"text\": \"3 files · ~70 min (Nova's estimate, not a limit) · risk: low · full VM · Opus 5.5 medium · <https://rhino-fcp.atlassian.net/browse/RH-1234|full plan>\" } ] },\n    { \"type\": \"actions\", \"block_id\": \"plan_decision\", \"elements\": [\n      { \"type\": \"button\", \"action_id\": \"plan_approve\", \"style\": \"primary\", \"value\": \"nova:RH-1234|v2\",\n        \"text\": { \"type\": \"plain_text\", \"text\": \"Approve\" } },\n      { \"type\": \"button\", \"action_id\": \"plan_change\", \"value\": \"nova:RH-1234|v2\",\n        \"text\": { \"type\": \"plain_text\", \"text\": \"Change\" } },\n      { \"type\": \"button\", \"action_id\": \"plan_stop\", \"style\": \"danger\", \"value\": \"nova:RH-1234|v2\",\n        \"text\": { \"type\": \"plain_text\", \"text\": \"Stop\" },\n        \"confirm\": { \"title\": { \"type\": \"plain_text\", \"text\": \"Stop Nova on RH-1234?\" },\n                     \"text\": { \"type\": \"plain_text\", \"text\": \"The branch and notes are kept.\" },\n                     \"confirm\": { \"type\": \"plain_text\", \"text\": \"Stop\" },\n                     \"deny\": { \"type\": \"plain_text\", \"text\": \"Keep going\" } } }\n    ] }\n  ]\n}"
+  }
+ },
+ {
+  "key": "G4-15",
+  "title": "[Platform] Check selection: Nova picks its checks and records why",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-08",
+   "G4-07"
+  ],
+  "needs": "FCP Lab (G0 moves it into the org, G7 runs it on Linux) and the fcp-lab skill (G8); G3 Stop hook (proof before done)",
+  "what": "Give Nova a small helper that suggests starting checks and services from the changed paths, and a record (.nova/checks.json) where Nova writes what it ran, why, and what it chose not to check. The PR's checks table is built from it.",
+  "why": "Nova should start the right checks without booting the whole app for a copy change, and the reviewer should see its reasons so they can disagree.",
+  "how": [
+   "Add ai-agents/harness/src/checks.ts (below). suggestStart() only suggests; Nova reads the checking guide and decides. Nothing stops Nova from adding a check.",
+   "Services: fcp's compose files have no profiles today. Use FCP Lab's way of starting part of the stack (the fcp-lab skill: \"start only the services needed\"). If FCP Lab can't, a person adds compose profiles in a small fcp PR agreed with the BE guild.",
+   "Nova writes every check it ran (command, result, why, proof) and every check it skipped with a reason (\"no visible change, so no browser run\").",
+   "G3's Stop hook (proof before \"done\") reads checks.json: every QA check in the plan needs a result and proof.",
+   "Ask G8 to add one line to the verify skill: \"record your choices in .nova/checks.json\"."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/checks.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/checks.ts — suggestions, and the record behind the PR's checks table (.nova/checks.json).\nimport { z } from \"zod\";\n\nexport const CheckRun = z.object({\n  name: z.string(),  // \"vitest related\", \"e2e/pr/projects-table-empty-state.spec.ts\"\n  command: z.string(),\n  result: z.enum([\"pass\", \"fail\", \"fails_on_main_too\", \"not_run\"]),\n  why: z.string(),  // one line for the reviewer\n  proof: z.string().nullish(),  // S3 key of the output, video or trace\n  qa_check: z.string().nullish(),  // \"QA-2\" when it proves a QA plan check\n});\nexport const ChecksRecord = z.object({\n  kind: z.string(),  // from readiness: fe_bug, be_bug, ...\n  services_started: z.array(z.string()),  // [] for a lint-only change\n  ran: z.array(CheckRun),\n  skipped: z.array(z.tuple([z.string(), z.string()])),  // [check, reason]\n});\n\n/** A starting point from the checking guide. Nova decides; this never blocks or forces a check. */\nexport function suggestStart(changed: string[]): { checks: string[]; services: string[] } {\n  const fe = changed.filter((p) => p.startsWith(\"frontend/src/\"));\n  const be = changed.filter((p) => p.startsWith(\"cloud/\") || p.startsWith(\"client/\"));\n  const checks: string[] = [];\n  const services: string[] = [];\n  if (fe.length) {\n    checks.push(\"npm run lint\", \"npm run check-types\", \"npx vitest --run --changed origin/main\");\n    if (fe.some((p) => p.startsWith(\"frontend/src/app/\"))) {\n      checks.push(\"the Playwright spec for this flow (frontend/e2e/pr/)\");\n      services.push(\"postgres-service\", \"web-service\", \"redis\");  // cloud/rhinoCloud/docker-compose.yml names\n    }\n  }\n  if (be.length) checks.push(\"pre-commit run --files <changed>\", \"./scripts/local_run_backend_unit_tests.sh cloud <module path>\");\n  return { checks, services };\n}"
+  }
+ },
+ {
+  "key": "G4-16",
+  "title": "[Platform] Checks first: QA checks become failing tests, then locked",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-07",
+   "G4-13"
+  ],
+  "needs": "G0 locked checks (CI flags edits to existing tests); G3 harness hooks and Stop hook",
+  "what": "After the plan is approved, Nova writes the QA checks as tests before any code, shows each one failing for the right reason, and the harness locks them: Nova can add tests but can't change the ones it is judged by.",
+  "why": "A test written after the code tends to test what the code does, not what the ticket asked. Showing it fail first proves it can fail, and the lock is the wall that stops an agent from weakening its own checks.",
+  "how": [
+   "Nova writes one test per QA check at the level the plan names: vitest in frontend/test/unit/; a Playwright spec in frontend/e2e/pr/ using page objects in e2e/pages/ and Given / When / Then test.step names; or a Django test with factory_boy factories on CommonRhinoTestCase. Tests read test IDs, ARIA roles, visible text and row counts.",
+   "The harness (not the model) runs them on the unchanged code. Each must fail on an assertion, not on an import or syntax error. That run is saved as the \"before\" evidence.",
+   "ai-agents/harness/src/hooks/locked-checks.ts (below) then stores a sha256 of each test file in /work/.nova/locked.json, outside the checkout.",
+   "A PreToolUse hook on Edit|Write denies edits to locked files with a calm reason. The Stop hook re-hashes them, so an edit through Bash (sed -i) is caught too. G0's CI check and the scope judge (G4-17) are the outer layers.",
+   "If the QA plan itself was wrong, Nova asks the requester to change it (plan v+1); the new approval unlocks and re-locks."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/hooks/locked-checks.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/hooks/locked-checks.ts — a wall: Nova may add tests, not change the ones it is judged by.\nimport { createHash } from \"node:crypto\";\nimport { existsSync, readFileSync, writeFileSync } from \"node:fs\";\nimport { relative, resolve } from \"node:path\";\nimport type { HookCallback } from \"@anthropic-ai/claude-agent-sdk/core\";\n\nconst REPO = \"/work/fcp\";\nconst LOCK = \"/work/.nova/locked.json\";  // outside the checkout; path per G3's harness layout\n\nconst digest = (rel: string) => createHash(\"sha256\").update(readFileSync(resolve(REPO, rel))).digest(\"hex\");\nconst locked = (): Record<string, string> => (existsSync(LOCK) ? JSON.parse(readFileSync(LOCK, \"utf8\")) : {});\n\n/** Called by the harness once every QA test was shown failing on the unchanged code. */\nexport function lock(testFiles: string[]): void {\n  writeFileSync(LOCK, JSON.stringify(Object.fromEntries(testFiles.map((rel) => [rel, digest(rel)]))));\n}\n\nexport const denyLockedEdits: HookCallback = async (input) => {  // PreToolUse, matcher \"Edit|Write\"\n  if (input.hook_event_name !== \"PreToolUse\") return {};\n  const path = (input.tool_input as { file_path?: string }).file_path;\n  if (!path || !Object.hasOwn(locked(), relative(REPO, resolve(path)))) return {};\n  return { hookSpecificOutput: {\n    hookEventName: \"PreToolUse\",\n    permissionDecision: \"deny\",\n    permissionDecisionReason: \"This test is a locked QA check for this ticket. Add a new test instead, \" +\n      \"or ask the requester to change the QA plan.\",\n  } };\n};\n\n/** For the Stop hook: catches edits made through Bash too. */\nexport function changedLockedFiles(): string[] {\n  const changed = (rel: string, d: string) => !existsSync(resolve(REPO, rel)) || digest(rel) !== d;\n  return Object.entries(locked()).filter(([rel, d]) => changed(rel, d)).map(([rel]) => rel);\n}"
+  }
+ },
+ {
+  "key": "G4-17",
+  "title": "[Platform] Scope judge: ticket and diff only; veto unrelated changes",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G3 harness; G0 locked checks",
+  "what": "A judge that sees only the ticket text and the final diff, and can veto unrelated refactors and weakened tests before the PR leaves draft.",
+  "why": "Agents drift: they tidy nearby code or loosen a test to get green. A judge without Nova's reasoning keeps PRs to the ticket. Spotify's judge vetoes about 25% of sessions and the agent recovers about half of them.",
+  "how": [
+   "Add ai-agents/harness/src/judges/scope.ts (below). Sonnet 5.5 at medium (a rubric judge) in its own query() session, structured output from a zod schema, no tools. Input: the ticket text, `git diff origin/main...HEAD`, and a mechanical list of test changes (removed assertions, .skip / .only, @skip, longer timeouts, removed test cases).",
+   "On a veto, Nova gets the reasons and either reverts the unrelated change or explains why the ticket needs it; the explanation goes into the PR. A second veto on the same item goes to a person instead of another round.",
+   "A weakened test is never explained away: Nova restores it (the wall from G0 and G4-16).",
+   "Check the judge against people's labels first: 20 diffs from TICKET-BENCH runs plus 10 with a planted unrelated refactor or a loosened assertion.",
+   "Track the veto rate in the weekly review (G4-29). Spotify's 25% is a reference, not a target."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/judges/scope.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/judges/scope.ts — sees ONLY the ticket and the diff. Never the plan, the transcript or Nova's notes.\nimport { query } from \"@anthropic-ai/claude-agent-sdk/core\";\nimport { z } from \"zod\";\nimport { testChanges } from \"./test-changes.js\";  // mechanical: removed assertions, .skip/.only, @skip, longer timeouts\n\nconst SCOPE_PROMPT = `You review a pull request for scope, as a careful reviewer from another team would.\nYou get the ticket and the diff, nothing else. Decide whether every change serves the ticket.\n\nVeto when you see:\n- a change the ticket does not need: refactors, renames, reformatting or \"while I was here\" fixes in other code;\n- a test made weaker: removed or loosened assertions, skipped tests, longer timeouts, fewer cases, lower thresholds.\n\nSmall supporting changes the ticket clearly needs are fine (a new test ID, a helper the fix uses, a type).\nWhen you are unsure, say so in the note and pass. Cite the file and lines for every item.`;\n\nconst Item = z.object({ path: z.string(), lines: z.string(), why: z.string() });\nexport const ScopeVerdict = z.object({\n  verdict: z.enum([\"pass\", \"veto\"]), unrelated: z.array(Item), weakened_tests: z.array(Item), note: z.string(),\n});\nexport type ScopeVerdict = z.infer<typeof ScopeVerdict>;\n\nexport async function scopeJudge(ticket: string, diff: string): Promise<ScopeVerdict> {\n  const prompt = `Ticket:\\n${ticket}\\n\\nDiff:\\n${diff}\\n\\nTest changes:\\n${testChanges(diff)}`;\n  for await (const msg of query({ prompt, options: {\n    model: \"claude-sonnet-5-5\", effort: \"medium\", tools: [], settingSources: [],  // a rubric judge in its own session\n    systemPrompt: SCOPE_PROMPT,\n    outputFormat: { type: \"json_schema\", schema: z.toJSONSchema(ScopeVerdict) },\n  } })) {\n    if (msg.type === \"result\" && msg.subtype === \"success\") return ScopeVerdict.parse(msg.structured_output);\n  }\n  throw new Error(\"the scope judge returned no verdict\");\n}"
+  }
+ },
+ {
+  "key": "G4-18",
+  "title": "[Platform] Self-review: a fresh-context reviewer subagent with a receipt",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-07"
+  ],
+  "needs": "Byte's lens playbooks (RhinoHealth/byte skills/fe/references/passes and skills/be) baked into the image (G3)",
+  "what": "A reviewer with a fresh context reads the diff, the ticket and the approved plan (to check scope against the plan), and returns findings with a severity. Nova fixes what it agrees with, and every finding is saved for the PR's receipt.",
+  "why": "Models grade their own work too kindly. A reviewer that never saw Nova's reasoning finds more, and the receipt (\"found 6 · fixed 5 · left 1, because …\") tells the human reviewer what was already looked at.",
+  "how": [
+   "Add ai-agents/harness/src/review.ts (below). The harness starts the reviewer in its own query() session with a fixed prompt, not as a subagent through Nova's Agent tool, so Nova can't pass its reasoning along.",
+   "The harness writes the diff to /run/nova/review/diff.patch and the reviewer gets only Read, Grep and Glob, so it can't change anything. No Bash: `git diff --no-index` or `--output=` would let it read or write outside the repo, which Byte's engines.ts warns about too.",
+   "Reuse Byte's lenses so Nova and Byte look for the same things: skills/fe/references/passes/{convention,logic,security,performance}.md and skills/be/SKILL.md from RhinoHealth/byte, baked into the image.",
+   "Model per the routing table: Opus 5.5 at medium for logic and security; a second pass on Sonnet 5.5 at low for conventions when the diff is big enough to be worth it.",
+   "\"Important\" means correctness, security, a missed requirement, a plan item not done, or a change the plan didn't ask for. Reviewers don't list every possible improvement.",
+   "The harness adds a fingerprint per finding (sha1 of path, rule and the normalised message) and appends it to .nova/review.jsonl for the receipt and the loop (G4-23)."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/review.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/review.ts — the self-review reviewer. Its own query() session with a fixed prompt: it sees\n// the ticket, the approved plan and the diff, never Nova's transcript or notes.\nimport { execFile } from \"node:child_process\";\nimport { writeFile } from \"node:fs/promises\";\nimport { promisify } from \"node:util\";\nimport { query } from \"@anthropic-ai/claude-agent-sdk/core\";\nimport { z } from \"zod\";\n\nconst LENSES = \"/opt/ai-agents/byte-playbooks\";  // Byte's lens files, baked into the image\n\nexport const Finding = z.object({\n  path: z.string(), line: z.number().int(), rule: z.string(), severity: z.enum([\"important\", \"nit\"]), body: z.string(),\n});\nexport type Finding = z.infer<typeof Finding>;\nconst Findings = z.object({ findings: z.array(Finding) });\n\nconst PROMPT = `You review a change you did not write. Read the ticket, the approved plan and the diff in /run/nova/review/diff.patch.\nUse the lenses in ${LENSES}. Report what matters: bugs, security problems, a requirement or plan item that is missing,\nand changes the plan did not ask for. Mark each finding important or nit, with path and line.\nDon't list every possible improvement. No findings is a fine answer for a clean diff.`;\n\nexport async function reviewOnce(ticket: string, planMd: string): Promise<Finding[]> {\n  const { stdout } = await promisify(execFile)(\"git\", [\"diff\", \"origin/main...HEAD\"], { cwd: \"/work/fcp\", maxBuffer: 64 << 20 });\n  await writeFile(\"/run/nova/review/diff.patch\", stdout);  // the harness runs git; the reviewer only reads\n  const prompt = `Ticket:\\n${ticket}\\n\\nApproved plan:\\n${planMd}`;\n  for await (const msg of query({ prompt, options: {\n    model: \"claude-opus-5-5\", effort: \"medium\",  // logic and security, per the routing table\n    cwd: \"/work/fcp\", settingSources: [\"project\"],  // repo conventions (frontend/AGENTS.md) still apply\n    systemPrompt: PROMPT,\n    allowedTools: [\"Read\", \"Grep\", \"Glob\"],  // no Bash: git diff --no-index or --output= could read or write outside the repo\n    disallowedTools: [\"Bash\", \"Edit\", \"Write\", \"NotebookEdit\", \"WebFetch\", \"WebSearch\"],\n    permissionMode: \"dontAsk\",  // anything not allowed above is refused\n    additionalDirectories: [LENSES, \"/run/nova/review\"],\n    outputFormat: { type: \"json_schema\", schema: z.toJSONSchema(Findings) },\n  } })) {\n    if (msg.type === \"result\" && msg.subtype === \"success\") return Findings.parse(msg.structured_output).findings;\n  }\n  throw new Error(\"the reviewer returned no result\");  // the harness adds fingerprints and saves to .nova/review.jsonl\n}"
+  }
+ },
+ {
+  "key": "G4-19",
+  "title": "[Platform] Review panel workflow for bigger diffs, and when to use it",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-01",
+   "G4-18"
+  ],
+  "needs": "Byte's lens playbooks; G8 plan-and-grill skill (the \"when to fan out\" lines); G2's Byte panel uses the same pattern later",
+  "what": "A saved review workflow for bigger changes (several lenses in parallel, then a skeptic per finding who tries to refute it), and a short skill section on when a workflow is worth it and how big.",
+  "why": "On large diffs one reviewer misses things; a panel with a skeptic per finding finds more and cries wolf less. On small diffs it only adds cost, so Nova needs a clear sense of when to use it.",
+  "how": [
+   "Add ai-agents/harness/workflows/nova-review-panel.js (below; plain JavaScript), saved in ~/.claude/workflows/ in the image like nova-research.",
+   "Run the panel from G4-18's read-only reviewer session (Read, Grep, Glob and Workflow), not from Nova's: workflow agents use their session's tools, so the lenses and skeptics can't edit anything. The harness writes the diff to /run/nova/review/diff.patch first.",
+   "Lenses: correctness, security, conventions, plan coverage (is every plan item and QA check done?), tests (do they read what the user sees, and could they fail?). A skeptic must show the problem at file:line or the finding is dropped.",
+   "Models: lenses and skeptics inherit Opus 5.5; the conventions lens runs on Sonnet 5.5 at low.",
+   "Write \"when to fan out\" for G8's plan-and-grill skill: the panel for diffs over ~300 changed lines, 8+ files, or a risky area; one reviewer otherwise. Workflow size \"small\" (under 5 agents per step) by default; the plan says why and roughly how big.",
+   "The VM's CPUs bound how many agents run at once (CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS: 3 lite, 6 full, 12 wide). A workflow can't start new runs.",
+   "Try it on the 5 big TICKET-BENCH cases: keep it only if it finds real issues the single reviewer missed without more false alarms."
+  ],
+  "code": {
+   "file": "ai-agents/harness/workflows/nova-review-panel.js",
+   "lang": "javascript",
+   "text": "// ai-agents/harness/workflows/nova-review-panel.js — Nova's review of a bigger diff: lenses → findings → a skeptic per finding.\nexport const meta = {\n  name: 'nova-review-panel',\n  description: 'Review a bigger diff through several lenses, then try to refute each important finding',\n  phases: [{ title: 'Lenses' }, { title: 'Skeptics' }],\n}\n\nconst FINDINGS = { type: 'object', required: ['findings'], properties: { findings: { type: 'array', items: {\n  type: 'object', required: ['path', 'line', 'severity', 'rule', 'body'],\n  properties: { path: { type: 'string' }, line: { type: 'integer' }, severity: { enum: ['important', 'nit'] },\n    rule: { type: 'string' }, body: { type: 'string' } } } } } }\nconst VERDICT = { type: 'object', required: ['refuted', 'evidence'],\n  properties: { refuted: { type: 'boolean' }, evidence: { type: 'string' } } }\n\nconst LENSES = [\n  { name: 'correctness', opts: {} },\n  { name: 'security', opts: {} },\n  { name: 'conventions (frontend/AGENTS.md and the Byte playbook)', opts: { model: 'sonnet', effort: 'low' } },\n  { name: 'plan coverage: is every plan item and QA check done?', opts: {} },\n  { name: 'tests: do they read what the user sees, and could they fail?', opts: {} },\n]\n\nconst reviewed = await pipeline(LENSES,\n  (lens) => agent(`Review the diff in /run/nova/review/diff.patch through the ${lens.name} lens.\\nTicket:\\n${args.ticket}`,\n    { schema: FINDINGS, phase: 'Lenses', ...lens.opts }),\n  (found) => parallel((found?.findings ?? []).filter((f) => f.severity === 'important').map((f) => () =>\n    agent(`Try to refute this finding. Read the code at ${f.path}:${f.line}. If you cannot show the problem, refuted=true.\\n${f.body}`,\n      { schema: VERDICT, phase: 'Skeptics' }).then((v) => (v && !v.refuted ? { ...f, evidence: v.evidence } : null)))))\n\nconst kept = reviewed.flat().filter(Boolean)\nlog(`${kept.length} important findings survived the skeptics`)\nreturn { findings: kept }"
+  }
+ },
+ {
+  "key": "G4-20",
+  "title": "[Platform] Evidence pack and PR body from the pr-story template",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-15",
+   "G4-16",
+   "G4-18"
+  ],
+  "needs": "G8 pr-story skill and the updated fcp PR template; G0 independent-approval check (reads Requested-by:); G3 artifacts in S3",
+  "what": "Collect the run's proof (before and after test runs, a short video per UI check, the checks table, the receipt, the trace link, harness suggestions) into an evidence pack in S3, and render the PR body with the pr-story headings.",
+  "why": "Reviewers should see proof, not claims, in the same place on every PR. The same headings every time mean anyone, from any team, knows where to look.",
+  "how": [
+   "Add ai-agents/harness/src/pr-body.ts (below). It reads .nova/plan.json, checks.json, qa_results.json, receipt.json and the trace URL. Above the fold stays under ~300 words; long output is linked, never pasted.",
+   "Headings follow G8's pr-story template, which replaces fcp's 4-section .github/pull_request_template.md (G8 does that with the guilds) instead of adding a second template. Keep \"### References\" with the Jira link so add-jira-links.yml finds it and leaves the body alone.",
+   "Always end with \"Requested-by: @<github login>\" (from config/people.yaml); G0's independent-approval check reads it.",
+   "Media only where the QA plan asked: a video of 30 s or less for flows, screenshots at 760 and 1440 for layout, text for API and CLI output; each labelled with its check. Seed data only, never pictures of code or logs.",
+   "Decide how media gets into the PR: GitHub has no API for PR attachments, so use links to the evidence bucket through a small authenticated viewer (decide with DevOps; no public bucket).",
+   "Post a short Jira comment in the same voice: status, PR link, what was found."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/pr-body.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/pr-body.ts — renders the PR body from the evidence pack with the pr-story headings (G8).\nimport type { Evidence } from \"./evidence.js\";  // plan, checks, QA results, receipt, links; loaded from .nova/ and S3\nconst lines = (items: Iterable<string>) => [...items].map((i) => `- ${i}`).join(\"\\n\") || \"- None.\";\n\nexport function render(ev: Evidence): string {\n  const checks = ev.qaResults.map((c) => c.tableRow()).join(\"\\n\");  // \"| QA-1: <user sees> | pass | <video link> |\"\n  return `### What changes\n${ev.whatChanges}\n### Why\n${ev.jiraKey}: ${ev.ticketTitle}. Root cause: ${ev.rootCause} (\\`${ev.rootCauseAt}\\`)\n### How it was checked\n| Check | Result | Proof |\n|---|---|---|\n${checks}\n\nFailing before the fix: ${ev.beforeRunLink} · passing after: ${ev.afterRunLink}\n### What was not checked, and why\n${lines(ev.checks.skipped.map(([name, why]) => `${name}: ${why}`))}\n### Risk and rollback\nRisk: ${ev.plan.risk} (${ev.plan.risk_reason}). Roll back by reverting this PR. Watch: ${ev.watch}\n### Where to look first\n${lines(ev.lookFirst.map(([path, why]) => `\\`${path}\\`: ${why}`))}\n<details><summary>Self-review receipt, trace, harness suggestions, cost and time</summary>\n\n${ev.receipt.line()}  <!-- \"Found 6 · fixed 5 · left 1, because …\" -->\nTrace: ${ev.traceLink} · ${ev.minutes} min · $${ev.costUsd.toFixed(2)} (measured, not a limit)\n${lines(ev.harnessSuggestions)}\n</details>\n\n### References\n- [${ev.jiraKey}](https://rhino-fcp.atlassian.net/browse/${ev.jiraKey})\n\nRequested-by: @${ev.requesterGithub}\n`;\n}"
+  }
+ },
+ {
+  "key": "G4-21",
+  "title": "[Platform] PR judge: check every claim in the PR description",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G4-20"
+  ],
+  "needs": "",
+  "what": "Before the PR leaves draft, a judge reads the description as a reviewer from the other team would, checks each claim against the diff and the evidence, and flags anything unclear, unsupported or missing.",
+  "why": "A clear, true description is what lets anyone review any area. Agents tend to overclaim (\"all edge cases handled\"); checking claims against the diff catches that before a person reads it.",
+  "how": [
+   "Add ai-agents/harness/prompts/pr-judge.md (below). Run it in its own query() session on Sonnet 5.5 at medium, structured output from a zod schema, read-only tools (Read, Grep and Glob; no Bash, because `git diff --output=` writes files, so the harness writes the diff to a file first, as in G4-18), with the description, the diff and the evidence pack. Not the transcript.",
+   "Each flagged item names the sentence, the problem (unclear, not in the diff, no proof, missing heading, too long) and a suggested rewrite.",
+   "Nova rewrites the description and the judge reads it again. An item that comes back twice stays as a note for the reviewer instead of another round.",
+   "Check the judge on 10 past human-written fcp PRs and 10 Nova drafts with planted false claims: it should catch the planted claims without flagging most of the human PRs."
+  ],
+  "code": {
+   "file": "ai-agents/harness/prompts/pr-judge.md",
+   "lang": "markdown",
+   "text": "<!-- ai-agents/harness/prompts/pr-judge.md — the PR judge. Input: the PR description, `git diff origin/main...HEAD`, the evidence pack. -->\nYou are a reviewer from the other team. You did not write this change and you don't know this area well.\nRead the PR description first, the way you would on GitHub. Then check it against the diff and the evidence.\n\nFor every claim in the description, ask:\n- Is it in the diff? (\"Adds a loading state\" → find the loading state.)\n- Is there proof? A check marked pass needs a test run, a video or a transcript in the evidence pack.\n- Would I understand it without opening the Jira ticket?\n\nAlso check the shape: What changes, Why, How it was checked, What was not checked and why, Risk and rollback,\nWhere to look first, then the folded receipt, References and the Requested-by line. Above the fold stays under\nabout 300 words. No pasted logs. Pictures and videos only for checks that asked for them, each labelled.\n\nFlag only what would confuse or mislead a reviewer. A clear, true description with nothing to flag is a good result.\nReturn {\"ready\": bool, \"items\": [{\"sentence\", \"problem\": \"unclear|not_in_diff|no_proof|missing|too_long\", \"suggestion\"}]}."
+  }
+ },
+ {
+  "key": "G4-22",
+  "title": "[Platform] Dogfood Nova on RhinoHealth/ai-agents tickets",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G4-05",
+   "G4-14",
+   "G4-16",
+   "G4-18",
+   "G4-20"
+  ],
+  "needs": "G3 end-to-end path (Slack → draft PR in a fresh VM); the rhino-ai-agents GitHub App installed on RhinoHealth/ai-agents; the ai-agents ruleset (G3)",
+  "what": "Run Nova end to end on 5–8 small tickets in our own RhinoHealth/ai-agents repo before any fcp ticket, fix what breaks, and note what should become a check or a skill line.",
+  "why": "Our own repo is the safest place to find the rough edges: the reviewers built Nova, and nothing customer-facing changes.",
+  "how": [
+   "Pick 5–8 RH tickets for ai-agents (component \"ai-agents\"): docs, tests, Slack message copy, small orchestrator bugs. Nothing that touches the walls.",
+   "Add ai-agents/config/repos/ai-agents.yaml (below): protected paths so Nova can't edit its own hooks, judges, checks, broker, gateway, evals or workflow files; the verify command (the npm scripts ai-agents CI runs); reviewers.",
+   "Hand each ticket over by assigning it to Nova. Pieces not ready yet (the Byte loop, the ready gate) are done by hand and noted. ai-agents has no UI, so the QA agent is not needed here.",
+   "After each run, read the transcript and the receipt. File each problem as a ticket and each \"this should be a check or a skill line\" in the harness-suggestions list.",
+   "Approval follows the same rule as fcp: one person who is not the requester."
+  ],
+  "code": {
+   "file": "ai-agents/config/repos/ai-agents.yaml",
+   "lang": "yaml",
+   "text": "# ai-agents/config/repos/ai-agents.yaml — Nova's policy for dogfooding on its own repo. Format per G3's broker allow-list.\nrepo: RhinoHealth/ai-agents\nbranch_prefix: nova/\nverify: \"npm run lint && npm run typecheck && npm test && npm run build\"   # what ai-agents CI runs (G3), the same commands people use; confirm\nprotected_paths:                # a wall: Nova never edits what enforces the walls or judges it (ai-agents's block in settings/protected-paths.yaml)\n  - \".github/workflows/**\"\n  - \"harness/src/hooks.ts\"        # the walls (G3-21)\n  - \"harness/src/hooks/**\"\n  - \"harness/src/checks/**\"       # false-heal and proof checks (G5)\n  - \"harness/src/judges/**\"\n  - \"harness/prompts/pr-judge.md\"\n  - \"checks/**\"                 # the required checks: independent approval, locked checks, weakened tests\n  - \"broker/**\"\n  - \"gateway/**\"\n  - \"evals/**\"\n  - \"config/**\"\n  - \"settings/**\"                # managed settings, spend limits, protected paths\n  - \"packer/**\"\nask_first_paths: []             # fcp uses this for the pilot scope (migrations, auth, gRPC); nothing here\nreviewers:\n  team: ai-agents-maintainers   # GitHub team to create; exactly 1 approval, never the requester\nsandbox: lite                   # no UI and no FCP Lab needed\njira:\n  project: RH\n  component: ai-agents"
+  }
+ },
+ {
+  "key": "G4-23",
+  "title": "[Platform] Self-review loop: repeat until nothing important is left",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   9,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G4-18",
+   "G4-19",
+   "G4-17"
+  ],
+  "needs": "G3 progress watcher (spots loops; no round or time limit here)",
+  "what": "Wire the reviewer, the panel and the scope judge into one loop: review, fix, re-run the checks, review again, until nothing important is open. A finding that comes back after a \"fix\" is flagged to a person instead of looped on.",
+  "why": "One review pass leaves things behind, and an endless loop wastes money and hides a real disagreement. Fingerprints let Nova tell real progress from ping-pong.",
+  "how": [
+   "Add ai-agents/harness/src/self-review.ts (below). Small diffs use the reviewer (G4-18); bigger ones, when the plan says so, use the nova-review-panel workflow (G4-19).",
+   "After each round of fixes, re-run the checks Nova chose (checks.json), so a fix can't quietly break a QA check.",
+   "A finding whose fingerprint was fixed before and is back is ping-pong: stop fixing it, list it in the PR as \"left, because …\" and ask in the ticket's Slack thread.",
+   "The scope judge (G4-17) runs once the reviewer is clean; a veto is handled by reverting or explaining.",
+   "No round cap: the loop ends when nothing important is open or every open item is with a person. G3's progress watcher still steps in if nothing moves.",
+   "Write .nova/receipt.json (found, fixed, left with reasons) for the PR body (G4-20) and for Byte (G2)."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/self-review.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/self-review.ts — review, fix, re-check, until nothing important is open.\nimport type { Plan } from \"@rhinohealth/ai-agents-shared\";\nimport { scopeJudge } from \"./judges/scope.js\";\nimport { fingerprinted, reviewOnce, reviewPanel, type Fingerprinted } from \"./review.js\";  // sha1 per finding (G4-18)\nimport type { NovaSession } from \"./session.js\";  // G3's harness session\nexport class Receipt {  // .nova/receipt.json (found, fixed, left) is written from it for the PR body and Byte\n  found = 0;\n  get fixed() { return this.fixedPrints.size; }  // each finding is fixed at most once; a return is ping-pong\n  left: [finding: string, reason: string][] = [];\n  fixedPrints = new Set<string>();\n  leftPrints = new Set<string>();\n  leave(f: Fingerprinted, reason: string) { this.left.push([`${f.path}:${f.line}`, reason]); this.leftPrints.add(f.fingerprint); }\n}\nexport async function selfReview(session: NovaSession, plan: Plan, receipt: Receipt): Promise<Receipt> {\n  while (true) {  // no round cap: it ends when nothing important is open; G3's progress watcher spots loops\n    const found = plan.workflow ? await reviewPanel(session, plan) : await reviewOnce(session.ticket, session.planMd);\n    const important = fingerprinted(found).filter((f) => f.severity === \"important\" && !receipt.leftPrints.has(f.fingerprint));\n    if (!important.length) break;\n    receipt.found += important.length;\n    for (const f of important) {\n      if (receipt.fixedPrints.has(f.fingerprint)) {  // back after a \"fix\": ping-pong, so a person decides\n        receipt.leave(f, \"it came back after a fix; asked the requester\");\n        await session.askHuman(`A review finding keeps coming back: ${f.path}:${f.line} ${f.body}`);\n        continue;\n      }\n      const outcome = await session.fixOrExplain(f);  // Nova may disagree, with a reason\n      if (outcome.fixed) receipt.fixedPrints.add(f.fingerprint);\n      else receipt.leave(f, outcome.reason);\n    }\n    await session.rerunChecks();  // a fix must not break a QA check\n  }\n  const verdict = await scopeJudge(session.ticket, await session.diff());  // G4-17: ticket + diff only\n  if (verdict.verdict === \"veto\") await session.handleVeto(verdict);  // revert or explain; a second veto goes to a person\n  return receipt;\n}"
+  }
+ },
+ {
+  "key": "G4-24",
+  "title": "[Platform] QA agent: run the QA plan in a browser, video per check",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   8,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G4-13",
+   "G4-16"
+  ],
+  "needs": "G3 full VM with FCP Lab, browsers and seed data; Playwright MCP (or the Playwright CLI) pinned in the image",
+  "what": "After the build, a QA agent runs each QA check against the running app in a browser, like a tester, without reading the diff or the code. It records a short video per check and says pass or fail with what it saw. It is calibrated with examples so it doesn't go easy.",
+  "why": "Tests can pass while the screen is still wrong. A tester that sees only the app and the QA plan catches what a builder misses, and the videos are the proof reviewers trust most.",
+  "how": [
+   "Add qaOptions() to ai-agents/harness/src/qa.ts (below). The harness starts the QA agent in its own query() session: Sonnet 5.5 at medium, or Opus 5.5 at low when judging screens is the main job (routing table).",
+   "Its tools are a browser and reading /work/.nova/qa/ (the QA plan and calibration examples). No Bash, no grep, no reads of /work/fcp, no git.",
+   "Browser: decide between the Playwright MCP server and the Playwright CLI for agents (the CLI uses fewer tokens); pin it in the image; one isolated browser context per check with video on.",
+   "App: FCP Lab on the VM seeded with fake data (TestDataCreator, POST {API_PREFIX}test/create_test_data). Layout checks run at 760x900 and 1440x900 (e2e/helpers/responsive.ts).",
+   "Calibration: 8–10 labelled cases in ai-agents/harness/prompts/qa-calibration/ (a toast that shows while the form still saves, an empty state that overlaps the table at 760, a count off by one). Before the pilot it must fail every planted-bug case; leniency is tracked weekly.",
+   "Results go to .nova/qa_results.json (per check: pass or fail, what it saw, the video's S3 key). A fail goes back to Nova as a finding; Nova can't mark it passed. Videos are 30 s or less and show seed data only."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/qa.ts (QA run)",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/qa.ts (part 2) — the QA agent runs the QA plan in a browser. Its own session: no code, no diff, no Nova notes.\nimport type { Options } from \"@anthropic-ai/claude-agent-sdk/core\";\nimport { z } from \"zod\";\n\nconst QA_PROMPT = `You are a careful tester. You get the QA plan and the app's URL. You do not get the code or the diff.\nFor each check, open a fresh browser context, do what a user would do, and look at what the screen really shows.\nPass a check only when you saw the expected result yourself. Close is not a pass: a missing state, an overlap,\na wrong count, or text that appears only after a reload is a fail. Read the calibration examples first.`;\n\nexport const QaResults = z.object({  // saved as .nova/qa_results.json\n  checks: z.array(z.object({ id: z.string(), passed: z.boolean(), saw: z.string(), video: z.string() })),  // video: S3 key\n});\n\nexport function qaOptions(screensAreTheJob: boolean): Options {\n  return {\n    model: screensAreTheJob ? \"claude-opus-5-5\" : \"claude-sonnet-5-5\",  // routing table\n    effort: screensAreTheJob ? \"low\" : \"medium\",\n    cwd: \"/work/.nova/qa\",  // the QA plan and calibration examples, not the checkout\n    settingSources: [],  // no repo CLAUDE.md, skills or memory\n    systemPrompt: QA_PROMPT,\n    mcpServers: { playwright: {  // pinned in the image; flags per the pinned version (check --save-video)\n      type: \"stdio\",\n      command: \"/opt/ai-agents/bin/playwright-mcp\",\n      args: [\"--isolated\", \"--save-video=1280x720\", \"--output-dir=/work/.nova/qa/videos\"],\n    } },\n    strictMcpConfig: true,\n    allowedTools: [\"Read\", \"mcp__playwright\"],  // check the server-level allow rule\n    disallowedTools: [\"Bash\", \"Grep\", \"Glob\", \"Edit\", \"Write\", \"WebFetch\", \"WebSearch\", \"Read(/work/fcp/**)\"],\n    permissionMode: \"dontAsk\",\n    outputFormat: { type: \"json_schema\", schema: z.toJSONSchema(QaResults) },  // per check: id, passed, saw, video\n  };\n}\n// App under test: FCP Lab on this VM, seeded with fake data via POST {API_PREFIX}test/create_test_data."
+  }
+ },
+ {
+  "key": "G4-25",
+  "title": "[Platform] TICKET-BENCH: scores by kind and a smoke gate on harness PRs",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G4-10"
+  ],
+  "needs": "G0 gateway spend per run tag; G3 Temporal (an evalRun workflow) and warm-pool capacity",
+  "what": "Score bench runs as pass@1 and pass^3 plus cost and minutes per task, split by kind of change. Run the 15-task smoke set on every harness change in ai-agents, and the full 40 monthly.",
+  "why": "This is how we decide whether a harness change, a new skill line or a cheaper model setting helps. Time and cost are measured to learn, never used as limits.",
+  "how": [
+   "Add ai-agents/evals/ticket_bench/score.py (below; Python, in the evals uv project next to Harbor). pass@1 is the mean success rate; pass^3 is the chance that all 3 tries of a task pass (consistency).",
+   "Cost per task comes from the gateway's run tag (bench:<task>:<try>); minutes from Harbor's trial timings. Report by kind, and the 5 big cases on their own.",
+   "Add an evalRun workflow in ai-agents/orchestrator/src/workflows/eval-run.ts (only the orchestrator starts runs) on its own eval queue with fixed slots, so bench runs never take Nova's VMs. A required check on ai-agents PRs that touch harness/, prompts, skills or the image asks the orchestrator for a smoke run (1 try per task; the monthly full run uses 3) and posts the table. No workflow_dispatch.",
+   "Gate: a harness change must not lower pass@1. 15 tasks are noisy (one task is about 6.7 points): a drop of one task means run again; two or more fail the check. A new rule in Nova's prompt or skills ships only if it raises pass@1 on the full set.",
+   "A monthly Temporal schedule runs the full set and posts the trend to #ai-agents-alerts and the weekly review (G4-29). The W8–9 effort sweep on the routing table reuses the same runner with a model and effort matrix."
+  ],
+  "code": {
+   "file": "ai-agents/evals/ticket_bench/score.py",
+   "lang": "python",
+   "text": "# ai-agents/evals/ticket_bench/score.py — pass@1, pass^3, cost and minutes, split by kind. Python, next to Harbor.\nimport json\nimport sys\nfrom collections import defaultdict\nfrom math import comb\nfrom statistics import mean, median\n\n\ndef pass_hat_k(successes: int, tries: int, k: int) -> float:\n    \"\"\"Chance that k tries picked from this task's runs all pass (tau-bench's pass^k).\"\"\"\n    return comb(successes, k) / comb(tries, k) if tries >= k else float(\"nan\")\n\n\ndef score(rows: list[dict]) -> dict:\n    by_task = defaultdict(list)\n    for r in rows:  # one row per trial: task, kind, reward, cost_usd, minutes\n        by_task[(r[\"kind\"], r[\"task\"])].append(r)\n    by_kind = defaultdict(list)\n    for (kind, _), trials in by_task.items():\n        wins = sum(t[\"reward\"] == 1 for t in trials)\n        by_kind[kind].append({\"p1\": wins / len(trials), \"p3\": pass_hat_k(wins, len(trials), 3),\n                              \"cost\": mean(t[\"cost_usd\"] for t in trials), \"min\": median(t[\"minutes\"] for t in trials)})\n    return {kind: {\"tasks\": len(v),\n                   \"pass@1\": round(mean(x[\"p1\"] for x in v), 3),\n                   \"pass^3\": round(mean(x[\"p3\"] for x in v), 3),\n                   \"cost_per_task_usd\": round(mean(x[\"cost\"] for x in v), 2),  # measured, never a limit\n                   \"minutes_per_task\": round(median(x[\"min\"] for x in v), 1)}\n            for kind, v in sorted(by_kind.items())}\n\n\nif __name__ == \"__main__\":\n    print(json.dumps(score([json.loads(line) for line in open(sys.argv[1])]), indent=2))"
+  }
+ },
+ {
+  "key": "G4-26",
+  "title": "[Platform] Draft PR: Byte reviews, Nova fixes or answers each finding",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   9,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G4-20",
+   "G4-21",
+   "G4-23"
+  ],
+  "needs": "G2 \"Byte on Nova's PRs\" (reads the receipt, posts only new important findings); a person changes fcp's byte-review.yml (with Nave)",
+  "what": "Nova opens its PR as a draft, asks Byte to review it, and for each important Byte finding either fixes it or replies with its reason. A finding that keeps coming back goes to a person.",
+  "why": "Byte stays independent of Nova's self-review, which is what makes it worth having. Doing this while the PR is a draft means people are not pinged until it is clean.",
+  "how": [
+   "Open the PR through the broker: gh pr create --draft --title \"[FE] RH-1234: <what changes for the user>\" --body-file .nova/pr.md --head nova/RH-1234-<slug>.",
+   "Today Byte can't see Nova drafts: byte-review.yml only reviews pull_request events when draft == false, and ignores comments from bots. A person changes the condition (below) with Nave as part of G2. Nova never edits workflow files.",
+   "Request the byte team as reviewer (gh pr edit <n> --add-reviewer RhinoHealth/byte); add pr edit and pr ready to Nova's broker allow-list.",
+   "Read Byte's inline comments and check run through the broker (gh api repos/RhinoHealth/fcp/pulls/<n>/comments, Byte's app only). Important findings: fix and reply \"Fixed in <sha>\", or reply with the reason Nova disagrees. Nits: count only.",
+   "Fingerprint Byte's findings like self-review findings (G4-23). One that is back after a fix goes to the requester in Slack.",
+   "Each push re-runs CI by itself (frontend-ci on pull_request synchronize, cloud-ci on push). Nova never re-runs or dispatches workflows."
+  ],
+  "code": {
+   "file": "fcp/.github/workflows/byte-review.yml (change made by a person)",
+   "lang": "yaml",
+   "text": "# fcp/.github/workflows/byte-review.yml — the change a PERSON makes (with Nave, under G2). Nova never edits workflow files.\n# Today the pull_request path needs draft == false and the comment path skips bots, so a Nova draft never reaches Byte.\n# Admit drafts only when the PR's author is Nova's GitHub App.\njobs:\n  review:\n    if: >-\n      (github.event_name == 'issue_comment' &&\n       github.event.action == 'created' &&\n       github.event.issue.pull_request != null &&\n       github.event.comment.user.type != 'Bot' &&\n       (contains(github.event.comment.body, '@byte-review') ||\n        contains(github.event.comment.body, '@byte-sniff'))) ||\n      (github.event_name == 'pull_request_review_comment' &&\n       github.event.comment.user.type != 'Bot' &&\n       github.event.comment.in_reply_to_id != null) ||\n      (github.event_name == 'pull_request' &&\n       (github.event.pull_request.draft == false ||\n        github.event.pull_request.user.login == 'rhino-ai-agents[bot]') &&\n       github.event.pull_request.head.repo.full_name == github.repository &&\n       (github.event.action != 'review_requested' ||\n        github.event.requested_team.slug == 'byte') &&\n       (github.event.action != 'synchronize' ||\n        contains(github.event.pull_request.requested_teams.*.slug, 'byte')))\n    # bot login = the G0 app's slug + \"[bot]\" (confirm); the rest of the job is unchanged"
+  }
+ },
+ {
+  "key": "G4-27",
+  "title": "[Platform] Ready gate: mark the PR ready only when it is clean",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   9,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G4-26",
+   "G4-17",
+   "G4-24"
+  ],
+  "needs": "G0 fcp ruleset (1 approval, required checks) and the independent-approval check; G2 risk label and reviewer routing; G3 reminders for unreviewed PRs",
+  "what": "Nova marks its PR ready for review only when required CI is green, every QA check passed, the scope judge and PR judge are clean, and no important finding is open. Only then are people pinged: the reviewer team, the requester in Slack, and the Jira ticket goes back to the requester.",
+  "why": "People's attention is the scarcest part of this loop. Pinging them only for clean PRs keeps trust in Nova, and the ticket always has a person as owner.",
+  "how": [
+   "Add ai-agents/orchestrator/src/activities/ready-gate.ts (below). Required checks come from gh pr checks <n> --required --json name,bucket through the broker.",
+   "If main fails the same check, Nova links main's failing run as proof and flags it in the PR instead of looping (G3 failure playbook).",
+   "When clean: gh pr ready <n>; request the reviewer team by area (frontend-guild for frontend/**, backend-guild for cloud/** and client/**, as weekly-dependency-upgrades.yml does); Nova state PR open; assign the Jira ticket back to the requester; post in the Slack thread.",
+   "Approval stays a GitHub wall: exactly 1 approval from someone who is not the requester (G0's independent-approval check reads the Requested-by line). The rhino-ai-agents app can't merge and has no bypass.",
+   "After ready, review comments from people go into the same fix-or-answer loop (G4-26). G3 reminds after 2 days without a review."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/activities/ready-gate.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/activities/ready-gate.ts — draft → ready only when clean.\nimport type { GateEvidence } from \"@rhinohealth/ai-agents-shared\";  // qa_results, scope_judge, pr_judge, findings, reviewer_team\nimport { gh } from \"../broker-client.js\";  // every GitHub call goes through the broker, scoped to one repo\n\nconst DONE = new Set([\"fixed\", \"answered\", \"with_a_person\"]);\n\nexport interface GateResult {\n  ready: boolean;\n  blockers: string[];\n}\n\nexport async function readyGate(pr: number, ev: GateEvidence): Promise<GateResult> {\n  const checks = await gh<{ name: string; bucket: string }[]>([\"pr\", \"checks\", String(pr), \"--required\", \"--json\", \"name,bucket\"]);\n  const blockers = checks.filter((c) => c.bucket !== \"pass\" && c.bucket !== \"skipping\")\n    .map((c) => `CI: ${c.name} is ${c.bucket}`);\n  blockers.push(...ev.qa_results.filter((q) => !q.passed).map((q) => `QA check ${q.id} failed`));\n  if (ev.scope_judge.verdict === \"veto\" && !ev.scope_judge.explained) blockers.push(\"scope judge veto not resolved\");\n  if (!ev.pr_judge.ready) blockers.push(\"PR judge: the description has open items\");\n  const open = ev.findings.filter((f) => f.severity === \"important\" && !DONE.has(f.state));\n  blockers.push(...open.map((f) => `open finding ${f.path}:${f.line}`));\n  if (blockers.length) return { ready: false, blockers };  // stays a draft; nobody is pinged\n  await gh([\"pr\", \"ready\", String(pr)]);\n  await gh([\"pr\", \"edit\", String(pr), \"--add-reviewer\", ev.reviewer_team]);  // e.g. RhinoHealth/frontend-guild\n  return { ready: true, blockers: [] };\n}\n// Then the workflow sets Nova state to \"PR open\", assigns the ticket back to the requester and posts in Slack."
+  }
+ },
+ {
+  "key": "G4-28",
+  "title": "[Platform] Start the fcp pilot: first tickets and a how-to page",
+  "team": [
+   "plat",
+   "guild"
+  ],
+  "days": 0.5,
+  "w": [
+   9,
+   10
+  ],
+  "flag": null,
+  "deps": [
+   "G4-22",
+   "G4-27"
+  ],
+  "needs": "FE and BE guild leads pick tickets; rnd-kb page format (G6); G7 verify commands for fcp",
+  "what": "Agree with the FE and BE guilds on the first 5–10 fcp tickets for Nova (small FE bugs, missing tests, small BE fixes), set fcp's repo policy, and publish a one-page \"how to hand a ticket to Nova\".",
+  "why": "Pilot scope is a choice people make about what to assign while we learn. Starting narrow keeps the first PRs easy to review and proves the loop works.",
+  "how": [
+   "With the guild leads, gather candidate tickets in a Jira filter: small FE bugs, missing tests, small BE fixes. Not migrations, auth, infra or the cloud↔client gRPC contract.",
+   "Add ai-agents/config/repos/fcp.yaml like the dogfood file: ask_first_paths for the pilot scope (cloud/rhinoCloud/rhinoCore/migrations/**, client/rhinoOnPrem/*/migrations/**, cloud/rhinoCloud/rhinoDjango/login/**, frontend/src/app/(auth)/**, frontend/src/app/api/auth/**, common/fcp_common/rhinoAgentRpc/**), protected .github/workflows/**, verify commands (npm run verify and poe verify from G7), reviewer teams by path.",
+   "Write the how-to page (below) in RhinoHealth/rnd-kb (decision 6, brain location, still to confirm with Nave and Shai) and post it in #engineering.",
+   "Do a 20-minute walk-through at a guild meeting: assign a ticket live, approve its plan, open the PR."
+  ],
+  "code": {
+   "file": "rnd-kb/pages/nova/how-to-hand-a-ticket-to-nova.md",
+   "lang": "markdown",
+   "text": "---\n# rnd-kb page frontmatter (owner, review date, confidence, sources): format per G6, not final\nowner: sean\nreview_by: 2027-01-15\nconfidence: medium\nsources: [G4 plan, RhinoHealth/ai-agents README]\n---\n# How to hand a ticket to Nova\n\n**Good first tickets:** a small FE bug, missing tests, a small BE fix. Not migrations, auth, infra or the gRPC contract.\n\n1. **Assign the Jira ticket to \"Nova\".** You become the requester and stay the owner. (Or `/nova RH-1234` in Slack.)\n2. **Answer its questions.** For bigger tickets Nova asks first, in the ticket and in Slack. Reply with `@Nova`.\n3. **Approve the plan.** It starts with what \"done\" means and 3–5 checks. Approve, Change or Stop in Slack.\n4. **Wait for a ready PR.** Nova keeps it in draft until CI is green and Byte's important findings are handled.\n   The ticket comes back to you then.\n5. **Someone else approves.** One approval from a person who is not you; you can't approve your own Nova PR.\n\n**To stop:** unassign Nova, or comment `@Nova stop`. The branch and notes are kept.\n**Something odd?** Say so in the ticket's Slack thread. Every week we read all Nova PRs together."
+  }
+ },
+ {
+  "key": "G4-29",
+  "title": "[Guilds] Weekly review of every Nova PR, W9–W12",
+  "team": [
+   "guild",
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   9,
+   12
+  ],
+  "flag": null,
+  "deps": [
+   "G4-28"
+  ],
+  "needs": "G1 telemetry (cost per merged PR, run records); guild reviewers' time (about 30 minutes a week)",
+  "what": "Every week from W9 to W12, Sean and one reviewer from each guild read every Nova PR and its run: what merged and what closed, who approved, the longest runs, cost per merged PR, and what should become a check or a skill line.",
+  "why": "The pilot aims for 10 merged tickets by mid-December, at least half of Nova's PRs merged, and none approved by its requester. A weekly read is how we learn what to fix and whether the time was well spent.",
+  "how": [
+   "Before the meeting, run ai-agents/evals/reports/nova_weekly.py (below; Python, in the evals uv project: `uv run --project evals python evals/reports/nova_weekly.py <since>`) for the week's Nova PRs: state, requester, approver, and a flag if they match. Join cost, minutes, receipt counts and scope-judge vetoes from the run records by Jira key.",
+   "For each closed PR, write one line on why. For the 3 longest runs, ask one question: was the time well spent?",
+   "Turn harness suggestions into tickets: a new check, a skill line (only if it raises TICKET-BENCH pass@1, G4-25), or a new bench task.",
+   "Track the pilot numbers week by week: merged count, merged share, requester-approved count (must stay 0), PRs with full proof (QA results, receipt, trace link).",
+   "Keep short notes in rnd-kb: summaries only, no customer data."
+  ],
+  "code": {
+   "file": "ai-agents/evals/reports/nova_weekly.py",
+   "lang": "python",
+   "text": "# ai-agents/evals/reports/nova_weekly.py — the table for the weekly Nova PR review. Python, in the evals uv project.\nimport json\nimport subprocess\nimport sys\n\n\ndef gh(*args: str) -> list[dict]:\n    return json.loads(subprocess.run([\"gh\", *args], check=True, capture_output=True, text=True).stdout)\n\n\nsince = sys.argv[1]  # e.g. 2026-11-23\nprs = gh(\"pr\", \"list\", \"--repo\", \"RhinoHealth/fcp\", \"--author\", \"app/rhino-ai-agents\", \"--state\", \"all\",\n         \"--search\", f\"created:>={since}\", \"--json\", \"number,title,state,body,latestReviews\")\nprint(\"| PR | Title | State | Requester | Approver | Requester approved? |\")\nprint(\"|---|---|---|---|---|---|\")\nfor pr in prs:\n    lines = pr[\"body\"].splitlines()\n    requester = next((ln.split(\"@\", 1)[1].strip() for ln in lines if ln.startswith(\"Requested-by: @\")), \"?\")\n    approvers = [r[\"author\"][\"login\"] for r in pr[\"latestReviews\"] if r[\"state\"] == \"APPROVED\"]\n    flag = \"YES, look into it\" if requester in approvers else \"no\"\n    print(f\"| #{pr['number']} | {pr['title'][:60]} | {pr['state']} | {requester} | {', '.join(approvers) or '-'} | {flag} |\")\n# Cost, minutes, receipt counts and scope-judge vetoes come from the run records (S3, gateway tags; G0, G1), joined by Jira key."
+  }
+ },
+ {
+  "key": "G4-30",
+  "title": "[Platform] Parallel attempts for hard tickets: 2–3 tries, tests pick one",
+  "team": [
+   "plat"
+  ],
+  "days": 2,
+  "w": [
+   10,
+   12
+  ],
+  "flag": "stretch",
+  "deps": [
+   "G4-27",
+   "G4-25"
+  ],
+  "needs": "G3 warm pool, Nova queue slots (3 VMs at start) and fan-out walls",
+  "what": "For a ticket the plan marks hard, or after a failed attempt, run 2–3 independent attempts in separate VMs, drop the ones that fail the locked checks or break other tests, and let a judge pick one. Only one change ships.",
+  "why": "Several attempts with tests picking one raised Anthropic's SWE-bench score from 77.2% to 82.0%. It keeps one writer per change: each attempt writes only its own branch, and only one is kept.",
+  "how": [
+   "Add the attempts block to ticketToPr in ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (below): buildAttempt child workflows nova:RH-1234:a1..a3, settled together so one failed attempt doesn't fail the ticket, each claiming its own full VM and building from the same approved plan and locked checks.",
+   "Each attempt takes a Nova slot (3 at start), so attempts wait in the queue instead of starving other tickets. Default to 2 attempts while the pool is small. All attempts share the ticket's cost tag and backstop.",
+   "Drop attempts that fail any locked QA check or the verify command. If none survive, send the requester the best attempt's evidence.",
+   "Judge: Opus 5.5 at medium, side by side, sees the ticket and the surviving diffs and check results, not the transcripts. It picks one and says why.",
+   "Only the winner goes on to self-review, the PR and Byte; the other branches are deleted and their VMs released.",
+   "Measure on the 5 big and the hardest TICKET-BENCH tasks first; keep it only if pass@1 rises enough to pay for the extra VMs."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (attempts block)",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/workflows/ticket-to-pr.ts — parallel attempts for hard tickets (stretch). One change ships.\n// Workflow code: deterministic, no Node APIs, no fetch. reportNoSurvivor lives in this file; the work is in activities.\nimport { executeChild, proxyActivities } from \"@temporalio/workflow\";\nimport type * as activities from \"../activities/index.js\";\nimport type { AttemptResult, Plan } from \"@rhinohealth/ai-agents-shared\";\nimport { buildAttempt } from \"./build-attempt.js\";\nimport { act } from \"../policies.js\";  // G3-29 LONG preset: 7-day safety net, 2-minute heartbeats, no work limit\n\nconst { keepOnlyBranch } = proxyActivities<typeof activities>({ startToCloseTimeout: \"5 minutes\" });\n\nasync function attempts(key: string, plan: Plan, n = 2): Promise<AttemptResult | undefined> {\n  const branches = Array.from({ length: n }, (_, i) => `nova/${key}-a${i + 1}`);\n  const results = await Promise.allSettled(branches.map((branch, i) =>\n    executeChild(buildAttempt, {\n      workflowId: `nova:${key}:a${i + 1}`,  // each takes a Nova slot (G3) and its own fresh full VM\n      args: [{ key, plan, branch }],\n    })));  // allSettled: one failed attempt doesn't fail the ticket\n  const survivors = results\n    .filter((r): r is PromiseFulfilledResult<AttemptResult> => r.status === \"fulfilled\")\n    .map((r) => r.value)\n    .filter((a) => a.lockedChecksPass && a.verifyPass);\n  if (!survivors.length) {\n    await reportNoSurvivor(key, results);  // best attempt's evidence to the requester\n    return undefined;\n  }\n  let winner = survivors[0];\n  if (survivors.length > 1) {\n    const choice = await act.judgeAttempts(key, survivors.map((s) => s.summary));  // ticket + diffs + check results only\n    winner = survivors[choice.index];\n  }\n  await keepOnlyBranch(key, winner.branch, branches.filter((b) => b !== winner.branch));\n  return winner;\n}"
+  }
+ }
+]

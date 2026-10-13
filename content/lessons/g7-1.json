@@ -1,0 +1,699 @@
+{
+ "id": "g7-1",
+ "title": "The API test layer",
+ "minutes": 55,
+ "youNeed": [
+  "p10-2",
+  "p10-3",
+  "p2-1"
+ ],
+ "bridge": "The new API test layer is like adding a Vitest project next to an older Jest suite. It gets its own folder, config file and CI job. The old tests keep running as they are. Except: every test here sends a real request through Django into a real Postgres copy. So the slow part is the database, and the design is about making that fast.",
+ "intro": "G7 starts with one folder in fcp: cloud/rhinoCloud/tests_api/. It holds pytest tests that call the cloud's API in-process. It is built for speed: a full run in about 3 minutes on a laptop, the affected tests in under 30 seconds. This lesson walks through its five tickets: the decision, the database setup, the CI job, the agent report and testmon.",
+ "picture": {
+  "caption": "One edit, one fast answer: a template database copied per worker, and one page per failure.",
+  "nodes": [
+   {
+    "id": "dev",
+    "label": "Agent or engineer edits cloud code",
+    "kind": "agent"
+   },
+   {
+    "id": "poe",
+    "label": "poe api-test / api-test-affected",
+    "kind": "service"
+   },
+   {
+    "id": "tpl",
+    "label": "Template DB api_tpl_<hash>",
+    "kind": "machine"
+   },
+   {
+    "id": "wdb",
+    "label": "Worker DBs test_api_gw0 .. gw3",
+    "kind": "machine"
+   },
+   {
+    "id": "rep",
+    "label": "reports/failures.md and junit.xml",
+    "kind": "file"
+   },
+   {
+    "id": "ci",
+    "label": "API Tests job in cloud-ci.yml",
+    "kind": "check"
+   }
+  ],
+  "steps": [
+   {
+    "from": "dev",
+    "to": "poe",
+    "text": "runs the tests after an edit (only the affected ones with testmon)"
+   },
+   {
+    "from": "poe",
+    "to": "tpl",
+    "text": "the first worker takes a lock and migrates the template once"
+   },
+   {
+    "from": "tpl",
+    "to": "wdb",
+    "text": "each xdist worker gets CREATE DATABASE ... TEMPLATE, a copy in seconds"
+   },
+   {
+    "from": "wdb",
+    "to": "rep",
+    "text": "the tests run; the controller writes one short block per failure"
+   },
+   {
+    "from": "rep",
+    "to": "dev",
+    "text": "the agent reads failures.md and reruns one test with the printed command"
+   },
+   {
+    "from": "dev",
+    "to": "ci",
+    "text": "the push runs the same layer as the API Tests job, with a throw-away Postgres"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Two runners, one decision (G7-01)",
+   "p": [
+    "Open cloud/rhinoCloud in fcp. rhinoCore/tests holds about 1,900 unit tests that run with Django's own runner, manage.py test, on CommonRhinoTestCase and factory_boy. rhinoCore/integration-tests holds pytest tests that run against shared QA, where a push waits 20 to 30 minutes for a lock. Nothing in between gives a fast answer about an endpoint.",
+    "G7-01 is a 30-minute meeting with the BE guild and Shai (the G7 design lead), and its output is a written decision. Tests that call an endpoint and check the response go to tests_api/ on pytest, pytest-django and xdist. Model and service unit tests stay in rhinoCore/tests. Nobody moves old tests in bulk this quarter.",
+    "The rules come from numbers you bring: rhinoCore/tests has 69 mock.patch calls on AgentRpcClient, 24 on StorageService and 11 uses of CELERY_TASK_ALWAYS_EAGER. So the new layer uses no eager Celery and no mocks of those two classes; lesson g7-2 builds fakes instead. Data is created through the API, and it is fake data only (Faker, factory_boy), never rows copied from QA or prod.",
+    "The meeting also fixes the names the next tickets use. Group api-tests; Poe tasks api-test, api-test-affected and verify; CI job \"API Tests\"; markers contract and sdk_smoke. The speed goals (30 seconds affected, 3 minutes full, 6 minutes in CI with lint) are numbers to watch, not gates. The outcome goes into the testing section of be-repo-conventions/SKILL.md, so agents read the same rules."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "Why Python and not TypeScript? The agent platform is TypeScript, but fcp's backend is a Django codebase. Its tests, fakes and scripts stay Python, because agents work inside that code. The language of the platform does not change the language of the code it fixes."
+   }
+  },
+  {
+   "h": "The conftest, part 1: name the template (G7-02)",
+   "p": [
+    "G7-02 first adds a dependency group to cloud/rhinoCloud/pyproject.toml: api-tests with pytest, pytest-django, pytest-xdist and pytest-randomly, each with a version range. make update-deps refreshes uv.lock, and the sync-deps target in the Makefile gets --group api-tests.",
+    "tests_api/ gets its own pytest.ini with DJANGO_SETTINGS_MODULE = rhinoCloud.rhinoDjango.settings, django_find_project = false, the pythonpath entries and the two markers. Because the ini sits inside tests_api/, pytest tests_api never reads cloud/rhinoCloud/pytest.ini, which holds the integration-test markers.",
+    "Then the conftest. The problem it solves: rhinoCore has more than 220 migrations, and pytest-django would run all of them once per xdist worker. The conftest migrates one template database instead, and its name comes from the migration file names."
+   ],
+   "because": "We hash the migration names into the template's name, because a new migration must build a new template.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/conftest.py (part 1 of 2)",
+    "text": "import hashlib\nfrom pathlib import Path\n\nimport pytest\n\nfrom django.conf import settings\nfrom django.core.management import call_command\nfrom django.db import connection, connections\n\nCORE = Path(__file__).parents[1] / \"rhinoCore\"\nMIGRATIONS = \"\".join(sorted(p.name for p in (CORE / \"migrations\").glob(\"[0-9]*.py\")))\nTEMPLATE_DB = \"api_tpl_\" + hashlib.sha1(MIGRATIONS.encode()).hexdigest()[:12]  # a new migration means a new template",
+    "notes": [
+     {
+      "line": 1,
+      "text": "hashlib gives us sha1, a quick fingerprint of a string."
+     },
+     {
+      "line": 2,
+      "text": "Path builds file paths with the / operator, like path.join in Node."
+     },
+     {
+      "line": 6,
+      "text": "settings is the loaded Django settings module; we will change the database name in it."
+     },
+     {
+      "line": 7,
+      "text": "call_command runs a manage.py command (migrate, loaddata) from Python."
+     },
+     {
+      "line": 8,
+      "text": "connection is the default database connection; connections holds all of them."
+     },
+     {
+      "line": 10,
+      "text": "parents[1] is the folder above tests_api/, so CORE points at cloud/rhinoCloud/rhinoCore."
+     },
+     {
+      "line": 11,
+      "text": "Every migration file name that starts with a digit, sorted and glued into one long string."
+     },
+     {
+      "line": 12,
+      "text": "api_tpl_ plus the first 12 hex characters of the hash. Add a migration and the name changes, so a fresh template is built."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The conftest, part 2: build once, copy per worker",
+   "p": [
+    "pytest-django calls a fixture named django_db_setup once per session to create the test database. We override it. One worker builds the template under a Postgres advisory lock. The others wait on the same lock, then find the template ready. An advisory lock is a named lock in Postgres that your code takes and releases; Postgres attaches no meaning to it.",
+    "Then every worker asks Postgres for a copy: CREATE DATABASE test_api_gw1 TEMPLATE api_tpl_<hash>. Postgres copies files on disk, so this takes seconds. pytest-django then wraps each test in a transaction and rolls it back, as in lesson p10-3."
+   ],
+   "because": "We take a lock before checking for the template, because four workers start at once and only one may migrate.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/conftest.py (part 2 of 2)",
+    "text": "@pytest.fixture(scope=\"session\")\ndef django_db_setup(django_db_blocker, worker_id):\n    # Migrate once into a template DB, then give each xdist worker its own copy: seconds instead of 228 migrations.\n    db = settings.DATABASES[\"default\"]\n    worker_db = f\"test_api_{worker_id}\"  # worker_id is \"master\" when xdist is off\n    with django_db_blocker.unblock(), connection._nodb_cursor() as cur:  # Django's own cursor on the \"postgres\" DB\n        cur.execute(\"SELECT pg_advisory_lock(7007)\")  # one worker builds the template; released when cur closes\n        cur.execute(\"SELECT 1 FROM pg_database WHERE datname = %s\", [TEMPLATE_DB])\n        if cur.fetchone() is None:\n            cur.execute(f'CREATE DATABASE \"{TEMPLATE_DB}\"')\n            db[\"NAME\"] = TEMPLATE_DB\n            call_command(\"migrate\", verbosity=0)\n            call_command(\"createcachetable\")  # settings.CACHES uses the database_cache table\n            call_command(\"loaddata\", str(CORE / \"fixtures\" / \"initial_data_prod_aws.json\"), verbosity=0)\n            connections.close_all()  # CREATE DATABASE ... TEMPLATE needs no open sessions on the template\n        cur.execute(f'DROP DATABASE IF EXISTS \"{worker_db}\"')\n        cur.execute(f'CREATE DATABASE \"{worker_db}\" TEMPLATE \"{TEMPLATE_DB}\"')\n    db[\"NAME\"] = worker_db\n    yield",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Session scope: this fixture runs once per worker process, not once per test."
+     },
+     {
+      "line": 2,
+      "text": "The name pytest-django looks for. django_db_blocker guards database access; worker_id is gw0, gw1, ... (lesson p10-2)."
+     },
+     {
+      "line": 4,
+      "text": "The dict that describes the default database. Changing NAME here changes which database Django opens."
+     },
+     {
+      "line": 5,
+      "text": "One database per worker, for example test_api_gw2, or test_api_master without xdist."
+     },
+     {
+      "line": 6,
+      "text": "unblock() allows database access in this block. _nodb_cursor() is Django's own cursor on the server's postgres database, outside any test database."
+     },
+     {
+      "line": 7,
+      "text": "Take lock 7007. A second worker waits here until the first one's cursor closes."
+     },
+     {
+      "line": 8,
+      "text": "Ask Postgres whether the template already exists."
+     },
+     {
+      "line": 9,
+      "text": "Only when it does not exist: build it."
+     },
+     {
+      "line": 10,
+      "text": "Create the empty template database."
+     },
+     {
+      "line": 11,
+      "text": "Point Django at the template, so the next commands write into it."
+     },
+     {
+      "line": 12,
+      "text": "Run every migration once, quietly."
+     },
+     {
+      "line": 13,
+      "text": "The settings use a database cache table, so create it too."
+     },
+     {
+      "line": 14,
+      "text": "Load the same seed fixture CommonRhinoTestCase uses, so tests start with the same base rows."
+     },
+     {
+      "line": 15,
+      "text": "Close every connection. Postgres refuses to copy a template that has open sessions."
+     },
+     {
+      "line": 16,
+      "text": "Drop this worker's copy from an earlier run, if there is one."
+     },
+     {
+      "line": 17,
+      "text": "The copy: a full database in seconds instead of more than 220 migrations."
+     },
+     {
+      "line": 18,
+      "text": "From now on, every test on this worker uses its own copy."
+     },
+     {
+      "line": 19,
+      "text": "Hand control back to pytest. Nothing to clean up: the next run drops the copy."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "If a run dies in the middle of building the template, a half-built api_tpl_<hash> stays behind and the next run reuses it. Drop it by hand (DROP DATABASE) if tests fail with missing tables after a crash. The conftest's docstring also says that locally poe cloud-up-debug exposes Postgres on localhost:5431. One more: the tickets count 228 migrations, and the branch had 224 when this was written. The number only explains the speed-up, so never hard-code it."
+   }
+  },
+  {
+   "h": "The CI job, part 1: env and Postgres (G7-03)",
+   "p": [
+    "The layer must run on every push, not only on laptops. G7-03 adds a job called API Tests to .github/workflows/cloud-ci.yml. It copies the shape of the existing test job: the same runner, needs and if lines, and the same Postgres service container. A service container is one that GitHub Actions starts next to the job and removes after it.",
+    "Remember that cloud-ci.yml runs on push to any branch, not on pull_request (lesson p2-1). check-changes is the reusable job that says whether this push touched cloud code."
+   ],
+   "because": "We copy the test job's env and Postgres service, because settings read those variables at import time.",
+   "code": {
+    "lang": "yaml",
+    "file": ".github/workflows/cloud-ci.yml (api-tests job, part 1 of 2)",
+    "text": "  api-tests:\n    name: API Tests\n    runs-on: fcp-runner-set\n    needs: check-changes\n    if: github.ref == 'refs/heads/main' || needs.check-changes.outputs.has_changes == 'true'\n    env:\n      ENV: QA\n      RHINO_IS_RUNNING_UNIT_TESTS: 1\n      POSTGRES_HOST: localhost\n      POSTGRES_PASSWORD: ${{ secrets.CLOUD_TEST_POSTGRES_PASSWORD }}\n      # ...the rest of the `test` job's env block (a YAML anchor would keep the two jobs in sync)\n    services:\n      postgres:\n        image: public.ecr.aws/docker/library/postgres:17.6\n        ports: [\"5432:5432\"]\n        env: { POSTGRES_DB: rhino_cloud, POSTGRES_USER: rhino, POSTGRES_PASSWORD: \"${{ secrets.CLOUD_TEST_POSTGRES_PASSWORD }}\" }\n        command: -c fsync=off -c synchronous_commit=off -c full_page_writes=off\n        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The job id. Other jobs refer to it by this name."
+     },
+     {
+      "line": 2,
+      "text": "The name GitHub shows, and the name a ruleset would require later (G7-31)."
+     },
+     {
+      "line": 3,
+      "text": "fcp's self-hosted runner set, like every other cloud job."
+     },
+     {
+      "line": 4,
+      "text": "Wait for the change detector."
+     },
+     {
+      "line": 5,
+      "text": "Run on main always, and on a branch only when cloud code changed."
+     },
+     {
+      "line": 7,
+      "text": "The settings module picks its environment from ENV."
+     },
+     {
+      "line": 8,
+      "text": "Loads settings_test.py, which uses a fast MD5 password hasher."
+     },
+     {
+      "line": 9,
+      "text": "The service container is reachable on localhost."
+     },
+     {
+      "line": 10,
+      "text": "The password comes from a repo secret, never from the file."
+     },
+     {
+      "line": 11,
+      "text": "The test job's env block has about 30 more lines. A YAML anchor would let both jobs share one copy."
+     },
+     {
+      "line": 13,
+      "text": "The service container. GitHub starts it before the steps and removes it after."
+     },
+     {
+      "line": 14,
+      "text": "The same Postgres version as the test job, from AWS's public mirror of Docker Hub."
+     },
+     {
+      "line": 17,
+      "text": "Turn off disk safety. The database is thrown away, so speed matters more than durability."
+     },
+     {
+      "line": 18,
+      "text": "The job waits until pg_isready says the server accepts connections."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The CI job, part 2: run and keep the reports",
+   "p": [
+    "The steps install exactly the locked packages of the api-tests group and run the layer with four workers. When the job fails, the reports folder is uploaded, so you can download failures.md and junit.xml from the run page.",
+    "The job leaves out the NVFlare venv steps that the test job has. If a test needs NVFlare, it belongs in rhinoCore/tests, not here."
+   ],
+   "because": "We upload the reports only on failure, because a green run needs no evidence and an artifact costs storage.",
+   "code": {
+    "lang": "yaml",
+    "file": ".github/workflows/cloud-ci.yml (api-tests job, part 2 of 2)",
+    "text": "    steps:\n      - uses: actions/checkout@v6\n      - uses: actions/setup-python@v6\n        with:\n          python-version: \"3.13\"\n      - name: Run the API layer\n        working-directory: cloud/rhinoCloud\n        run: |\n          uv sync --frozen --group api-tests --no-install-project\n          .venv/bin/pytest tests_api -n 4 --junitxml=reports/junit.xml\n      - uses: actions/upload-artifact@v7\n        if: failure()\n        with: { name: api-tests-reports, path: cloud/rhinoCloud/reports/ }",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The job's steps run in order on the runner."
+     },
+     {
+      "line": 2,
+      "text": "Check out this commit."
+     },
+     {
+      "line": 3,
+      "text": "Install Python 3.13, the version cloud/rhinoCloud requires."
+     },
+     {
+      "line": 7,
+      "text": "Run the next commands inside cloud/rhinoCloud."
+     },
+     {
+      "line": 9,
+      "text": "Install exactly what uv.lock says (like npm ci), only the api-tests group, without installing the project itself."
+     },
+     {
+      "line": 10,
+      "text": "Run the layer with 4 xdist workers and write a JUnit report."
+     },
+     {
+      "line": 11,
+      "text": "Upload a folder from the runner so you can download it later."
+     },
+     {
+      "line": 12,
+      "text": "Only when an earlier step failed."
+     },
+     {
+      "line": 13,
+      "text": "The artifact's name and the folder that holds failures.md and junit.xml."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "Agents never change the checks they are judged by. Ask DevOps to add cloud-ci.yml, tests_api/pytest.ini and tests_api/conftest.py to the protected paths (the G0 and G3 walls). Then an agent PR that edits them fails the locked-checks check."
+   }
+  },
+  {
+   "h": "failures.md, part 1: collect the failures (G7-12)",
+   "p": [
+    "An agent fixes its own mistakes only when it can read the failure. A pytest log of 3,000 lines fills its context. G7-12 adds a small pytest plugin that writes one page, reports/failures.md, after every run.",
+    "A pytest plugin is a module with functions whose names pytest knows, called hooks (pytest hooks, not Claude Code hooks). pytest_sessionfinish runs once, after all tests. Register the module in tests_api/conftest.py with pytest_plugins = [\"plugins.agent_report\"]."
+   ],
+   "because": "We read the results from pytest's terminal reporter, because it already holds every failed report, also from xdist workers.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/plugins/agent_report.py (part 1 of 2)",
+    "text": "import os\nfrom pathlib import Path\n\nMAX_FAILURES = 20\nTAIL_LINES = 40\n\n\ndef pytest_sessionfinish(session, exitstatus):\n    if hasattr(session.config, \"workerinput\"):  # an xdist worker: the controller writes the report\n        return\n    stats = session.config.pluginmanager.get_plugin(\"terminalreporter\").stats\n    failed = [r for r in stats.get(\"failed\", []) + stats.get(\"error\", []) if r.when in (\"setup\", \"call\")]\n    seed = session.config.getoption(\"randomly_seed\", default=None)\n    lines = [f\"# API tests: {len(failed)} failing (seed {seed})\", \"\"]",
+    "notes": [
+     {
+      "line": 1,
+      "text": "os reads the environment variable for the report folder."
+     },
+     {
+      "line": 4,
+      "text": "At most 20 failures on the page. More than that is a broken setup, not 20 bugs."
+     },
+     {
+      "line": 5,
+      "text": "The last 40 lines of each traceback, where the error usually is."
+     },
+     {
+      "line": 8,
+      "text": "The hook pytest calls once at the end of the session, with the session and the exit status."
+     },
+     {
+      "line": 9,
+      "text": "Only xdist workers have workerinput. Workers return; the controller process writes the one report."
+     },
+     {
+      "line": 11,
+      "text": "pytest's reporter plugin. Its stats dict maps an outcome (passed, failed, error) to a list of reports."
+     },
+     {
+      "line": 12,
+      "text": "Failed tests plus errors, only from setup (a fixture broke) or call (the test body broke). Teardown noise is left out."
+     },
+     {
+      "line": 13,
+      "text": "The seed pytest-randomly used, so the rerun command can repeat the same order."
+     },
+     {
+      "line": 14,
+      "text": "The page starts with a heading: how many failed and with which seed."
+     }
+    ]
+   }
+  },
+  {
+   "h": "failures.md, part 2: one block per failure",
+   "p": [
+    "Each failure becomes a short block. It holds the node id, the file and line, the first error line, the traceback's tail and a rerun command. JUnit XML (lesson p10-6) keeps everything else.",
+    "The seed matters. With --randomly-seed=1009, pytest-randomly shuffles the tests in the same order on every run and reseeds random, Faker and factory_boy. So the rerun command reproduces the failure. Decide with the guild whether the nightly uses a new seed each night to find order bugs."
+   ],
+   "because": "We print a ready-to-paste rerun command, because an agent that guesses the command wastes a turn and may run the wrong tests.",
+   "code": {
+    "lang": "python",
+    "file": "cloud/rhinoCloud/tests_api/plugins/agent_report.py (part 2 of 2)",
+    "text": "    for report in failed[:MAX_FAILURES]:\n        crash = getattr(report.longrepr, \"reprcrash\", None)\n        lines += [\n            f\"## {report.nodeid}\",\n            f\"- where: {crash.path}:{crash.lineno}\" if crash else \"- where: fixture or setup error\",\n            f\"- error: {crash.message.splitlines()[0]}\" if crash else \"\",\n            \"```\",\n            *report.longreprtext.splitlines()[-TAIL_LINES:],\n            \"```\",\n            f\"- rerun: `cd cloud/rhinoCloud && uv run --group api-tests pytest tests_api/{report.nodeid} --randomly-seed={seed}`\",\n            \"\",\n        ]\n    if len(failed) > MAX_FAILURES:\n        lines.append(f\"{len(failed) - MAX_FAILURES} more failures are in reports/junit.xml\")\n    out = Path(os.environ.get(\"API_TEST_REPORT_DIR\", \"reports\"))\n    out.mkdir(exist_ok=True)\n    (out / \"failures.md\").write_text(\"\\n\".join(lines) if failed else \"# API tests: all passed\\n\")",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Loop over the first 20 failures."
+     },
+     {
+      "line": 2,
+      "text": "reprcrash is where the error was raised: path, line number and message. A setup error may not have one, so default to None."
+     },
+     {
+      "line": 4,
+      "text": "A heading per failure: the node id, file::function[case]."
+     },
+     {
+      "line": 5,
+      "text": "file:line of the crash, or a note that a fixture or setup step failed."
+     },
+     {
+      "line": 6,
+      "text": "Only the first line of the error message."
+     },
+     {
+      "line": 8,
+      "text": "The last 40 lines of the full traceback, inside a fenced code block."
+     },
+     {
+      "line": 10,
+      "text": "A command that reruns exactly this test with the same seed."
+     },
+     {
+      "line": 13,
+      "text": "Say how many more failures exist and where to find them."
+     },
+     {
+      "line": 15,
+      "text": "The folder is reports/ unless the environment variable says otherwise."
+     },
+     {
+      "line": 16,
+      "text": "Create the folder; no error if it exists."
+     },
+     {
+      "line": 17,
+      "text": "Write the page, or one line that says all passed. A stale page from an earlier run is always overwritten."
+     }
+    ]
+   },
+   "see": "# API tests: 1 failing (seed 1009)\n\n## test_smoke.py::test_lists_projects\n- where: tests_api/test_smoke.py:14\n- error: AssertionError: assert 2 == 3\n- rerun: `cd cloud/rhinoCloud && uv run --group api-tests pytest tests_api/test_smoke.py::test_lists_projects --randomly-seed=1009`"
+  },
+  {
+   "h": "Only the affected tests (G7-13)",
+   "p": [
+    "The last two Poe tasks go into the root pyproject.toml, next to backend-integration-tests. api-test runs everything in parallel. api-test-affected runs only the tests whose code paths your change touched, with pytest-testmon (lesson p10-2). Add pytest-testmon to the api-tests group and .testmondata and reports/ to .gitignore.",
+    "testmon sees only Python code that tests execute. Migrations, fixture files and the conftest are read during setup, so a change there would look like no change at all. That is why poe verify (lesson g7-5) runs the full layer when one of those changes. The G3 nightly sandbox image runs api-test-affected once on main, so every VM starts with a fresh .testmondata."
+   ],
+   "because": "We give both tasks the same seed and options, because the same failing test should look the same in both.",
+   "code": {
+    "lang": "toml",
+    "file": "pyproject.toml (root, [tool.poe.tasks])",
+    "text": "# ============================================================================\n# BACKEND API TESTS (cloud/rhinoCloud/tests_api, uv group api-tests)\n# ============================================================================\n\napi-test = { cmd = \"uv run --frozen --group api-tests pytest tests_api -n auto --randomly-seed=1009 --junitxml=reports/junit.xml -q --tb=short\", cwd = \"cloud/rhinoCloud\", help = \"Run the whole cloud API layer in parallel. Writes reports/failures.md and reports/junit.xml. Extra args go to pytest.\" }\n\n# Only the tests whose code paths changed (pytest-testmon). No -n: the set is small, and testmon + xdist must be\n# checked for the pinned version first. The first run on a machine runs everything and writes .testmondata;\n# the sandbox image ships one built from main. poe verify runs api-test instead when migrations or fixtures change.\napi-test-affected = { cmd = \"uv run --frozen --group api-tests pytest tests_api --testmon --randomly-seed=1009 -q --tb=short\", cwd = \"cloud/rhinoCloud\", help = \"Run only the API tests affected by your changes (pytest-testmon).\" }",
+    "notes": [
+     {
+      "line": 1,
+      "text": "A banner comment, in the style the root pyproject already uses for its task groups."
+     },
+     {
+      "line": 5,
+      "text": "A cmd task: pytest in the api-tests group with one worker per CPU (-n auto). It adds the fixed seed, a JUnit report, quiet output and short tracebacks. cwd makes it run from cloud/rhinoCloud, and help is what poe prints in its task list."
+     },
+     {
+      "line": 7,
+      "text": "No -n here: the set is small, and testmon with xdist is not yet checked for the pinned version."
+     },
+     {
+      "line": 10,
+      "text": "The same command with --testmon instead of -n auto and the JUnit report."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "Prove testmon on history before you trust it. Take 5 recent cloud PRs and check that the affected set included every test that failed in CI. Put the answer in the G7-13 PR."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Read the setup tests_api builds on, in your fcp checkout",
+  "youNeed": [
+   "Your fcp checkout (~/Projects/fcp)",
+   "Python 3 (python3 is on every Mac with git's Command Line Tools)"
+  ],
+  "worked": [
+   {
+    "do": "cd ~/Projects/fcp && ls cloud/rhinoCloud/rhinoCore/migrations/[0-9]*.py | wc -l",
+    "see": "A number in the 220s (the tickets counted 228 on main on 12 Oct). Each one would run once per worker without the template."
+   },
+   {
+    "do": "sed -n '/^\\[dependency-groups\\]/,/^\\[tool/p' cloud/rhinoCloud/pyproject.toml",
+    "see": "The groups grpc-stub-gen, dev, lint, test and integration-tests. There is no api-tests group yet; G7-02 adds it."
+   },
+   {
+    "do": "cat cloud/rhinoCloud/pytest.ini",
+    "see": "[pytest] with markers local, ci_only, nightly, testing_trace_id and connect_api: the integration-test markers tests_api must not inherit."
+   },
+   {
+    "do": "sed -n '/^  test:/,/^    steps:/p' .github/workflows/cloud-ci.yml | grep -nE 'POSTGRES|fsync|image:'",
+    "see": "The POSTGRES_* variables, image: public.ecr.aws/docker/library/postgres:17.6 and -c fsync=off: the block G7-03 copies."
+   },
+   {
+    "do": "grep -rn CELERY_TASK_ALWAYS_EAGER cloud/rhinoCloud/rhinoCore/tests | wc -l && grep -rn patch cloud/rhinoCloud/rhinoCore/tests | grep -c AgentRpcClient",
+    "see": "11\n69"
+   },
+   {
+    "do": "python3 -c \"import hashlib, pathlib; m=''.join(sorted(p.name for p in pathlib.Path('cloud/rhinoCloud/rhinoCore/migrations').glob('[0-9]*.py'))); print('api_tpl_' + hashlib.sha1(m.encode()).hexdigest()[:12])\"",
+    "see": "api_tpl_ followed by 12 hex characters, for example api_tpl_3f9c0a1b7d2e. This is the template name the conftest would use today."
+   }
+  ],
+  "faded": "Repeat the last command, but add one made-up migration name to the string before hashing (for example m + '9999_fake.py'). Predict first: same name or a new one? The command to write is left to you.",
+  "alone": "Read the test job's env block in cloud-ci.yml. Write down which variables the api-tests job must copy so the settings module can import. Start with ENV, DJANGO_SECRET_KEY and the POSTGRES_* lines. Then say which ones it can leave out because tests_api uses fakes, not MinIO or Redis.",
+  "done": "You can name the migration count, the missing group, today's template name and the env lines the new job needs."
+ },
+ "quiz": [
+  {
+   "q": "A teammate writes a test that checks one model method, with no request. Where does it go?",
+   "options": [
+    {
+     "text": "tests_api/, because new tests use pytest.",
+     "correct": false,
+     "why": "G7-01 splits by kind of test, not by age: endpoint tests go to tests_api/."
+    },
+    {
+     "text": "rhinoCore/tests, on manage.py test with CommonRhinoTestCase.",
+     "correct": true,
+     "why": "Model and service unit tests stay where they are; tests_api is for tests that call an endpoint and check the response."
+    },
+    {
+     "text": "rhinoCore/integration-tests, so it runs on QA.",
+     "correct": false,
+     "why": "That folder is for tests that need a real environment; a model method needs none."
+    }
+   ]
+  },
+  {
+   "q": "Why does the conftest take pg_advisory_lock(7007) before checking for the template?",
+   "options": [
+    {
+     "text": "To stop tests in other CI jobs from reading the template.",
+     "correct": false,
+     "why": "Each CI job has its own throw-away Postgres; the lock is about workers inside one run."
+    },
+    {
+     "text": "Because Postgres requires a lock before CREATE DATABASE.",
+     "correct": false,
+     "why": "It does not; the lock is our own choice."
+    },
+    {
+     "text": "Because four xdist workers start at once, and only one may run the migrations.",
+     "correct": true,
+     "why": "The others wait on the lock, then find the template and copy it."
+    }
+   ]
+  },
+  {
+   "q": "You change a fixture JSON file in rhinoCore/fixtures. What does poe api-test-affected run?",
+   "options": [
+    {
+     "text": "Possibly nothing, because testmon only sees Python code that tests execute.",
+     "correct": true,
+     "why": "Fixtures, migrations and the conftest are read during setup, so poe verify runs the full layer when they change."
+    },
+    {
+     "text": "Every test that loads the fixture, because testmon tracks file reads.",
+     "correct": false,
+     "why": "testmon tracks executed Python lines, not data files."
+    },
+    {
+     "text": "The whole layer, because a fixture change clears .testmondata.",
+     "correct": false,
+     "why": "Nothing clears it; that is why verify checks these paths itself."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p10-2: what does the worker_id fixture return when xdist is off?",
+  "From p10-3: what does pytest-django do at the end of each test marked django_db?"
+ ],
+ "videos": [
+  {
+   "title": "getting started with pytest (beginner - intermediate) anthony explains #518",
+   "url": "https://www.youtube.com/watch?v=mzlH8lp4ISA",
+   "channel": "anthonywritescode",
+   "minutes": 13,
+   "why": "pytest core maintainer shows the basics from a blank project."
+  }
+ ],
+ "words": [
+  {
+   "term": "API test layer",
+   "plain": "The new tests_api/ folder: pytest tests that send requests through the cloud's API in-process and check the response."
+  },
+  {
+   "term": "django_db_setup",
+   "plain": "The pytest-django fixture that creates the test database once per session; G7-02 overrides it to copy a template."
+  },
+  {
+   "term": "advisory lock",
+   "plain": "A named lock in Postgres that code takes and releases on purpose; here it lets one worker build the template."
+  },
+  {
+   "term": "service container",
+   "plain": "A container GitHub Actions starts next to a job (here Postgres) and removes when the job ends."
+  },
+  {
+   "term": "failures.md",
+   "plain": "The one-page report the agent_report plugin writes: per failure the place, the error, the traceback tail and a rerun command."
+  },
+  {
+   "term": "fixed seed",
+   "plain": "A set random seed (1009) so pytest-randomly shuffles tests the same way every run and a failure reproduces."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G7-01",
+   "why": "This lesson explained the split between the two runners, the rules for tests_api and the names the next tickets use.",
+   "walk": [
+    "Count what you will bring with the lab commands: migrations, the 69 and 24 patches, and the 11 eager Celery uses.",
+    "Book 30 minutes with the BE guild and Shai. Agree which tests go to tests_api/ and which stay; no mass move this quarter.",
+    "Agree the rules: no CELERY_TASK_ALWAYS_EAGER, no mocks of AgentRpcClient or StorageService, data through the API, fake data only.",
+    "Agree the names (api-tests, api-test, api-test-affected, verify, \"API Tests\", contract, sdk_smoke) and the three speed numbers to watch.",
+    "Write the outcome into the testing section of agents/be-guild/skills/be-repo-conventions/SKILL.md and open the PR."
+   ]
+  },
+  {
+   "key": "G7-02",
+   "why": "This lesson walked through the conftest line by line: the hashed template name, the lock, the build and the copy per worker.",
+   "walk": [
+    "Add the api-tests group to cloud/rhinoCloud/pyproject.toml, run make update-deps, and add --group api-tests to the sync-deps target.",
+    "Create tests_api/pytest.ini with the settings module, django_find_project = false, the pythonpath entries and the markers contract and sdk_smoke.",
+    "Write tests_api/conftest.py from the two blocks above; set RHINO_IS_RUNNING_UNIT_TESTS=1 and ENV=QA, and note poe cloud-up-debug (port 5431) in its docstring.",
+    "Add tests_api/test_smoke.py: an authenticated APIClient GETs /api/v2/projects/ and checks the status code and the row count.",
+    "Time uv run --group api-tests pytest tests_api -n 4 cold and warm and put both numbers in the PR."
+   ]
+  },
+  {
+   "key": "G7-03",
+   "why": "This lesson explained the api-tests job: the copied env, the Postgres service, the frozen install and the reports artifact.",
+   "walk": [
+    "Add the api-tests job to .github/workflows/cloud-ci.yml as in the two blocks above, copying the test job's full env block.",
+    "Cache ~/.cache/uv with the key pattern the other jobs use (uv-cloud-api-tests-uv<version>-<hash of uv.lock>).",
+    "Leave out MinIO, Redis and the NVFlare venv steps; G7-05 and G7-07 add the services for the contract suites.",
+    "Push a branch with a cloud change and check that API Tests runs and a forced failure uploads api-tests-reports.",
+    "Ask DevOps or Platform to add cloud-ci.yml, tests_api/pytest.ini and tests_api/conftest.py to the protected paths."
+   ]
+  },
+  {
+   "key": "G7-12",
+   "why": "This lesson explained the agent_report plugin line by line and why the fixed seed makes the rerun command work.",
+   "walk": [
+    "Create tests_api/plugins/agent_report.py from the two blocks above and register it with pytest_plugins in tests_api/conftest.py.",
+    "Add the api-test Poe task to the root pyproject.toml next to backend-integration-tests, and reports/ to .gitignore.",
+    "Run with -n auto and check that only one failures.md is written (the controller's).",
+    "Break one test on purpose, give Claude Code only reports/failures.md, and check it fixes the test without opening the log.",
+    "Decide with the BE guild whether the nightly uses a new seed each night."
+   ]
+  },
+  {
+   "key": "G7-13",
+   "why": "This lesson explained the api-test-affected task, what testmon cannot see, and how the sandbox image keeps .testmondata fresh.",
+   "walk": [
+    "Add pytest-testmon >= 2.1, < 3 to the api-tests group and .testmondata to .gitignore.",
+    "Add the api-test-affected Poe task from the block above, without -n.",
+    "Tell G3 that the nightly ai-agent-sandbox image runs poe api-test-affected once on main.",
+    "Check it on 5 recent cloud PRs: did the affected set include every test that failed in CI? Put the answer in the PR."
+   ]
+  }
+ ],
+ "remember": "Migrate once into a template, copy it per worker, and give the agent one page with a rerun command."
+}

@@ -1,0 +1,1087 @@
+[
+ {
+  "key": "G7-01",
+  "title": "[BE] Decide: pytest-django for the API layer, next to manage.py test",
+  "team": [
+   "be"
+  ],
+  "days": 0.5,
+  "w": [
+   3,
+   3
+  ],
+  "flag": "decide",
+  "deps": [],
+  "needs": "",
+  "what": "Agree with the BE guild that the new cloud API test layer (cloud/rhinoCloud/tests_api/) runs on pytest with pytest-django and xdist, while rhinoCore/tests keep running on manage.py test. Write down which tests go where and the few rules for the new layer.",
+  "why": "Two test runners side by side only work if everyone, agents included, knows which tests go where. pytest-django gives each xdist worker its own database and plain fixtures, and the fakes, builders and fast feedback in this goal are built on that.",
+  "how": [
+   "Book 30 minutes with the BE guild and Shai (G7 design lead). Bring the numbers from the repo: 228 cloud migrations, 69 mock.patch calls on AgentRpcClient and 24 on StorageService in rhinoCore/tests, and 11 uses of CELERY_TASK_ALWAYS_EAGER.",
+   "Agree the split: tests that call an endpoint and check the response go to tests_api/ (pytest); model and service unit tests stay in rhinoCore/tests with CommonRhinoTestCase and factory_boy. No mass move of old tests this quarter.",
+   "Agree the rules for tests_api/: no CELERY_TASK_ALWAYS_EAGER and no mock.patch of AgentRpcClient or StorageService (use the three fakes instead); create data through the API; fake data only (Faker, factory_boy), never rows copied from QA or prod.",
+   "Agree the names the next tickets use: uv group `api-tests`, Poe tasks `api-test`, `api-test-affected` and `verify`, the CI job \"API Tests\" in cloud-ci.yml, and the pytest markers `contract` and `sdk_smoke`.",
+   "Agree the speed goals as numbers to watch, not gates: affected tests under 30 s in the sandbox, the full layer under 3 min on a laptop, API layer plus lint under 6 min in CI.",
+   "Write the outcome into the testing section of agents/be-guild/skills/be-repo-conventions/SKILL.md (it already describes the unit vs integration split), so agents read the rules people agreed on."
+  ],
+  "code": null
+ },
+ {
+  "key": "G7-02",
+  "title": "[BE] Create tests_api/ with pytest-django, xdist and a template DB",
+  "team": [
+   "be"
+  ],
+  "days": 2,
+  "w": [
+   3,
+   4
+  ],
+  "flag": null,
+  "deps": [
+   "G7-01"
+  ],
+  "needs": "",
+  "what": "Add cloud/rhinoCloud/tests_api/ with its own pytest.ini, a conftest that migrates a template Postgres database once and copies it for each xdist worker, and a first test that calls an endpoint through DRF's APIClient.",
+  "why": "rhinoCore has 228 migrations, so migrating a database per worker is slow, while copying a template takes seconds. This is what lets the full API layer run in about 3 minutes locally and the affected subset in 30 seconds.",
+  "how": [
+   "Add a uv group to cloud/rhinoCloud/pyproject.toml: `api-tests = [\"pytest >= 9.0.3, < 10\", \"pytest-django >= 4.11, < 5\", \"pytest-xdist ~= 3.8.0\", \"pytest-randomly >= 3.16, < 4\"]`. Run `make update-deps` and add `--group api-tests` to the `sync-deps` target in cloud/rhinoCloud/Makefile.",
+   "Create tests_api/pytest.ini with `DJANGO_SETTINGS_MODULE = rhinoCloud.rhinoDjango.settings`, `django_find_project = false`, `pythonpath = ../.. ../../../common ../rhinoCore/integration-tests` and the markers `contract` and `sdk_smoke`. Because the ini sits in tests_api/, `pytest tests_api` does not pick up cloud/rhinoCloud/pytest.ini (the integration-test markers).",
+   "Write tests_api/conftest.py with the django_db_setup override below. The template name is a hash of the migration file names, so a new migration builds a new template. It runs migrate, createcachetable (settings use the database_cache table) and loads rhinoCore/fixtures/initial_data_prod_aws.json, the same seed CommonRhinoTestCase uses.",
+   "Environment: RHINO_IS_RUNNING_UNIT_TESTS=1 (fast MD5 hasher from settings_test.py), ENV=QA, and the Postgres variables from the `test` job in .github/workflows/cloud-ci.yml. Locally, `poe cloud-up-debug` exposes Postgres on localhost:5431; say so in the conftest's module docstring.",
+   "Add tests_api/test_smoke.py: an authenticated APIClient GETs /api/v2/projects/ and the test checks the status code and the number of rows.",
+   "Time `uv run --group api-tests pytest tests_api -n 4` cold (template built) and warm (template reused) and put both numbers in the PR."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/tests_api/conftest.py",
+   "lang": "python",
+   "text": "import hashlib\nfrom pathlib import Path\n\nimport pytest\n\nfrom django.conf import settings\nfrom django.core.management import call_command\nfrom django.db import connection, connections\n\nCORE = Path(__file__).parents[1] / \"rhinoCore\"\nMIGRATIONS = \"\".join(sorted(p.name for p in (CORE / \"migrations\").glob(\"[0-9]*.py\")))\nTEMPLATE_DB = \"api_tpl_\" + hashlib.sha1(MIGRATIONS.encode()).hexdigest()[:12]  # a new migration means a new template\n\n\n@pytest.fixture(scope=\"session\")\ndef django_db_setup(django_db_blocker, worker_id):\n    # Migrate once into a template DB, then give each xdist worker its own copy: seconds instead of 228 migrations.\n    db = settings.DATABASES[\"default\"]\n    worker_db = f\"test_api_{worker_id}\"  # worker_id is \"master\" when xdist is off\n    with django_db_blocker.unblock(), connection._nodb_cursor() as cur:  # Django's own cursor on the \"postgres\" DB\n        cur.execute(\"SELECT pg_advisory_lock(7007)\")  # one worker builds the template; released when cur closes\n        cur.execute(\"SELECT 1 FROM pg_database WHERE datname = %s\", [TEMPLATE_DB])\n        if cur.fetchone() is None:\n            cur.execute(f'CREATE DATABASE \"{TEMPLATE_DB}\"')\n            db[\"NAME\"] = TEMPLATE_DB\n            call_command(\"migrate\", verbosity=0)\n            call_command(\"createcachetable\")  # settings.CACHES uses the database_cache table\n            call_command(\"loaddata\", str(CORE / \"fixtures\" / \"initial_data_prod_aws.json\"), verbosity=0)\n            connections.close_all()  # CREATE DATABASE ... TEMPLATE needs no open sessions on the template\n        cur.execute(f'DROP DATABASE IF EXISTS \"{worker_db}\"')\n        cur.execute(f'CREATE DATABASE \"{worker_db}\" TEMPLATE \"{TEMPLATE_DB}\"')\n    db[\"NAME\"] = worker_db\n    yield"
+  }
+ },
+ {
+  "key": "G7-03",
+  "title": "[BE] Run the API layer as its own job in cloud-ci.yml",
+  "team": [
+   "be"
+  ],
+  "days": 1,
+  "w": [
+   4,
+   4
+  ],
+  "flag": null,
+  "deps": [
+   "G7-02"
+  ],
+  "needs": "G0 protected paths, so agents can't edit the checks they are judged by",
+  "what": "Add an \"API Tests\" job to .github/workflows/cloud-ci.yml that runs tests_api on fcp-runner-set with a throw-away Postgres, on every push that check-changes marks as a cloud change.",
+  "why": "Agents and people get the API layer's answer on every push within minutes, without the 20–30 minute queue on shared QA. The goal is API layer plus lint in under 6 minutes.",
+  "how": [
+   "Copy the shape of the existing `test` job: `needs: check-changes`, the same `if:`, and the postgres 17.6 service with fsync, synchronous_commit and full_page_writes off. Add the MinIO and Redis services only when the contract suites need them (G7-05, G7-07).",
+   "Install with `uv sync --frozen --group api-tests --no-install-project` and cache ~/.cache/uv with the key pattern the other jobs use (`uv-cloud-api-tests-uv<version>-<hash of uv.lock>`).",
+   "Run `pytest tests_api -n 4 --junitxml=reports/junit.xml` in cloud/rhinoCloud and upload reports/ with actions/upload-artifact@v7 when the job fails.",
+   "Leave out the NVFlare venv steps; the API layer should not need them. If a test does need them, it stays in rhinoCore/tests.",
+   "Ask DevOps/Platform to add .github/workflows/cloud-ci.yml, tests_api/pytest.ini and tests_api/conftest.py to the paths agents may not change (G0/G3 walls)."
+  ],
+  "code": {
+   "file": ".github/workflows/cloud-ci.yml",
+   "lang": "yaml",
+   "text": "  api-tests:\n    name: API Tests\n    runs-on: fcp-runner-set\n    needs: check-changes\n    if: github.ref == 'refs/heads/main' || needs.check-changes.outputs.has_changes == 'true'\n    env:\n      ENV: QA\n      RHINO_IS_RUNNING_UNIT_TESTS: 1\n      POSTGRES_HOST: localhost\n      POSTGRES_PASSWORD: ${{ secrets.CLOUD_TEST_POSTGRES_PASSWORD }}\n      # ...the rest of the `test` job's env block (a YAML anchor would keep the two jobs in sync)\n    services:\n      postgres:\n        image: public.ecr.aws/docker/library/postgres:17.6\n        ports: [\"5432:5432\"]\n        env: { POSTGRES_DB: rhino_cloud, POSTGRES_USER: rhino, POSTGRES_PASSWORD: \"${{ secrets.CLOUD_TEST_POSTGRES_PASSWORD }}\" }\n        command: -c fsync=off -c synchronous_commit=off -c full_page_writes=off\n        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5\n    steps:\n      - uses: actions/checkout@v6\n      - uses: actions/setup-python@v6\n        with:\n          python-version: \"3.13\"\n      - name: Run the API layer\n        working-directory: cloud/rhinoCloud\n        run: |\n          uv sync --frozen --group api-tests --no-install-project\n          .venv/bin/pytest tests_api -n 4 --junitxml=reports/junit.xml\n      - uses: actions/upload-artifact@v7\n        if: failure()\n        with: { name: api-tests-reports, path: cloud/rhinoCloud/reports/ }"
+  }
+ },
+ {
+  "key": "G7-04",
+  "title": "[BE] FakeOnPremClient: in-memory gRPC servicer with a contract suite",
+  "team": [
+   "be"
+  ],
+  "days": 2.5,
+  "w": [
+   4,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G7-02"
+  ],
+  "needs": "FCP Lab (Nave) for the real-client side of the contract suite, wired in G7-26",
+  "what": "A fake Rhino client that serves the real RhinoCloudInternalRpcProxy gRPC service in-process, so cloud code under test reaches it through the real AgentRpcClient. A contract suite runs the same checks against the fake and against a real client in FCP Lab.",
+  "why": "rhinoCore/tests patch AgentRpcClient with mocks in 69 places; mocks drift from the real client and skip the protobuf round-trip. A fake behind the real wire format catches those bugs, and the contract suite keeps the fake honest.",
+  "how": [
+   "Create tests_api/fakes/onprem_client.py (sketch). It subclasses RhinoCloudInternalRpcProxyServicer from common/fcp_common/rhinoAgentRpc/agent_rpc_internal_cloud_proxy_pb2_grpc.py and decodes request_data with the RhinoAgentRpc service descriptor, the same lookup AgentRpcClient._get_agent_rpc_method_response_type uses.",
+   "Add an `onprem_client` fixture in tests_api/conftest.py: start grpc.server on 127.0.0.1:0, call add_RhinoCloudInternalRpcProxyServicer_to_server, and monkeypatch AGENT_RPC_INTERNAL_CLOUD_PROXY_DNS and AGENT_RPC_INTERNAL_CLOUD_PROXY_PORT (AgentRpcClient reads them every time it is created).",
+   "Implement what the first scenarios need: HealthCheck, SystemStatus, ScheduleTask, GetEnvironmentVariable, GetAgentGcpProjectId, ValidateDatasetImportPaths and GetTensorBoardLogsMetadata. Any other method returns an error that names it, so a gap is loud. `offline_agents` returns the TIMEOUT error type the real proxy returns when a client is not connected.",
+   "Handlers never touch the database: they run on a gRPC server thread outside the test's transaction. Finishing a task is explicit: the test calls complete_task(), which runs handle_task_response from rhinoTaskServices/rhinoTaskResponseService/handle_task_response.py, the code task_response_job runs in production.",
+   "Write tests_api/contracts/test_onprem_client_contract.py (marker `contract`): health check, unknown agent id, a scheduled task and its response, the timeout error type. Add a `--target` option: `fake` by default; `lab` points the proxy env vars at the Lab's agent-rpc-cloud-side-service and the Lab's client id (G7-26 runs it).",
+   "Leave the existing mocks in rhinoCore/tests alone; new tests in tests_api use the fake."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/tests_api/fakes/onprem_client.py",
+   "lang": "python",
+   "text": "from fcp_common.rhinoAgentRpc import agent_rpc_onprem_side_pb2 as onprem\nfrom fcp_common.rhinoAgentRpc.agent_rpc_internal_cloud_proxy_pb2 import AgentRpcResponse\nfrom fcp_common.rhinoAgentRpc.agent_rpc_internal_cloud_proxy_pb2_grpc import RhinoCloudInternalRpcProxyServicer\nfrom rhinoCloud.rhinoTaskServices.rhinoTaskResponseService.handle_task_response import handle_task_response\n\nMETHODS = onprem.RhinoAgentRpc.GetDescriptor().methods_by_name  # the same lookup AgentRpcClient uses\n\n\nclass FakeOnPremClient(RhinoCloudInternalRpcProxyServicer):\n    \"\"\"In-memory Rhino clients behind the real cloud->agent gRPC contract. Pinned by tests_api/contracts/ (also run on FCP Lab).\"\"\"\n\n    def __init__(self):\n        self.calls: list[tuple[str, str]] = []  # (rhino_agent_id, method_name)\n        self.offline_agents: set[str] = set()\n        self.scheduled: list[onprem.ScheduleTaskRequest] = []  # more handlers: SystemStatus, GetEnvironmentVariable, ...\n\n    def AgentRpc(self, request, context):  # runs on a gRPC server thread: never touch the database here\n        self.calls.append((request.rhino_agent_id, request.method_name))\n        if request.rhino_agent_id in self.offline_agents:\n            return AgentRpcResponse(error_message=\"agent not connected\", error_type=AgentRpcResponse.ErrorType.TIMEOUT)\n        handler = getattr(self, f\"_{request.method_name}\", None)\n        if handler is None:  # loud on purpose: add the method here and a case to the contract suite\n            return AgentRpcResponse(error_message=f\"FakeOnPremClient does not implement {request.method_name}\")\n        request_type = getattr(onprem, METHODS[request.method_name].input_type.name)\n        return AgentRpcResponse(response_data=handler(request_type.FromString(request.request_data)).SerializeToString())\n\n    def _HealthCheck(self, request):\n        return onprem.HealthCheckResponse(is_healthy=True)\n    def _ScheduleTask(self, request):\n        self.scheduled.append(request)\n        return onprem.EmptyMessage()\n\n    def complete_task(self, task_uid: str, status: str, output: dict) -> None:\n        \"\"\"Call from the test thread: runs the same handler as task_response_job (the RQ task-response worker).\"\"\"\n        handle_task_response(task_uid=task_uid, task_status_str=status, task_output=output)"
+  }
+ },
+ {
+  "key": "G7-05",
+  "title": "[BE] In-memory object store fake with a contract suite against MinIO",
+  "team": [
+   "be"
+  ],
+  "days": 1.5,
+  "w": [
+   4,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G7-02"
+  ],
+  "needs": "",
+  "what": "An InMemoryStorageProvider that implements CloudStorageServiceProviderBase, swapped into StorageService by a fixture, and a contract suite that runs the same checks against the fake and against MinIO.",
+  "why": "rhinoCore/tests patch StorageService in 24 places. An in-memory store lets API tests really upload and read files without MinIO, and the contract suite proves it behaves like MinIO/S3 for the calls we make.",
+  "how": [
+   "Create tests_api/fakes/object_store.py (sketch) implementing every abstract method of CloudStorageServiceProviderBase in rhinoCore/services/cloud_services/storage_service.py, plus upload_file_from_bytes and storage_service_prefix.",
+   "Fixture `object_store`: `monkeypatch.setattr(storage_service, \"AWSStorageServiceProvider\", lambda: store)`. StorageService.__init__ builds AWSStorageServiceProvider() at call time when CLOUD_PROVIDER is AWS (the test env), so production code does not change.",
+   "Presigned URLs point at http://object-store.fake/<bucket>/<key>. StorageService.get_file downloads them with requests.get, so the fixture also patches storage_service.requests.get to serve that host from memory. Write this one seam down in the fake's docstring.",
+   "Write tests_api/contracts/test_object_store_contract.py, parametrized over `memory` and `minio` (minio when MINIO_S3_ENDPOINT_URL is set): missing bucket, list with prefix and filter_non_files, overwrite, delete, metadata size, presigned download.",
+   "Add the MinIO service (public.ecr.aws/u7h0g2s9/rhinofcp/minio:2025.2.7, as in the `test` job) to the API Tests job and run `pytest tests_api -m contract` there."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/tests_api/fakes/object_store.py",
+   "lang": "python",
+   "text": "import datetime\nfrom pathlib import Path\n\nfrom rhinoCloud.rhinoCore.services.cloud_services.storage_service import CloudStorageServiceProviderBase, FileMetadata\n\nFAKE_HOST = \"http://object-store.fake\"  # the fixture patches storage_service.requests.get to serve this host\n\n\nclass InMemoryStorageProvider(CloudStorageServiceProviderBase):\n    \"\"\"S3-shaped store in a dict. Pinned by tests_api/contracts/test_object_store_contract.py, which also runs on MinIO.\"\"\"\n\n    storage_service_prefix = \"s3://\"  # same as AWSStorageServiceProvider; check before relying on it\n\n    def __init__(self):\n        self.buckets: dict[str, dict[str, tuple[bytes, datetime.datetime]]] = {}\n\n    def list_objects(self, *, bucket_name, prefix=None, filter_non_files=False) -> list[str]:\n        objects = self.buckets[bucket_name]  # a missing bucket raises; the contract suite pins what MinIO does\n        keys = [key for key in objects if key.startswith(prefix or \"\")]\n        return [key for key in keys if not filter_non_files or (not key.endswith(\"/\") and objects[key][0])]\n\n    def upload_file_from_bytes(self, *, bucket_name: str, object_key: str, file_bytes: bytes) -> None:\n        self.buckets[bucket_name][object_key] = (file_bytes, datetime.datetime.now(datetime.UTC))\n\n    def upload_file(self, *, bucket_name: str, object_key: str, file_path: str) -> None:\n        self.upload_file_from_bytes(bucket_name=bucket_name, object_key=object_key, file_bytes=Path(file_path).read_bytes())\n\n    def generate_presigned_download_url(self, *, bucket_name, object_key, expires_in, response_disposition=None) -> str:\n        return f\"{FAKE_HOST}/{bucket_name}/{object_key}?expires_in={expires_in}\"\n\n    def get_file_metadata(self, *, bucket_name: str, object_key: str) -> FileMetadata:\n        data, modified = self.buckets[bucket_name][object_key]\n        return FileMetadata(last_modified=modified, size_bytes=len(data))\n\n    # bucket_exists, create_bucket, get_bucket, list_bucket_names, download_file, delete_file, ...: same style"
+  }
+ },
+ {
+  "key": "G7-06",
+  "title": "[BE] Data builders 1: workgroups, users and projects through the API",
+  "team": [
+   "be"
+  ],
+  "days": 2,
+  "w": [
+   4,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G7-02"
+  ],
+  "needs": "",
+  "what": "An in-process transport for the integration tests' RhinoAPITestWrapper, so tests_api can create data the way the UI and SDK do, plus builders for a site (a workgroup and its user, through TestDataCreator's \"custom\" scenario) and for projects.",
+  "why": "Data created through the API goes through the serializers and permission checks that factories skip. Reusing the integration tests' wrapper means ported scenarios keep their own calls, like api_client.create_project(), almost unchanged.",
+  "how": [
+   "In rhinoCore/integration-tests/integration_test_utils/common.py, move the requests.request(...) calls in RhinoAPI.make_call (including the page fetches) into one `_send()` method. Runs against QA behave exactly as before.",
+   "Add tests_api/api.py (sketch): InProcessRhinoAPI overrides `_send` and `_request_jwt_token` to use DRF's APIClient. The token still comes from the real auth/obtain_token endpoint, so auth is tested too.",
+   "Add tests_api/builders.py with a `builder` fixture: `builder.site()` posts test/create_test_data with scenario \"custom\" (TestDataCreator's format: a workgroup, a user with a `$var` password, a user_role) and returns a Site with a logged-in wrapper; `builder.project(site)` calls wrapper.create_project. Only the bootstrap Rhino admin comes from RhinoAdminTestFactory.",
+   "Add an `api_client` fixture: a RhinoAPITestWrapper on the in-process transport whose default_primary_workgroup_uid is the site's workgroup. It has the same name as the integration fixture, so ported tests keep working.",
+   "Fake data only: Faker names and emails, generated passwords. Never copy rows from QA or prod.",
+   "Builder tests: the site's user lists its own workgroup; a new project shows up in GET projects/ for that user and not for a user of another site."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/tests_api/api.py",
+   "lang": "python",
+   "text": "import json\nfrom urllib.parse import urlencode\n\nfrom rest_framework.test import APIClient\n\nfrom integration_test_utils.common import RhinoAPI\nfrom integration_test_utils.rhino_api_wrapper import RhinoAPITestWrapper\n\n\nclass InProcessRhinoAPI(RhinoAPI):\n    \"\"\"The integration tests' RhinoAPI with the HTTP call swapped for DRF's APIClient: same auth (a real JWT from\n    auth/obtain_token), same error handling and pagination, but no network and no shared QA.\"\"\"\n\n    def __init__(self, user_username: str, user_password: str, api_version: str = \"v2\"):\n        super().__init__(api_version=api_version, user_username=user_username, user_password=user_password)\n        self.api_base_url = \"/api/\"\n        self.client = APIClient()\n\n    def _request_jwt_token(self) -> str:\n        credentials = {\"email\": self.user_username, \"password\": self.user_password}\n        return self.client.post(f\"{self.api_base_versioned_url}auth/obtain_token\", credentials).json()[\"access\"]\n\n    def _send(self, method, url, headers=None, data=None, params=None, json_body=None, timeout=None):\n        # New seam: RhinoAPI.make_call (and its page fetches) call _send() instead of requests.request().\n        meta = {\"HTTP_\" + name.upper().replace(\"-\", \"_\"): value for name, value in (headers or {}).items() if value}\n        body = json.dumps(json_body) if json_body is not None else (data or \"\")  # multipart uploads: check per endpoint\n        return self.client.generic(\n            method, url, body, content_type=\"application/json\", QUERY_STRING=urlencode(params or {}), **meta\n        )\n\n\ndef in_process_wrapper(email: str, password: str, workgroup_uid: str) -> RhinoAPITestWrapper:  # for `api_client`\n    wrapper = RhinoAPITestWrapper(user_username=email, user_password=password, workgroup_uid=workgroup_uid)\n    wrapper.api = InProcessRhinoAPI(email, password)\n    return wrapper"
+  }
+ },
+ {
+  "key": "G7-07",
+  "title": "[BE] FakeTaskQueue for Celery with a contract suite on a real worker",
+  "team": [
+   "be"
+  ],
+  "days": 2,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G7-02"
+  ],
+  "needs": "",
+  "what": "A fixture that records every Celery task the code sends (by replacing app.send_task) and a drain() that runs them in-process, oldest first, plus a contract suite that runs the same scenarios on a real Celery worker with Redis.",
+  "why": "Eleven test classes in rhinoCore/tests set CELERY_TASK_ALWAYS_EAGER, which Celery's docs say is not suitable for testing: tasks run inside the caller and skip the broker's serialization (ours is pickle). Recording and then draining keeps both the order and the serialization honest.",
+  "how": [
+   "Create tests_api/fakes/task_queue.py (sketch) and a `task_queue` fixture that does `monkeypatch.setattr(app, \"send_task\", queue.send_task)` on the app in rhinoCore/celery_tasks/app.py. Task.apply_async ends in app.send_task, so RhinoTask's header injection still runs.",
+   "Serialize arguments with kombu using app.conf.task_serializer and accept_content (pickle and json in rhinoDjango/settings.py), the way a broker would, so an argument that can't be serialized fails in the test.",
+   "drain() runs each task with Task.apply and the recorded headers (RhinoTask restores the metadata context from them), re-raises the task's own error, and follows Celery's `chain` option, which vocabulary_indexing.index_large_vocabulary and the NVFlare inference flow use.",
+   "Contract suite tests_api/contracts/test_task_queue_contract.py (marker `contract`): a plain task, a chain, an error, the metadata context kept. The real side uses celery.contrib.testing.worker.start_worker with the Redis service and a transactional DB, because results go to the django-db result backend.",
+   "Add the Redis service (public.ecr.aws/u7h0g2s9/rhinofcp/redis:7.4.3, as in the `test` job) to the API Tests job for the contract run. RQ jobs such as task_response_job are not in scope here; FakeOnPremClient.complete_task reaches that code directly."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/tests_api/fakes/task_queue.py",
+   "lang": "python",
+   "text": "import uuid\nfrom collections import namedtuple\n\nfrom celery.canvas import maybe_signature\nfrom kombu.serialization import dumps, loads\n\nfrom rhinoCloud.rhinoCore.celery_tasks.app import app\n\nSentTask = namedtuple(\"SentTask\", \"name args kwargs options task_id\")\n\n\nclass FakeTaskQueue:\n    \"\"\"Stands in for the broker: send_task() records, drain() runs, oldest first. Unlike CELERY_TASK_ALWAYS_EAGER,\n    arguments go through our serializer (pickle) as on Redis, and nothing runs until the test asks.\"\"\"\n\n    def __init__(self):\n        self.sent: list[SentTask] = []\n        self.ran: list[SentTask] = []\n\n    def send_task(self, name, args=None, kwargs=None, task_id=None, **options):  # replaces app.send_task\n        content_type, encoding, body = dumps((args or (), kwargs or {}), serializer=app.conf.task_serializer)\n        args, kwargs = loads(body, content_type, encoding, accept=app.conf.accept_content)\n        self.sent.append(SentTask(name, tuple(args), kwargs, options, task_id or str(uuid.uuid4())))\n        return app.AsyncResult(self.sent[-1].task_id)  # callers read .id; tests call drain(), never .get()\n\n    def drain(self) -> list[SentTask]:\n        while self.sent:\n            task = self.sent.pop(0)\n            result = app.tasks[task.name].apply(task.args, task.kwargs, task_id=task.task_id, headers=task.options.get(\"headers\"))\n            result.get(propagate=True)  # the task's own exception, raised in the test\n            if chain := list(task.options.get(\"chain\") or []):\n                next_sig = maybe_signature(chain.pop(), app=app)  # Celery keeps the rest of a chain reversed\n                next_sig.apply_async(() if next_sig.immutable else (result.result,), chain=chain or None)\n            self.ran.append(task)\n        return self.ran"
+  }
+ },
+ {
+  "key": "G7-08",
+  "title": "[BE] Data builders 2: data schemas, datasets and code objects",
+  "team": [
+   "be"
+  ],
+  "days": 2,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G7-04",
+   "G7-06"
+  ],
+  "needs": "",
+  "what": "Builders for data schemas, datasets (imported through POST datasets/, with FakeOnPremClient finishing the import task) and code objects, plus two scenario helpers that mirror TestDataCreator's \"pneumonia\" and \"python_code\" scenarios.",
+  "why": "Most cloud-only scenarios need a project with a schema, a dataset and a code object. Building them through the API catches what factories skip: serializer validation, permission checks and import status changes.",
+  "how": [
+   "`data_schema()` calls wrapper.create_schema with the CSVs already in rhinoCore/integration-tests/pytest_fixtures/, for example \"Pneumonia Input Schema.csv\".",
+   "`dataset()` (sketch) calls wrapper.create_dataset with sync off; add a `sync` parameter to RhinoAPITestWrapper.create_dataset, which hard-codes True today. A sync import polls the database in the request thread while it waits, so the fake could never answer in time.",
+   "It then takes the recorded ScheduleTask for TaskType.DATASET_IMPORT from the fake and calls complete_task with TaskStatus.COMPLETED and a fake import output. Copy the output shape from the dataset-handler tests in rhinoTaskServices/tests.",
+   "`code_object()` posts to code_objects/ with the same config as TestDataCreator's python_code scenario (the generic-python-runner image from ContainerImageRegistry and the BMI one-liner).",
+   "Scenario helpers `pneumonia(site)` and `python_code(site, project_uid)` return small dataclasses of uids, so ported tests read like the old scenarios.",
+   "Import outputs are fake rows made in the test with Faker. No PHI and no copies of real data."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/tests_api/builders.py",
+   "lang": "python",
+   "text": "from dataclasses import dataclass\nfrom pathlib import Path\n\nfrom faker import Faker\n\nfrom fcp_common.rhinoTaskServices.task_common import TaskStatus, TaskType\nfrom rhinoCloud.rhinoCore.models.dataset import Dataset\n\nfrom integration_test_utils.rhino_api_wrapper import RhinoAPITestWrapper\n\nSCHEMA_CSVS = Path(__file__).parents[1] / \"rhinoCore\" / \"integration-tests\" / \"pytest_fixtures\"\nfake = Faker()\n\n\n@dataclass\nclass Site:\n    api: RhinoAPITestWrapper  # logged in as the site's user, on the in-process transport (see builder.site())\n    workgroup_uid: str\n    email: str\n    password: str  # generated per test; fake\n\n\ndef data_schema(site: Site, project_uid: str, csv_name: str = \"Pneumonia Input Schema.csv\") -> str:\n    return site.api.create_schema(project_uid, SCHEMA_CSVS / csv_name)\n\n\ndef dataset(site: Site, project_uid: str, schema_uid: str, onprem_client, import_output: dict) -> str:\n    \"\"\"Import through POST datasets/ like the UI does; the fake client \"runs\" the import task.\n    sync=False on purpose: a sync import polls the DB in this thread while waiting, so the fake could never answer.\"\"\"\n    created = site.api.create_dataset(fake.catch_phrase(), project_uid, schema_uid, \"/rhino_data/fake.csv\", sync=False)\n    task = next(t for t in reversed(onprem_client.scheduled) if t.task_type == TaskType.DATASET_IMPORT)\n    onprem_client.complete_task(task.task_uid, TaskStatus.COMPLETED, import_output)  # fake rows, made with Faker\n    status = site.api.api.make_call(\"GET\", f\"datasets/{created['uid']}/\")[\"data\"][\"import_status\"]\n    assert status == Dataset.ImportStatusTypes.COMPLETE, status\n    return created[\"uid\"]"
+  }
+ },
+ {
+  "key": "G7-09",
+  "title": "[DevOps] Gate D: prove FCP Lab on a clean Ubuntu 24.04 VM",
+  "team": [
+   "devops",
+   "be"
+  ],
+  "days": 2,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "Nave (FCP Lab owner) to move the lab repo into the org and fix Linux issues",
+  "what": "Run FCP Lab's core proof on a fresh Ubuntu 24.04 amd64 VM sized like the planned runner (8 vCPU, 32 GB, 100 GB gp3), fix what breaks together with Nave, and record the time, memory and disk a Lab needs.",
+  "why": "The Lab has only passed on Macs; its own docs/verification.md lists Gate D, a clean Linux host, as never run. CI runners, sandbox VMs and the nightly image are all Linux, so the rest of the Lab work waits on this.",
+  "how": [
+   "With Nave, move the lab repo into the RhinoHealth org as a private repo (its ci/README.md says it lives under a personal account today), so CI can check it out later with a GitHub App token.",
+   "Launch one throw-away m8i.2xlarge by hand in the inf account from Ubuntu 24.04: IMDSv2, encrypted gp3, an auto_stop_at tag for the VM autostop lambda, and no cloud credentials, kubeconfig or VPN on it. Install Docker Engine and Compose v2.",
+   "Run the lab's ci/rehearse.sh (it wraps `lab ci --source <fcp> --json`) through the measuring script below, cold and then warm. Keep the lab's reports/ on the VM.",
+   "Record what G7-16 needs for sizing: cold and warm boot time, peak memory per service, `docker system df` (the lab README says one source hash builds about 11 GB of images), and whether Orthanc (amd64 only) and the browser proof pass.",
+   "Turn each failure into a lab patch or an fcp fix with Nave, and rerun on a fresh VM until two runs in a row reach `state: ready`.",
+   "Repeat once inside an ARC dind pod on inf-rhinohealth (the lab's CI template warns not to swap in ARC/dind without testing), then terminate the VM."
+  ],
+  "code": {
+   "file": "fcp-local-lab/ci/gate-d.sh (lab repo; final repo name to confirm with Nave)",
+   "lang": "bash",
+   "text": "#!/bin/bash\n# Gate D on a fresh Ubuntu 24.04 amd64 VM, plus the numbers G7-16 needs to size lab-runner-set.\n# Usage: ci/gate-d.sh /absolute/path/to/fcp   (no cloud credentials, kubeconfig or VPN on this machine)\nset -euo pipefail\nfcp=\"${1:?usage: ci/gate-d.sh /absolute/path/to/fcp}\"\nlab_root=\"$(cd -- \"$(dirname -- \"$0\")/..\" && pwd)\"\nout=\"gate-d-$(date -u +%Y%m%dT%H%M%SZ)\"\nmkdir -p \"$out\"\n\n{ uname -a; nproc; free -g; df -h /var/lib/docker; docker version --format '{{.Server.Version}}'; docker compose version; } > \"$out/host.txt\"\n\n# Sample per-container CPU and memory every 10 s while the Lab runs.\n( while sleep 10; do\n    docker stats --no-stream --format '{{.Name}},{{.CPUPerc}},{{.MemUsage}}' | sed \"s/^/$(date +%s),/\" >> \"$out/stats.csv\"\n  done ) &\nsampler=$!\ntrap 'kill \"$sampler\"' EXIT\n\nfor run in cold warm; do  # the warm run reuses the images the cold run built\n  start=$(date +%s)\n  \"$lab_root/ci/rehearse.sh\" \"$fcp\" > \"$out/$run.json\" || echo \"$run FAILED\" >> \"$out/timings.txt\"\n  echo \"$run $(( $(date +%s) - start ))s\" >> \"$out/timings.txt\"\ndone\n\ndocker system df -v > \"$out/disk.txt\"  # the lab README expects about 11 GB of images per source hash\ndu -sh \"${FCP_LAB_HOME:-$HOME/.fcp-lab}\" >> \"$out/disk.txt\"\necho \"Attach $out/ to the ticket. Keep the lab's reports/ on this VM; they hold the Lab's own evidence.\""
+  }
+ },
+ {
+  "key": "G7-10",
+  "title": "[Guilds] Add npm run verify to the frontend: lint, types, related tests",
+  "team": [
+   "guild"
+  ],
+  "days": 1,
+  "w": [
+   5,
+   5
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G8 verify skill and G4 checking guide point to it",
+  "what": "Add a `verify` script to frontend/package.json that checks what changed since main: Biome on the changed files, the type check, the Vitest tests related to the changed files and the stories of changed components, with one pass/fail summary.",
+  "why": "Agents and people need one fast command that gives the answer CI will give, before they say \"done\". Today that is four separate commands and the whole unit suite.",
+  "how": [
+   "Add frontend/scripts/verify.ts (sketch); Node 24 runs .ts files directly, so there is no new .js or .mjs file. Add `\"verify\": \"node scripts/verify.ts\"`; `npm run verify -- --all` checks everything (CI uses this).",
+   "Changed files are `git diff --name-only --relative <merge-base with origin/main>` plus untracked files; VERIFY_BASE overrides the base.",
+   "Steps: `biome check <files>`, `tsc --noEmit`, `vitest related <files> --run --passWithNoTests`. Print one line per step at the end, so the result fits in an agent's context.",
+   "Affected stories: decide with the FE guild. Option A is @storybook/addon-vitest, which turns stories into Vitest tests that `vitest related` picks up; option B is a render smoke test of each changed *.stories.tsx. FE reviews already prefer Storybook stories over class-name tests.",
+   "Add a short section to frontend/AGENTS.md: tests assert on what the user sees. Use test ids, ARIA roles and names, visible text and row counts, never class names or internal state. It matches the e2e/pages POM rules already there."
+  ],
+  "code": {
+   "file": "frontend/scripts/verify.ts",
+   "lang": "typescript",
+   "text": "// `npm run verify` checks what changed since main; `npm run verify -- --all` checks everything (CI).\nimport {execFileSync, spawnSync} from \"node:child_process\"\n\nconst all = process.argv.includes(\"--all\")\nconst git = (...args: string[]) => execFileSync(\"git\", args, {encoding: \"utf8\"}).trim()\nconst base = process.env.VERIFY_BASE ?? git(\"merge-base\", \"HEAD\", \"origin/main\")\nconst changed = [\n\t...git(\"diff\", \"--name-only\", \"--relative\", \"--diff-filter=ACMR\", base).split(\"\\n\"),\n\t...git(\"ls-files\", \"--others\", \"--exclude-standard\").split(\"\\n\")\n].filter((file) => /\\.(ts|tsx|css|json)$/.test(file))\nconst code = changed.filter((file) => /^(src|test)\\/.*\\.tsx?$/.test(file))\n\nconst steps: [string, string[]][] = [[\"types\", [\"tsc\", \"--noEmit\", \"--pretty\", \"false\"]]]\nif (all || changed.length > 0) steps.unshift([\"lint\", [\"biome\", \"check\", ...(all ? [\".\"] : changed)]])\nif (all) steps.push([\"unit tests\", [\"vitest\", \"run\", ...(process.env.VITEST_MONOCART ? [\"--coverage\"] : [])]])\nelse if (code.length > 0)\n\tsteps.push([\"related unit tests\", [\"vitest\", \"related\", ...code, \"--run\", \"--passWithNoTests\"]])\n// Affected stories: decide with the FE guild (@storybook/addon-vitest would make them part of `vitest related`).\n\nconst results = steps.map(([name, args]) => ({name, ok: spawnSync(\"npx\", args, {stdio: \"inherit\"}).status === 0}))\nconsole.log(`\\nverify: ${all ? \"all files\" : `${changed.length} changed files since ${base.slice(0, 7)}`}`)\nfor (const {name, ok} of results) console.log(`${ok ? \"pass\" : \"FAIL\"}  ${name}`)\nprocess.exit(results.every(({ok}) => ok) ? 0 : 1)"
+  }
+ },
+ {
+  "key": "G7-11",
+  "title": "[BE] Fail cloud CI on breaking OpenAPI changes (oasdiff)",
+  "team": [
+   "be"
+  ],
+  "days": 1,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G4 checking guide gets a line for this check",
+  "what": "Export the cloud's OpenAPI schema for this commit and for its merge base with main, and fail the build when oasdiff finds a breaking change.",
+  "why": "The published SDK, the frontend and the MCP server all read this API, and customers keep older SDK versions for months. A removed field or a new required parameter should be caught in CI, not by a customer.",
+  "how": [
+   "Add cloud/rhinoCloud/scripts/export_openapi.py: django.setup(), then drf_spectacular's SchemaGenerator(patterns=_MAIN_SCHEMA_PATTERNS, api_version=\"v2\") from rhinoDjango/urls.py (the same patterns /docs/v2/openapi/ serves), written as YAML. Do the same for _CONNECT_SCHEMA_PATTERNS.",
+   "Add an \"OpenAPI breaking changes\" job to cloud-ci.yml (sketch). It runs this commit's script against a git worktree of the merge base through PYTHONPATH, so the very first run already has a base to compare with.",
+   "Run oasdiff breaking with --fail-on ERR; warnings show as annotations. A deliberate break needs a person to add a line with the ticket key to cloud/rhinoCloud/openapi-breaking-ignore.txt (oasdiff --err-ignore); agents may not edit that file (protected path).",
+   "Check that the export needs no database. If a serializer queries at import time, fix the serializer.",
+   "Add one line to Nova's checking guide (G4): run this check when a change touches serializers, views or urls.py."
+  ],
+  "code": {
+   "file": ".github/workflows/cloud-ci.yml",
+   "lang": "yaml",
+   "text": "  openapi-diff:\n    name: OpenAPI breaking changes\n    runs-on: fcp-runner-set\n    needs: check-changes\n    if: github.ref != 'refs/heads/main' && needs.check-changes.outputs.has_changes == 'true'\n    env:\n      ENV: QA\n      DJANGO_SECRET_KEY: rhino\n      DJANGO_SETTINGS_MODULE: rhinoCloud.rhinoDjango.settings\n      # ...plus whatever settings.py reads at import time (copy from the `test` job); no database is used\n    steps:\n      - uses: actions/checkout@v6\n        with:\n          fetch-depth: 0\n      - uses: actions/setup-python@v6\n        with:\n          python-version: \"3.13\"\n      - name: Install dependencies\n        working-directory: cloud/rhinoCloud\n        run: uv sync --frozen --no-install-project && echo \"$PWD/.venv/bin\" >> \"$GITHUB_PATH\"\n      - name: Export the v2 schema for the merge base and for this commit\n        run: |\n          git worktree add \"$RUNNER_TEMP/base\" \"$(git merge-base HEAD origin/main)\"\n          # This commit's export script runs against both trees, so the first run already has a base.\n          PYTHONPATH=\"$RUNNER_TEMP/base/cloud:$RUNNER_TEMP/base/common\" python cloud/rhinoCloud/scripts/export_openapi.py > \"$RUNNER_TEMP/base.yaml\"\n          PYTHONPATH=\"$PWD/cloud:$PWD/common\" python cloud/rhinoCloud/scripts/export_openapi.py > \"$RUNNER_TEMP/head.yaml\"\n      - name: Fail on breaking changes\n        # $RUNNER_TEMP sits on the work volume the dind sidecar shares; pin the image by digest\n        run: >\n          docker run --rm -v \"$RUNNER_TEMP:/work\" -v \"$PWD/cloud/rhinoCloud:/cfg:ro\" tufin/oasdiff@sha256:<digest>\n          breaking /work/base.yaml /work/head.yaml --fail-on ERR --format githubactions\n          --err-ignore /cfg/openapi-breaking-ignore.txt"
+  }
+ },
+ {
+  "key": "G7-12",
+  "title": "[BE] Agent-friendly test output: failures.md, JUnit and a fixed seed",
+  "team": [
+   "be"
+  ],
+  "days": 1,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G7-03"
+  ],
+  "needs": "",
+  "what": "Make `poe api-test` write reports/failures.md (a short, complete report per failing test) and reports/junit.xml, and run with a fixed random seed that the report prints.",
+  "why": "An agent fixes its own mistakes only when the failure is easy to read. A 3,000-line log fills its context; a one-page report with the file, the error and an exact rerun command does not.",
+  "how": [
+   "Add tests_api/plugins/agent_report.py (sketch) and register it with `pytest_plugins` in tests_api/conftest.py. Under xdist only the controller writes the report.",
+   "Per failure: test id, file:line, the first line of the error, the last 40 lines of the traceback and a rerun command with the seed. Cap it at 20 failures and point to junit.xml for the rest.",
+   "Add the Poe task to the root pyproject.toml next to backend-integration-tests: `api-test = { cmd = \"uv run --frozen --group api-tests pytest tests_api -n auto --randomly-seed=1009 --junitxml=reports/junit.xml -q --tb=short\", cwd = \"cloud/rhinoCloud\", help = \"...\" }`; add reports/ to .gitignore.",
+   "pytest-randomly with a fixed seed shuffles tests in the same order every run and reseeds random, Faker and factory_boy, so a failure reproduces. Decide with the guild whether the nightly uses a new seed each night to find order bugs.",
+   "Try it: break one test on purpose, give Claude Code only reports/failures.md, and check it can fix the test without opening the log."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/tests_api/plugins/agent_report.py",
+   "lang": "python",
+   "text": "import os\nfrom pathlib import Path\n\nMAX_FAILURES = 20\nTAIL_LINES = 40\n\n\ndef pytest_sessionfinish(session, exitstatus):\n    if hasattr(session.config, \"workerinput\"):  # an xdist worker: the controller writes the report\n        return\n    stats = session.config.pluginmanager.get_plugin(\"terminalreporter\").stats\n    failed = [r for r in stats.get(\"failed\", []) + stats.get(\"error\", []) if r.when in (\"setup\", \"call\")]\n    seed = session.config.getoption(\"randomly_seed\", default=None)\n    lines = [f\"# API tests: {len(failed)} failing (seed {seed})\", \"\"]\n    for report in failed[:MAX_FAILURES]:\n        crash = getattr(report.longrepr, \"reprcrash\", None)\n        lines += [\n            f\"## {report.nodeid}\",\n            f\"- where: {crash.path}:{crash.lineno}\" if crash else \"- where: fixture or setup error\",\n            f\"- error: {crash.message.splitlines()[0]}\" if crash else \"\",\n            \"```\",\n            *report.longreprtext.splitlines()[-TAIL_LINES:],\n            \"```\",\n            f\"- rerun: `cd cloud/rhinoCloud && uv run --group api-tests pytest tests_api/{report.nodeid} --randomly-seed={seed}`\",\n            \"\",\n        ]\n    if len(failed) > MAX_FAILURES:\n        lines.append(f\"{len(failed) - MAX_FAILURES} more failures are in reports/junit.xml\")\n    out = Path(os.environ.get(\"API_TEST_REPORT_DIR\", \"reports\"))\n    out.mkdir(exist_ok=True)\n    (out / \"failures.md\").write_text(\"\\n\".join(lines) if failed else \"# API tests: all passed\\n\")"
+  }
+ },
+ {
+  "key": "G7-13",
+  "title": "[BE] Run only the affected API tests with pytest-testmon",
+  "team": [
+   "be"
+  ],
+  "days": 1,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G7-12"
+  ],
+  "needs": "G3 ai-agent-sandbox image builds .testmondata from main each night",
+  "what": "Add `poe api-test-affected`, which uses pytest-testmon to run only the API tests whose code paths the current changes touch, for the editor, the sandbox and poe verify.",
+  "why": "Inside the sandbox an agent should get an answer in under 30 seconds after an edit. Running only the tests whose code changed gets there without skipping the tests that matter.",
+  "how": [
+   "Add `pytest-testmon >= 2.1, < 3` to the api-tests group and `.testmondata` to .gitignore.",
+   "Add the Poe task (sketch). Run it without -n: the affected set is small, and testmon's xdist support must be checked for the pinned version before the two are combined.",
+   "testmon only sees Python code that the tests run. Migrations, fixtures and tests_api/conftest.py are read during setup, so poe verify (G7-14) runs the full layer when any of them change.",
+   "The G3 nightly sandbox image runs `poe api-test-affected` once on main, so each VM starts with fresh .testmondata and the first run inside a task is already small.",
+   "Check it on 5 recent cloud PRs: did the affected set include every test that failed in CI for them? Put the answer in the PR."
+  ],
+  "code": {
+   "file": "pyproject.toml (root, [tool.poe.tasks])",
+   "lang": "toml",
+   "text": "# ============================================================================\n# BACKEND API TESTS (cloud/rhinoCloud/tests_api, uv group api-tests)\n# ============================================================================\n\napi-test = { cmd = \"uv run --frozen --group api-tests pytest tests_api -n auto --randomly-seed=1009 --junitxml=reports/junit.xml -q --tb=short\", cwd = \"cloud/rhinoCloud\", help = \"Run the whole cloud API layer in parallel. Writes reports/failures.md and reports/junit.xml. Extra args go to pytest.\" }\n\n# Only the tests whose code paths changed (pytest-testmon). No -n: the set is small, and testmon + xdist must be\n# checked for the pinned version first. The first run on a machine runs everything and writes .testmondata;\n# the sandbox image ships one built from main. poe verify runs api-test instead when migrations or fixtures change.\napi-test-affected = { cmd = \"uv run --frozen --group api-tests pytest tests_api --testmon --randomly-seed=1009 -q --tb=short\", cwd = \"cloud/rhinoCloud\", help = \"Run only the API tests affected by your changes (pytest-testmon).\" }"
+  }
+ },
+ {
+  "key": "G7-14",
+  "title": "[BE] Add poe verify; run it from the editor hook, Stop hook and CI",
+  "team": [
+   "be"
+  ],
+  "days": 1,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G7-10",
+   "G7-13"
+  ],
+  "needs": "G3-21: the TypeScript harness's Stop hook (ai-agents/harness/src/hooks.ts); G8 rhino-core verify skill; G4 checking guide",
+  "what": "Add `poe verify` (lint the changed Python files and run the affected tests per area) and a Claude Code Stop hook in fcp's .claude/settings.json that runs `poe verify` or `npm run verify` for what changed. Nova's Stop hook and CI call the same commands.",
+  "why": "When the editor, the agent and CI run the same command, green means the same thing everywhere, and agents stop guessing which checks to run.",
+  "how": [
+   "Add scripts/poe_verify.py (sketch) and `verify = { script = \"scripts.poe_verify:main(all_files=all)\", args = [{ name = \"all\", type = \"boolean\" }] }` in [tool.poe.tasks], next to the createsuperuser script task.",
+   "Add scripts/claude_stop_verify.sh and a Stop hook entry in the tracked .claude/settings.json. The script picks the command by changed paths; on failure it prints the summary and the failures.md path to stderr and exits 2, so Claude keeps working. If the hook input has stop_hook_active true, it reports and lets the session end, so it never loops.",
+   "Nova gets this hook too: its harness loads fcp's project settings (settingSources [\"project\"], G3-19), so verify runs once, here, and Nova's own Stop hook (G3-21) only checks the proof for the plan's QA checks. The command and its exit code, not shared code, are the contract between fcp and the harness; agree it with Platform.",
+   "CI: the API Tests job runs `uvx --from poethepoet poe verify --all`, and frontend-ci's unit-tests job runs `npm run verify -- --all` with VITEST_MONOCART=1 in place of its separate lint, check-types and test:unit:coverage steps.",
+   "client/ has no fast test layer yet: decide with the BE guild whether verify runs `scripts/local_run_backend_unit_tests.sh client <module>` (needs Docker) or only lints client files for now.",
+   "Point the G8 verify skill, the G4 checking guide and the be-repo-conventions skill at `poe verify` and `npm run verify`, one line each."
+  ],
+  "code": {
+   "file": "scripts/poe_verify.py",
+   "lang": "python",
+   "text": "\"\"\"poe verify: lint and test what changed since main. The Claude Code Stop hook (scripts/claude_stop_verify.sh),\nNova's Stop hook and CI (`poe verify --all`) run this same command, so \"green\" means the same thing everywhere.\"\"\"\n\nimport subprocess\nimport sys\n\nCORE = \"cloud/rhinoCloud/rhinoCore/\"\nCLOUD = (\"cloud/rhinoCloud/\", \"common/fcp_common/\")\nFULL_RUN = (CORE + \"migrations/\", CORE + \"fixtures/\", \"cloud/rhinoCloud/tests_api/conftest.py\")  # testmon can't see these\n\n\ndef _git(*args: str) -> list[str]:\n    return subprocess.run([\"git\", *args], capture_output=True, text=True, check=True).stdout.splitlines()\n\n\ndef main(all_files: bool = False) -> None:\n    base = _git(\"merge-base\", \"HEAD\", \"origin/main\")[0]\n    changed = _git(\"diff\", \"--name-only\", base) + _git(\"ls-files\", \"--others\", \"--exclude-standard\")\n    python_files = [f for f in changed if f.endswith(\".py\")]\n    steps: list[tuple[str, list[str]]] = []\n    if all_files or python_files:\n        steps.append((\"lint\", [\"pre-commit\", \"run\", *([\"--all-files\"] if all_files else [\"--files\", *python_files])]))\n    if all_files or any(f.startswith(FULL_RUN) for f in changed):\n        steps.append((\"cloud API tests: all\", [\"poe\", \"api-test\"]))\n    elif any(f.startswith(CLOUD) for f in changed):\n        steps.append((\"cloud API tests: affected\", [\"poe\", \"api-test-affected\"]))\n    if any(f.startswith(\"sdk/\") for f in changed):\n        steps.append((\"sdk\", [\"make\", \"-C\", \"sdk\", \"lint\", \"test\"]))\n    # client/: no fast test layer yet. Decide with the BE guild: lint only, or the Docker-based unit tests.\n    failed = {name for name, cmd in steps if subprocess.run(cmd).returncode != 0}\n    for name, _ in steps:\n        print(f\"{'FAIL' if name in failed else 'pass'}  {name}\")\n    if failed:\n        print(\"Details: cloud/rhinoCloud/reports/failures.md\", file=sys.stderr)\n    sys.exit(1 if failed else 0)"
+  }
+ },
+ {
+  "key": "G7-15",
+  "title": "[BE] Lint new migrations with django-migration-linter and Squawk",
+  "team": [
+   "be"
+  ],
+  "days": 1,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G4 checking guide gets a line for this check",
+  "what": "In cloud CI, check every migration added since main twice: django-migration-linter for changes that break the code still running during a deploy, and Squawk on the SQL from `manage.py sqlmigrate` for locks and table rewrites that hurt a live Postgres.",
+  "why": "Agents will write migrations. A column drop or a table rewrite looks harmless in a diff but breaks old pods during a rollout or locks a big table, and both tools catch this before review.",
+  "how": [
+   "Add django-migration-linter to the `test` dependency group, and to INSTALLED_APPS only when RHINO_IS_RUNNING_UNIT_TESTS=1 (in rhinoDjango/settings_test.py).",
+   "Add the step below to the `test` job in cloud-ci.yml after \"Check for missing migrations\"; that job's checkout needs fetch-depth: 0 for the merge base. The job already has the Postgres service that sqlmigrate needs.",
+   "Add .squawk.toml at the repo root: pg_version 17.6 (what CI and the Lab run; check the prod RDS version), assume_in_transaction = true (Django wraps migrations in a transaction), and excluded rules with a reason each.",
+   "Start advisory for 2 weeks (continue-on-error), go through the findings with the BE guild, then make it blocking. Exceptions are per migration, with a comment, and added by a person.",
+   "Client migrations (rhinoAgent, rhinoRawDataHandler) run on customer machines at upgrade time; add them later if the guild wants it."
+  ],
+  "code": {
+   "file": ".github/workflows/cloud-ci.yml (test job)",
+   "lang": "yaml",
+   "text": "      # After \"Check for missing migrations\". This job's checkout needs `fetch-depth: 0` for the merge base.\n      - name: Lint new migrations (django-migration-linter + Squawk)\n        working-directory: cloud/rhinoCloud\n        continue-on-error: true  # advisory for the first 2 weeks, then remove this line\n        run: |\n          base=$(git merge-base HEAD origin/main)\n          ./manage.py lintmigrations --git-commit-id \"$base\"\n          mkdir -p \"$RUNNER_TEMP/sql\"\n          new=$(git diff --name-only --diff-filter=A \"$base\" -- rhinoCore/migrations/ | grep -E '/[0-9]{4}_[^/]+\\.py$' || true)\n          for file in $new; do\n            name=$(basename \"$file\" .py)\n            ./manage.py sqlmigrate rhinoCore \"$name\" > \"$RUNNER_TEMP/sql/$name.sql\"\n          done\n          if [ -n \"$new\" ]; then\n            # .squawk.toml at the repo root: pg_version, assume_in_transaction = true, excluded rules with reasons\n            uvx --from squawk-cli squawk --config ../../.squawk.toml \"$RUNNER_TEMP\"/sql/*.sql\n          fi"
+  }
+ },
+ {
+  "key": "G7-16",
+  "title": "[DevOps] lab-runner-set: a dedicated Karpenter pool and ARC scale set",
+  "team": [
+   "devops"
+  ],
+  "days": 2,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G7-09"
+  ],
+  "needs": "",
+  "what": "Add a Karpenter NodePool \"fcp-lab\" on inf-rhinohealth (8 vCPU / 32 GB nodes, tainted, on the default EC2NodeClass whose root volume is already 100 GB) and an ARC scale set lab-runner-set (dind) that only runs there, one Lab per node.",
+  "why": "A Lab idles at about 3 GB, grows during a job and builds about 11 GB of images. On the shared spot nodes it would starve fcp-runner-set jobs and fill their disks; a pool of its own keeps Lab runs predictable.",
+  "how": [
+   "New module modules/karpenter-node-pool (one kubectl_manifest NodePool, with the same requirement keys as modules/aws-eks/templates/node_pool.tpl) and a new unit multi_tenant/accounts/infrastructure/karpenter-fcp-lab/terragrunt.hcl.",
+   "NodePool: 8 vCPU, 32 GiB, instance generation above 5, taint example.com/pool=fcp-lab:NoSchedule, a cpu limit of 48 (6 nodes) and a short consolidateAfter so idle nodes go away. Decide spot or on-demand: spot is cheaper, but an interruption makes a smoke run look flaky.",
+   "In modules/github-runner-scale-sets, add an optional `runner_tolerations` list to the scale_sets object and pass it to template.spec.tolerations; leave it out when empty, so other releases see no diff.",
+   "Add the entry below to multi_tenant/accounts/infrastructure/github-runner-scale-sets/terragrunt.hcl, with requests taken from G7-09's measurements.",
+   "Add lab-runner-set to the labels in fcp's .github/actionlint.yaml.",
+   "Plan locally as today and paste the plan in the PR; a person applies. Then check `kubectl -n arc-runners get autoscalingrunnerset lab-runner-set`."
+  ],
+  "code": {
+   "file": "multi_tenant/accounts/infrastructure/github-runner-scale-sets/terragrunt.hcl",
+   "lang": "hcl",
+   "text": "    # New entry in inputs.scale_sets\n    \"fcp-lab\" = {\n      # One FCP Lab per runner pod. The Lab runs in the dind sidecar, so these requests mostly make Karpenter\n      # give each pod its own 8 vCPU / 32 GB node from the fcp-lab NodePool (modules/karpenter-node-pool).\n      github_config_url = \"https://github.com/RhinoHealth/fcp\"\n      release_name      = \"lab-runner-set\"\n      min_runners       = 0\n      max_runners       = 6 # QA has 6 locks today (3 components x 2 clouds); start at the same parallelism\n      runner_resources_requests = {\n        cpu                 = \"6\"\n        memory              = \"24Gi\"\n        \"ephemeral-storage\" = \"80Gi\" # the default EC2NodeClass root volume is 100 GB (eks unit: root_volume_size)\n      }\n      runner_node_selector = {\n        \"karpenter.sh/nodepool\" = \"fcp-lab\"\n      }\n      # New optional field in modules/github-runner-scale-sets/variables.tf, passed to template.spec.tolerations\n      runner_tolerations = [\n        { key = \"example.com/pool\", operator = \"Equal\", value = \"fcp-lab\", effect = \"NoSchedule\" }\n      ]\n    }"
+  }
+ },
+ {
+  "key": "G7-17",
+  "title": "[DevOps] Add tofu validate, tflint and trivy config to infrastructure CI",
+  "team": [
+   "devops"
+  ],
+  "days": 1.5,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G0 protected paths; Security triages the trivy findings",
+  "what": "A new workflow in the infrastructure repo that validates every module, runs tflint and scans the Terraform code with trivy config, all without cloud keys.",
+  "why": "Today infrastructure CI only checks formatting (terrugrunt-lint.yml), and plans are run by hand over VPN. Agents will propose infra changes, so the cheap checks that need no keys must run on every push first.",
+  "how": [
+   "Create .github/workflows/terraform-checks.yml next to terrugrunt-lint.yml with the same pattern: the same push paths, runs-on infrastructure-runner-set, actions pinned by SHA, `tenv tofu install`. Push runs on a PR's head commit already show on the PR.",
+   "validate: `tofu init -backend=false` and `tofu validate` in each modules/* folder, with no state and no credentials. Terragrunt units are covered later by plans (G7-32).",
+   "tflint: add .tflint.hcl at the repo root with the aws and google rulesets and run `tflint --recursive`; pass GITHUB_TOKEN so plugin downloads are not rate-limited.",
+   "trivy: `trivy config --severity HIGH,CRITICAL` over modules/, terraform/ and multi_tenant/, advisory (exit code 0) for 2 weeks. Go through the findings with Security, then fail on new HIGH and CRITICAL findings, with a .trivyignore that names an owner and a reason on every line.",
+   "Fix or ignore the first-run errors in the same PR and list every ignored rule in the PR description.",
+   "Ask for the new workflow, .tflint.hcl and .trivyignore to be on the paths agents may not change (G0/G3 walls)."
+  ],
+  "code": {
+   "file": ".github/workflows/terraform-checks.yml (infrastructure repo)",
+   "lang": "yaml",
+   "text": "name: \"[TERRAFORM] Checks\"\non:\n  push:\n    paths: ['.github/workflows/terraform-checks.yml', 'terraform/**', 'modules/**', 'multi_tenant/**', 'single_tenant/**']\n  workflow_dispatch:\n\njobs:\n  validate:\n    name: Validate modules\n    runs-on: infrastructure-runner-set\n    steps:\n      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0\n      - name: Install Tofu\n        env:\n          TENV_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n        run: tenv tofu install\n      - name: tofu validate every module (no backend, no cloud keys)\n        run: |\n          status=0\n          for dir in modules/*/; do\n            (cd \"$dir\" && tofu init -backend=false -input=false -no-color >/dev/null && tofu validate -no-color) \\\n              || { echo \"::error file=${dir}::tofu validate failed\"; status=1; }\n          done\n          exit $status\n  tflint:\n    name: tflint\n    runs-on: infrastructure-runner-set\n    steps:\n      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0\n      - uses: terraform-linters/setup-tflint@<sha> # pin by SHA like the checkout above\n      - run: tflint --init && tflint --recursive --config \"$PWD/.tflint.hcl\" --minimum-failure-severity=error\n        env:\n          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n  # trivy: aquasecurity/trivy-action@<sha> with scan-type: config, severity: HIGH,CRITICAL, exit-code: '0' for 2 weeks"
+  }
+ },
+ {
+  "key": "G7-18",
+  "title": "[BE] Port the first 8 cloud-only integration tests into tests_api",
+  "team": [
+   "be"
+  ],
+  "days": 2.5,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G7-05",
+   "G7-08",
+   "G7-12"
+  ],
+  "needs": "",
+  "what": "Move 8 integration tests that only need the cloud from rhinoCore/integration-tests/ into tests_api/, where they run in-process against the fakes instead of on shared QA.",
+  "why": "These tests wait in the QA queue today although they never need a real Rhino client. In the API layer they run in seconds on every push, and agents can run them inside the sandbox.",
+  "how": [
+   "Port permission/test_project_permission.py (4 tests), test_client_offline_validation.py (2), test_tensorboard.py::test_get_or_create_tensorboard_no_logs_returns_guidance and test_runtime_file.py::test_cross_workgroup_access.",
+   "Keep each test's own calls (api_client.create_project and so on) and replace hard-coded QA ids with builders, for example the collaborator workgroup 65e46694-… and the pre-seeded offline workgroup cafecafe-…-000000000004.",
+   "Offline client: find how the cloud decides a client is offline (RH-5356) and build that state through the fake (offline_agents) or a builder. The runtime-file test uses the in-memory object store; the TensorBoard test uses the fake's empty GetTensorBoardLogsMetadata.",
+   "Move, don't copy: mark the QA original `@pytest.mark.nightly` (per-push QA runs skip that marker) and delete it once the port has been green in CI for 2 weeks.",
+   "Assert on what the caller sees: status codes, error text, fields and row counts, not on which internal calls happened."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/tests_api/test_project_permissions.py",
+   "lang": "python",
+   "text": "\"\"\"Ported from rhinoCore/integration-tests/permission/test_project_permission.py: the same calls, run in-process\nagainst the fakes instead of qa-cloud. The QA original is marked nightly until this has been green for 2 weeks.\"\"\"\n\nfrom rhinoCloud.rhinoCore.services.permission_service import remove_rhino_admin_from_permissions\nfrom rhinoCloud.rhinoCore.services.project_permission.permission_constants import ActionTypes, PermissionPersona\n\n\ndef test_project_permission_endpoint(api_client):\n    project_uid = api_client.create_project(permissions=None)\n    expected = remove_rhino_admin_from_permissions(ActionTypes().get_project_default_dict())\n    assert api_client.get_project_permissions(project_uid) == expected\n\n\ndef test_project_collab_permission_endpoint(api_client, builder):\n    collaborator = builder.site()  # was the hard-coded QA workgroup 65e46694-0951-4634-a839-634af42a8177\n    project_uid = api_client.create_project(permissions=None)\n    api_client.add_collaborator(project_uid, collaborator.workgroup_uid)\n    permissions = api_client.get_site_permissions(project_uid)[collaborator.workgroup_uid][\"permissions\"]\n    assert permissions == remove_rhino_admin_from_permissions(ActionTypes().get_site_default_dict())\n\n    custom = ActionTypes().get_site_default_dict()\n    custom[ActionTypes.SHARE_SECURE_ACCESS_LIST.name] = [\n        PermissionPersona.RHINO_ADMIN.name,\n        PermissionPersona.COLLABORATOR_MEMBER.name,\n    ]\n    project_uid = api_client.create_project(permissions=None)\n    api_client.add_collaborator(project_uid, collaborator.workgroup_uid, permissions=custom)\n    permissions = api_client.get_site_permissions(project_uid)[collaborator.workgroup_uid][\"permissions\"]\n    assert permissions[ActionTypes.SHARE_SECURE_ACCESS_LIST.name] == [PermissionPersona.COLLABORATOR_MEMBER.name]"
+  }
+ },
+ {
+  "key": "G7-19",
+  "title": "[BE] Add a buf breaking check for the cloud-client gRPC protos",
+  "team": [
+   "be"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G4 checking guide gets a line for this check",
+  "what": "Add common/buf.yaml and a `buf breaking` step in cloud CI that compares common/fcp_common/rhinoAgentRpc/*.proto with the merge base on main.",
+  "why": "On-prem clients upgrade later than the cloud, so a removed field or RPC breaks customers who have not upgraded yet. The cloud dispatches agent calls by method name (AgentRpcRequest.method_name), so even a rename that looks safe on the wire breaks them.",
+  "how": [
+   "Add common/buf.yaml (sketch). The module root is common/ because `make protoc` uses --proto_path=common, so buf sees the same file paths as the generated _pb2 modules.",
+   "Use the PACKAGE rule set, not WIRE: WIRE allows deleting or renaming RPCs, which our method-name dispatch cannot survive.",
+   "In the cloud-ci.yml lint job (it already runs the protoc drift check), set fetch-depth: 0, add bufbuild/buf-action with setup_only: true, then run `buf breaking common --against \".git#ref=$(git merge-base HEAD origin/main),subdir=common\"`.",
+   "The protos have no `reserved` entries today. Add a short note to common/fcp_common/rhinoAgentRpc/README.md: reserve a removed field's number and name instead of reusing them.",
+   "A deliberate break needs a person and a plan for old clients; add one line about this to Nova's checking guide (G4)."
+  ],
+  "code": {
+   "file": "common/buf.yaml",
+   "lang": "yaml",
+   "text": "# Module root is common/ because `make protoc` runs with --proto_path=common, so buf sees\n# fcp_common/rhinoAgentRpc/*.proto with the same paths as the generated _pb2 files.\nversion: v2\nmodules:\n  - path: .\nbreaking:\n  use:\n    # PACKAGE, not WIRE: AgentRpcRequest carries the RPC by method_name, so deleting or renaming an RPC\n    # breaks older on-prem clients even though the bytes still parse. Clients upgrade later than the cloud.\n    - PACKAGE\n  except:\n    # We never use the proto JSON mapping between cloud and client (gRPC binary only). Confirm with the BE guild.\n    - FIELD_SAME_JSON_NAME"
+  }
+ },
+ {
+  "key": "G7-20",
+  "title": "[DevOps] Build FCP Lab images once per commit and push them to ECR",
+  "team": [
+   "devops",
+   "be"
+  ],
+  "days": 1.5,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G7-09",
+   "G7-16"
+  ],
+  "needs": "Nave (lab build and pull commands); G3 ai-agents account for cross-account pulls from sandboxes",
+  "what": "A reusable fcp workflow that builds the Lab's cloud, client and frontend images for a commit once, pushes them to new ECR repos in the inf account, and skips the build when the tag already exists.",
+  "why": "A cold Lab build takes 10+ minutes. Building once per commit and pulling everywhere (PR smoke, compare, sandboxes) is what makes the 15-minute smoke target reachable.",
+  "how": [
+   "Add \"fcp-lab-cloud\", \"fcp-lab-client\" and \"fcp-lab-frontend\" to multi_tenant/accounts/infrastructure/artifacts/artifacts.hcl with tags_immutability_enabled = true. When G3 creates the ai-agents account, add its root to allowed_principals in artifacts/aws-ecr/terragrunt.hcl.",
+   "With Nave, add a lab command that builds a source tree's images and pushes them to a registry, and a way for `lab up` to pull them instead of building. The lab only builds locally today, so the flags in the sketch are placeholders.",
+   "Add .github/workflows/_lab-images-reusable.yml (sketch) on lab-runner-set: OIDC to the GitHubActions role in 123456789012, amazon-ecr-login, skip if the tag exists, else build and push.",
+   "Tag images `<git sha>-lab<lab version>`, because they carry the lab's own patches. A concurrency group per commit makes cloud-ci, client-ci and frontend-ci share one build.",
+   "modules/aws-ecr keeps only the last N images per repo; check that N covers a week of commits."
+  ],
+  "code": {
+   "file": ".github/workflows/_lab-images-reusable.yml",
+   "lang": "yaml",
+   "text": "name: FCP Lab images (reusable)\non:\n  workflow_call:\n    outputs:\n      tag: { value: \"${{ jobs.images.outputs.tag }}\" }\n\njobs:\n  images:\n    runs-on: lab-runner-set\n    permissions: { id-token: write, contents: read }\n    concurrency: lab-images-${{ github.sha }}  # cloud-ci, client-ci and frontend-ci on one commit share one build\n    outputs:\n      tag: ${{ steps.build.outputs.tag }}\n    steps:\n      - uses: actions/checkout@v6\n      - uses: actions/create-github-app-token@v3\n        id: lab-token\n        with:  # decide which App; read-only, on the lab repo only\n          app-id: ${{ secrets.LAB_READER_APP_ID }}\n          private-key: ${{ secrets.LAB_READER_APP_PRIVATE_KEY }}\n          repositories: fcp-local-lab  # final repo name to confirm with Nave (moved into the org in G7-09)\n          permission-contents: read\n      - uses: actions/checkout@v6\n        with: { repository: RhinoHealth/fcp-local-lab, path: .lab, token: \"${{ steps.lab-token.outputs.token }}\" }\n      - uses: aws-actions/configure-aws-credentials@v6\n        with: { aws-region: us-east-1, role-to-assume: \"arn:aws:iam::123456789012:role/GitHubActions\" }\n      - uses: aws-actions/amazon-ecr-login@v2\n      - name: Build and push once per commit\n        id: build\n        run: |\n          tag=\"${GITHUB_SHA}-lab$(python3 .lab/lab --version)\"\n          echo \"tag=$tag\" >> \"$GITHUB_OUTPUT\"\n          aws ecr describe-images --repository-name fcp-lab-cloud --image-ids imageTag=\"$tag\" >/dev/null 2>&1 && exit 0\n          # Placeholder CLI: the lab only builds locally today; agree the command with Nave.\n          python3 .lab/lab build --source \"$GITHUB_WORKSPACE\" --push \"123456789012.dkr.ecr.us-east-1.amazonaws.com/fcp-lab-{component}:$tag\""
+  }
+ },
+ {
+  "key": "G7-21",
+  "title": "[BE] Smoke-test the published SDK against the new API in CI",
+  "team": [
+   "be"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G7-06"
+  ],
+  "needs": "G4 checking guide gets a line for this check",
+  "what": "A small tests_api/sdk_smoke suite that installs the latest rhino-health release from PyPI and runs a few real SDK calls against this commit's API through pytest-django's live_server.",
+  "why": "Customers run published SDK versions, not the SDK in the repo. If a cloud change breaks the released SDK, we want to know in the PR and not from a support ticket.",
+  "how": [
+   "Write tests_api/sdk_smoke/test_published_sdk.py (sketch): log in, create a project, find it by name. Add more calls only for what customers use most (ask the SDK owner).",
+   "Run it as a step in the API Tests job: read the latest version from https://pypi.org/pypi/rhino-health/json, then `uv run --group api-tests --with rhino-health==$SDK_VERSION pytest tests_api/sdk_smoke -m sdk_smoke`.",
+   "cloud/rhinoCloud/pyproject.toml sets `exclude-newer = \"7 days\"`, which also applies to --with; override it for this step so yesterday's release is tested too.",
+   "Also test the oldest SDK version we still support; the SDK owner decides which one.",
+   "While there: sdk-ci.yml sets TEST_USERNAME from secrets.SDK_TEST_PASSWORD and TEST_PASSWORD from secrets.SDK_TEST_USERNAME. That looks swapped; check with the SDK owner before changing it."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/tests_api/sdk_smoke/test_published_sdk.py",
+   "lang": "python",
+   "text": "\"\"\"The latest *published* rhino-health SDK against this commit's API, over real HTTP (pytest-django live_server).\nThe API Tests job runs: uv run --group api-tests --with rhino-health==$SDK_VERSION pytest tests_api/sdk_smoke\"\"\"\n\nimport pytest\n\nrh = pytest.importorskip(\"rhino_health\")  # in no uv group on purpose: CI installs the released wheel\n\npytestmark = [pytest.mark.sdk_smoke, pytest.mark.django_db(transaction=True)]  # live_server needs committed rows\n\n\n@pytest.fixture\ndef sdk(live_server, builder):\n    site = builder.site()  # a fake workgroup and user, created through the API\n    session = rh.login(username=site.email, password=site.password, rhino_api_url=f\"{live_server.url}/api/\")\n    return session, site\n\n\ndef test_published_sdk_creates_and_finds_a_project(sdk):\n    from rhino_health.lib.endpoints.project.project_dataclass import ProjectCreateInput\n\n    session, site = sdk\n    project = session.project.add_project(\n        ProjectCreateInput(name=\"SDK smoke\", description=\"\", type=\"Validation\", primary_workgroup_uid=site.workgroup_uid)\n    )\n    assert session.project.get_project_by_name(\"sdk smoke\").uid == project.uid  # the name search ignores case\n\n\n# Next: data schemas, datasets and code objects, picked with the SDK owner from what customers call most."
+  }
+ },
+ {
+  "key": "G7-22",
+  "title": "[BE] Setup doctor: poe doctor checks and fixes a dev setup",
+  "team": [
+   "be"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "",
+  "what": "One command, `poe doctor`, that checks a machine against what fcp needs (tools and versions, Docker memory, the rhino-net network, venvs, git hooks) and, with --fix, repairs what is safe to repair.",
+  "why": "DX puts setup problems at about 86 hours per developer per year. Agents in fresh VMs hit the same problems, and one command with clear output helps both.",
+  "how": [
+   "Add scripts/poe_doctor.py (sketch) and `doctor = { script = \"scripts.poe_doctor:main(fix=fix, as_json=json)\", args = [...] }` in [tool.poe.tasks], next to scripts/poe_createsuperuser.py.",
+   "Checks, one line each with its fix: node and npm from frontend/package.json engines (>=24.15.0, >=11.14.1), Python 3.13 through uv, `uv sync --check` for cloud/rhinoCloud (and client), Docker memory of at least 16 GiB (FCP Lab needs it), the rhino-net network, and poe itself.",
+   "Git hooks: after `npm install`, husky sets core.hooksPath to frontend/.husky/_, so the black, isort and flake8 hooks in .pre-commit-config.yaml never run on commit. The doctor reports this and points to `poe verify`; decide with the BE guild whether husky's pre-commit should also call pre-commit for Python files.",
+   "--fix runs only safe local commands (uv python install, make sync-deps, docker network create) and prints them; it never touches credentials, ~/.aws or Docker volumes.",
+   "--json prints one JSON object per check for machines; the nightly sandbox image build uses it (G7-25).",
+   "Try it on two laptops, one of them a new joiner's if possible, and fix the three most confusing messages."
+  ],
+  "code": {
+   "file": "scripts/poe_doctor.py",
+   "lang": "python",
+   "text": "\"\"\"poe doctor: check a local fcp setup; --fix runs the safe local fixes; --json is for the sandbox image build.\"\"\"\nimport json\nimport shutil\nimport subprocess\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\nENGINES = json.loads((ROOT / \"frontend\" / \"package.json\").read_text())[\"engines\"]  # node >=24.15.0, npm >=11.14.1\n\n\ndef _run(*cmd: str) -> str | None:\n    done = shutil.which(cmd[0]) and subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)\n    return done.stdout.strip() if done and done.returncode == 0 else None\n\n\ndef _at_least(have: str | None, want: str) -> bool:  # \"v24.16.0\" >= \">=24.15.0\"\n    return have is not None and [int(p) for p in have.strip(\"v\").split(\".\")] >= [int(p) for p in want.strip(\">=\").split(\".\")]\n\n\nCHECKS = [  # (what, passes, fix, safe for --fix); npm, poe and the rhino-net network follow the same pattern\n    (\"node \" + ENGINES[\"node\"], lambda: _at_least(_run(\"node\", \"--version\"), ENGINES[\"node\"]), \"nvm install\", False),\n    (\"Python 3.13 (uv)\", lambda: _run(\"uv\", \"python\", \"find\", \"3.13\"), \"uv python install 3.13\", True),\n    (\"cloud venv = uv.lock\", lambda: _run(\"uv\", \"sync\", \"--check\", \"--directory\", \"cloud/rhinoCloud\"), \"make -C cloud/rhinoCloud sync-deps\", True),\n    (\"Docker >= 16 GiB (FCP Lab)\", lambda: int(_run(\"docker\", \"info\", \"-f\", \"{{.MemTotal}}\") or 0) >= 16 * 2**30, \"raise Docker's memory limit\", False),\n    (\"Python commit hooks (husky owns core.hooksPath, so black/isort/flake8 never run)\", lambda: _run(\"git\", \"config\", \"core.hooksPath\") is None, \"run `poe verify` before you push\", False),\n]\n\n\ndef main(fix: bool = False, as_json: bool = False) -> None:\n    results = [(what, bool(passes()), how, safe) for what, passes, how, safe in CHECKS]\n    for what, ok, how, safe in results:\n        if fix and safe and not ok:\n            subprocess.run(how, shell=True, cwd=ROOT)  # local commands only: never credentials, ~/.aws or volumes\n        print(json.dumps({\"check\": what, \"ok\": ok, \"fix\": how}) if as_json else f\"{'ok ' if ok else 'FIX'}  {what}  {'' if ok else '-> ' + how}\")\n    raise SystemExit(0 if all(ok for _, ok, _, _ in results) else 1)"
+  }
+ },
+ {
+  "key": "G7-23",
+  "title": "[DevOps] Validate gitops charts: helm lint and helm template | kubeconform",
+  "team": [
+   "devops"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "",
+  "what": "A gitops workflow that, for each chart a PR changes, runs helm lint and renders every <env>-values.yaml with helm template piped into kubeconform.",
+  "why": "gitops has no checks today, so a typo in a values file reaches Argo CD as a sync error on a real cluster. Rendering and schema-checking every environment catches most of that in a minute, with no cluster access.",
+  "how": [
+   "Create .github/workflows/chart-checks.yml on pull_request, runs-on gitops-runner-set, actions pinned by SHA.",
+   "Changed charts are the folders with a Chart.yaml that the PR touches (cloud/rhino-server, cloud/temporal, frontend/dashboard, argocd/argocd-apps, and so on).",
+   "Per chart: `helm dependency build` (Chart.lock is committed and *.tgz is gitignored; use Nexus's helm proxy if a public repo rate-limits), `helm lint`, then `helm template` for each *-values.yaml piped into `kubeconform -strict -summary`.",
+   "CRDs (ExternalSecret, KEDA ScaledObject, HTTPRoute, Argo CD Application) come from the datreeio CRDs-catalog schema location. Use the oldest Kubernetes version among the product clusters for -kubernetes-version.",
+   "First run: list the current failures per environment in the PR and fix the cheap ones; skip the rest with a comment and an owner."
+  ],
+  "code": {
+   "file": ".github/workflows/chart-checks.yml (gitops repo)",
+   "lang": "yaml",
+   "text": "name: Chart checks\non:\n  pull_request:\n    branches: [main]\n\npermissions: { contents: read }\n\njobs:\n  charts:\n    runs-on: gitops-runner-set\n    steps:\n      - uses: actions/checkout@<sha> # pin by SHA\n        with: { fetch-depth: 0 }\n      - uses: azure/setup-helm@<sha> # pin by SHA\n      - name: Install kubeconform\n        run: |\n          mkdir -p \"$RUNNER_TEMP/bin\" && echo \"$RUNNER_TEMP/bin\" >> \"$GITHUB_PATH\"\n          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz | tar xz -C \"$RUNNER_TEMP/bin\"\n      - name: Lint and render every environment of each changed chart\n        run: |\n          status=0\n          charts=$(git diff --name-only origin/main...HEAD | xargs -r -n1 dirname | sort -u \\\n            | while read -r d; do while [ \"$d\" != . ] && [ ! -f \"$d/Chart.yaml\" ]; do d=$(dirname \"$d\"); done; [ -f \"$d/Chart.yaml\" ] && echo \"$d\"; done | sort -u)\n          for chart in $charts; do\n            helm dependency build \"$chart\" >/dev/null && helm lint \"$chart\" || status=1\n            for values in \"$chart\"/*-values.yaml; do\n              [ -e \"$values\" ] || continue\n              helm template ci \"$chart\" -f \"$values\" | kubeconform -strict -summary -kubernetes-version 1.36.0 \\\n                -schema-location default \\\n                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \\\n                || { echo \"::error file=$values::does not render to valid manifests\"; status=1; }\n            done\n          done\n          exit $status"
+  }
+ },
+ {
+  "key": "G7-24",
+  "title": "[BE] Record nightly QA results per test: JUnit and a 20-night history",
+  "team": [
+   "be"
+  ],
+  "days": 1.5,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "",
+  "what": "Make the cloud nightly integration run keep a JUnit file per cloud as an artifact, and add a script that turns the last 20 nights into one pass/fail/rerun table per test.",
+  "why": "Today a failed night is a Slack message and an 88-minute log. To tell real failures from flaky ones we need per-test history, and the BE flaky-test fixer will read the same data.",
+  "how": [
+   "Baseline (read 12 Oct): \"[CLOUD] - Integration Tests\" (cloud-int-tests-dispatch.yml, 02:44 UTC) failed its last 60 scheduled runs, on both AWS and GCP, in the \"Run integration tests\" step. The 12 Oct AWS run had 4 failed, 312 passed and 4 reruns in 88 minutes. The frontend nightly passed 19 of its last 20.",
+   "In _cloud-int-tests-reusable-aws.yml and -gcp.yml, add `-rR --junitxml=/tmp/junit.xml` to the entrypoint call inside kubectl exec, copy the file out with `kubectl cp` before \"Delete the integration tests pod\", and upload it as nightly-junit-<cloud> (sketch).",
+   "10 tests already carry @pytest.mark.flaky(reruns=N) (gc/test_gc.py, rhino_sdk/test_metrics/ and others). `-rR` lists the reruns; count \"passed after a rerun\" as flaky, not green.",
+   "Add scripts/nightly_history.py: `gh run list --workflow cloud-int-tests-dispatch.yml --event schedule -L 20`, `gh run download` each nightly-junit artifact, and write nightly-history.md (test x night: pass, fail, rerun-pass), newest night first.",
+   "Do the same for frontend-int-tests-dispatch.yml later with Playwright's JUnit reporter; cloud first."
+  ],
+  "code": {
+   "file": ".github/workflows/_cloud-int-tests-reusable-aws.yml (and -gcp.yml)",
+   "lang": "yaml",
+   "text": "      # In \"Run Integration Tests\", add to the entrypoint call inside `kubectl exec`:\n      #   integration-tests-entrypoint-ci.sh -s --durations=0 -vv --color=yes -rR --junitxml=/tmp/junit.xml ...\n      # Then, before \"Delete the integration tests pod\":\n      - name: Copy the JUnit report out of the integration tests pod\n        if: always() && inputs.run_nightly_tests\n        continue-on-error: true\n        run: >\n          kubectl cp -c integration-tests\n          \"${{ needs.prepare_cloud_environment.outputs.pod_with_sdk }}:/tmp/junit.xml\" junit-aws.xml\n      - name: Keep it for the nightly history\n        if: always() && inputs.run_nightly_tests\n        uses: actions/upload-artifact@v7\n        with:\n          name: nightly-junit-aws\n          path: junit-aws.xml\n          retention-days: 90\n      # scripts/nightly_history.py then reads the last 20 scheduled runs:\n      #   gh run list --workflow cloud-int-tests-dispatch.yml --event schedule -L 20 --json databaseId\n      #   gh run download <id> -n nightly-junit-aws\n      # and writes nightly-history.md: one row per test, one column per night (pass / fail / rerun-pass)."
+  }
+ },
+ {
+  "key": "G7-25",
+  "title": "[DevOps] Run poe doctor in the nightly ai-agent-sandbox image build",
+  "team": [
+   "devops"
+  ],
+  "days": 0.5,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G7-22"
+  ],
+  "needs": "G3 ai-agent-sandbox Packer image (packer/images/ai-agent-sandbox) and its nightly build",
+  "what": "Add tasks to the ai-agent-sandbox Ansible playbook that run `poe doctor --json` on the image's fresh fcp checkout, keep the report with the image, and fail the build if a check fails.",
+  "why": "The nightly image is a brand-new machine every night, so it proves that a fresh setup still works. When the doctor fails there, people's laptops will hit the same problem soon.",
+  "how": [
+   "In infrastructure/packer/images/ai-agent-sandbox/playbook.yml (created in G3), after the fcp checkout and the dependency install, add the tasks below.",
+   "Run as the sandbox's normal user, not root, so file ownership matches what Nova sees.",
+   "A failing doctor fails the Packer build, so the image is not promoted and yesterday's image stays in use (G3 keeps the previous image for rollback).",
+   "Put the failing check names into the G3 image-build alert, so the owner sees what broke without opening the Packer log."
+  ],
+  "code": {
+   "file": "packer/images/ai-agent-sandbox/playbook.yml (infrastructure repo, G3)",
+   "lang": "yaml",
+   "text": "- name: Prove a fresh fcp setup works (poe doctor)\n  ansible.builtin.command:\n    cmd: uvx --from poethepoet poe doctor --json\n    chdir: \"{{ fcp_checkout_dir }}\"  # the image's fcp checkout; take the variable name from G3's playbook\n  become: true\n  become_user: \"{{ sandbox_user }}\"  # the user Nova runs as, so file ownership matches\n  register: doctor\n  changed_when: false\n  failed_when: false\n\n- name: Keep the doctor report with the image's build evidence\n  ansible.builtin.copy:\n    content: \"{{ doctor.stdout }}\"\n    dest: /var/log/ai-agent-sandbox/doctor.jsonl\n    mode: \"0644\"\n\n- name: Fail the build, so this image is not promoted, when a check fails\n  ansible.builtin.fail:\n    msg: \"poe doctor failed: {{ doctor.stdout_lines | map('from_json') | rejectattr('ok') | map(attribute='check') | join(', ') }}\"\n  when: doctor.rc != 0"
+  }
+ },
+ {
+  "key": "G7-26",
+  "title": "[BE] FCP Lab smoke on every PR; compare with main only on failure",
+  "team": [
+   "be",
+   "devops"
+  ],
+  "days": 2.5,
+  "w": [
+   8,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G7-04",
+   "G7-05",
+   "G7-07",
+   "G7-16",
+   "G7-20"
+  ],
+  "needs": "Nave (lab CLI in CI)",
+  "what": "A reusable workflow, _lab-smoke-reusable.yml, that boots FCP Lab from this commit's images on lab-runner-set, runs a smoke suite (the core proof, a short list of pr/ Playwright specs and the fakes' contract suites against the real services), and runs `lab compare` only when something failed.",
+  "why": "This is the cross-tier check that replaces queuing on shared QA for every push. It is private to the PR, aims at under 15 minutes, and when it fails it says whether main fails the same way.",
+  "how": [
+   "Define the smoke suite with the BE and FE guilds: `lab test <id> --suite core` plus 4 to 6 fast specs from frontend/e2e/pr/ through `--spec`, picked by last week's run times. The full allowlist stays nightly.",
+   "Contract suites against the real thing: run `pytest tests_api -m contract --target lab` inside the environment (`lab exec <id> web-service -- ...`), so FakeOnPremClient, the object store and the task queue are checked against the real client, MinIO and Celery. Check with Nave how tests_api gets into the Lab's web-service.",
+   "Workflow (sketch): check out fcp with fetch-depth 0, check out the lab repo with an App token as in G7-20, OIDC and ECR login, `lab up` from G7-20's images, the smoke suite, `lab compare --json` only on failure, and the reports uploaded with upload-artifact@v7 plus a short job summary (regressed, suspect, already failing on main).",
+   "`concurrency: lab-smoke-<ref>` with cancel-in-progress: one run per branch, and a newer push cancels the older run. This is not a shared lock.",
+   "Call it from cloud-ci.yml and client-ci.yml (push) and frontend-ci.yaml (pull_request) next to the QA jobs. Both run for now; QA moves in G7-31 and G7-33.",
+   "The Lab uses its own fake seed data; no QA fixtures and no cloud credentials go into the environment."
+  ],
+  "code": {
+   "file": ".github/workflows/_lab-smoke-reusable.yml",
+   "lang": "yaml",
+   "text": "name: FCP Lab smoke (reusable)\non:\n  workflow_call:\n    inputs:\n      image_tag: { required: true, type: string }\n      suite: { required: false, type: string, default: smoke }  # G7-33 passes frontend-e2e\n\njobs:\n  smoke:\n    name: FCP Lab smoke\n    runs-on: lab-runner-set\n    permissions: { id-token: write, contents: read }\n    concurrency:\n      group: lab-smoke-${{ github.workflow }}-${{ github.ref }}  # a newer push cancels the older run; not a shared lock\n      cancel-in-progress: true\n    env:\n      LAB_ID: ci-${{ github.run_id }}\n    steps:\n      - uses: actions/checkout@v6\n        with: { fetch-depth: 0 }  # compare needs the merge base with origin/main\n      # ...lab checkout, AWS OIDC and ECR login as in _lab-images-reusable.yml\n      - name: Boot the Lab from this commit's images\n        run: python3 .lab/lab up --source \"$GITHUB_WORKSPACE\" --id \"$LAB_ID\" --mode snapshot --images \"${{ inputs.image_tag }}\"  # --images: see G7-20\n      - name: Smoke suite  # inputs.suite == 'frontend-e2e' runs the lab's whole allowlist instead (G7-33)\n        run: |\n          python3 .lab/lab test \"$LAB_ID\" --suite core --json > core.json\n          python3 .lab/lab test \"$LAB_ID\" --suite frontend-e2e --spec not-found-page.spec.ts --json > e2e.json  # + the agreed specs\n          python3 .lab/lab exec \"$LAB_ID\" web-service -- pytest tests_api -m contract --target lab  # path: check with Nave\n      - name: Compare with main, only because something failed\n        if: failure()\n        run: python3 .lab/lab compare --source \"$GITHUB_WORKSPACE\" --id \"cmp-$GITHUB_RUN_ID\" --json > compare.json || true\n      - uses: actions/upload-artifact@v7\n        if: always()\n        with: { name: lab-smoke-reports, path: \"*.json\" }  # plus the lab's reports/ directory for traces"
+  }
+ },
+ {
+  "key": "G7-27",
+  "title": "[BE] Port the next 7 cloud-only integration tests (vocabularies)",
+  "team": [
+   "be"
+  ],
+  "days": 2.5,
+  "w": [
+   8,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G7-07",
+   "G7-18"
+  ],
+  "needs": "",
+  "what": "Move the six custom-vocabulary parsing tests from test_semantic_mapping.py and test_vocabulary.py::test_large_vocabulary_upload into tests_api/, which brings the ported total to 15.",
+  "why": "Vocabulary parsing is pure cloud logic, but its tests wait on shared QA today. The large upload also covers the multipart upload, the object store and a queued Celery chain, which the fakes can show without real infrastructure.",
+  "how": [
+   "Port test_custom_vocabulary and its five variants (_no_identifier, _no_term_name, _some_have_term_name, _duplicate_term_name, _duplicate_term_name_different_identifier), and move assert_vocabulary_terms to tests_api/helpers.py.",
+   "Port test_large_vocabulary_upload: the multipart parts land in the in-memory object store. Check that index_large_vocabulary's chain is queued in task_queue, but don't drain it, because start_indexing needs an indexing VM and OpenSearch that the API layer does not run.",
+   "Keep test_very_large_vocabulary_upload and the full-flow vocabulary tests on QA nightly: they need real indexing.",
+   "Same rule as G7-18: the QA original gets @pytest.mark.nightly and is deleted after 2 green weeks.",
+   "Check the run time of the whole layer after the port; if it is over 3 minutes locally, look at the 10 slowest tests (`--durations=10`) before adding more."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/tests_api/test_custom_vocabularies.py",
+   "lang": "python",
+   "text": "\"\"\"Ported from rhinoCore/integration-tests/test_semantic_mapping.py and test_vocabulary.py (custom vocabularies).\"\"\"\n\nfrom helpers import assert_vocabulary_terms  # moved from test_semantic_mapping.py into tests_api/helpers.py\n\nSTART_INDEXING = \"rhinoCloud.rhinoCore.celery_tasks.vocabulary_indexing.start_indexing\"\n\n\ndef test_custom_vocabulary_no_identifier(api_client):\n    project_uid = api_client.create_project()\n    vocabulary_uid = api_client.create_vocabulary(\n        project_uid=project_uid,\n        name=\"test_custom_vocabulary_no_identifier\",\n        terms=\"\\n\".join(f\"test_term_name{i}\" for i in range(1, 5)),\n        type=\"custom\",\n    )\n    expected = [{\"term_display_name\": f\"test_term_name{i}\", \"term_identifier\": None} for i in range(1, 5)]\n    assert_vocabulary_terms(api_client, vocabulary_uid, expected)\n\n\ndef test_large_vocabulary_upload(api_client, task_queue, object_store):\n    project_uid = api_client.create_project()\n    vocabulary_uid = upload_large_vocabulary(api_client, project_uid)  # same helper and file as the QA test\n    assert api_client.get_vocabulary(vocabulary_uid)[\"status\"]  # check: the status the upload sets before indexing\n    # index_large_vocabulary queues a Celery chain that starts an indexing VM. Check it was queued, but do not drain\n    # it: the API layer runs no VM and no OpenSearch. The QA nightly keeps the full indexing flow.\n    assert START_INDEXING in [task.name for task in task_queue.sent]"
+  }
+ },
+ {
+  "key": "G7-28",
+  "title": "[DevOps] Add actionlint and zizmor to every repo with workflows",
+  "team": [
+   "devops"
+  ],
+  "days": 0.5,
+  "w": [
+   8,
+   9
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G3 RhinoHealth/ai-agents and G8 RhinoHealth/claude-plugins repos; Nave for the byte repo",
+  "what": "One small workflow, copied into fcp, infrastructure, gitops, byte, ai-agents and claude-plugins, that runs actionlint and zizmor on .github/workflows.",
+  "why": "Workflows hold our CI tokens and OIDC roles, and agents will open PRs that touch them. actionlint catches broken workflows; zizmor catches risky ones (template injection, unpinned actions, wide permissions).",
+  "how": [
+   "Use each repo's .github/actionlint.yaml for runner labels: fcp and infrastructure have one (unused in infrastructure today); add one to gitops with gitops-runner-set.",
+   "zizmor starts advisory (`--min-severity medium`, never failing the job). fcp pins actions by tag, so add .github/zizmor.yml with an unpinned-uses policy that allows tags for actions/* and asks for SHAs everywhere else.",
+   "Look at the comment-triggered workflows first (byte-review.yml in fcp and infrastructure): they run on untrusted input.",
+   "byte: open the PR together with Nave. ai-agents and claude-plugins: add the file when those repos are created (G3, G8). Where a runner has no uv (byte and ai-agents are Node repos), add astral-sh/setup-uv before the uvx steps."
+  ],
+  "code": {
+   "file": ".github/workflows/workflow-lint.yml (one copy per repo)",
+   "lang": "yaml",
+   "text": "name: Workflow lint\non:\n  push:\n    paths: ['.github/workflows/**', '.github/actionlint.yaml', '.github/zizmor.yml']\n\npermissions:\n  contents: read\n\njobs:\n  lint:\n    # fcp-runner-set here; infrastructure-runner-set, gitops-runner-set, ... in the other repos\n    runs-on: fcp-runner-set\n    steps:\n      - uses: actions/checkout@v6  # fcp pins by tag; infrastructure pins by SHA (keep each repo's style)\n        with:\n          persist-credentials: false\n      - name: actionlint (runner labels come from .github/actionlint.yaml)\n        run: uvx --from \"actionlint-py==<pinned>\" actionlint -color\n      - name: zizmor (advisory for now)\n        # .github/zizmor.yml: rules.unpinned-uses.config.policies: { \"actions/*\": ref-pin, \"*\": hash-pin }\n        run: uvx \"zizmor==<pinned>\" --min-severity medium --config .github/zizmor.yml .github/workflows || true"
+  }
+ },
+ {
+  "key": "G7-29",
+  "title": "[BE] Triage nightly failures: fix, quarantine with a ticket, or hand off",
+  "team": [
+   "be"
+  ],
+  "days": 1.5,
+  "w": [
+   8,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G7-24"
+  ],
+  "needs": "G5 BE flaky-test fixer and G8 fix-flaky-test skill read the flaky list",
+  "what": "Sort every failing or rerun-only test in the 20-night history into real bug, test bug, environment or flaky; fix the quick ones, and quarantine the flaky ones with a Jira ticket the flaky-test fixer can pick up.",
+  "why": "A nightly that is never green teaches everyone to ignore it. Agents can only use it as a signal once a red night means something.",
+  "how": [
+   "Go through nightly-history.md (G7-24) with the BE guild in one session and give each test a category and an owner.",
+   "Real or test bug: fix it now if it takes under an hour, otherwise open a Jira bug with the failing output.",
+   "Environment problems (QA images, instant-container builds such as the 12 Oct failure in rhino_sdk/test_code_object.py::test_instant_container_code_python_image[NVFLARE, Python 3.11, CUDA 12.2, …]): hand them to DevOps with the evidence.",
+   "Flaky: add @pytest.mark.quarantine(ticket=\"RH-…\") (sketch; register it in cloud/rhinoCloud/pytest.ini) and a Jira ticket labelled flaky-test for the G5 fixer. The test keeps running and reporting. People quarantine tests; agents never do.",
+   "The 10 existing @pytest.mark.flaky(reruns=N) markers get flaky-test tickets too, so their flakiness shows in the history instead of being retried away.",
+   "Post one line a week in #integration-tests-nightly: green nights out of the last 7."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/rhinoCore/integration-tests/conftest.py",
+   "lang": "python",
+   "text": "# Called from the existing pytest_collection_modifyitems (which already shuffles tests and adds trace ids).\n# Register the marker in cloud/rhinoCloud/pytest.ini:\n#   quarantine(ticket): known flaky; still runs and reports, but does not turn the nightly red\n\n\ndef _apply_quarantine(items: list[pytest.Item]) -> None:\n    for item in items:\n        marker = item.get_closest_marker(\"quarantine\")\n        if marker is None:\n            continue\n        ticket = marker.kwargs[\"ticket\"]  # required: every quarantined test has a Jira ticket and an owner\n        # Non-strict xfail: the test still runs; junit.xml shows it as skipped with this reason, so\n        # scripts/nightly_history.py can list quarantined tests and their tickets.\n        item.add_marker(pytest.mark.xfail(reason=f\"quarantined, see {ticket}\", strict=False))\n\n\n# In a test module, added by a person after triage (agents never quarantine, skip or delete tests):\n#\n#   @pytest.mark.quarantine(ticket=\"RH-0000\")  # placeholder key\n#   def test_...(api_client): ...\n#\n# The 10 tests with @pytest.mark.flaky(reruns=N) today get a flaky-test ticket each; decide with the guild\n# whether to replace their reruns with quarantine, so the flakiness shows in the history."
+  }
+ },
+ {
+  "key": "G7-30",
+  "title": "[DevOps] Read-only TerraformPlanRole and OIDC trust for PR plans",
+  "team": [
+   "devops"
+  ],
+  "days": 1,
+  "w": [
+   10,
+   10
+  ],
+  "flag": "stretch",
+  "deps": [],
+  "needs": "G0 narrows Vault's gha-runners role first",
+  "what": "A read-only role in each AWS account that Terragrunt can assume for `plan`, and an OIDC role in the inf account that only pull_request runs of RhinoHealth/infrastructure can assume.",
+  "why": "Plans are run by hand over VPN and pasted into PRs today. A read-only role lets CI post them without giving CI any power to apply.",
+  "how": [
+   "New tree: terraform/accounts/<account>/aws/global/iam/terraform-plan/ (template: solutions/aws/global/iam/github-actions) with TerraformPlanRole: ReadOnlyAccess plus an explicit deny on data reads (sketch). It can write nothing, so plans run with -lock=false (use_lockfile would write a .tflock).",
+   "OIDC role GitHubActionsTerraformPlan in inf (123456789012): trust only `repo:RhinoHealth/infrastructure:pull_request` (not repo:RhinoHealth/*), with read on rhinohealth-terraform-state and sts:AssumeRole on each account's TerraformPlanRole.",
+   "account.hcl files: make the assumed role switchable, `assume_role_arn = \"arn:aws:iam::<id>:role/${get_env(\"TG_ROLE_NAME\", \"TerraformDeploymentRole\")}\"`.",
+   "The vault provider (auth_login_aws, role terraform) is generated into every old-tree unit by common.hcl, and helm/kubernetes units call EKS. Plans need a read-only Vault role terraform-plan (after G0 narrows gha-runners) and an EKS access entry with AmazonEKSViewPolicy; until then PR plans skip the units that need them.",
+   "New accounts arrive without these roles (Control Tower); add both to the manual bootstrap list next to TerraformDeploymentRole and the GitHub OIDC role. A person applies."
+  ],
+  "code": {
+   "file": "terraform/accounts/<account>/aws/global/iam/terraform-plan/main.tf",
+   "lang": "hcl",
+   "text": "# One per AWS account. Template: terraform/accounts/solutions/aws/global/iam/github-actions. A person applies it.\ndata \"aws_iam_policy_document\" \"assume\" {\n  statement {\n    actions = [\"sts:AssumeRole\"]\n    principals {\n      type        = \"AWS\"\n      identifiers = [\"arn:aws:iam::123456789012:role/GitHubActionsTerraformPlan\"] # OIDC role, trusts PRs of infrastructure only\n    }\n  }\n}\n\nresource \"aws_iam_role\" \"terraform_plan\" {\n  name               = \"TerraformPlanRole\"\n  assume_role_policy = data.aws_iam_policy_document.assume.json\n  tags               = var.tags\n}\n\nresource \"aws_iam_role_policy_attachment\" \"read_only\" {\n  role       = aws_iam_role.terraform_plan.name\n  policy_arn = \"arn:aws:iam::aws:policy/ReadOnlyAccess\"\n}\n\n# A plan needs configuration, never data: ReadOnlyAccess alone could read objects, secrets and tables.\ndata \"aws_iam_policy_document\" \"no_data_reads\" {\n  statement {\n    effect    = \"Deny\"\n    actions   = [\"s3:GetObject\", \"secretsmanager:GetSecretValue\", \"ssm:GetParameter*\", \"kms:Decrypt\", \"dynamodb:GetItem\", \"dynamodb:Query\", \"dynamodb:Scan\"]\n    resources = [\"*\"] # units whose data sources read secrets are skipped in PR plans\n  }\n}\n\nresource \"aws_iam_role_policy\" \"no_data_reads\" {\n  role   = aws_iam_role.terraform_plan.id\n  policy = data.aws_iam_policy_document.no_data_reads.json\n}"
+  }
+ },
+ {
+  "key": "G7-31",
+  "title": "[DevOps] Take cloud and client branch pushes off the shared QA locks",
+  "team": [
+   "devops",
+   "be"
+  ],
+  "days": 1.5,
+  "w": [
+   10,
+   11
+  ],
+  "flag": null,
+  "deps": [
+   "G7-26"
+  ],
+  "needs": "G0 ruleset makes \"FCP Lab smoke\" and \"API Tests\" required",
+  "what": "In cloud-ci.yml and client-ci.yml, run the QA integration jobs (and their per-component, per-cloud locks) only on main, in the nightly and for releases; branch pushes get the Lab smoke instead.",
+  "why": "Every branch push of cloud or client code waits 20–30 minutes on cloud_integration_tests_{aws,gcp} or client_integration_tests_{aws,gcp}. Agents push often, so this queue would grow with them.",
+  "how": [
+   "Run the Lab smoke next to QA for two weeks (G7-26) and compare the verdicts push by push. Move only when the Lab caught everything QA caught; list the exceptions (for example GCP-only paths) and keep those on the nightly.",
+   "Change the `if:` of integration-tests-aws and -gcp in cloud-ci.yml and client-ci.yml to main only (sketch). `publish` already needs both jobs on main, so post-merge QA stays.",
+   "Leave cloud-int-tests-dispatch.yml (nightly 02:44 UTC) and client-int-tests-dispatch.yml unchanged; they keep taking the same concurrency groups, which still protect each QA environment.",
+   "Branch-only jobs that existed to feed QA (build, build-rhino-agent): check who else reads their images before skipping them on branches.",
+   "Required checks: the fcp ruleset main-branch-protection is disabled today and lists no required checks (read 12 Oct). Agree with G0 that \"FCP Lab smoke\" and \"API Tests\" become required checks.",
+   "Tell the BE guild in Slack what changed, and that people (never agents) can still run QA on a branch from the dispatch workflows."
+  ],
+  "code": {
+   "file": ".github/workflows/cloud-ci.yml (client-ci.yml gets the same change)",
+   "lang": "yaml",
+   "text": "  lab-images:\n    needs: check-changes\n    if: github.ref != 'refs/heads/main' && needs.check-changes.outputs.has_changes == 'true'\n    uses: ./.github/workflows/_lab-images-reusable.yml\n    secrets: inherit\n\n  lab-smoke:\n    name: FCP Lab smoke\n    needs: [check-changes, lab-images]\n    if: github.ref != 'refs/heads/main' && needs.check-changes.outputs.has_changes == 'true'\n    uses: ./.github/workflows/_lab-smoke-reusable.yml\n    with:\n      image_tag: ${{ needs.lab-images.outputs.tag }}\n    secrets: inherit\n\n  integration-tests-aws:\n    name: \"I&T - AWS\"\n    needs: [build, build-rhino-agent, check-changes]\n    # Shared QA (lock cloud_integration_tests_aws on qa-cloud / rhino-agent-qa-1) only after merge to main.\n    # The nightly (cloud-int-tests-dispatch.yml) and releases keep using it; branch pushes no longer wait for it.\n    if: github.ref == 'refs/heads/main'\n    uses: ./.github/workflows/_cloud-int-tests-reusable-aws.yml\n    # with: ...unchanged\n\n  # integration-tests-gcp: the same `if:`. `publish` already needs both and only runs on main."
+  }
+ },
+ {
+  "key": "G7-32",
+  "title": "[DevOps] Post read-only Terragrunt plans on infrastructure PRs",
+  "team": [
+   "devops"
+  ],
+  "days": 1.5,
+  "w": [
+   10,
+   11
+  ],
+  "flag": "stretch",
+  "deps": [
+   "G7-30"
+  ],
+  "needs": "G0 Vault narrowing (read-only Vault role for plans)",
+  "what": "A pull_request workflow in the infrastructure repo that runs `terragrunt plan` with TerraformPlanRole for the units a PR changes and posts one comment with the result per unit. It never applies.",
+  "why": "Reviewers and agents see the real effect of an infra change on the PR instead of a plan pasted by hand. Applying stays a person's job.",
+  "how": [
+   "Create .github/workflows/terragrunt-plan.yml (sketch) on pull_request, runs-on infrastructure-runner-set, TG_ROLE_NAME=TerraformPlanRole, OIDC to GitHubActionsTerraformPlan.",
+   "Units = folders with a changed terragrunt.hcl. For a module-only change, find the units that use the module with Terragrunt 1.1's include-units-reading option (check its exact flag name).",
+   "`terragrunt plan -lock=false -input=false -no-color` per unit. Never write plan files with -out: a plan file holds secret values in plain text.",
+   "Post one sticky comment: per unit the \"Plan: X to add, Y to change, Z to destroy\" line and the changed resource addresses; the full output stays in the job log of this private repo.",
+   "No apply, destroy or workflow_dispatch anywhere in this workflow; agents can read the comment but not act on infrastructure."
+  ],
+  "code": {
+   "file": ".github/workflows/terragrunt-plan.yml (infrastructure repo)",
+   "lang": "yaml",
+   "text": "name: \"[TERRAGRUNT] Plan on PRs (read-only)\"\non:\n  pull_request:\n    paths: ['terraform/**', 'modules/**', 'multi_tenant/**', 'single_tenant/**']\n\npermissions: { id-token: write, contents: read, pull-requests: write }\n\njobs:\n  plan:\n    runs-on: infrastructure-runner-set\n    env:\n      TG_ROLE_NAME: TerraformPlanRole  # read by account.hcl (G7-30); never TerraformDeploymentRole here\n    steps:\n      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0\n        with: { fetch-depth: 0 }\n      - uses: aws-actions/configure-aws-credentials@<sha> # pin by SHA\n        with: { aws-region: us-east-1, role-to-assume: \"arn:aws:iam::123456789012:role/GitHubActionsTerraformPlan\" }\n      - name: Install Tofu and Terragrunt\n        env: { TENV_GITHUB_TOKEN: \"${{ secrets.GITHUB_TOKEN }}\" }\n        run: tenv tofu install && tenv tg install\n      - name: Plan the changed units (read-only, no lock, no plan files)\n        run: |\n          git diff --name-only origin/main...HEAD | grep 'terragrunt.hcl$' | xargs -r -n1 dirname | sort -u > units.txt\n          # Module-only changes: add the units that read the module (Terragrunt 1.1 include-units-reading; check the flag).\n          while read -r unit; do\n            (cd \"$unit\" && terragrunt plan -lock=false -input=false -no-color) > \"plan-${unit//\\//_}.txt\" 2>&1 || true\n          done < units.txt\n      - name: One comment with the summary per unit\n        env: { GH_TOKEN: \"${{ github.token }}\" }\n        run: .github/scripts/post_plan_comment.sh units.txt  # \"Plan: X to add, Y to change, Z to destroy\" + addresses"
+  }
+ },
+ {
+  "key": "G7-33",
+  "title": "[DevOps] Move the frontend PR gate from qa-front-end to FCP Lab",
+  "team": [
+   "devops",
+   "be"
+  ],
+  "days": 1.5,
+  "w": [
+   11,
+   12
+  ],
+  "flag": null,
+  "deps": [
+   "G7-26",
+   "G7-31"
+  ],
+  "needs": "G0 ruleset makes the new gate a required check",
+  "what": "In frontend-ci.yaml, pull requests stop calling _frontend-int-tests-reusable-{aws,gcp}.yml (lock frontend_integration_tests_{aws,gcp} on qa-front-end) and run the pr/ Playwright project on the Lab instead; QA keeps main, the nightly and releases.",
+  "why": "frontend-ci is the only CI that runs on pull_request, and every FE PR queues for qa-front-end today. The e2e_tests alls-green job inside the reusable workflows is the gate that has to move with it.",
+  "how": [
+   "Add an e2e-lab job that calls _lab-smoke-reusable.yml with suite frontend-e2e (the lab's allowlist of 24 pr/ and nightly/ spec files). List the specs the Lab can't run (the lab's AGENTS.md names them, such as GCP VMs or a real AWS bucket) and keep only those on the QA nightly.",
+   "Move the e2e_tests re-actors/alls-green gate out of _frontend-int-tests-reusable-aws.yml and -gcp.yml into frontend-ci.yaml (sketch), so one gate covers the Lab on PRs and QA on main.",
+   "integration-tests-aws and -gcp get `github.event_name != 'pull_request'`; check whether build-e2e-app is still needed on PRs once QA no longer runs there.",
+   "merge-frontend-coverage reads e2e coverage from the QA runs: point it at the Lab job's artifact, or accept no e2e coverage on PRs (decide with the FE guild).",
+   "Test this on a draft PR. Don't dispatch frontend-ci on a branch: that deploys over main's dev dashboard and Storybook.",
+   "Ask G0 to make e2e_tests required in the main ruleset, as in G7-31."
+  ],
+  "code": {
+   "file": ".github/workflows/frontend-ci.yaml",
+   "lang": "yaml",
+   "text": "  e2e-lab:\n    name: E2E on FCP Lab\n    needs: [check-changes, lab-images]\n    if: github.event_name == 'pull_request' && needs.check-changes.outputs.has_changes == 'true'\n    uses: ./.github/workflows/_lab-smoke-reusable.yml\n    with:\n      image_tag: ${{ needs.lab-images.outputs.tag }}\n      suite: frontend-e2e  # the lab's allowlist instead of the short smoke list\n    secrets: inherit\n\n  integration-tests-aws:\n    name: \"I&T - AWS\"\n    uses: ./.github/workflows/_frontend-int-tests-reusable-aws.yml\n    needs: [check-changes, build-e2e-app]\n    # qa-front-end (lock frontend_integration_tests_aws) after merge, nightly and releases only\n    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || needs.check-changes.outputs.has_changes == 'true')\n    # with: ...unchanged\n\n  e2e_tests:  # moved here from the reusable workflows: one gate for the Lab on PRs and for QA on main\n    if: always()\n    needs: [e2e-lab, integration-tests-aws, integration-tests-gcp]\n    runs-on: fcp-runner-set\n    steps:\n      - uses: re-actors/alls-green@release/v1\n        with:\n          allowed-skips: e2e-lab, integration-tests-aws, integration-tests-gcp\n          jobs: ${{ toJSON(needs) }}"
+  }
+ },
+ {
+  "key": "G7-34",
+  "title": "[DevOps] argocd-diff-preview for gitops PRs on a throw-away kind cluster",
+  "team": [
+   "devops"
+  ],
+  "days": 1.5,
+  "w": [
+   11,
+   12
+  ],
+  "flag": "stretch",
+  "deps": [
+   "G7-23"
+  ],
+  "needs": "",
+  "what": "A gitops pull_request workflow that renders the Argo CD applications for main and for the PR on a throw-away kind cluster with argocd-diff-preview and posts the rendered manifest diff as a PR comment.",
+  "why": "A values change can touch many environments at once, and reviewers can't see that from the diff alone. Seeing the rendered result before merge catches surprises, and nothing ever syncs to a real cluster.",
+  "how": [
+   "argocd/argocd-apps is a Helm chart that renders Applications from <env>-values.yaml and is installed with helm on inf, so there are no plain Application files for the tool to find. Render them for both branches first (sketch).",
+   "Run dagandersen/argocd-diff-preview (pinned) in docker; the kind cluster runs inside the dind sidecar of gitops-runner-set and is gone with the pod. Every destination in our apps is a remote product cluster; the tool renders locally and never contacts them.",
+   "Give it a read-only token for the gitops repo (and any private chart source); no cluster credentials at all.",
+   "Post the diff as one comment, edited on each push; for very large diffs post the summary and attach the full diff as an artifact.",
+   "No argocd sync, apply or workflow_dispatch anywhere in this workflow."
+  ],
+  "code": {
+   "file": ".github/workflows/argocd-diff-preview.yml (gitops repo)",
+   "lang": "yaml",
+   "text": "name: Argo CD diff preview\non:\n  pull_request:\n    branches: [main]\n\npermissions: { contents: read, pull-requests: write }\n\njobs:\n  diff:\n    runs-on: gitops-runner-set  # ARC dind: kind runs inside the dind sidecar; nothing reaches a real cluster\n    steps:\n      - uses: actions/checkout@<sha> # pin by SHA\n        with: { path: pull-request }\n      - uses: actions/checkout@<sha>\n        with: { ref: main, path: main }\n      - name: Render the Applications (argocd-apps is a Helm chart installed with helm on inf, not plain YAML)\n        run: |\n          for side in main pull-request; do\n            for values in \"$side\"/argocd/argocd-apps/*-values.yaml; do\n              helm template apps \"$side/argocd/argocd-apps\" -f \"$values\" > \"$side/rendered-apps-$(basename \"$values\")\"\n            done\n          done\n      - name: Diff on a throw-away kind cluster\n        run: |\n          docker run --network host -v /var/run/docker.sock:/var/run/docker.sock \\\n            -v \"$PWD/main:/base-branch\" -v \"$PWD/pull-request:/target-branch\" -v \"$PWD/output:/output\" \\\n            -e TARGET_BRANCH=\"${{ github.head_ref }}\" -e REPO=\"${{ github.repository }}\" \\\n            dagandersen/argocd-diff-preview:<pinned version>\n      - name: Post the diff\n        env: { GH_TOKEN: \"${{ github.token }}\" }\n        run: |\n          gh pr comment \"${{ github.event.number }}\" --edit-last --body-file output/diff.md \\\n            || gh pr comment \"${{ github.event.number }}\" --body-file output/diff.md"
+  }
+ },
+ {
+  "key": "G7-35",
+  "title": "[BE] Nightly mutation report on files that agent PRs changed",
+  "team": [
+   "be"
+  ],
+  "days": 2,
+  "w": [
+   11,
+   12
+  ],
+  "flag": "stretch",
+  "deps": [
+   "G7-12"
+  ],
+  "needs": "G0 rhino-ai-agents GitHub App (to find agent PRs); G5 coverage-gap routine reads the report",
+  "what": "A nightly, advisory job that runs mutmut on the cloud files that agent PRs changed the day before, judged by the API layer, and publishes the surviving mutants.",
+  "why": "A test suite that passes no matter what the code does gives agents false confidence. Surviving mutants show where the tests are weak, and they are the input for the coverage-gap routine, in the pattern Meta's ACH used.",
+  "how": [
+   "Add .github/workflows/cloud-mutation-nightly.yml (sketch): schedule only, never a required check, on fcp-runner-set with the same Postgres service and env as the API Tests job.",
+   "Files: merged PRs from the last day authored by the rhino-ai-agents App (`gh pr list --search \"author:app/rhino-ai-agents merged:>=<date>\"`), keeping cloud/rhinoCloud/rhinoCore/**/*.py without tests and migrations, at most 10 files a night.",
+   "mutmut 3 with a generated setup.cfg [mutmut] section: paths_to_mutate = those files, tests_dir = tests_api/. Only the API layer judges mutants, because rhinoCore/tests run on manage.py test, not pytest.",
+   "Check that mutmut 3's mutants/ copy is what `rhinoCloud.rhinoCore...` imports (the code is imported through PYTHONPATH=cloud). If it is not, run from cloud/ with rhinoCloud/... paths, or try cosmic-ray, and say which in the PR.",
+   "Report: killed, survived and timed-out counts per file, plus the surviving mutants' diffs, as the job summary and an artifact. The weekly run review reads it; the G5 coverage-gap routine turns survivors into test proposals."
+  ],
+  "code": {
+   "file": ".github/workflows/cloud-mutation-nightly.yml",
+   "lang": "yaml",
+   "text": "name: \"[CLOUD] - Mutation report (advisory)\"\non:\n  schedule:\n    - cron: '17 4 * * *' # after the 02:44 UTC cloud nightly\n\njobs:\n  mutation:\n    runs-on: fcp-runner-set\n    # services and env: the same Postgres service and env as the API Tests job in cloud-ci.yml\n    steps:\n      - uses: actions/checkout@v6\n      - name: Cloud files that agent PRs changed yesterday\n        env:\n          GH_TOKEN: ${{ github.token }}\n        run: |\n          gh pr list --state merged --limit 50 --search \"author:app/rhino-ai-agents merged:>=$(date -u -d yesterday +%F)\" \\\n            --json files --jq '.[].files[].path' \\\n            | grep -E '^cloud/rhinoCloud/rhinoCore/.+\\.py$' | grep -vE '/(tests|migrations|integration-tests)/' \\\n            | sed 's|^cloud/rhinoCloud/||' | sort -u | head -n 10 > touched.txt || true\n      - name: Mutate only those files; only the API layer judges the mutants\n        working-directory: cloud/rhinoCloud\n        run: |\n          [ -s ../../touched.txt ] || { echo \"No agent-changed cloud files yesterday\"; exit 0; }\n          printf '[mutmut]\\npaths_to_mutate=%s\\ntests_dir=tests_api/\\n' \"$(paste -sd, ../../touched.txt)\" > setup.cfg\n          uv run --frozen --group api-tests --with mutmut mutmut run || true\n          uv run --frozen --group api-tests --with mutmut mutmut results > ../../mutation-report.txt\n      - name: Report (advisory, never a required check)\n        if: hashFiles('mutation-report.txt') != ''\n        run: |\n          { echo \"## Surviving mutants in agent-changed files\"; echo '```'; cat mutation-report.txt; echo '```'; } >> \"$GITHUB_STEP_SUMMARY\"\n      - uses: actions/upload-artifact@v7\n        if: hashFiles('mutation-report.txt') != ''\n        with: { name: mutation-report, path: mutation-report.txt }"
+  }
+ }
+]

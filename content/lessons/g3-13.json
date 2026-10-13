@@ -1,0 +1,497 @@
+{
+ "id": "g3-13",
+ "title": "The Slack app",
+ "minutes": 40,
+ "youNeed": [
+  "p9-1",
+  "g3-10"
+ ],
+ "bridge": "The Slack app is like a small Express server whose routes are /nova and the buttons. Except nobody calls it over HTTP. It dials out to Slack over a WebSocket, and every route ends in a Temporal call.",
+ "intro": "People hand work to Nova and follow it where they already talk. This lesson builds our own Slack app: the /nova command, a status message per ticket and the plan buttons. Replies in a thread answer Nova's questions. Every click reaches the waiting workflow at once and is never lost.",
+ "picture": {
+  "caption": "Slack talks to the app over a socket the app opened; each command, click and reply becomes a Temporal call.",
+  "nodes": [
+   {
+    "id": "person",
+    "label": "Sean in the Nova channel",
+    "kind": "person"
+   },
+   {
+    "id": "slack",
+    "label": "Slack",
+    "kind": "cloud"
+   },
+   {
+    "id": "app",
+    "label": "slack-app (Bolt, Socket Mode)",
+    "kind": "service"
+   },
+   {
+    "id": "wf",
+    "label": "workflow nova:RH-1234",
+    "kind": "service"
+   },
+   {
+    "id": "thread",
+    "label": "status message and thread",
+    "kind": "file"
+   },
+   {
+    "id": "broker",
+    "label": "broker: thread to workflow map",
+    "kind": "service"
+   }
+  ],
+  "steps": [
+   {
+    "from": "app",
+    "to": "slack",
+    "text": "at start, opens a WebSocket out to Slack"
+   },
+   {
+    "from": "person",
+    "to": "slack",
+    "text": "types /nova RH-1234 or clicks Approve"
+   },
+   {
+    "from": "slack",
+    "to": "app",
+    "text": "sends the event down the open socket; the app acks within 3 seconds"
+   },
+   {
+    "from": "app",
+    "to": "wf",
+    "text": "startRun, a status query, or a signal with who did it"
+   },
+   {
+    "from": "app",
+    "to": "thread",
+    "text": "edits the message in place: who decided, no more buttons"
+   },
+   {
+    "from": "broker",
+    "to": "app",
+    "text": "a reply in a thread maps to its workflow: answerQuestion"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "No public endpoint: Socket Mode",
+   "p": [
+    "A normal Slack app gives Slack a public URL, and Slack calls it for every command and click. We do not want a public endpoint on the agent platform. Socket Mode turns this around: our app opens a WebSocket to Slack, and Slack sends events down that connection.",
+    "The app needs two tokens. The app token (xapp-) opens the socket. The bot token (xoxb-) calls Slack's API, for example to post or edit a message. Both come from Vault at infrastructure/ai-agents/slack-app through the ExternalSecret.",
+    "A Slack admin creates the app with Socket Mode and the scopes chat:write, commands, users:read.email and channels:history in the Nova channel. Claude Tag is not an option for us under ZDR, so we run our own app."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Nothing on the internet can call the platform. The Jira poll and this socket both dial out."
+   }
+  },
+  {
+   "h": "/nova, part 1: parse the command",
+   "p": [
+    "The command has three forms: /nova RH-1234 starts, /nova status RH-1234 asks, /nova stop RH-1234 stops. Part 1 reads the words and finds the person and the workflow."
+   ],
+   "because": "We call ack() first, because Slack wants an answer within 3 seconds, and Temporal calls can take longer.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/slack-app/src/app.ts (part 1 of 2)",
+    "text": "import { App } from \"@slack/bolt\";\n\nconst app = new App({ token: process.env.SLACK_BOT_TOKEN, appToken: process.env.SLACK_APP_TOKEN, socketMode: true });\nconst USAGE = \"Try /nova RH-1234, /nova status RH-1234 or /nova stop RH-1234.\";\n\napp.command(\"/nova\", async ({ ack, command, respond }) => {\n  await ack(); // Slack needs an answer within 3 seconds; the work happens after\n  const words = command.text.trim().split(/\\s+/).filter(Boolean);\n  const [verb, key] = words.length > 1 ? [words[0], words[1]!.toUpperCase()] : [\"start\", (words[0] ?? \"\").toUpperCase()];\n  if (!JIRA_KEY.test(key)) {\n    await respond(USAGE);\n    return;\n  }\n  const by = people.bySlackId(command.user_id); // config/people.yaml (G4-05)\n  const temporal = await temporalClient();\n  const handle = temporal.workflow.getHandle(`nova:${key}`);",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Bolt 5 is Slack's own framework for apps in Node (lesson p9-1)."
+     },
+     {
+      "line": 3,
+      "text": "socketMode: true with an appToken: the app dials out. The bot token is for API calls."
+     },
+     {
+      "line": 4,
+      "text": "The help text, sent back whenever the command makes no sense."
+     },
+     {
+      "line": 6,
+      "text": "app.command registers a handler for /nova. respond answers only the person who typed it."
+     },
+     {
+      "line": 7,
+      "text": "ack() tells Slack \"got it\" at once. The real work comes after."
+     },
+     {
+      "line": 8,
+      "text": "Split the text on spaces and drop empty pieces."
+     },
+     {
+      "line": 9,
+      "text": "Two words: verb and key. One word: the verb is start and the word is the key. Keys are upper-cased, so rh-1234 works."
+     },
+     {
+      "line": 10,
+      "text": "JIRA_KEY is a regex like ^[A-Z]+-\\d+$. Anything else gets the usage text."
+     },
+     {
+      "line": 14,
+      "text": "Map the Slack user to a person: Slack ID, Jira accountId and GitHub login, from config/people.yaml (G4-05)."
+     },
+     {
+      "line": 16,
+      "text": "The workflow ID is nova:<key>, the same one the Jira poll builds."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "people.bySlackId reads a people block in config/people.yaml (Slack ID, email, Jira accountId). No ticket defines that block. Agree its shape with the G4-05 owner before you write the lookup."
+   }
+  },
+  {
+   "h": "/nova, part 2: start, status, stop",
+   "p": [
+    "Part 2 does the work for each verb. Start goes through startRun, so a ticket that the poll already started is joined, not started twice."
+   ],
+   "because": "We pass who did it on every signal, because Jira and the PR must record which person started, stopped or decided.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/slack-app/src/app.ts (part 2 of 2)",
+    "text": "  if (verb === \"start\") {\n    // G4-05 turns this into \"assign the ticket to Nova\", so the poll starts it and records the requester\n    await startRun(temporal, \"nova\", key, \"ticketToPr\", { key, requester: by.jiraAccountId }); // a Handoff (G4-04)\n    await respond(`Nova has ${key}. Follow along in its thread.`);\n  } else if (verb === \"status\") {\n    await respond(oneLine(await handle.query<RunStatus>(\"status\")));\n  } else if (verb === \"stop\") {\n    await handle.signal(\"stop\", by);\n    await respond(`Stopping ${key}. The branch and notes are kept.`);\n  } else {\n    await respond(USAGE);\n  }\n});\n\nawait app.start(); // dials out to Slack over a WebSocket",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Later G4-05 changes start to \"assign the ticket to Nova\". Then the poll starts it and records the requester the same way as in Jira."
+     },
+     {
+      "line": 3,
+      "text": "startRun from lesson g3-10, with a Handoff: the key and the requester's Jira accountId."
+     },
+     {
+      "line": 4,
+      "text": "respond sends a message only this person sees, an ephemeral message."
+     },
+     {
+      "line": 6,
+      "text": "status is a Temporal query: it reads the workflow's state without changing it. oneLine formats it."
+     },
+     {
+      "line": 8,
+      "text": "stop is a signal. by records who pressed it."
+     },
+     {
+      "line": 9,
+      "text": "The branch and notes are kept on Stop (lesson g3-12)."
+     },
+     {
+      "line": 15,
+      "text": "app.start() opens the WebSocket. From now on Slack sends events down it."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "If a Temporal call fails, the error goes back as an ephemeral message to the person who typed the command. Nobody else's channel fills with errors."
+   }
+  },
+  {
+   "h": "One thread and one status message per ticket",
+   "p": [
+    "Each ticket gets one thread in the Nova channel. Its first message is the status message. It moves through Checking, Planning, Awaiting approval, Working and PR open, or ends at Needs info or Stopped.",
+    "The app keeps it current with chat.update, which edits a message in place. People see one line that is always right, not a stream of updates.",
+    "The thread's channel and ts (Slack's ID for a message) become the run's Slack scope in the broker. So the run may post only in its own thread, and the broker knows which workflow owns which thread."
+   ]
+  },
+  {
+   "h": "Buttons, part 1: who may decide",
+   "p": [
+    "The plan arrives with buttons: Approve, Change, Stop. A running ticket has a Stop button, and the backstop (lesson g3-14) has Continue. Each button has an action_id, Slack's name for the button, and a value that we fill. G4-14 decides how the plan looks and who may click."
+   ],
+   "because": "We check who clicked before we signal, because only the requester decides a plan.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/slack-app/src/actions.ts (part 1 of 2)",
+    "text": "const SIGNALS: Record<string, string> = { plan_approve: \"decidePlan\", plan_stop: \"stop\", run_stop: \"stop\", backstop_continue: \"resume\" };\n\napp.action(/^(plan_approve|plan_change|plan_stop|run_stop|backstop_continue)$/, async ({ ack, body, action, client }) => {\n  await ack();\n  if (body.type !== \"block_actions\" || action.type !== \"button\") return;\n  const [workflowId = \"\", version = \"\"] = (action.value ?? \"\").split(\"|\"); // \"nova:RH-1234|3\": plan v3 (G4-14)\n  const person = people.bySlackId(body.user.id); // config/people.yaml (G4-05)\n  if (!(await mayDecide(person, workflowId, action.action_id))) { // G4-14: only the requester\n    return ephemeral(client, body, \"Only the requester can decide this.\");\n  }\n  if (action.action_id === \"plan_change\") {\n    await client.views.open({ trigger_id: body.trigger_id, view: changeModal(workflowId, version) });\n    return;\n  }",
+    "notes": [
+     {
+      "line": 1,
+      "text": "action_id to signal name. Approve is decidePlan; both stops are stop; Continue is resume."
+     },
+     {
+      "line": 3,
+      "text": "One handler for all five known action_ids, matched by a regex."
+     },
+     {
+      "line": 4,
+      "text": "ack() first, as for commands."
+     },
+     {
+      "line": 5,
+      "text": "Only button clicks in messages. Other payload shapes are ignored."
+     },
+     {
+      "line": 6,
+      "text": "The value is \"nova:RH-1234|3\": the workflow ID and the plan version, set by G4-14."
+     },
+     {
+      "line": 8,
+      "text": "mayDecide is the permission hook G4-14 fills in: only the requester decides a plan."
+     },
+     {
+      "line": 9,
+      "text": "Anyone refused gets an ephemeral message that says who can decide."
+     },
+     {
+      "line": 11,
+      "text": "Change needs a comment, so it opens a modal (a Slack form) first. The form's submit handler sends decidePlan with the comment."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Buttons, part 2: signal, then remove the buttons",
+   "p": [
+    "A decision must reach the waiting workflow, be recorded, and never be lost. And an old button must not fire twice."
+   ],
+   "because": "We update the message only after the signal arrives, so a failed click keeps its buttons for a retry.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/slack-app/src/actions.ts (part 2 of 2)",
+    "text": "  const payload = action.action_id === \"plan_approve\" ? { kind: \"approve\", by: person.email, version } : person.email;\n  try {\n    await (await temporalClient()).workflow.getHandle(workflowId).signal(SIGNALS[action.action_id]!, payload);\n  } catch { // Temporal down: never drop a decision silently\n    return ephemeral(client, body, \"That didn't reach Nova. Please try again in a minute.\");\n  }\n  await client.chat.update({ channel: body.channel?.id ?? \"\", ts: body.message?.ts ?? \"\", // no second click\n    blocks: decidedBlocks(body.message, action.action_id, person) });\n});",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Approve carries a PlanDecision with who decided and which plan version. Stop and Continue carry who did it."
+     },
+     {
+      "line": 3,
+      "text": "Send the signal to the workflow named in the button's value."
+     },
+     {
+      "line": 4,
+      "text": "If Temporal is down, the signal throws."
+     },
+     {
+      "line": 5,
+      "text": "Tell the person to try again. A decision is never dropped silently."
+     },
+     {
+      "line": 7,
+      "text": "chat.update edits the plan message in place."
+     },
+     {
+      "line": 8,
+      "text": "decidedBlocks shows who decided and removes the buttons. The workflow also ignores a decision that arrives after one was taken."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "Two ticket mix-ups to fix in the PR. First, /nova stop (G3-30) sends the whole person object as by, but these buttons (G3-35) send person.email. Use the email in both, as the batch stop does. Second, Continue sends a resume signal that no workflow defines yet. Agree with the backstop owner (lesson g3-14) where resume is handled."
+   }
+  },
+  {
+   "h": "Replies in the thread answer questions",
+   "p": [
+    "When Nova asks a question with ask_human, the broker posts it in the ticket's thread and records which workflow posted there. A person's reply in that thread becomes answerQuestion(text, by)."
+   ],
+   "because": "We map threads to workflows in the broker, because the broker already owns the run's Slack scope and survives app restarts.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/slack-app/src/actions.ts (thread replies)",
+    "text": "app.event(\"message\", async ({ event }) => {\n  if (event.subtype !== undefined || event.bot_id || !event.thread_ts) return; // only people, only inside a ticket's thread\n  const workflowId = await workflowForThread(event.channel, event.thread_ts);\n  if (!workflowId) return;\n  const person = people.bySlackId(event.user);\n  await (await temporalClient()).workflow.getHandle(workflowId).signal(\"answerQuestion\", event.text ?? \"\", person.email);\n});",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Every message the app can see arrives here."
+     },
+     {
+      "line": 2,
+      "text": "Skip edits and joins (subtype), bot messages (bot_id) and top-level messages (no thread_ts). Only people, only inside a thread."
+     },
+     {
+      "line": 3,
+      "text": "workflowForThread asks the broker which workflow owns this thread."
+     },
+     {
+      "line": 4,
+      "text": "A thread that is not a ticket's: ignore."
+     },
+     {
+      "line": 6,
+      "text": "Signal answerQuestion with the text and who wrote it. ticketToPr wakes up from its wait (lesson g3-10)."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "The ticket says several replies before Nova resumes are joined. ticketToPr's handler in lesson g3-10 overwrites run.answer. Append instead, for example run.answer = [run.answer, text].filter(Boolean).join(\"\\n\")."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Trace commands, clicks and replies through the code",
+  "youNeed": [
+   "this lesson open",
+   "lesson g3-10's ticketToPr signals",
+   "paper or a text file for your answers"
+  ],
+  "worked": [
+   {
+    "do": "Sean types /nova rh-1234. Read app.ts part 1, lines 8 and 9. What are verb and key?",
+    "see": "verb is \"start\", key is \"RH-1234\"."
+   },
+   {
+    "do": "Read part 2, line 3. Which workflow ID and which input does startRun get?",
+    "see": "nova:RH-1234, with the Handoff { key: \"RH-1234\", requester: <Sean's Jira accountId> }."
+   },
+   {
+    "do": "Sean types /nova please. Follow part 1, lines 9 to 12. What does he see, and who else sees it?",
+    "see": "key is \"PLEASE\", JIRA_KEY fails, and he gets the usage text. Nobody else sees it: respond is ephemeral."
+   },
+   {
+    "do": "Sean, the requester, clicks Approve on plan version 3. Read actions part 1, line 6, and part 2, lines 1 and 3. Which signal and payload reach the workflow?",
+    "see": "decidePlan with { kind: \"approve\", by: <Sean's email>, version: \"3\" }."
+   },
+   {
+    "do": "Dana clicks Approve on the same plan. Read part 1, lines 8 and 9.",
+    "see": "mayDecide refuses; Dana gets \"Only the requester can decide this.\" No signal is sent."
+   },
+   {
+    "do": "Temporal is down when Sean clicks. Read part 2, lines 4 to 7. What does Sean see, and are the buttons still there?",
+    "see": "\"That didn't reach Nova. Please try again in a minute.\" The return comes before chat.update, so the buttons stay."
+   }
+  ],
+  "faded": "Trace a reply. Nova asked a question in RH-1234's thread, and Sean replies \"use the v2 endpoint\" in that thread. Follow the message handler line by line: which checks pass, and what workflowForThread returns. The last step is yours: write the exact signal name and both arguments.",
+  "alone": "Trace two new cases with no help. First, the Nova bot itself posts a progress line in the thread: say which line stops it. Second, Sean clicks Change: say what opens, why no signal is sent yet, and what the form's submit handler must send.",
+  "done": "For every command, click and reply, you can name the Temporal call it makes and who ends up recorded."
+ },
+ "quiz": [
+  {
+   "q": "Why does the Slack app use Socket Mode?",
+   "options": [
+    {
+     "text": "Bolt 5 only supports Socket Mode.",
+     "correct": false,
+     "why": "Bolt also supports HTTP endpoints. We choose sockets."
+    },
+    {
+     "text": "Socket Mode is faster for slash commands.",
+     "correct": false,
+     "why": "Speed is not the reason."
+    },
+    {
+     "text": "The app dials out to Slack over a WebSocket, so the platform has no public endpoint.",
+     "correct": true,
+     "why": "Like the Jira poll, nothing on the internet calls us."
+    }
+   ]
+  },
+  {
+   "q": "Why does every handler call ack() before calling Temporal?",
+   "options": [
+    {
+     "text": "Slack needs an answer within 3 seconds, and a Temporal call can take longer.",
+     "correct": true,
+     "why": "ack() answers at once; the work and the reply come after."
+    },
+    {
+     "text": "ack() sends the result of the command to the person.",
+     "correct": false,
+     "why": "respond or ephemeral sends the result. ack only confirms receipt."
+    },
+    {
+     "text": "ack() starts the workflow.",
+     "correct": false,
+     "why": "startRun starts it. ack talks only to Slack."
+    }
+   ]
+  },
+  {
+   "q": "After Sean approves a plan, the app edits the message. Why?",
+   "options": [
+    {
+     "text": "Slack requires every button message to be edited after a click.",
+     "correct": false,
+     "why": "Slack requires an ack, not an edit."
+    },
+    {
+     "text": "To show who decided and remove the buttons, so an old button cannot fire twice.",
+     "correct": true,
+     "why": "The workflow also ignores a late decision; two guards for one rule."
+    },
+    {
+     "text": "To make the thread look tidy.",
+     "correct": false,
+     "why": "It does look tidy, but the reason is a decision that must count once."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From lesson g3-12: name four ways a person can stop a run.",
+  "From lesson g3-11: when Slack is down, where does notify send Nova's message?"
+ ],
+ "videos": [
+  {
+   "title": "How to Build a Slack App",
+   "url": "https://www.youtube.com/watch?v=25ArxpK48tU",
+   "channel": "Fireship",
+   "minutes": 10,
+   "why": "Quick overview of Slack app pieces: slash commands, events, interactivity."
+  }
+ ],
+ "words": [
+  {
+   "term": "Socket Mode",
+   "plain": "A Slack app mode where the app opens a WebSocket to Slack, so it needs no public URL."
+  },
+  {
+   "term": "ack",
+   "plain": "The call that tells Slack an event was received; it must come within 3 seconds."
+  },
+  {
+   "term": "ephemeral message",
+   "plain": "A Slack message only one person sees, used for errors and command answers."
+  },
+  {
+   "term": "action_id",
+   "plain": "Slack's name for a button, for example plan_approve; our handler maps it to a signal."
+  },
+  {
+   "term": "thread_ts",
+   "plain": "The ID of the message that starts a Slack thread; replies carry it."
+  },
+  {
+   "term": "chat.update",
+   "plain": "The Slack API call that edits a message in place."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-30",
+   "why": "This lesson explained Socket Mode, the two tokens, the /nova handler line by line, and the status message.",
+   "walk": [
+    "Ask a Slack admin to create the app with Socket Mode and the /nova command. Scopes: chat:write, commands, users:read.email, channels:history in the Nova channel.",
+    "Put the xapp- and xoxb- tokens in Vault at infrastructure/ai-agents/slack-app. The ExternalSecret gives them to the slack-app pod as SLACK_APP_TOKEN and SLACK_BOT_TOKEN.",
+    "Create ai-agents/slack-app/src/app.ts (code above) with JIRA_KEY, the people lookup from config/people.yaml and a temporalClient helper.",
+    "Post one thread per ticket in the Nova channel. Its first message is the status message, kept current with chat.update.",
+    "Give the thread's channel and ts to the broker as the run's Slack scope.",
+    "Pass by on every signal. Send errors back as ephemeral messages after ack.",
+    "Test the command parsing with node:test. Leave a note that G4-05 changes start to \"assign the ticket to Nova\"."
+   ]
+  },
+  {
+   "key": "G3-35",
+   "why": "This lesson explained the button handler and the thread-reply handler line by line, and how no decision is lost or counted twice.",
+   "walk": [
+    "Create ai-agents/slack-app/src/actions.ts with the action handler and the message handler (code above).",
+    "Add the view_submission handler for the Change modal. It sends decidePlan with kind change, the comment, who and the version.",
+    "Leave mayDecide as the hook G4-14 fills in, and let G4-14 put the plan version in the button value.",
+    "After a decision, update the message: who decided, no buttons. Make ticketToPr ignore a decision after one was taken.",
+    "Have the broker record which workflow posted in which thread, and add workflowForThread. Join several replies into one answer.",
+    "If a signal cannot be delivered, tell the person to try again. Never drop it.",
+    "Write node:test cases for each action with recorded Bolt payloads."
+   ]
+  }
+ ],
+ "remember": "The Slack app dials out, acks at once, and turns every command, click and reply into one recorded Temporal call."
+}

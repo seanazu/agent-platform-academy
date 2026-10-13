@@ -1,0 +1,547 @@
+{
+ "id": "g6-6",
+ "title": "The brain bot",
+ "minutes": 55,
+ "youNeed": [
+  "g6-5",
+  "p9-1",
+  "p8-5"
+ ],
+ "bridge": "The brain bot is like Nova's Slack app from g3-13. It is a Bolt app in Socket Mode that dials out to Slack, so it needs no public URL. Except: it is written in Python, not TypeScript, because it imports Shai's kb_tools in-process. So it ranks pages and redacts exactly like the kb CLI and BRAIN-QA.",
+ "intro": "Most questions are asked in Slack, not in Claude Code. This lesson builds a small bot that answers @Rhino Brain mentions in allow-listed public channels. It answers with citations, or says it does not know. Then we deploy it on inf-rhinohealth like n8n, and harden it. Hard questions fan out to read-only helpers, and a checker confirms each claim. A thumbs-down opens an issue for the page owner.",
+ "picture": {
+  "caption": "The model reads mirrors and returns structured JSON; our code checks the citations and posts the reply.",
+  "nodes": [
+   {
+    "id": "user",
+    "label": "Engineer in a public channel",
+    "kind": "person"
+   },
+   {
+    "id": "bot",
+    "label": "bot/app.py (Bolt, Socket Mode)",
+    "kind": "service"
+   },
+   {
+    "id": "sdk",
+    "label": "Agent SDK query() with Read, Grep, Glob",
+    "kind": "agent"
+   },
+   {
+    "id": "mirror",
+    "label": "/mirror/rnd-kb and /mirror/fcp (read-only)",
+    "kind": "file"
+   },
+   {
+    "id": "gateway",
+    "label": "LLM gateway (adds the brain-bot key)",
+    "kind": "service"
+   },
+   {
+    "id": "owner",
+    "label": "Page owner (issue on a thumbs-down)",
+    "kind": "person"
+   }
+  ],
+  "steps": [
+   {
+    "from": "user",
+    "to": "bot",
+    "text": "@Rhino Brain how does a code run reach the client?"
+   },
+   {
+    "from": "bot",
+    "to": "bot",
+    "text": "channel in BRAIN_CHANNELS? no PHI or deny-list terms? else refuse politely"
+   },
+   {
+    "from": "bot",
+    "to": "sdk",
+    "text": "query() with the question; the model never calls Slack"
+   },
+   {
+    "from": "sdk",
+    "to": "mirror",
+    "text": "reads pages and code; no Bash, no writes, no web"
+   },
+   {
+    "from": "sdk",
+    "to": "gateway",
+    "text": "every model call goes through the gateway; the pod holds no key"
+   },
+   {
+    "from": "bot",
+    "to": "user",
+    "text": "drops citations that do not resolve at the mirror's sha, redacts, replies in the thread"
+   },
+   {
+    "from": "user",
+    "to": "owner",
+    "text": "a thumbs-down opens an rnd-kb issue assigned to the cited page's owner"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Why this one stays Python",
+   "p": [
+    "The agent platform is TypeScript on Node 24 (ts_platform.md). The brain bot is the one agent service that stays Python, and the reason is in the ticket: it imports kb_tools in-process. kb_tools holds the stdlib search ranking and the PHI scan. The kb CLI, BRAIN-QA and the bot must rank pages and redact the same way, so all three import the same module. Shai and Nave own that repo's language.",
+    "So the bot uses Bolt for Python and the Python Agent SDK (claude_agent_sdk). The shape is the same as Nova's Slack app: Socket Mode, no public endpoint, the gateway adds the key. Only the language differs."
+   ]
+  },
+  {
+   "h": "bot/app.py: options and walls (G6-21)",
+   "p": [
+    "The file has three parts: the options for the agent session, an answer() function, and the Slack handler. The options are the walls in code. Read-only tools only, no setting sources and a system prompt from a file. And a JSON schema for the output, so our code can check the citations.",
+    "The model is Sonnet 5.5 at low effort, with a prompt line to search even when confident. ANTHROPIC_BASE_URL is the LLM gateway, which adds the brain-bot key."
+   ],
+   "because": "We ask for structured output with a citations list, because our code can only check what it can parse. A citation inside free text cannot be checked.",
+   "code": {
+    "lang": "python",
+    "file": "rnd-kb-tooling/bot/app.py",
+    "text": "# rnd-kb-tooling/bot/app.py: sketch. Runs on inf-rhinohealth; ANTHROPIC_BASE_URL is the LLM gateway (it adds the key).\nimport asyncio\nimport os\n\nfrom claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query\nfrom slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler\nfrom slack_bolt.async_app import AsyncApp\n\nfrom bot.citations import ANSWER, format_reply, keep_resolvable  # ANSWER: {answer, citations, unverified} schema\nfrom kb_tools.scan import has_blocked_terms, redact  # same PHI patterns and deny-list as kb-lint\n\napp = AsyncApp(token=os.environ[\"SLACK_BOT_TOKEN\"])\nCHANNELS = set(os.environ[\"BRAIN_CHANNELS\"].split(\",\"))  # public engineering channels only (DATA-SCOPE.md)\nOPTIONS = ClaudeAgentOptions(\n    model=\"claude-sonnet-5-5\", effort=\"low\",\n    cwd=\"/mirror/rnd-kb\", add_dirs=[\"/mirror/fcp\"],  # read-only git mirrors, refreshed every 10 minutes\n    tools=[\"Read\", \"Grep\", \"Glob\"], setting_sources=[],  # no Bash, no writes, no web, no local config\n    system_prompt=open(\"/app/prompts/brain.md\").read(),\n    output_format={\"type\": \"json_schema\", \"schema\": ANSWER})",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Runs on inf-rhinohealth; the gateway URL is the only model endpoint it knows."
+     },
+     {
+      "line": 5,
+      "text": "The Python Agent SDK: options, the result message type, and query()."
+     },
+     {
+      "line": 6,
+      "text": "Bolt's async Socket Mode handler: the bot dials out to Slack over a websocket."
+     },
+     {
+      "line": 9,
+      "text": "ANSWER is the JSON schema {answer, citations, unverified}; keep_resolvable and format_reply are our own code."
+     },
+     {
+      "line": 10,
+      "text": "has_blocked_terms and redact come from kb_tools.scan: the same PHI patterns and deny-list as kb-lint."
+     },
+     {
+      "line": 12,
+      "text": "The Bolt app with the bot token from the environment (Vault writes it into the pod)."
+     },
+     {
+      "line": 13,
+      "text": "BRAIN_CHANNELS: the public engineering channels from G6-01; the bot answers nowhere else."
+     },
+     {
+      "line": 15,
+      "text": "Sonnet 5.5 at low effort: enough for a cited answer from one page."
+     },
+     {
+      "line": 16,
+      "text": "cwd is the rnd-kb mirror; add_dirs adds the fcp mirror. Both are read-only git mirrors refreshed every 10 minutes."
+     },
+     {
+      "line": 17,
+      "text": "Read, Grep and Glob only, and no setting sources: no Bash, no writes, no web, no local config. Check the docs for the exact option name in the pinned Python SDK (tools vs allowed_tools)."
+     },
+     {
+      "line": 19,
+      "text": "output_format with the ANSWER schema: the result arrives as JSON we can check."
+     }
+    ]
+   }
+  },
+  {
+   "h": "answer() and the mention handler",
+   "p": [
+    "answer() runs one query and returns the structured output. Before that, keep_resolvable() drops every citation that does not resolve to a file in the mirror at its sha. With none left, the reply becomes \"I don't know\" and where to ask.",
+    "The handler checks the channel and the text before any model call, and posts the reply itself after redacting deny-list terms. The model never calls Slack."
+   ],
+   "because": "We check channel and text before the model call, because a refused question should cost nothing and leak nothing.",
+   "code": {
+    "lang": "python",
+    "file": "rnd-kb-tooling/bot/app.py",
+    "text": "async def answer(question: str) -> dict:\n    async for message in query(prompt=question, options=OPTIONS):\n        if isinstance(message, ResultMessage):\n            return keep_resolvable(message.structured_output)  # drops citations missing at the mirror's sha\n\n\n@app.event(\"app_mention\")\nasync def on_mention(event, say):\n    if event[\"channel\"] not in CHANNELS or has_blocked_terms(event[\"text\"]):\n        return await say(thread_ts=event[\"ts\"], text=\"I can't answer that here. Ask in a public engineering channel, without patient or customer details.\")\n    await say(thread_ts=event[\"ts\"], text=redact(format_reply(await answer(event[\"text\"]))))\n\nif __name__ == \"__main__\":\n    asyncio.run(AsyncSocketModeHandler(app, os.environ[\"SLACK_APP_TOKEN\"]).start_async())",
+    "notes": [
+     {
+      "line": 1,
+      "text": "answer() is async: Bolt's async app and the SDK's async iterator fit together."
+     },
+     {
+      "line": 2,
+      "text": "query() yields messages as the session runs; we wait for the final one."
+     },
+     {
+      "line": 3,
+      "text": "ResultMessage carries structured_output when a schema was given."
+     },
+     {
+      "line": 4,
+      "text": "keep_resolvable drops citations missing at the mirror's sha and turns an empty list into 'I don't know'."
+     },
+     {
+      "line": 7,
+      "text": "app_mention fires only when someone writes @Rhino Brain."
+     },
+     {
+      "line": 9,
+      "text": "Wall 1: not an allowed channel, or the text has PHI-like or deny-list terms: refuse with one fixed sentence."
+     },
+     {
+      "line": 11,
+      "text": "Reply in the thread (thread_ts) with the formatted, redacted answer."
+     },
+     {
+      "line": 14,
+      "text": "Start the Socket Mode handler with the app-level token. No HTTP server, no public route."
+     }
+    ]
+   },
+   "ifInstead": "If instead the bot replies to a mention in a channel you did not list, BRAIN_CHANNELS is wrong or empty. The check is on channel IDs (C0123...), not names."
+  },
+  {
+   "h": "Deploy it like n8n (G6-22)",
+   "p": [
+    "Inf tools are Terraform helm_release units in the infrastructure repo, not Argo apps (lesson p5-2). The bot follows the n8n pattern. A new ECR repo rnd-kb-bot with immutable tags, and a secrets unit that owns the Vault path infrastructure/brain-bot. Then a repository unit that deploys the chart. A person writes the Slack bot and app tokens, the rhino-kb App key and the read-only Jira token into Vault.",
+    "The repository unit uses the generic agent-services module from G3 (its final name is not decided; the sketch calls it ai-agents-service). One replica, because Socket Mode holds one connection. No Service and no HTTPRoute, because the bot dials out. A NetworkPolicy allows egress only to Slack, GitHub, the Jira site and the gateway service."
+   ],
+   "because": "We reuse the agent-services module instead of writing a second one. Every agent service on inf should deploy the same way and be reviewed once.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/multi_tenant/accounts/infrastructure/brain-bot/repository/terragrunt.hcl",
+    "text": "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n\nlocals {\n  bot = read_terragrunt_config(find_in_parent_folders(\"brain-bot.hcl\"))\n}\n\nterraform {\n  # Generic helm_release module for agent services, made by G3's \"deploy agent services\" ticket.\n  # Its name isn't decided yet; reuse it rather than writing a second module here.\n  source = \"../../../../../modules/ai-agents-service//\"\n}\n\ndependency \"secrets\" {\n  config_path  = \"../secrets\"\n  mock_outputs = { vault_path = \"infrastructure/brain-bot\" }\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "include root: the old multi_tenant tree's root.hcl, like n8n's units."
+     },
+     {
+      "line": 6,
+      "text": "brain-bot.hcl next to the units holds the shared locals: namespace, image digest, gateway URL, channels."
+     },
+     {
+      "line": 10,
+      "text": "The comment records the open point: the module's name comes from G3's deploy ticket."
+     },
+     {
+      "line": 12,
+      "text": "source points at the module folder; the trailing // marks the module root for Terragrunt."
+     },
+     {
+      "line": 15,
+      "text": "dependency secrets: this unit reads the Vault path from the secrets unit's outputs."
+     },
+     {
+      "line": 17,
+      "text": "mock_outputs let terragrunt validate and plan run before the secrets unit is applied."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The inputs: image, secrets, env, mirrors",
+   "p": [
+    "The inputs block is what a reviewer reads. Image by digest, one replica, the Vault path and no exposure. Then the two environment variables the code reads, and the two git mirrors the code expects at /mirror/.",
+    "The plan is run locally over VPN and pasted into the PR, as today; a person applies. An alert goes to #ai-agents-alerts when the pod restarts more than 3 times in an hour."
+   ],
+   "because": "We pin the image by digest because a tag can move and a digest cannot. So the running bot is exactly the one that passed CI.",
+   "code": {
+    "lang": "hcl",
+    "file": "infrastructure/multi_tenant/accounts/infrastructure/brain-bot/repository/terragrunt.hcl",
+    "text": "inputs = {\n  name              = \"brain-bot\"\n  namespace         = local.bot.locals.namespace # \"ai-agents\", next to the broker, gateway and Slack app\n  image             = \"123456789012.dkr.ecr.us-east-1.amazonaws.com/rnd-kb-bot@${local.bot.locals.image_digest}\"\n  replicas          = 1 # one Socket Mode connection\n  vault_secret_path = dependency.secrets.outputs.vault_path\n  expose            = false # no Service, no HTTPRoute: Socket Mode dials out\n  env = {\n    ANTHROPIC_BASE_URL = local.bot.locals.gateway_url # the gateway adds the brain-bot key\n    BRAIN_CHANNELS     = join(\",\", local.bot.locals.channels)\n  }\n  git_mirrors = {\n    \"rnd-kb\" = \"https://github.com/RhinoHealth/rnd-kb\"\n    \"fcp\"    = \"https://github.com/RhinoHealth/fcp\"\n  }\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "name brain-bot; the pod, the ExternalSecret and the NetworkPolicy take this name."
+     },
+     {
+      "line": 3,
+      "text": "namespace ai-agents: next to the broker, the gateway and the Slack app."
+     },
+     {
+      "line": 4,
+      "text": "The ECR image in the inf account, by digest from brain-bot.hcl."
+     },
+     {
+      "line": 5,
+      "text": "replicas 1: one Socket Mode connection."
+     },
+     {
+      "line": 6,
+      "text": "vault_secret_path from the secrets unit: the ExternalSecret reads this path from vault-store."
+     },
+     {
+      "line": 7,
+      "text": "expose false: no Service, no HTTPRoute."
+     },
+     {
+      "line": 9,
+      "text": "ANTHROPIC_BASE_URL: the gateway. The pod never holds an Anthropic key."
+     },
+     {
+      "line": 10,
+      "text": "BRAIN_CHANNELS joined from the list in brain-bot.hcl."
+     },
+     {
+      "line": 12,
+      "text": "git_mirrors: the module runs a git-sync sidecar per entry, read-only, every 10 minutes."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "Agents never apply. The plan is posted; a person applies. The bot's pod holds Slack and GitHub tokens from Vault. It has no Anthropic key, and no write access to any repo except issues on rnd-kb."
+   }
+  },
+  {
+   "h": "Hard questions: fan out and check (G6-23)",
+   "p": [
+    "Simple questions need one page. Hard ones span code and tickets, where one pass guesses. So a router (Haiku 5.5 at low effort, structured output) labels each question simple or hard. Simple stays on v0.",
+    "Hard runs Sonnet 5.5 at high effort with the Agent tool and read-only helpers (lesson p8-5). code-reader, kb-reader and jira-reader return pointers. A checker re-reads each cited source and keeps a claim only if the source says it. Unchecked claims are listed under \"unverified\", never dropped silently.",
+    "jira-reader needs Jira. We give it an in-process, read-only jira_search tool; the token comes from Vault and never enters a prompt."
+   ],
+   "because": "We define the Jira tool in our own code. Then the model may search tickets without ever seeing a token or a write method.",
+   "code": {
+    "lang": "python",
+    "file": "rnd-kb-tooling/bot/hard.py",
+    "text": "# rnd-kb-tooling/bot/hard.py: sketch: fan out on hard questions, then check each claim\nfrom claude_agent_sdk import AgentDefinition, ClaudeAgentOptions, create_sdk_mcp_server, tool\n\nfrom bot.jira import search_issues  # read-only Jira client; token from Vault, never in the prompt\n\n\n@tool(\"jira_search\", \"Read-only JQL search. Returns key, summary, status, resolution.\", {\"jql\": str})\nasync def jira_search(args: dict) -> dict:\n    return {\"content\": [{\"type\": \"text\", \"text\": await search_issues(args[\"jql\"], limit=20)}]}\n\n\ndef helper(description: str, prompt_file: str, tools: list[str], model: str, effort: str) -> AgentDefinition:\n    return AgentDefinition(description=description, prompt=open(f\"/app/prompts/{prompt_file}\").read(),\n                           tools=tools, model=model, effort=effort)",
+    "notes": [
+     {
+      "line": 2,
+      "text": "AgentDefinition describes a helper; create_sdk_mcp_server and tool make an in-process tool server."
+     },
+     {
+      "line": 4,
+      "text": "search_issues: our read-only Jira client with the Vault token."
+     },
+     {
+      "line": 7,
+      "text": "@tool declares the tool: name, description (what the model reads) and the input shape {jql: str}."
+     },
+     {
+      "line": 8,
+      "text": "The handler runs the JQL and returns up to 20 results as text."
+     },
+     {
+      "line": 12,
+      "text": "helper() builds an AgentDefinition from a description, a prompt file, a tools list, a model and an effort."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Helpers, checker, thumbs-down",
+   "p": [
+    "HELPERS maps a name to its definition. Three readers on Haiku 5.5 at medium return pointers (file:line or path@sha). The checker on Sonnet 5.5 at medium re-reads each cited source. hard_options() takes the v0 options and adds effort high, the Agent tool, the helpers and the Jira server. Helpers cannot start helpers.",
+    "The thumbs-down: on reaction_added with name -1 on a bot reply, the bot opens an issue in rnd-kb. The issue holds the question, the answer and the cited pages. It is assigned to the owner from OWNERS.yml, through the rhino-kb App with issues:write. Public channels only, so the text can be verbatim.",
+    "Ten hard questions join BRAIN-QA's nightly run. The fan-out stays only if correctness goes up, and cost per answer is watched in Grafana."
+   ],
+   "because": "We send a thumbs-down to the page owner as an issue. A bad answer usually means a page is wrong or missing, and the owner is the one who can fix that.",
+   "code": {
+    "lang": "python",
+    "file": "rnd-kb-tooling/bot/hard.py",
+    "text": "HELPERS = {\n    \"code-reader\": helper(\"Finds where something happens in fcp; returns file:line pointers.\", \"code_reader.md\",\n                          [\"Read\", \"Grep\", \"Glob\"], \"claude-haiku-5-5\", \"medium\"),\n    \"kb-reader\": helper(\"Finds brain pages that cover the question; returns path@sha.\", \"kb_reader.md\",\n                        [\"Read\", \"Grep\", \"Glob\"], \"claude-haiku-5-5\", \"medium\"),\n    \"jira-reader\": helper(\"Finds tickets and epics that explain a change or a decision.\", \"jira_reader.md\",\n                          [\"mcp__jira__jira_search\"], \"claude-haiku-5-5\", \"medium\"),\n    \"checker\": helper(\"Re-reads each cited source and keeps only claims the source supports.\", \"checker.md\",\n                      [\"Read\", \"Grep\", \"mcp__jira__jira_search\"], \"claude-sonnet-5-5\", \"medium\"),\n}\n\n\ndef hard_options(base: ClaudeAgentOptions) -> ClaudeAgentOptions:\n    base.effort = \"high\"\n    base.tools = [\"Read\", \"Grep\", \"Glob\", \"Agent\"]  # still read-only; helpers can't start helpers\n    base.agents = HELPERS\n    base.mcp_servers = {\"jira\": create_sdk_mcp_server(name=\"jira\", version=\"1.0.0\", tools=[jira_search])}\n    return base",
+    "notes": [
+     {
+      "line": 1,
+      "text": "HELPERS: name to AgentDefinition. The model picks a helper by its description."
+     },
+     {
+      "line": 2,
+      "text": "code-reader: Read, Grep, Glob over the fcp mirror; Haiku 5.5 at medium; returns file:line."
+     },
+     {
+      "line": 4,
+      "text": "kb-reader: the same tools over the rnd-kb mirror; returns path@sha."
+     },
+     {
+      "line": 6,
+      "text": "jira-reader: only the mcp__jira__jira_search tool; nothing else."
+     },
+     {
+      "line": 8,
+      "text": "checker: Sonnet 5.5 at medium, with Read, Grep and the Jira tool, keeps only supported claims."
+     },
+     {
+      "line": 13,
+      "text": "hard_options() starts from the v0 options and raises effort to high."
+     },
+     {
+      "line": 14,
+      "text": "The main session gets Read, Grep, Glob and Agent. Still read-only; helpers cannot start helpers."
+     },
+     {
+      "line": 16,
+      "text": "The in-process MCP server named jira exposes jira_search to the helpers that list it."
+     }
+    ]
+   }
+  }
+ ],
+ "lab": {
+  "title": "keep_resolvable: drop citations that do not resolve",
+  "youNeed": [
+   "Python 3.13 and uv",
+   "git"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/labs/bot/mirror/engineering && cd ~/labs/bot/mirror && git init -q . && printf -- '---\\ntitle: How a code run reaches the on-prem client\\n---\\nThe client opens the connection.\\n' > engineering/code-run-path.md && git add -A && git commit -qm page && git rev-parse --short HEAD",
+    "see": "a short sha, for example 841d4a5"
+   },
+   {
+    "do": "cd ~/labs/bot and create citations.py:\n\nimport subprocess\nfrom pathlib import Path\n\ndef mirror_sha(mirror):\n    return subprocess.run([\"git\", \"-C\", mirror, \"rev-parse\", \"--short\", \"HEAD\"], capture_output=True, text=True, check=True).stdout.strip()\n\ndef keep_resolvable(result, mirror):\n    sha = mirror_sha(mirror)\n    good = []\n    for citation in result.get(\"citations\", []):\n        path, _, cited_sha = citation.removeprefix(\"rnd-kb/\").partition(\"@\")\n        if cited_sha == sha and (Path(mirror) / path).is_file():\n            good.append(citation)\n    if not good:\n        return {\"answer\": \"I don't know. Ask in #engineering or check the brain index.\", \"citations\": [], \"unverified\": []}\n    return {**result, \"citations\": good}\n\ndef format_reply(result):\n    cites = \"\\n\".join(f\"- {c}\" for c in result[\"citations\"])\n    extra = \"\\nUnverified: \" + \"; \".join(result[\"unverified\"]) if result.get(\"unverified\") else \"\"\n    return f\"{result['answer']}\\n\\nSources:\\n{cites}{extra}\" if cites else result[\"answer\"]",
+    "see": "A 22-line module: the bot's citation wall."
+   },
+   {
+    "do": "Create test_citations.py with four tests: a real citation (path exists, sha matches) is kept; a made-up page is dropped and the answer starts with \"I don't know\"; a stale sha (0000000) is dropped; format_reply lists Sources and an Unverified line. Use mirror_sha(\"mirror\") to build the real citation.",
+    "see": "Four test functions."
+   },
+   {
+    "do": "uv run --with pytest pytest -q test_citations.py",
+    "see": "....\n4 passed in 0.17s"
+   },
+   {
+    "do": "Commit a change to the page (echo more >> mirror/engineering/code-run-path.md; git -C mirror commit -qam edit) and run the tests again without changing them.",
+    "see": "4 passed: the tests take the sha from the mirror, so a new commit still resolves."
+   }
+  ],
+  "faded": "Add has_blocked_terms(text) with a small deny-list and one PHI-like pattern (a 9-digit number). Add a test that the on_mention path would refuse 'patient 123456789 in Acme hospital' before any model call. Write the regular expression yourself.",
+  "alone": "Write hard_router.py: a function route(question) that returns 'simple' or 'hard' without a model. Use two rules you choose, for example: mentions a ticket key or two areas means hard. Add five tests. Then write, in a comment, which questions a real Haiku router would get right that your rules miss.",
+  "done": "All tests pass, and a citation to a page that is not in the mirror becomes an 'I don't know' reply. Blocked text is refused before a model call."
+ },
+ "quiz": [
+  {
+   "q": "The model returns a citation to rnd-kb/engineering/old-page.md@<current sha>, but that file was deleted last week. What happens?",
+   "options": [
+    {
+     "text": "The reply shows it; the sha matches, so it is valid.",
+     "correct": false,
+     "why": "keep_resolvable checks that the file exists in the mirror at that sha; a deleted page does not."
+    },
+    {
+     "text": "keep_resolvable drops it; with no citations left the bot replies 'I don't know' and where to ask.",
+     "correct": true,
+     "why": "That is the rule in G6-21: every citation must resolve to a file in the mirror at its sha."
+    },
+    {
+     "text": "The bot opens an issue for the page owner.",
+     "correct": false,
+     "why": "Issues come from a thumbs-down (G6-23), not from a dropped citation."
+    }
+   ]
+  },
+  {
+   "q": "Why is the brain bot Python when the rest of the platform is TypeScript?",
+   "options": [
+    {
+     "text": "Bolt only exists for Python.",
+     "correct": false,
+     "why": "Nova's Slack app uses Bolt 5 for TypeScript."
+    },
+    {
+     "text": "It imports kb_tools in-process, so it ranks pages and redacts exactly like the kb CLI and BRAIN-QA.",
+     "correct": true,
+     "why": "That is the reason in G6-21 and in ts_platform.md's 'what stays Python' table."
+    },
+    {
+     "text": "The Agent SDK's structured output only works in Python.",
+     "correct": false,
+     "why": "Both SDKs support it; the TypeScript option is outputFormat."
+    }
+   ]
+  },
+  {
+   "q": "Where does the bot get its Anthropic key?",
+   "options": [
+    {
+     "text": "From Vault, through the ExternalSecret like the Slack tokens.",
+     "correct": false,
+     "why": "The pod holds no Anthropic key; only Slack, GitHub App and Jira tokens come from Vault."
+    },
+    {
+     "text": "It has none; ANTHROPIC_BASE_URL points at the LLM gateway, which adds the brain-bot key.",
+     "correct": true,
+     "why": "G6-21 and G6-22: the gateway adds the key and meters spend."
+    },
+    {
+     "text": "From the managed settings file.",
+     "correct": false,
+     "why": "Managed settings configure laptops; the bot is a pod on inf."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p9-1: why does a Socket Mode app need no public URL, and which two tokens does it use?",
+  "From p8-5: what can a subagent defined with AgentDefinition not do that the main session can?"
+ ],
+ "videos": [
+  {
+   "title": "How to Build a Slack App",
+   "url": "https://www.youtube.com/watch?v=25ArxpK48tU",
+   "channel": "Fireship",
+   "minutes": 10,
+   "why": "Quick overview of Slack app pieces: slash commands, events, interactivity."
+  }
+ ],
+ "words": [
+  {
+   "term": "Socket Mode",
+   "plain": "A Slack connection where the app dials out over a websocket, so it needs no public endpoint."
+  },
+  {
+   "term": "structured output",
+   "plain": "Asking the model to answer in JSON that matches a schema, so code can check the fields."
+  },
+  {
+   "term": "git mirror",
+   "plain": "A read-only clone of a repo kept fresh by a sidecar (git-sync every 10 minutes) that the bot reads from."
+  },
+  {
+   "term": "helper (subagent)",
+   "plain": "A smaller agent with its own tools and model that the main session starts for one job and that returns pointers."
+  },
+  {
+   "term": "checker",
+   "plain": "The helper that re-reads each cited source and keeps a claim only if the source supports it."
+  },
+  {
+   "term": "helm_release unit",
+   "plain": "A Terragrunt folder in the infrastructure repo that deploys a Helm chart; how inf tools like n8n and the bot ship."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G6-21",
+   "why": "This lesson walked through app.py and you built the citation wall in the lab.",
+   "walk": [
+    "Create rnd-kb-tooling/bot/app.py from the two blocks above, plus bot/citations.py (ANSWER schema, keep_resolvable, format_reply). Add prompts/brain.md with the line 'search even when you feel sure'.",
+    "Limit tools to Read, Grep and Glob over /mirror/rnd-kb and /mirror/fcp, with no setting sources. Use Sonnet 5.5 at low effort; ANTHROPIC_BASE_URL is the gateway.",
+    "Walls in code: BRAIN_CHANNELS only, refuse text with PHI patterns or deny-list terms (kb_tools.scan), redact replies, never read private channels.",
+    "Drop every citation that does not resolve in the mirror at its sha. With none left, reply 'I don't know' and where to ask.",
+    "Point BRAIN-QA's answer mode at answer() and run it once (targets: 85% retrieval, 80% correct)."
+   ]
+  },
+  {
+   "key": "G6-22",
+   "why": "This lesson walked through the Terragrunt unit and explained the n8n pattern it follows.",
+   "walk": [
+    "Add \"rnd-kb-bot\" = { tags_immutability_enabled = true } to multi_tenant/accounts/infrastructure/artifacts/artifacts.hcl and a build workflow in rnd-kb-tooling that pushes bot images by digest.",
+    "Add multi_tenant/accounts/infrastructure/brain-bot/{brain-bot.hcl, secrets/, repository/} following the n8n units; the secrets unit owns Vault path infrastructure/brain-bot.",
+    "Write repository/terragrunt.hcl from the two blocks above with G3's agent-services module: one replica, ExternalSecret from vault-store, two git-sync mirrors, expose false.",
+    "Add a NetworkPolicy: egress only to Slack, GitHub, the Jira site and the LLM gateway service.",
+    "Plan locally over VPN, paste the plan into the PR, and a person applies. Alert #ai-agents-alerts on more than 3 restarts in an hour."
+   ]
+  },
+  {
+   "key": "G6-23",
+   "why": "This lesson walked through hard.py: the Jira tool, the helpers, the checker and the thumbs-down flow.",
+   "walk": [
+    "Add a router on Haiku 5.5 at low effort with structured output {simple | hard}; simple stays on v0.",
+    "Create bot/hard.py from the two blocks above: jira_search tool (token from Vault), helper(), HELPERS, hard_options().",
+    "Write the four prompt files: code_reader.md, kb_reader.md, jira_reader.md, checker.md; the checker lists unsupported claims under 'unverified'.",
+    "Handle reaction_added with name -1 on a bot reply. Open an rnd-kb issue with question, answer and cited pages, assigned to the owner from OWNERS.yml (rhino-kb App, issues:write).",
+    "Add 10 hard questions to BRAIN-QA's nightly; keep the fan-out only if correctness goes up; watch cost per answer in Grafana."
+   ]
+  }
+ ],
+ "remember": "The model reads and proposes; our code checks the citations, redacts, posts, and sends a thumbs-down to the page owner."
+}

@@ -1,0 +1,463 @@
+{
+ "id": "p4-5",
+ "title": "Egress control: Squid allow-lists and PrivateLink",
+ "minutes": 45,
+ "youNeed": [
+  "p3-2",
+  "p4-3"
+ ],
+ "bridge": "A Squid allow-list is like a Content Security Policy for a whole VM: it names the only places outbound traffic may go. Except it stops everything on the VM, not only a page: curl, npm, pip and the agent itself. So every name a run truly needs must be on the list, or reach us another way.",
+ "intro": "A sandbox reads untrusted text, and an injected prompt will try to send our code somewhere. This lesson shows the two ways traffic may leave a sandbox. Squid lets web traffic reach a short list of names. PrivateLink lets the VM reach exactly three services on inf. Everything else has no path.",
+ "picture": {
+  "caption": "Web traffic goes to Squid and is checked by name; our own services are reached over PrivateLink; nothing else leaves.",
+  "nodes": [
+   {
+    "id": "vm",
+    "label": "sandbox VM (HTTPS_PROXY set)",
+    "kind": "machine"
+   },
+   {
+    "id": "squid",
+    "label": "Squid :3128 behind an internal NLB",
+    "kind": "service"
+   },
+   {
+    "id": "list",
+    "label": "allow-list: nexus.example.com",
+    "kind": "check"
+   },
+   {
+    "id": "nexus",
+    "label": "Nexus (npm, pypi mirrors)",
+    "kind": "cloud"
+   },
+   {
+    "id": "pl",
+    "label": "PrivateLink endpoint",
+    "kind": "service"
+   },
+   {
+    "id": "inf",
+    "label": "broker, gateway, OTel on inf",
+    "kind": "service"
+   },
+   {
+    "id": "log",
+    "label": "access.log → VictoriaLogs",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "vm",
+    "to": "squid",
+    "text": "CONNECT nexus.example.com:443 (the proxy sees the name, not the content)"
+   },
+   {
+    "from": "squid",
+    "to": "list",
+    "text": "is the name on the list, and is the caller a sandbox subnet?"
+   },
+   {
+    "from": "list",
+    "to": "nexus",
+    "text": "yes: Squid opens the tunnel; packages come from our mirror"
+   },
+   {
+    "from": "squid",
+    "to": "log",
+    "text": "every try is logged; TCP_DENIED/403 for github.com is a signal"
+   },
+   {
+    "from": "vm",
+    "to": "pl",
+    "text": "broker., gateway. and otel.ai-agents.example.com skip the proxy (NO_PROXY)"
+   },
+   {
+    "from": "pl",
+    "to": "inf",
+    "text": "three ports only, never the rest of inf"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Start: a proxy on your laptop",
+   "p": [
+    "A forward proxy is a server that makes web requests for you. Tools find it through the HTTPS_PROXY environment variable. For HTTPS, the client sends CONNECT host:443 to the proxy, and the proxy opens a tunnel. The proxy sees the host name and port, never the content, which stays encrypted.",
+    "That is enough for an allow-list: the proxy decides by name whether to open the tunnel. Run Squid in Docker and try two sites, one on the list and one not."
+   ],
+   "because": "We try the proxy on a laptop first because the 403 for github.com is the behaviour every sandbox relies on.",
+   "code": {
+    "lang": "bash",
+    "file": "~/academy/squid (the lab sets up squid.conf and the list)",
+    "text": "docker run -d --name squid-lab -p 3128:3128 \\\n  -v \"$PWD/squid.conf:/etc/squid/squid.conf:ro\" \\\n  -v \"$PWD/sites.whitelist.txt:/etc/squid/sites.whitelist.txt:ro\" ubuntu/squid:latest\ncurl -s -o /dev/null -w '%{http_code}\\n' -x http://localhost:3128 https://example.com\ncurl -sS -o /dev/null -x http://localhost:3128 https://github.com; echo \"exit $?\"",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Squid 6 in a container, listening on 3128 like the sandbox proxy. Pin an image digest for anything real."
+     },
+     {
+      "line": 2,
+      "text": "Our config replaces the image's default one, read-only."
+     },
+     {
+      "line": 4,
+      "text": "-x sends the request through the proxy. example.com plays Nexus in the lab."
+     },
+     {
+      "line": 5,
+      "text": "github.com is not on the list: the proxy refuses to open the tunnel."
+     }
+    ]
+   },
+   "see": "200\ncurl: (56) CONNECT tunnel failed, response 403\nexit 56",
+   "ifInstead": "If instead the first curl also gets 403, Squid does not see you as a sandbox. Check the acl sandboxes src line includes Docker's address ranges (the lab uses all private ranges)."
+  },
+  {
+   "h": "squid.conf, line by line",
+   "p": [
+    "G3-09 starts from the company's existing template, modules/squid-proxy/templates/squid_proxy.tpl. It drops basic auth, because callers are known by their subnet, and proxy protocol, because the NLB is internal.",
+    "Squid reads http_access rules top to bottom and stops at the first match. The order below is: refuse anything not on port 443, allow sandboxes to listed names, refuse the rest."
+   ],
+   "because": "We end with 'deny all' because an allow-list that falls through to allow is not an allow-list.",
+   "code": {
+    "lang": "text",
+    "file": "modules/aws-egress-proxy/templates/squid.conf.tpl (G3-09)",
+    "text": "# Internal egress proxy for AI agent sandboxes. Based on modules/squid-proxy/templates/squid_proxy.tpl,\n# without basic auth (callers are known by subnet) and without proxy protocol (internal NLB).\nhttp_port 3128\n\nacl SSL_ports port 443\nacl CONNECT method CONNECT\nhttp_access deny !SSL_ports\nhttp_access deny CONNECT !SSL_ports\n\nacl sandboxes src ${sandbox_cidrs}\nacl whitelist dstdomain \"/etc/squid/sites.whitelist.txt\"\n\nhttp_access allow sandboxes whitelist\nhttp_access deny all\n\n# Blocked tries are a signal: G3-31 alerts Security on repeats (possible prompt injection).\naccess_log daemon:/var/log/squid/access.log squid\ncache deny all\nhttpd_suppress_version_string on\nvia off\nforwarded_for delete",
+    "notes": [
+     {
+      "line": 3,
+      "text": "The port the sandboxes use: HTTPS_PROXY points here."
+     },
+     {
+      "line": 7,
+      "text": "Plain HTTP and other ports are refused before any name check."
+     },
+     {
+      "line": 10,
+      "text": "${sandbox_cidrs} is filled by templatefile() with the sandbox subnets (p4-3)."
+     },
+     {
+      "line": 11,
+      "text": "dstdomain matches the requested host name against the list file. A leading dot also matches subdomains."
+     },
+     {
+      "line": 13,
+      "text": "First match wins: a sandbox asking for a listed name gets through."
+     },
+     {
+      "line": 14,
+      "text": "Everything else, from anyone, is refused."
+     },
+     {
+      "line": 18,
+      "text": "No caching: every request goes to the source, and nothing from one run lingers for the next."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The list, and what is not on it",
+   "p": [
+    "The starting list has one name: nexus.example.com. Nexus mirrors npm and PyPI (G3-05), so npm ci and uv sync still work. Docker images come from ECR through its endpoints, not through Squid.",
+    "github.com and api.github.com stay off on purpose. All git and GitHub API traffic goes through the broker (G3-10). An open github.com would let an injected prompt push our code to someone else's repo with their own token. The broker, the LLM gateway and the OTel collector are reached over PrivateLink, not through Squid. Security confirms the list in G3-12."
+   ],
+   "because": "We bake the proxy into the VM's environment because every tool reads HTTPS_PROXY, so nothing needs its own setting.",
+   "code": {
+    "lang": "text",
+    "file": "the list file, and the image's environment (G3-09, baked by G3-14)",
+    "text": "# /etc/squid/sites.whitelist.txt on the proxy\nnexus.example.com\n\n# /etc/environment on every sandbox VM\nHTTPS_PROXY=http://proxy.ai-agents.example.com:3128\nHTTP_PROXY=http://proxy.ai-agents.example.com:3128\nNO_PROXY=.amazonaws.com,.ai-agents.example.com",
+    "notes": [
+     {
+      "line": 2,
+      "text": "One name. Adding one is a Security decision, not a code review."
+     },
+     {
+      "line": 5,
+      "text": "The proxy's name in the private DNS zone, pointing at the internal NLB."
+     },
+     {
+      "line": 7,
+      "text": "These go direct: AWS endpoints (p3-2) and our services over PrivateLink. Squid never sees them."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "The list is a wall only together with the rest. That means no route out, a security group that allows only 3128 and 443, and a DNS firewall with the same names. Any one alone has a hole."
+   }
+  },
+  {
+   "h": "Where the proxy runs",
+   "p": [
+    "G3-09 builds modules/aws-egress-proxy. Two small instances (t3.small to start) run Squid in an Auto Scaling group. An internal network load balancer (NLB) on port 3128 in the sandbox subnets spreads connections over them. They live in their own two /28 subnets, cut from the VPC's spare /18 (p4-3).",
+    "Those two subnets have the only internet route in the account, and the proxies have public IPs. The proxy's security group lets in 3128 from the sandbox security group only. G3-12 still has to choose between this and running Squid on inf behind PrivateLink."
+   ],
+   "callout": {
+    "kind": "gotcha",
+    "text": "We reuse the template, not modules/squid-proxy itself. That module is a public, internet-facing Helm release with basic auth in a product cluster: the opposite of what sandboxes need."
+   }
+  },
+  {
+   "h": "Blocked tries are a signal",
+   "p": [
+    "Squid writes one line per request. TCP_TUNNEL/200 means a tunnel was opened; TCP_DENIED/403 means the list refused it. A sandbox that keeps asking for github.com or pastebin.com may be following an injected instruction.",
+    "G3-09 ships access.log with Vector to logs.example.com with processing type squid_access, the same parser the product proxies use. G3-31 alerts Security when a run is refused again and again."
+   ],
+   "because": "We log every refusal because a blocked exfiltration attempt is the earliest sign of a prompt injection.",
+   "code": {
+    "lang": "text",
+    "file": "/var/log/squid/access.log (from the lab)",
+    "text": "1791904120.015    436 172.17.0.1 TCP_TUNNEL/200 4917 CONNECT example.com:443 - HIER_DIRECT/172.66.147.243 -\n1791904121.572   1523 172.17.0.1 TCP_TUNNEL/200 4198799 CONNECT registry.npmjs.org:443 - HIER_DIRECT/104.16.3.34 -\n1791904121.614      0 172.17.0.1 TCP_DENIED/403 3346 CONNECT github.com:443 - HIER_NONE/- text/html\n1791904121.696      0 172.17.0.1 TCP_DENIED/403 3344 GET http://example.com/ - HIER_NONE/- text/html",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Time, milliseconds taken, the caller's address, the result, bytes, method and target."
+     },
+     {
+      "line": 2,
+      "text": "A tunnel to a listed name: allowed. In a sandbox this would be Nexus."
+     },
+     {
+      "line": 3,
+      "text": "github.com refused before any connection: HIER_NONE means Squid never contacted it."
+     },
+     {
+      "line": 4,
+      "text": "Plain HTTP refused by the port rule, even for a listed name."
+     }
+    ]
+   }
+  },
+  {
+   "h": "PrivateLink: our three services",
+   "p": [
+    "The harness must talk to the broker, the LLM gateway and the OTel collector. They run on the inf cluster, in another account. Peering the networks would open all of inf to every sandbox. PrivateLink publishes one internal load balancer as a service; the sandbox VPC gets a private IP for it.",
+    "G3-17 publishes three ports and nothing else, and only the ai-agents account may connect. In the sandbox VPC, broker., gateway. and otel.ai-agents.example.com point at the endpoint. NO_PROXY sends them there directly. p5-4 reads the whole unit."
+   ],
+   "because": "We publish ports one by one because a sandbox that could reach envoy-internal or Temporal could reach every internal tool.",
+   "code": {
+    "lang": "hcl",
+    "file": "multi_tenant/accounts/infrastructure/ai-agents/sandbox-privatelink/main.tf (start, G3-17)",
+    "text": "# Sandboxes reach exactly three things on inf: the broker's sandbox port, the LLM gateway and the\n# OTel collector. Not envoy-internal (that would expose every internal tool) and not Temporal.\nlocals {\n  sandbox_ports = { broker = 443, gateway = 8443, otel = 4318 }\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The broker's sandbox port only. Its internal port, which opens runs, is never published."
+     },
+     {
+      "line": 2,
+      "text": "The two things it must never expose, written down so a reviewer can check."
+     },
+     {
+      "line": 4,
+      "text": "One NLB listener per entry. 4318 is the standard OTLP over HTTP port."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Every way out, in one table",
+   "p": [
+    "Egress control is several layers, each closing a different gap. Read the table from top to bottom: each line is a wall from p3-2, p3-6 or this lesson.",
+    "When a run needs something new, find the layer that blocks it and ask whether it should go through the broker instead. Usually it should."
+   ],
+   "because": "We keep the layers side by side because a change to one is only safe if the others still hold.",
+   "code": {
+    "lang": "text",
+    "file": "sandbox egress, layer by layer",
+    "text": "layer                  allows                                       closes\nroute table            local, S3 prefix list                         any direct packet to the internet\nsecurity group         3128 to the proxy, 443 to endpoints and PL    every other port and host\nSquid allow-list       nexus.example.com over CONNECT 443        github.com, pastebin, any other site\nDNS firewall           the same names, *.amazonaws.com, our zone     data hidden in DNS lookups\nS3 endpoint policy     our runs bucket and ECR's layer bucket        presigned URLs to other buckets\nPrivateLink            broker 443, gateway 8443, OTel 4318           the rest of inf\nbroker                 one repo, one branch, one issue, one thread   GitHub, Jira, Slack beyond the run",
+    "notes": [
+     {
+      "line": 2,
+      "text": "p3-2: no 0.0.0.0/0 route."
+     },
+     {
+      "line": 4,
+      "text": "This lesson. The only path to a public name."
+     },
+     {
+      "line": 5,
+      "text": "p3-2: NXDOMAIN for everything else."
+     },
+     {
+      "line": 8,
+      "text": "p11-2: what reaches GitHub at all goes through capability checks."
+     }
+    ]
+   }
+  }
+ ],
+ "lab": {
+  "title": "An allow-list proxy on your laptop",
+  "youNeed": [
+   "Docker Desktop running (the ubuntu/squid image is about 330 MB unpacked)",
+   "curl"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/academy/squid && cd ~/academy/squid. Save squid.conf from section 2, replacing ${sandbox_cidrs} with 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16",
+    "see": "(one file; those are every private range, so Docker's address counts as a sandbox)"
+   },
+   {
+    "do": "printf 'example.com\\n.npmjs.org\\n' > sites.whitelist.txt",
+    "see": "(example.com stands in for Nexus; .npmjs.org with a dot also allows registry.npmjs.org)"
+   },
+   {
+    "do": "Run the block from section 1",
+    "see": "a container ID\n200\ncurl: (56) CONNECT tunnel failed, response 403\nexit 56"
+   },
+   {
+    "do": "curl -s -o /dev/null -w '%{http_code}\\n' -x http://localhost:3128 http://example.com",
+    "see": "403\n(plain HTTP to a listed name: refused by the port rule)"
+   },
+   {
+    "do": "HTTPS_PROXY=http://localhost:3128 curl -s -o /dev/null -w '%{http_code}\\n' https://registry.npmjs.org/zod",
+    "see": "200\n(no -x: curl found the proxy in the environment, like every tool on a sandbox)"
+   },
+   {
+    "do": "HTTPS_PROXY=http://localhost:3128 NO_PROXY=example.com curl -s -o /dev/null -w '%{http_code}\\n' https://example.com && docker exec squid-lab tail -n 1 /var/log/squid/access.log",
+    "see": "200\n... TCP_TUNNEL/200 ... CONNECT registry.npmjs.org:443 ...\n(the last log line is still npm: the example.com request went direct)"
+   },
+   {
+    "do": "docker exec squid-lab tail -n 4 /var/log/squid/access.log",
+    "see": "... TCP_TUNNEL/200 ... CONNECT example.com:443 ...\n... TCP_DENIED/403 ... CONNECT github.com:443 - HIER_NONE/- text/html\n... TCP_DENIED/403 ... GET http://example.com/ - HIER_NONE/- text/html\n... TCP_TUNNEL/200 ... CONNECT registry.npmjs.org:443 ..."
+   }
+  ],
+  "faded": "Change the list: remove .npmjs.org, then make Squid reread its config with docker exec squid-lab squid -k reconfigure. Left to you: the curl that proves registry.npmjs.org is now refused, and the access.log line that shows it.",
+  "alone": "Write blocked.sh. It reads the proxy's access.log and keeps only TCP_DENIED lines. Then it prints the three most refused destinations with counts. Hint: awk '{print $7}' | sort | uniq -c | sort -rn | head -3. Make three refused tries to github.com and two to pastebin.com. Check that github.com:443 is listed above pastebin.com:443; counts include your earlier tries. This is the signal G3-31 alerts on. Finish with docker rm -f squid-lab.",
+  "done": "Listed names get 200, github.com and plain HTTP are refused, and NO_PROXY names never reach Squid. access.log shows each case."
+ },
+ "quiz": [
+  {
+   "q": "Why is github.com not on the sandbox allow-list?",
+   "options": [
+    {
+     "text": "Git and API traffic goes through the broker. An open github.com would let an injected prompt push our code elsewhere",
+     "correct": true,
+     "why": "The broker checks repo and branch; a direct path would skip every check."
+    },
+    {
+     "text": "GitHub blocks traffic from AWS addresses",
+     "correct": false,
+     "why": "It does not; the choice is ours, for security."
+    },
+    {
+     "text": "Squid cannot tunnel to github.com",
+     "correct": false,
+     "why": "It can, as any listed name; it is refused because it is not listed."
+    }
+   ]
+  },
+  {
+   "q": "A VM calls https://broker.ai-agents.example.com. Which path does it take?",
+   "options": [
+    {
+     "text": "Through Squid, because HTTPS_PROXY is set",
+     "correct": false,
+     "why": "NO_PROXY lists .ai-agents.example.com, so it goes direct."
+    },
+    {
+     "text": "Directly to the PrivateLink endpoint in the VPC, then to the broker's sandbox port on inf",
+     "correct": true,
+     "why": "Private DNS names point at the endpoint; only three ports are published."
+    },
+    {
+     "text": "Over VPC peering to inf",
+     "correct": false,
+     "why": "There is no peering; an SCP even denies creating it (p3-1)."
+    }
+   ]
+  },
+  {
+   "q": "The access log shows TCP_DENIED/403 CONNECT pastebin.com:443 twenty times from one sandbox. What does it most likely mean?",
+   "options": [
+    {
+     "text": "Squid is overloaded",
+     "correct": false,
+     "why": "Overload shows as errors and slow answers, not as list refusals."
+    },
+    {
+     "text": "Nexus is down",
+     "correct": false,
+     "why": "Nexus failures appear as tunnel errors to nexus.example.com."
+    },
+    {
+     "text": "The run may be following an injected instruction to send data out; Security should look (G3-31)",
+     "correct": true,
+     "why": "Repeated refusals for unlisted names are the signal we log every try for."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p3-2: what does the DNS firewall answer for an unlisted name, and why do we need it besides Squid?",
+  "From p4-3: which resource in aws-egress-proxy gives the proxy subnets their way out?"
+ ],
+ "videos": [
+  {
+   "title": "Proxy vs Reverse Proxy (Real-world Examples)",
+   "url": "https://www.youtube.com/watch?v=4NB0NDtOwIQ",
+   "channel": "ByteByteGo",
+   "minutes": 5,
+   "why": "Five-minute foundation for why a forward proxy controls outbound traffic."
+  },
+  {
+   "title": "Squid proxy server - Installation and how to allow access and block websites",
+   "url": "https://www.youtube.com/watch?v=xfu83JXlBOg",
+   "channel": "Kind Spirit Technology",
+   "minutes": 11,
+   "why": "Practical Squid install plus ACLs that allow or block domains."
+  }
+ ],
+ "words": [
+  {
+   "term": "forward proxy",
+   "plain": "A server that makes requests on a client's behalf; ours decides by host name."
+  },
+  {
+   "term": "HTTPS_PROXY and NO_PROXY",
+   "plain": "Environment variables that tell tools which proxy to use, and which names to reach directly."
+  },
+  {
+   "term": "CONNECT",
+   "plain": "The HTTP method that asks a proxy for a tunnel to host:443; the proxy sees the name, not the content."
+  },
+  {
+   "term": "dstdomain ACL",
+   "plain": "A Squid rule that matches the requested host name against a list."
+  },
+  {
+   "term": "allow-list",
+   "plain": "A list of the only names allowed; everything else is refused by default."
+  },
+  {
+   "term": "access log",
+   "plain": "Squid's one line per request; TCP_DENIED/403 marks a refusal."
+  },
+  {
+   "term": "PrivateLink",
+   "plain": "Publishing one internal load balancer to another VPC as a private IP, with no network peering."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-09",
+   "why": "The internal Squid proxy: the config, the one-name list, its own subnets, logs to VictoriaLogs, the image's proxy env."
+  },
+  {
+   "key": "G3-17",
+   "why": "PrivateLink publishes the broker's sandbox port, the gateway and OTel to the ai-agents account only."
+  },
+  {
+   "key": "G3-04",
+   "why": "The DNS firewall allows the same names as the proxy and answers NXDOMAIN for the rest."
+  },
+  {
+   "key": "G3-12",
+   "why": "Security confirms the allow-list and decides where the proxy runs."
+  }
+ ],
+ "remember": "A sandbox reaches the web only through Squid's short list, and our services only through three PrivateLink ports. github.com is never on the list."
+}

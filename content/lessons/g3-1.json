@@ -1,0 +1,458 @@
+{
+ "id": "g3-1",
+ "title": "The repo: ai-agents on npm workspaces",
+ "minutes": 40,
+ "youNeed": [
+  "p1-1",
+  "p1-8",
+  "p2-4"
+ ],
+ "bridge": "The ai-agents repo is like fcp's frontend folder with its package.json and CI. Except it is one npm workspace: six packages, one lockfile, one CI, one ruleset. And the harness does not ship as a package at all, but as one bundled file.",
+ "intro": "Every service in G3 lives in one private repo, RhinoHealth/ai-agents. This lesson builds that repo: the workspaces, the CI, the Docker images, the harness release and the ruleset on main. Get this right once, and every later ticket has a home and the same walls.",
+ "picture": {
+  "caption": "One repo, three outputs: a green CI, five images in inf ECR, and one harness tarball that the sandbox image unpacks.",
+  "nodes": [
+   {
+    "id": "pr",
+    "label": "a PR to main",
+    "kind": "file"
+   },
+   {
+    "id": "ci",
+    "label": "ci.yml: lint, test, evals",
+    "kind": "check"
+   },
+   {
+    "id": "ruleset",
+    "label": "ruleset on main",
+    "kind": "check"
+   },
+   {
+    "id": "images",
+    "label": "images.yml",
+    "kind": "service"
+   },
+   {
+    "id": "ecr",
+    "label": "inf ECR",
+    "kind": "cloud"
+   },
+   {
+    "id": "release",
+    "label": "release-harness.yml",
+    "kind": "service"
+   },
+   {
+    "id": "tgz",
+    "label": "ai-agents-harness-<version>.tgz",
+    "kind": "file"
+   },
+   {
+    "id": "packer",
+    "label": "Packer image (lesson g3-5)",
+    "kind": "machine"
+   }
+  ],
+  "steps": [
+   {
+    "from": "pr",
+    "to": "ci",
+    "text": "every PR runs the three jobs"
+   },
+   {
+    "from": "ci",
+    "to": "ruleset",
+    "text": "the ruleset requires lint, test and evals, plus one approval"
+   },
+   {
+    "from": "ruleset",
+    "to": "images",
+    "text": "after the merge, main builds five Docker images"
+   },
+   {
+    "from": "images",
+    "to": "ecr",
+    "text": "pushed to inf ECR, tags immutable"
+   },
+   {
+    "from": "ruleset",
+    "to": "release",
+    "text": "a release bundles harness/ with esbuild"
+   },
+   {
+    "from": "release",
+    "to": "tgz",
+    "text": "one file, nova-worker.mjs, plus workflows, prompts and settings"
+   },
+   {
+    "from": "tgz",
+    "to": "packer",
+    "text": "the nightly image unpacks it; nothing to install on the VM"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "Why one repo, and why TypeScript",
+   "p": [
+    "G3 builds five programs: the LLM gateway, the broker, the Temporal orchestrator, the Slack app and nova-worker. They share types, config, a Jira client and a GitHub client. One repo with npm workspaces gives them one lockfile, one CI and one set of rules.",
+    "The platform is TypeScript on Node 24, like Byte, and Byte's broker becomes the base of ours. The language the platform is written in is not the language the agents work in. Nova fixes Django code and React code equally well.",
+    "One folder stays Python: evals/. Harbor, our benchmark runner, is Python, so its adapters are too. It is a small uv project beside the TypeScript workspaces, as in lesson p10-1."
+   ],
+   "callout": {
+    "kind": "why",
+    "text": "A workspace is an npm feature. One root package.json lists folders, each folder is its own package, and npm links them together in one node_modules. You already use the idea in a monorepo; here it is npm's built-in version."
+   }
+  },
+  {
+   "h": "The root package.json",
+   "p": [
+    "Start from the real file. This is the root of the repo, and the only package.json with a lockfile next to it."
+   ],
+   "because": "We write the root first because every script, every test glob and every CI job hangs off it.",
+   "code": {
+    "lang": "json",
+    "file": "ai-agents/package.json",
+    "text": "{\n  \"name\": \"@rhinohealth/ai-agents\",\n  \"version\": \"0.1.0\",\n  \"private\": true,\n  \"description\": \"AI agent platform: LLM gateway, broker, Temporal orchestrator, nova-worker harness, Slack app.\",\n  \"type\": \"module\",\n  \"workspaces\": [\"shared\", \"gateway\", \"broker\", \"orchestrator\", \"harness\", \"slack-app\"],\n  \"scripts\": {\n    \"build\": \"npm run build --workspaces --if-present\",\n    \"lint\": \"eslint .\",\n    \"typecheck\": \"npm run typecheck --workspaces --if-present\",\n    \"test\": \"node --import tsx --test \\\"*/test/**/*.test.ts\\\"\",\n    \"check\": \"npm run lint && npm run typecheck && npm test && npm run build\"\n  },\n  \"engines\": {\n    \"node\": \">=24\"\n  },\n  \"devDependencies\": {\n    \"@types/node\": \"24.12.2\",\n    \"eslint\": \"10.8.0\",\n    \"tsx\": \"4.20.3\",\n    \"typescript\": \"5.9.3\",\n    \"typescript-eslint\": \"8.65.0\"\n  }\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The root package. It is private, so nobody can npm publish it by mistake."
+     },
+     {
+      "line": 6,
+      "text": "\"type\": \"module\" means every .js file is an ES module: import, not require. The SDK and Temporal both work this way."
+     },
+     {
+      "line": 7,
+      "text": "The workspaces. Each name is a folder with its own package.json. checks/, metrics/ and drills/ are added by later tickets."
+     },
+     {
+      "line": 8,
+      "text": "--workspaces runs the script in every package; --if-present skips packages that do not define it."
+     },
+     {
+      "line": 10,
+      "text": "ESLint runs once, from the root, with one eslint.config.js (typescript-eslint, like Byte)."
+     },
+     {
+      "line": 12,
+      "text": "node:test is Node's own test runner. --import tsx lets it run .ts files with no build step. The glob finds test/ in every workspace."
+     },
+     {
+      "line": 13,
+      "text": "check is what CI runs, in this order. Run it locally before you push."
+     },
+     {
+      "line": 16,
+      "text": "Node 24, because fcp's frontend needs >=24.15 and the harness runs on the same Node inside the VM."
+     },
+     {
+      "line": 18,
+      "text": "Exact versions, no ^ or ~. Byte does this too: a lockfile change is then the only way a version moves."
+     },
+     {
+      "line": 22,
+      "text": "TypeScript 5.9, the same line as Byte. typescript-eslint does not support TypeScript 7 yet."
+     }
+    ]
+   },
+   "see": "$ npm run check\n> eslint .\n> npm run typecheck --workspaces --if-present\n> node --import tsx --test \"*/test/**/*.test.ts\"\nℹ tests 12\nℹ pass 12\nℹ fail 0",
+   "ifInstead": "If instead npm says \"Unsupported engine\", your shell is on an older Node. Run `nvm use 24` and check that `node -v` prints v24.x."
+  },
+  {
+   "h": "Inside a workspace",
+   "p": [
+    "Every TypeScript workspace has the same shape: <pkg>/package.json named @rhinohealth/ai-agents-<pkg>, src/*.ts in kebab-case (ticket-to-pr.ts, git-proxy.ts), and test/*.test.ts. A file name is the kebab-case of the thing inside it.",
+    "tsconfig.base.json at the root sets strict, target ES2023, module and moduleResolution NodeNext, and verbatimModuleSyntax. Each workspace extends it. NodeNext means imports inside the repo end in .js even when the source is .ts; TypeScript resolves them.",
+    "The shared workspace holds the zod schemas and types every service uses: Task, RunScope, Plan, Charter, Handoff. Other workspaces depend on it by name, and npm links the folder, so there is nothing to publish."
+   ],
+   "because": "We give shared/ a real package name because the broker and the orchestrator must agree on the same Handoff shape. A linked package is the one way to share types without copying.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/shared/src/schemas.ts",
+    "text": "import { z } from \"zod\";\n\n/** What starts a Nova run (G4-04). The workflow ID is built from key. */\nexport const Handoff = z.object({\n  key: z.string().regex(/^[A-Z]+-\\d+$/), // RH-1234\n  requester: z.string(), // the Jira accountId of the person who assigned the ticket\n  drill: z.boolean().optional(), // drill tickets use minute-scale timers (G3-38)\n});\nexport type Handoff = z.infer<typeof Handoff>;",
+    "notes": [
+     {
+      "line": 1,
+      "text": "zod 4 is the SDK's peer dependency, so it is already in the lockfile."
+     },
+     {
+      "line": 4,
+      "text": "A zod schema is both a runtime check and a TypeScript type (lesson p1-5)."
+     },
+     {
+      "line": 5,
+      "text": "The regex refuses lower-case or missing numbers before anything else runs."
+     },
+     {
+      "line": 9,
+      "text": "z.infer gives the type for free. Every workspace imports this one Handoff."
+     }
+    ]
+   }
+  },
+  {
+   "h": "CI: three jobs on every PR",
+   "p": [
+    "ci.yml runs on pull_request and on push to main, on fcp-runner-set, our self-hosted runners from lesson p2-1. It has three jobs: lint, test and evals. The ruleset requires all three, so their names matter."
+   ],
+   "because": "We split lint, test and evals into three jobs because a required check is a job name. We want to see which one is red.",
+   "code": {
+    "lang": "yaml",
+    "file": "ai-agents/.github/workflows/ci.yml",
+    "text": "name: CI\non:\n  pull_request:\n  push:\n    branches: [main]\njobs:\n  lint:\n    runs-on: fcp-runner-set\n    steps:\n      - uses: actions/checkout@<sha> # v5\n      - uses: actions/setup-node@<sha> # v5\n        with: { node-version: 24, cache: npm }\n      - run: npm ci\n      - run: npm run lint\n      - run: npm run typecheck\n  test:\n    runs-on: fcp-runner-set\n    steps:\n      - uses: actions/checkout@<sha> # v5\n      - uses: actions/setup-node@<sha> # v5\n        with: { node-version: 24, cache: npm }\n      - run: npm ci\n      - run: npm test\n      - run: npm run build",
+    "notes": [
+     {
+      "line": 2,
+      "text": "pull_request for every PR and push to main for the merge commit, like fcp's frontend-ci."
+     },
+     {
+      "line": 8,
+      "text": "fcp-runner-set is the self-hosted runner group. Ask DevOps to let the new repo use it."
+     },
+     {
+      "line": 10,
+      "text": "Every action pinned by commit SHA, with the version as a comment (lesson p2-2)."
+     },
+     {
+      "line": 12,
+      "text": "cache: npm keeps node_modules downloads between runs, keyed on package-lock.json."
+     },
+     {
+      "line": 13,
+      "text": "npm ci installs exactly the lockfile. npm install could change it."
+     },
+     {
+      "line": 24,
+      "text": "build runs tsc in every workspace, so a type error in dist/ also fails the PR."
+     }
+    ]
+   },
+   "see": "The third job, evals, uses astral-sh/setup-uv, then `uv sync --frozen --project evals`, `pre-commit run --all-files` and `uv run --project evals pytest`. Its Python style is fcp's: black and isort at 120 columns, flake8 with select=F."
+  },
+  {
+   "h": "Images and the harness release",
+   "p": [
+    "images.yml runs on main only. It builds the orchestrator, broker, gateway, slack-app and checks images and pushes them to inf ECR. Each Dockerfile follows Byte's: FROM node:24-bookworm-slim pinned by digest, npm ci --ignore-scripts, a non-root user 10001 (lesson p1-8).",
+    "DevOps adds the ECR repositories in multi_tenant/accounts/infrastructure/artifacts/artifacts.hcl with tags_immutability_enabled = true. Immutable tags mean a pushed image can never be replaced under the same tag.",
+    "The harness is different. It runs inside every sandbox VM, so we do not want npm install there. release-harness.yml bundles harness/ with esbuild into one file, nova-worker.mjs. The shared package and every dependency are inside it. A two-line banner sits on top: the #!/usr/bin/env node shebang, then the createRequire line (lesson p1-7).",
+    "Because it is bundled, the harness imports the Agent SDK from @anthropic-ai/claude-agent-sdk/core, the SDK's entry for bundled apps. The names are the same as the root entry. It runs the image's pinned claude binary through pathToClaudeCodeExecutable, so the SDK's own binary is not needed."
+   ],
+   "because": "We attach a tarball to a GitHub release because Packer can download a release asset with a short-lived token. A tarball needs nothing installed to unpack.",
+   "code": {
+    "lang": "yaml",
+    "file": "ai-agents/.github/workflows/release-harness.yml",
+    "text": "  release:\n    runs-on: fcp-runner-set\n    permissions: { contents: write } # to attach the asset\n    steps:\n      - uses: actions/checkout@<sha> # v5\n      - uses: actions/setup-node@<sha> # v5\n        with: { node-version: 24, cache: npm }\n      - run: npm ci\n      - run: |\n          npx esbuild harness/src/main.ts --bundle --platform=node --format=esm \\\n            --banner:js=$'#!/usr/bin/env node\\nimport { createRequire } from \"node:module\"; const require = createRequire(import.meta.url);' \\\n            --outfile=dist/harness/nova-worker.mjs\n      - run: cp -r harness/workflows harness/prompts dist/harness/ && mkdir -p dist/harness/settings &&\n               cp settings/protected-paths.yaml dist/harness/settings/\n      - run: tar -czf ai-agents-harness-${{ github.ref_name }}.tgz -C dist harness\n      - run: gh release upload \"${{ github.ref_name }}\" ai-agents-harness-${{ github.ref_name }}.tgz\n        env: { GH_TOKEN: \"${{ github.token }}\" }",
+    "notes": [
+     {
+      "line": 3,
+      "text": "The job needs contents: write only to upload the asset. Nothing else."
+     },
+     {
+      "line": 9,
+      "text": "run: | starts a multi-line shell script. GitHub runs it with bash on Linux runners."
+     },
+     {
+      "line": 10,
+      "text": "esbuild bundles main.ts and everything it imports into one ESM file for Node."
+     },
+     {
+      "line": 11,
+      "text": "The two-line banner from lesson p1-7. $'...' is bash quoting that turns \\n into a real new line. Line 1 is the shebang, so /usr/local/bin/nova-worker (a link to this file, lesson g3-5) runs directly. Line 2 gives the bundle a real require for CommonJS packages such as yaml."
+     },
+     {
+      "line": 13,
+      "text": "workflows/ (Workflow tool scripts), prompts/ and protected-paths.yaml ride along; the hooks read them."
+     },
+     {
+      "line": 15,
+      "text": "The tag name is the version: ai-agents-harness-v0.3.0.tgz."
+     },
+     {
+      "line": 16,
+      "text": "gh release upload attaches the file to the release with the job's own token."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "The G3-01 ticket sketch puts only the shebang in the banner. That bundle builds, then fails on the VM with: Dynamic require of \"process\" is not supported. The cause is the yaml package, which is CommonJS. Always use the two-line banner above, shebang first. Before you tag a release, run the bundle once on your laptop, as in lesson p1-7."
+   }
+  },
+  {
+   "h": "The ruleset on main",
+   "p": [
+    "A ruleset is GitHub's rule list for a branch (lesson p2-4). On main: a PR is required, with exactly one approval. A new push dismisses stale approvals. The required checks are lint, test and evals. No force push, no delete.",
+    "The rhino-ai-agents GitHub App gets no bypass. That is the wall: an agent can open a PR here, but it cannot merge one. There is no CODEOWNERS file, on purpose; the one approval is the independent approval from G0.",
+    "Finish with a short AGENTS.md (what lives where, how to run tests) and a CLAUDE.md that only says @AGENTS.md, exactly like frontend/."
+   ],
+   "callout": {
+    "kind": "wall",
+    "text": "Exactly one approval, and never from the requester of the agent's PR. Agents never merge. The ruleset enforces it; no prompt can change it."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Build a two-workspace ai-agents skeleton and run its tests",
+  "youNeed": [
+   "Node 24 (nvm use 24)",
+   "npm 10",
+   "an empty folder"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ws/shared/src ws/broker/src ws/broker/test && cd ws",
+    "see": "(no output; you are now inside ws/)"
+   },
+   {
+    "do": "Write package.json at the root: \"type\": \"module\", \"workspaces\": [\"shared\", \"broker\"], scripts test = node --import tsx --test \"*/test/**/*.test.ts\", typecheck = npm run typecheck --workspaces --if-present, engines node >=24.",
+    "see": "(a file; copy the root package.json from the section above and keep only two workspaces)"
+   },
+   {
+    "do": "Write tsconfig.base.json with strict, target ES2023, module and moduleResolution NodeNext, verbatimModuleSyntax, types [\"node\"].",
+    "see": "(a file)"
+   },
+   {
+    "do": "Write shared/package.json (name @rhinohealth/ai-agents-shared, main ./src/index.ts, script typecheck tsc -p tsconfig.json --noEmit) and shared/src/index.ts with the Handoff zod schema from this lesson.",
+    "see": "(two files)"
+   },
+   {
+    "do": "Write broker/package.json (name @rhinohealth/ai-agents-broker, dependency \"@rhinohealth/ai-agents-shared\": \"0.1.0\"), broker/src/health.ts exporting health() => ({ ok: true, service: \"broker\" }), and broker/test/health.test.ts with two node:test tests: health() and Handoff.safeParse({ key: \"rh-1\", requester: \"sean\" }).success === false.",
+    "see": "(three files)"
+   },
+   {
+    "do": "npm install --save-exact --save-dev tsx@4.20.3 typescript@5.9.3 @types/node@24.12.2 && npm install --save-exact -w shared zod@4",
+    "see": "added 30 packages, and audited 33 packages\nfound 0 vulnerabilities"
+   },
+   {
+    "do": "ls -la node_modules/@rhinohealth/",
+    "see": "ai-agents-broker -> ../../broker\nai-agents-shared -> ../../shared"
+   },
+   {
+    "do": "npm test",
+    "see": "✔ health answers without auth (0.571375ms)\n✔ the shared Handoff schema rejects a bad key (0.712458ms)\nℹ tests 2\nℹ pass 2\nℹ fail 0"
+   },
+   {
+    "do": "npm run typecheck",
+    "see": "> @rhinohealth/ai-agents-shared@0.1.0 typecheck\n> tsc -p tsconfig.json --noEmit\n> @rhinohealth/ai-agents-broker@0.1.0 typecheck\n> tsc -p tsconfig.json --noEmit"
+   }
+  ],
+  "faded": "Add a third workspace, slack-app, with one test that imports Handoff from the shared package and parses a valid key. Add it to the root workspaces list and run npm install again. The last step is yours: make npm test show 3 passing tests, and say why node_modules/@rhinohealth/ now has three links.",
+  "alone": "Add a check script to the root that runs typecheck, then test, in that order, and make one test fail on purpose. Run npm run check and confirm it stops at the failing test with exit code 1 (echo $?). Then fix the test and run it again.",
+  "done": "npm test prints pass 3 and fail 0, and node_modules/@rhinohealth/ shows three symlinks into your workspaces."
+ },
+ "quiz": [
+  {
+   "q": "Why does the harness ship as one bundled file instead of a package in ECR?",
+   "options": [
+    {
+     "text": "Because the VM has no Docker",
+     "correct": false,
+     "why": "The image has Docker; FCP Lab needs it. The reason is about installing, not containers."
+    },
+    {
+     "text": "Because nothing should be installed on a VM at run time; Packer unpacks a tarball once a night",
+     "correct": true,
+     "why": "A bundled file needs no npm install and no network. The nightly image bakes it in."
+    },
+    {
+     "text": "Because esbuild is faster than tsc",
+     "correct": false,
+     "why": "Speed is not the point; a single file with every dependency inside is."
+    }
+   ]
+  },
+  {
+   "q": "The ruleset on main requires checks named lint, test and evals. What makes a check requirable?",
+   "options": [
+    {
+     "text": "The workflow file name",
+     "correct": false,
+     "why": "GitHub matches required checks by job name, not by file."
+    },
+    {
+     "text": "The job name in the workflow",
+     "correct": true,
+     "why": "A required status check is a job name. That is why fcp had to rename its 'Unit Tests' jobs (G0-02)."
+    },
+    {
+     "text": "A label on the PR",
+     "correct": false,
+     "why": "Labels do not gate merges; required checks and approvals do."
+    }
+   ]
+  },
+  {
+   "q": "Which import does the bundled harness use for the Agent SDK?",
+   "options": [
+    {
+     "text": "@anthropic-ai/claude-agent-sdk",
+     "correct": false,
+     "why": "The root entry expects the SDK's own files next to it; a bundle moves them. Use the entry made for bundles."
+    },
+    {
+     "text": "@anthropic-ai/claude-agent-sdk/core, the entry for bundled apps, with the same names",
+     "correct": true,
+     "why": "The /core entry is documented for bundled apps. Everything the harness uses is exported there too."
+    },
+    {
+     "text": "@anthropic-ai/claude-code",
+     "correct": false,
+     "why": "That is the CLI package. The harness runs the pinned claude binary through pathToClaudeCodeExecutable instead."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From p1-7: what does esbuild's --banner:js option add to the output file, and why does the harness need it?",
+  "From p2-4: what is the difference between a GitHub App's installation token and a personal access token?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "workspace",
+   "plain": "An npm feature where one root package.json lists folders, each a package, all sharing one lockfile and one node_modules."
+  },
+  {
+   "term": "lockfile",
+   "plain": "package-lock.json: the exact version of every package installed, so every machine installs the same thing."
+  },
+  {
+   "term": "ruleset",
+   "plain": "GitHub's list of rules for a branch: required PR, approvals, required checks, no force push."
+  },
+  {
+   "term": "required check",
+   "plain": "A CI job name that must be green before a PR can merge."
+  },
+  {
+   "term": "bundle",
+   "plain": "One JavaScript file that contains a program and every library it imports, made by esbuild."
+  },
+  {
+   "term": "ECR",
+   "plain": "AWS's Docker image registry. inf ECR is the one our cluster pulls from."
+  },
+  {
+   "term": "immutable tag",
+   "plain": "An ECR setting: once an image is pushed under a tag, no other image can take that tag."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-01",
+   "why": "This lesson showed what this ticket creates. That is the workspace layout, the three CI jobs, the image build, the harness bundle and the ruleset.",
+   "walk": [
+    "Create the private repo RhinoHealth/ai-agents. Add the root package.json (code above), package-lock.json, tsconfig.base.json, eslint.config.js like Byte's, AGENTS.md and a CLAUDE.md that says @AGENTS.md.",
+    "Create shared/, gateway/, broker/, orchestrator/, harness/ and slack-app/, each with package.json named @rhinohealth/ai-agents-<pkg>, src/ in kebab-case and test/. Put the zod schemas in shared/src/schemas.ts.",
+    "Create evals/ as a uv project (evals/pyproject.toml, Python 3.13) with fcp's black, isort and flake8 settings through pre-commit.",
+    "Add .github/workflows/ci.yml with jobs lint, test and evals (code above) on fcp-runner-set. Ask DevOps to allow the repo on the runner group.",
+    "Add images.yml (on main: five images from node:24-bookworm-slim by digest, npm ci --ignore-scripts, user 10001, pushed to inf ECR). Ask DevOps to add ai-agents-orchestrator, ai-agents-broker, ai-agents-slack-app and ai-agents-checks to artifacts.hcl with tags_immutability_enabled = true.",
+    "Add release-harness.yml (code above). It bundles nova-worker.mjs with the two-line banner (shebang, then createRequire). It packs a tarball with workflows/, prompts/ and settings/protected-paths.yaml and attaches it to the release. The ticket sketch has only the shebang line; fix that in the PR.",
+    "Create the ruleset on main: PR required, 1 approval, dismiss stale approvals, and required checks lint, test, evals. Also no force push, no delete, no bypass for rhino-ai-agents, and no CODEOWNERS."
+   ]
+  }
+ ],
+ "remember": "One repo, one lockfile, one CI, one ruleset. Every agent service lives in ai-agents, and the harness leaves it as one bundled file."
+}

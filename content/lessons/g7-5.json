@@ -1,0 +1,674 @@
+{
+ "id": "g7-5",
+ "title": "verify and doctor",
+ "minutes": 55,
+ "youNeed": [
+  "p10-6",
+  "g7-1",
+  "p8-4"
+ ],
+ "bridge": "verify is like the one npm script you run before you push, which runs lint, types and the tests near your change. Except: the editor, the agent's Stop hook and CI all run the very same command. So green means the same thing in all three places, and doctor makes sure a fresh machine can run it at all.",
+ "intro": "Agents and people need one fast command that gives the answer CI will give, before they say done. This lesson builds npm run verify, poe verify and the Stop hook that runs them. Then it builds poe doctor and its nightly run in the sandbox image. The backend parts are Python because fcp's backend is Django and its tooling lives in the root pyproject.toml.",
+ "picture": {
+  "caption": "One command per area, three callers, and a nightly proof that a fresh machine can run it.",
+  "nodes": [
+   {
+    "id": "dev",
+    "label": "Engineer in Claude Code",
+    "kind": "person"
+   },
+   {
+    "id": "nova",
+    "label": "Nova in a sandbox VM",
+    "kind": "agent"
+   },
+   {
+    "id": "hook",
+    "label": "Stop hook: claude_stop_verify.sh",
+    "kind": "service"
+   },
+   {
+    "id": "verify",
+    "label": "poe verify / npm run verify",
+    "kind": "check"
+   },
+   {
+    "id": "ci",
+    "label": "CI: poe verify --all, npm run verify -- --all",
+    "kind": "check"
+   },
+   {
+    "id": "doctor",
+    "label": "poe doctor --json in the nightly image build",
+    "kind": "machine"
+   }
+  ],
+  "steps": [
+   {
+    "from": "dev",
+    "to": "hook",
+    "text": "wants to stop; the project's Stop hook runs"
+   },
+   {
+    "from": "nova",
+    "to": "hook",
+    "text": "loads fcp's project settings, so the same hook runs"
+   },
+   {
+    "from": "hook",
+    "to": "verify",
+    "text": "picks the command by changed paths; exit 2 sends the agent back to work"
+   },
+   {
+    "from": "ci",
+    "to": "verify",
+    "text": "runs the same command with --all"
+   },
+   {
+    "from": "doctor",
+    "to": "verify",
+    "text": "proves each night that a fresh setup can run it; a failure blocks the image"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "npm run verify for the frontend (G7-10)",
+   "p": [
+    "Today a frontend change needs four commands: npm run lint, npm run check-types, the unit tests and Storybook. G7-10 adds one script, frontend/scripts/verify.ts, and \"verify\": \"node scripts/verify.ts\" in frontend/package.json. Node 24 runs .ts files directly, so there is no new .js or .mjs file.",
+    "It checks what changed since main: Biome on the changed files, the type check, and vitest related. vitest related runs only the tests that import the changed files. npm run verify -- --all checks everything; CI uses that."
+   ],
+   "because": "We print one line per step at the end, because the whole result must fit in an agent's context.",
+   "code": {
+    "lang": "typescript",
+    "file": "frontend/scripts/verify.ts",
+    "text": "// `npm run verify` checks what changed since main; `npm run verify -- --all` checks everything (CI).\nimport {execFileSync, spawnSync} from \"node:child_process\"\n\nconst all = process.argv.includes(\"--all\")\nconst git = (...args: string[]) => execFileSync(\"git\", args, {encoding: \"utf8\"}).trim()\nconst base = process.env.VERIFY_BASE ?? git(\"merge-base\", \"HEAD\", \"origin/main\")\nconst changed = [\n\t...git(\"diff\", \"--name-only\", \"--relative\", \"--diff-filter=ACMR\", base).split(\"\\n\"),\n\t...git(\"ls-files\", \"--others\", \"--exclude-standard\").split(\"\\n\")\n].filter((file) => /\\.(ts|tsx|css|json)$/.test(file))\nconst code = changed.filter((file) => /^(src|test)\\/.*\\.tsx?$/.test(file))\n\nconst steps: [string, string[]][] = [[\"types\", [\"tsc\", \"--noEmit\", \"--pretty\", \"false\"]]]\nif (all || changed.length > 0) steps.unshift([\"lint\", [\"biome\", \"check\", ...(all ? [\".\"] : changed)]])\nif (all) steps.push([\"unit tests\", [\"vitest\", \"run\", ...(process.env.VITEST_MONOCART ? [\"--coverage\"] : [])]])\nelse if (code.length > 0)\n\tsteps.push([\"related unit tests\", [\"vitest\", \"related\", ...code, \"--run\", \"--passWithNoTests\"]])\n// Affected stories: decide with the FE guild (@storybook/addon-vitest would make them part of `vitest related`).\n\nconst results = steps.map(([name, args]) => ({name, ok: spawnSync(\"npx\", args, {stdio: \"inherit\"}).status === 0}))\nconsole.log(`\\nverify: ${all ? \"all files\" : `${changed.length} changed files since ${base.slice(0, 7)}`}`)\nfor (const {name, ok} of results) console.log(`${ok ? \"pass\" : \"FAIL\"}  ${name}`)\nprocess.exit(results.every(({ok}) => ok) ? 0 : 1)",
+    "notes": [
+     {
+      "line": 1,
+      "text": "How to call it: changed files by default, everything with --all."
+     },
+     {
+      "line": 2,
+      "text": "Run git and the tools without a shell (lesson p1-2)."
+     },
+     {
+      "line": 4,
+      "text": "True when the caller passed --all."
+     },
+     {
+      "line": 5,
+      "text": "A helper: run git with arguments and return its trimmed output."
+     },
+     {
+      "line": 6,
+      "text": "VERIFY_BASE overrides the base; otherwise the merge base with origin/main."
+     },
+     {
+      "line": 8,
+      "text": "Changed files since the base: added, copied, modified or renamed, relative to frontend/."
+     },
+     {
+      "line": 9,
+      "text": "Plus untracked files that are not ignored."
+     },
+     {
+      "line": 10,
+      "text": "Keep only file types Biome or the tests care about."
+     },
+     {
+      "line": 11,
+      "text": "Source and test files only, for vitest related."
+     },
+     {
+      "line": 13,
+      "text": "The steps as [name, command]. The type check always runs: types cross file boundaries."
+     },
+     {
+      "line": 14,
+      "text": "Lint first: everything with --all, otherwise only the changed files."
+     },
+     {
+      "line": 15,
+      "text": "With --all: the whole unit suite, with coverage when VITEST_MONOCART is set (CI)."
+     },
+     {
+      "line": 16,
+      "text": "Otherwise only the tests related to changed code; no tests is not a failure."
+     },
+     {
+      "line": 18,
+      "text": "Open decision with the FE guild: @storybook/addon-vitest or a render smoke test per changed story."
+     },
+     {
+      "line": 20,
+      "text": "Run each step through npx, show its output, and record pass or fail."
+     },
+     {
+      "line": 21,
+      "text": "One summary line: what was checked and since which commit."
+     },
+     {
+      "line": 22,
+      "text": "One line per step: pass or FAIL."
+     },
+     {
+      "line": 23,
+      "text": "Exit 0 only when every step passed."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "tip",
+    "text": "G7-10 also adds a short section to frontend/AGENTS.md: tests assert on what the user sees. Use test ids, ARIA roles and names, visible text and row counts, never class names or internal state."
+   }
+  },
+  {
+   "h": "poe verify, part 1: the areas (G7-14)",
+   "p": [
+    "The backend version is a Poe script task in the root pyproject.toml, next to the createsuperuser task. It reads verify = { script = \"scripts.poe_verify:main(all_files=all)\", args = [{ name = \"all\", type = \"boolean\" }] }. A script task calls a Python function, and the boolean arg becomes a --all flag (lesson p10-6).",
+    "The first part names the areas. Some paths force the full API layer, because testmon cannot see them (lesson g7-1)."
+   ],
+   "because": "We list the paths testmon cannot see, because a migration change must run every API test, not none.",
+   "code": {
+    "lang": "python",
+    "file": "scripts/poe_verify.py (part 1 of 2)",
+    "text": "\"\"\"poe verify: lint and test what changed since main. The Claude Code Stop hook (scripts/claude_stop_verify.sh),\nNova's Stop hook and CI (`poe verify --all`) run this same command, so \"green\" means the same thing everywhere.\"\"\"\n\nimport subprocess\nimport sys\n\nCORE = \"cloud/rhinoCloud/rhinoCore/\"\nCLOUD = (\"cloud/rhinoCloud/\", \"common/fcp_common/\")\nFULL_RUN = (CORE + \"migrations/\", CORE + \"fixtures/\", \"cloud/rhinoCloud/tests_api/conftest.py\")  # testmon can't see these\n\n\ndef _git(*args: str) -> list[str]:\n    return subprocess.run([\"git\", *args], capture_output=True, text=True, check=True).stdout.splitlines()\n",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The docstring names the three callers: the Stop hook, Nova's Stop hook and CI."
+     },
+     {
+      "line": 4,
+      "text": "To run git and the steps."
+     },
+     {
+      "line": 7,
+      "text": "The cloud's main app folder."
+     },
+     {
+      "line": 8,
+      "text": "Cloud code and the shared fcp_common package: a change here runs the affected API tests."
+     },
+     {
+      "line": 9,
+      "text": "Migrations, fixtures and the conftest: a change here runs the whole layer."
+     },
+     {
+      "line": 12,
+      "text": "Run git, fail loudly on an error, and return the output as a list of lines."
+     }
+    ]
+   }
+  },
+  {
+   "h": "poe verify, part 2: pick, run, report",
+   "p": [
+    "main() collects the changed files since the merge base plus untracked files, then builds a list of steps. Each area adds its own: lint for Python files, the API layer (all or affected), and the SDK's make targets. client/ has no fast test layer yet. Decide with the BE guild: lint client files only, or run the Docker-based unit tests."
+   ],
+   "because": "We print the failures.md path on stderr when something fails, because the agent should read that page next, not the log.",
+   "code": {
+    "lang": "python",
+    "file": "scripts/poe_verify.py (part 2 of 2)",
+    "text": "def main(all_files: bool = False) -> None:\n    base = _git(\"merge-base\", \"HEAD\", \"origin/main\")[0]\n    changed = _git(\"diff\", \"--name-only\", base) + _git(\"ls-files\", \"--others\", \"--exclude-standard\")\n    python_files = [f for f in changed if f.endswith(\".py\")]\n    steps: list[tuple[str, list[str]]] = []\n    if all_files or python_files:\n        steps.append((\"lint\", [\"pre-commit\", \"run\", *([\"--all-files\"] if all_files else [\"--files\", *python_files])]))\n    if all_files or any(f.startswith(FULL_RUN) for f in changed):\n        steps.append((\"cloud API tests: all\", [\"poe\", \"api-test\"]))\n    elif any(f.startswith(CLOUD) for f in changed):\n        steps.append((\"cloud API tests: affected\", [\"poe\", \"api-test-affected\"]))\n    if any(f.startswith(\"sdk/\") for f in changed):\n        steps.append((\"sdk\", [\"make\", \"-C\", \"sdk\", \"lint\", \"test\"]))\n    # client/: no fast test layer yet. Decide with the BE guild: lint only, or the Docker-based unit tests.\n    failed = {name for name, cmd in steps if subprocess.run(cmd).returncode != 0}\n    for name, _ in steps:\n        print(f\"{'FAIL' if name in failed else 'pass'}  {name}\")\n    if failed:\n        print(\"Details: cloud/rhinoCloud/reports/failures.md\", file=sys.stderr)\n    sys.exit(1 if failed else 0)",
+    "notes": [
+     {
+      "line": 1,
+      "text": "poe passes all_files=True for --all."
+     },
+     {
+      "line": 2,
+      "text": "The first line of git merge-base HEAD origin/main."
+     },
+     {
+      "line": 3,
+      "text": "Changed files since the base plus untracked ones."
+     },
+     {
+      "line": 4,
+      "text": "The .py files among them."
+     },
+     {
+      "line": 5,
+      "text": "An empty list of (name, command) pairs."
+     },
+     {
+      "line": 6,
+      "text": "Lint with pre-commit (black, isort, flake8): all files, or only the changed ones."
+     },
+     {
+      "line": 8,
+      "text": "startswith accepts a tuple: any FULL_RUN path changed means the whole layer."
+     },
+     {
+      "line": 10,
+      "text": "Otherwise, cloud code changed: only the affected tests."
+     },
+     {
+      "line": 12,
+      "text": "SDK changes run the SDK's own lint and tests through its Makefile."
+     },
+     {
+      "line": 14,
+      "text": "The open decision for the client, written where the next person will look."
+     },
+     {
+      "line": 15,
+      "text": "Run every step and collect the names of those that failed."
+     },
+     {
+      "line": 16,
+      "text": "One line per step: pass or FAIL."
+     },
+     {
+      "line": 19,
+      "text": "Point at failures.md on stderr."
+     },
+     {
+      "line": 20,
+      "text": "Exit 1 on any failure. The exit code is the contract with the hook and CI."
+     }
+    ]
+   }
+  },
+  {
+   "h": "One Stop hook for people and Nova",
+   "p": [
+    "A Stop hook is a command Claude Code runs when the agent wants to end its turn (lesson p8-4). G7-14 adds scripts/claude_stop_verify.sh and registers it in fcp's tracked .claude/settings.json. The script picks npm run verify or poe verify by changed paths. On failure it prints the summary and the failures.md path to stderr and exits 2, so Claude keeps working with that message.",
+    "If the hook input has stop_hook_active true, a stop was already blocked once. The script then reports and exits 0, so the session can end and never loops. Nova gets this hook too: its harness loads fcp's project settings (settingSources [\"project\"], G3-19). Nova's own Stop hook (G3-21) then only checks proof for the plan's QA checks.",
+    "CI runs the same commands. The API Tests job runs uvx --from poethepoet poe verify --all. frontend-ci's unit-tests job runs npm run verify -- --all with VITEST_MONOCART=1, in place of its separate lint, check-types and coverage steps."
+   ],
+   "because": "We register the hook in the tracked project settings, so every person and agent that opens fcp runs the same check.",
+   "code": {
+    "lang": "json",
+    "file": "fcp/.claude/settings.json (the hooks part; a sketch from the ticket's steps)",
+    "text": "{\n  \"hooks\": {\n    \"Stop\": [\n      {\n        \"hooks\": [\n          { \"type\": \"command\", \"command\": \"\\\"$CLAUDE_PROJECT_DIR\\\"/scripts/claude_stop_verify.sh\" }\n        ]\n      }\n    ]\n  }\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The hooks section of Claude Code's settings file."
+     },
+     {
+      "line": 3,
+      "text": "The event: the agent wants to end its turn. Stop has no tool, so no matcher."
+     },
+     {
+      "line": 6,
+      "text": "Run a shell command. CLAUDE_PROJECT_DIR is the repo root, so the path works from any folder."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "why",
+    "text": "The command and its exit code, not shared code, are the contract between fcp and the platform's harness. Agree it with Platform: exit 0 means green, exit 1 means red, and the hook turns red into exit 2."
+   }
+  },
+  {
+   "h": "poe doctor, part 1: read the requirements (G7-22)",
+   "p": [
+    "Setup problems cost developers many hours a year, and agents in fresh VMs hit the same ones. G7-22 adds poe doctor: one command that checks a machine against what fcp needs and, with --fix, repairs what is safe. Its Poe entry is doctor = { script = \"scripts.poe_doctor:main(fix=fix, as_json=json)\", args = [...] }.",
+    "The first part reads the requirements from the repo itself, so the doctor never disagrees with the files it checks."
+   ],
+   "because": "We read node and npm versions from frontend/package.json engines, because a copy in the script would drift.",
+   "code": {
+    "lang": "python",
+    "file": "scripts/poe_doctor.py (part 1 of 2)",
+    "text": "\"\"\"poe doctor: check a local fcp setup; --fix runs the safe local fixes; --json is for the sandbox image build.\"\"\"\nimport json\nimport shutil\nimport subprocess\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\nENGINES = json.loads((ROOT / \"frontend\" / \"package.json\").read_text())[\"engines\"]  # node >=24.15.0, npm >=11.14.1\n\n\ndef _run(*cmd: str) -> str | None:\n    done = shutil.which(cmd[0]) and subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)\n    return done.stdout.strip() if done and done.returncode == 0 else None\n\n\ndef _at_least(have: str | None, want: str) -> bool:  # \"v24.16.0\" >= \">=24.15.0\"\n    return have is not None and [int(p) for p in have.strip(\"v\").split(\".\")] >= [int(p) for p in want.strip(\">=\").split(\".\")]",
+    "notes": [
+     {
+      "line": 1,
+      "text": "What it does and the two flags."
+     },
+     {
+      "line": 3,
+      "text": "shutil.which finds a program on PATH, like the which command."
+     },
+     {
+      "line": 7,
+      "text": "The repo root: two levels up from scripts/poe_doctor.py."
+     },
+     {
+      "line": 8,
+      "text": "The engines block of frontend/package.json: node >=24.15.0, npm >=11.14.1."
+     },
+     {
+      "line": 11,
+      "text": "Run a command from the repo root; return its output, or None if it is missing or fails."
+     },
+     {
+      "line": 12,
+      "text": "If the program is not installed, stop here with a falsy value."
+     },
+     {
+      "line": 13,
+      "text": "Output only on success, else None."
+     },
+     {
+      "line": 16,
+      "text": "Compare versions as lists of numbers: v24.16.0 against >=24.15.0."
+     },
+     {
+      "line": 17,
+      "text": "Strip v and >=, split on dots, and compare the lists number by number."
+     }
+    ]
+   }
+  },
+  {
+   "h": "poe doctor, part 2: checks, fixes, output",
+   "p": [
+    "Each check is one line: what, a test, the fix, and whether --fix may run it. The other checks (npm, poe, the rhino-net Docker network) follow the same shape. --fix runs only safe local commands such as uv python install, make sync-deps and docker network create. It never touches credentials, ~/.aws or Docker volumes.",
+    "One check is about git hooks. After npm install, husky sets core.hooksPath to frontend/.husky/_, so the black, isort and flake8 hooks in .pre-commit-config.yaml never run on commit. The doctor reports it and points to poe verify."
+   ],
+   "because": "We print one JSON object per check with --json, because the nightly image build reads the result as data, not as text.",
+   "code": {
+    "lang": "python",
+    "file": "scripts/poe_doctor.py (part 2 of 2)",
+    "text": "CHECKS = [  # (what, passes, fix, safe for --fix); npm, poe and the rhino-net network follow the same pattern\n    (\"node \" + ENGINES[\"node\"], lambda: _at_least(_run(\"node\", \"--version\"), ENGINES[\"node\"]), \"nvm install\", False),\n    (\"Python 3.13 (uv)\", lambda: _run(\"uv\", \"python\", \"find\", \"3.13\"), \"uv python install 3.13\", True),\n    (\"cloud venv = uv.lock\", lambda: _run(\"uv\", \"sync\", \"--check\", \"--directory\", \"cloud/rhinoCloud\"), \"make -C cloud/rhinoCloud sync-deps\", True),\n    (\"Docker >= 16 GiB (FCP Lab)\", lambda: int(_run(\"docker\", \"info\", \"-f\", \"{{.MemTotal}}\") or 0) >= 16 * 2**30, \"raise Docker's memory limit\", False),\n    (\"Python commit hooks (husky owns core.hooksPath, so black/isort/flake8 never run)\", lambda: _run(\"git\", \"config\", \"core.hooksPath\") is None, \"run `poe verify` before you push\", False),\n]\n\n\ndef main(fix: bool = False, as_json: bool = False) -> None:\n    results = [(what, bool(passes()), how, safe) for what, passes, how, safe in CHECKS]\n    for what, ok, how, safe in results:\n        if fix and safe and not ok:\n            subprocess.run(how, shell=True, cwd=ROOT)  # local commands only: never credentials, ~/.aws or volumes\n        print(json.dumps({\"check\": what, \"ok\": ok, \"fix\": how}) if as_json else f\"{'ok ' if ok else 'FIX'}  {what}  {'' if ok else '-> ' + how}\")\n    raise SystemExit(0 if all(ok for _, ok, _, _ in results) else 1)",
+    "notes": [
+     {
+      "line": 1,
+      "text": "A table of checks: (what, passes, fix, safe for --fix)."
+     },
+     {
+      "line": 2,
+      "text": "Node's version against engines. The fix (nvm install) is not run automatically."
+     },
+     {
+      "line": 3,
+      "text": "uv can find Python 3.13; if not, uv python install 3.13 is safe to run."
+     },
+     {
+      "line": 4,
+      "text": "uv sync --check says whether the cloud venv matches the lockfile; make sync-deps fixes it."
+     },
+     {
+      "line": 5,
+      "text": "docker info reports total memory in bytes; FCP Lab needs at least 16 GiB."
+     },
+     {
+      "line": 6,
+      "text": "Passes only when core.hooksPath is unset; otherwise husky owns the hooks."
+     },
+     {
+      "line": 10,
+      "text": "poe passes fix and as_json from the flags."
+     },
+     {
+      "line": 11,
+      "text": "Run every check once and keep the answers."
+     },
+     {
+      "line": 13,
+      "text": "Only safe fixes, only for failed checks, and only with --fix."
+     },
+     {
+      "line": 14,
+      "text": "Run the fix command from the repo root; the comment repeats what it must never touch."
+     },
+     {
+      "line": 15,
+      "text": "One JSON line per check, or a human line: ok, or FIX with the command."
+     },
+     {
+      "line": 16,
+      "text": "Exit 0 only when every check passed."
+     }
+    ]
+   },
+   "see": "(example output; your machine differs)\nok   node >=24.15.0\nok   Python 3.13 (uv)\nFIX  cloud venv = uv.lock  -> make -C cloud/rhinoCloud sync-deps\nok   Docker >= 16 GiB (FCP Lab)\nFIX  Python commit hooks (husky owns core.hooksPath, so black/isort/flake8 never run)  -> run `poe verify` before you push"
+  },
+  {
+   "h": "doctor in the nightly image build (G7-25)",
+   "p": [
+    "The ai-agent-sandbox image (G3) is built every night from a brand-new machine, so it proves a fresh setup still works. G7-25 adds three Ansible tasks to its playbook, after the fcp checkout and the dependency install. Ansible is the tool that configures the machine during the Packer build (lesson p4-4).",
+    "A failing doctor fails the Packer build, so the image is not promoted and yesterday's image stays in use. The failing check names go into the G3 image-build alert, so the owner sees what broke without opening the Packer log."
+   ],
+   "because": "We register the doctor's output and decide later, because the report must be saved even when a check fails.",
+   "code": {
+    "lang": "yaml",
+    "file": "infrastructure/packer/images/ai-agent-sandbox/playbook.yml (G3's playbook, new tasks)",
+    "text": "- name: Prove a fresh fcp setup works (poe doctor)\n  ansible.builtin.command:\n    cmd: uvx --from poethepoet poe doctor --json\n    chdir: \"{{ fcp_checkout_dir }}\"  # the image's fcp checkout; take the variable name from G3's playbook\n  become: true\n  become_user: \"{{ sandbox_user }}\"  # the user Nova runs as, so file ownership matches\n  register: doctor\n  changed_when: false\n  failed_when: false\n\n- name: Keep the doctor report with the image's build evidence\n  ansible.builtin.copy:\n    content: \"{{ doctor.stdout }}\"\n    dest: /var/log/ai-agent-sandbox/doctor.jsonl\n    mode: \"0644\"\n\n- name: Fail the build, so this image is not promoted, when a check fails\n  ansible.builtin.fail:\n    msg: \"poe doctor failed: {{ doctor.stdout_lines | map('from_json') | rejectattr('ok') | map(attribute='check') | join(', ') }}\"\n  when: doctor.rc != 0",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Task 1: run the doctor."
+     },
+     {
+      "line": 3,
+      "text": "The doctor through uvx, with machine output."
+     },
+     {
+      "line": 4,
+      "text": "The image's fcp checkout. Take the variable name from G3's playbook."
+     },
+     {
+      "line": 6,
+      "text": "Run as the sandbox user Nova runs as, not root, so file ownership matches."
+     },
+     {
+      "line": 7,
+      "text": "Keep the result (stdout, return code) in a variable."
+     },
+     {
+      "line": 8,
+      "text": "Running checks changes nothing on the machine."
+     },
+     {
+      "line": 9,
+      "text": "Do not fail here; task 3 decides, after the report is saved."
+     },
+     {
+      "line": 11,
+      "text": "Task 2: save the JSON lines with the image's build evidence."
+     },
+     {
+      "line": 14,
+      "text": "One JSON object per line."
+     },
+     {
+      "line": 17,
+      "text": "Task 3: fail the build when a check failed."
+     },
+     {
+      "line": 19,
+      "text": "Parse each line, keep the ones that are not ok, and list their check names in the message."
+     },
+     {
+      "line": 20,
+      "text": "Only when the doctor exited non-zero."
+     }
+    ]
+   }
+  }
+ ],
+ "lab": {
+  "title": "poe verify and its Stop hook on a scratch project",
+  "youNeed": [
+   "Python 3.13 and uv",
+   "git",
+   "No Claude session: you feed the hook a fake input"
+  ],
+  "worked": [
+   {
+    "do": "mkdir lab75 && cd lab75 && git init -b main && uv init --python 3.13 --bare . && uv add --dev pytest poethepoet",
+    "see": "Initialized empty Git repository in .../lab75/.git/\nInitialized project `lab75`\n + poethepoet==...\n + pytest==...\n(output trimmed)"
+   },
+   {
+    "do": "mkdir -p app tests docs scripts && touch app/__init__.py scripts/__init__.py && printf 'def add(a: int, b: int) -> int:\\n    return a + b\\n' > app/money.py && printf 'from app.money import add\\n\\n\\ndef test_add():\\n    assert add(2, 3) == 5\\n' > tests/test_money.py && printf '[pytest]\\npythonpath = .\\n' > pytest.ini && echo '# Notes' > docs/notes.md && printf '.venv/\\n__pycache__/\\n.pytest_cache/\\n' > .gitignore",
+    "see": "(no output; two areas: app/ with tests, docs/ without)"
+   },
+   {
+    "do": "Create scripts/poe_verify.py, a small copy of G7-14's script for this project:\n\n\"\"\"poe verify: check what changed since main. The Stop hook and CI run this same command.\"\"\"\n\nimport os\nimport subprocess\nimport sys\n\n\ndef _git(*args: str) -> list[str]:\n    return subprocess.run([\"git\", *args], capture_output=True, text=True, check=True).stdout.splitlines()\n\n\ndef main(all_files: bool = False) -> None:\n    base = os.environ.get(\"VERIFY_BASE\") or _git(\"merge-base\", \"HEAD\", \"main\")[0]\n    changed = _git(\"diff\", \"--name-only\", base) + _git(\"ls-files\", \"--others\", \"--exclude-standard\")\n    python_files = [f for f in changed if f.endswith(\".py\")]\n    steps: list[tuple[str, list[str]]] = []\n    if all_files or python_files:\n        files = _git(\"ls-files\", \"*.py\") if all_files else python_files\n        steps.append((\"lint\", [sys.executable, \"-m\", \"py_compile\", *files]))\n    if all_files or any(f.startswith((\"app/\", \"tests/\")) for f in changed):\n        steps.append((\"tests\", [sys.executable, \"-m\", \"pytest\", \"-q\"]))\n    failed = {name for name, cmd in steps if subprocess.run(cmd).returncode != 0}\n    for name, _ in steps:\n        print(f\"{'FAIL' if name in failed else 'pass'}  {name}\")\n    print(f\"verify: {len(changed)} changed files since {base[:7]}\")\n    sys.exit(1 if failed else 0)",
+    "see": "(no output)"
+   },
+   {
+    "do": "Append the task to pyproject.toml:\n\n[tool.poe.tasks]\nverify = { script = \"scripts.poe_verify:main(all_files=all)\", args = [{ name = \"all\", type = \"boolean\" }], help = \"Lint and test what changed since main.\" }",
+    "see": "(no output; uv run poe prints the task list with verify in it)"
+   },
+   {
+    "do": "git add -A && git commit -qm start && git checkout -qb my-change && uv run poe verify",
+    "see": "Poe => verify\nverify: 0 changed files since a230933\n(your commit id differs)"
+   },
+   {
+    "do": "echo 'More notes' >> docs/notes.md && uv run poe verify; echo exit=$?",
+    "see": "Poe => verify\nverify: 1 changed files since a230933\nexit=0\n(a docs change runs no steps)"
+   },
+   {
+    "do": "sed -i '' 's/return a + b/return a - b/' app/money.py && uv run poe verify; echo exit=$?   (on Linux use sed -i without '')",
+    "see": "FAILED tests/test_money.py::test_add - assert -1 == 5\n1 failed in 0.03s\npass  lint\nFAIL  tests\nverify: 2 changed files since a230933\nexit=1"
+   },
+   {
+    "do": "Create scripts/claude_stop_verify.sh and make it executable (chmod +x):\n\n#!/bin/bash\n# Claude Code Stop hook: run verify before the agent may stop. Exit 2 sends it back to work.\ninput=$(cat)\nif echo \"$input\" | grep -q '\"stop_hook_active\": *true'; then\n  echo \"verify already asked once; letting the session end\" >&2\n  exit 0\nfi\nif ! out=$(uv run poe verify 2>&1); then\n  echo \"$out\" | grep -E '^(pass|FAIL) ' >&2\n  echo \"verify failed. Fix the failures above, then stop again.\" >&2\n  exit 2\nfi\nexit 0\n\nThen: echo '{\"hook_event_name\": \"Stop\", \"stop_hook_active\": false}' | scripts/claude_stop_verify.sh; echo exit=$?",
+    "see": "pass  lint\nFAIL  tests\nverify failed. Fix the failures above, then stop again.\nexit=2"
+   },
+   {
+    "do": "echo '{\"hook_event_name\": \"Stop\", \"stop_hook_active\": true}' | scripts/claude_stop_verify.sh; echo exit=$?",
+    "see": "verify already asked once; letting the session end\nexit=0"
+   }
+  ],
+  "faded": "Fix the bug (put return a + b back) and feed the hook the stop_hook_active false input again. Predict the output and the exit code before you run it; the command is left to you.",
+  "alone": "Add a FULL_RUN rule like G7-14's: a change to pytest.ini must run the tests even when app/ and tests/ did not change. Edit only pytest.ini (add a comment line), run uv run poe verify, and show that the tests step runs. Then run uv run poe verify --all and check both steps pass.",
+  "done": "verify runs no steps for a docs change and exits 1 on the bug. The hook turns that into exit 2, and a pytest.ini change runs the tests."
+ },
+ "quiz": [
+  {
+   "q": "The Stop hook finds verify red. What should the script do?",
+   "options": [
+    {
+     "text": "Exit 1, so Claude Code shows an error and stops.",
+     "correct": false,
+     "why": "Exit 1 is a hook error that does not send the agent back with the message."
+    },
+    {
+     "text": "Print the summary and the failures.md path to stderr and exit 2.",
+     "correct": true,
+     "why": "Exit 2 blocks the stop and hands stderr to the agent as its next instruction."
+    },
+    {
+     "text": "Fix the failing test itself, then exit 0.",
+     "correct": false,
+     "why": "A hook reports; the agent fixes the code."
+    }
+   ]
+  },
+  {
+   "q": "A change touches only cloud/rhinoCloud/rhinoCore/migrations/. What does poe verify run for the API layer?",
+   "options": [
+    {
+     "text": "Nothing, because no test file changed.",
+     "correct": false,
+     "why": "FULL_RUN exists for exactly this case."
+    },
+    {
+     "text": "poe api-test-affected, because migrations are cloud code.",
+     "correct": false,
+     "why": "testmon cannot see migrations, so the affected set could be empty."
+    },
+    {
+     "text": "poe api-test, the whole layer, because migrations are in FULL_RUN.",
+     "correct": true,
+     "why": "Migrations, fixtures and the conftest are read during setup, which testmon cannot track."
+    }
+   ]
+  },
+  {
+   "q": "poe doctor fails in the nightly sandbox image build. What happens?",
+   "options": [
+    {
+     "text": "The build fails, the image is not promoted, and yesterday's image stays in use.",
+     "correct": true,
+     "why": "The alert names the failing checks so the owner can fix them."
+    },
+    {
+     "text": "The doctor runs --fix and the build continues.",
+     "correct": false,
+     "why": "The playbook runs the doctor without --fix; a broken fresh setup must be seen, not patched."
+    },
+    {
+     "text": "The new image is promoted with a warning.",
+     "correct": false,
+     "why": "Then Nova would run on a machine that cannot run verify."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From g7-1: which paths can testmon not see, and why?",
+  "From p8-4: what does stop_hook_active tell a Stop hook?"
+ ],
+ "videos": [],
+ "words": [
+  {
+   "term": "verify",
+   "plain": "One command per area (npm run verify, poe verify) that checks what changed since main and prints pass or FAIL per step."
+  },
+  {
+   "term": "vitest related",
+   "plain": "A Vitest command that runs only the tests that import the given files."
+  },
+  {
+   "term": "FULL_RUN paths",
+   "plain": "Paths testmon cannot see (migrations, fixtures, conftest); a change there runs the whole API layer."
+  },
+  {
+   "term": "CLAUDE_PROJECT_DIR",
+   "plain": "The environment variable Claude Code sets to the project root when it runs a hook."
+  },
+  {
+   "term": "core.hooksPath",
+   "plain": "The git setting that says where git hooks live; husky sets it, so pre-commit's hooks never run."
+  },
+  {
+   "term": "Ansible task",
+   "plain": "One step in a playbook that configures the machine during the image build; register keeps its result."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G7-10",
+   "why": "This lesson walked through verify.ts line by line: the changed files, the steps and the one-line summary.",
+   "walk": [
+    "Add frontend/scripts/verify.ts from the block above and \"verify\": \"node scripts/verify.ts\" to frontend/package.json.",
+    "Check the base: git merge-base with origin/main, or VERIFY_BASE when set.",
+    "Decide affected stories with the FE guild: @storybook/addon-vitest or a render smoke test per changed story.",
+    "Add the section to frontend/AGENTS.md: tests assert on test ids, ARIA roles and names, visible text and row counts.",
+    "Run npm run verify on a branch with one changed component and check the summary lines."
+   ]
+  },
+  {
+   "key": "G7-14",
+   "why": "This lesson walked through poe_verify.py, the Stop hook and the CI calls that make green mean the same everywhere.",
+   "walk": [
+    "Add scripts/poe_verify.py from the two blocks above and the verify script task in [tool.poe.tasks].",
+    "Add scripts/claude_stop_verify.sh (pick the command by changed paths, exit 2 on failure, exit 0 when stop_hook_active) and the Stop entry in .claude/settings.json.",
+    "Agree with Platform that the command and its exit code are the contract with Nova's harness (settingSources [\"project\"]).",
+    "CI: API Tests runs uvx --from poethepoet poe verify --all. frontend-ci's unit-tests job runs npm run verify -- --all with VITEST_MONOCART=1.",
+    "Decide the client/ step with the BE guild; point the G8 verify skill, the G4 checking guide and be-repo-conventions at both commands."
+   ]
+  },
+  {
+   "key": "G7-22",
+   "why": "This lesson walked through poe_doctor.py: the requirements read from the repo, the checks table, safe fixes and JSON output.",
+   "walk": [
+    "Add scripts/poe_doctor.py from the two blocks above and the doctor script task next to scripts/poe_createsuperuser.py.",
+    "Add the remaining checks in the same shape: npm, poe, the rhino-net network, and uv sync --check for the client.",
+    "Keep --fix to safe local commands; never credentials, ~/.aws or Docker volumes.",
+    "Decide with the BE guild whether husky's pre-commit should also call pre-commit for Python files.",
+    "Try it on two laptops, one a new joiner's if possible, and fix the three most confusing messages."
+   ]
+  },
+  {
+   "key": "G7-25",
+   "why": "This lesson walked through the three Ansible tasks that run the doctor in the nightly image build.",
+   "walk": [
+    "In infrastructure/packer/images/ai-agent-sandbox/playbook.yml (from G3), after the fcp checkout and the install, add the three tasks above.",
+    "Use G3's variable names for the checkout folder and the sandbox user; run as that user, not root.",
+    "Check that a failing doctor fails the Packer build and the previous image stays in use.",
+    "Put the failing check names into the G3 image-build alert."
+   ]
+  }
+ ],
+ "remember": "The editor, the agent and CI run one verify per area; a nightly doctor proves a fresh machine can run it."
+}

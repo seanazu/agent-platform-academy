@@ -1,0 +1,580 @@
+{
+ "id": "g3-9",
+ "title": "The harness: session, hooks and store",
+ "minutes": 60,
+ "youNeed": [
+  "p8-4",
+  "p8-6",
+  "g3-8"
+ ],
+ "bridge": "nova-worker is like a small Node service run by pm2: it starts, reads its config, and does one long job. Except the job is a Claude session that runs tools on the VM. Our code only sets the options, the walls and where the transcript is saved. It never limits turns, time or budget.",
+ "intro": "nova-worker is the program that runs inside every sandbox VM. This lesson writes its three core files. session.ts starts a Claude Agent SDK session that talks only to our LLM gateway. hooks.ts holds the walls. store.ts saves the transcript to S3 so a run can resume on another VM.",
+ "picture": {
+  "caption": "nova-worker sets up one session. The model's calls go through the gateway; hooks guard every tool; the transcript leaves the VM batch by batch.",
+  "nodes": [
+   {
+    "id": "task",
+    "label": "/run/nova/task.json",
+    "kind": "file"
+   },
+   {
+    "id": "worker",
+    "label": "nova-worker (harness)",
+    "kind": "agent"
+   },
+   {
+    "id": "claude",
+    "label": "/usr/local/bin/claude (pinned)",
+    "kind": "machine"
+   },
+   {
+    "id": "gateway",
+    "label": "LLM gateway over PrivateLink",
+    "kind": "service"
+   },
+   {
+    "id": "hooks",
+    "label": "wall hooks",
+    "kind": "check"
+   },
+   {
+    "id": "broker",
+    "label": "broker",
+    "kind": "service"
+   },
+   {
+    "id": "s3",
+    "label": "runs/<run_id>/sessions/... in S3",
+    "kind": "file"
+   }
+  ],
+  "steps": [
+   {
+    "from": "task",
+    "to": "worker",
+    "text": "systemd starts nova-worker run /run/nova/task.json as user agent"
+   },
+   {
+    "from": "worker",
+    "to": "claude",
+    "text": "query() with our options; the SDK runs the pinned claude binary"
+   },
+   {
+    "from": "claude",
+    "to": "gateway",
+    "text": "every model call carries the run token; the gateway adds the real key"
+   },
+   {
+    "from": "claude",
+    "to": "hooks",
+    "text": "before each tool and before stopping, the hooks may refuse"
+   },
+   {
+    "from": "worker",
+    "to": "broker",
+    "text": "ask_human, post_progress, kb_search refresh, and a heartbeat every 30 s"
+   },
+   {
+    "from": "worker",
+    "to": "s3",
+    "text": "each transcript batch is PUT through a URL the broker presigned"
+   }
+  ]
+ },
+ "sections": [
+  {
+   "h": "One command, a few files",
+   "p": [
+    "The harness lives in ai-agents/harness/src/. main.ts is the command, nova-worker run /run/nova/task.json, behind a #!/usr/bin/env node line. session.ts builds the options, tools.ts holds our three tools, hooks.ts the walls, and store.ts the session store. It ships as one bundled file (lesson g3-1) and runs as user agent under systemd (lesson g3-8).",
+    "Because it is a bundle, it imports the SDK from @anthropic-ai/claude-agent-sdk/core, the entry the SDK documents for bundled apps. The names are the same as the root entry.",
+    "main.ts puts the gateway URL and the run token into process.env at start. Every session in the VM then reaches the gateway the same way: Nova, the QA agent, judges and reviewers. It writes /run/nova/status.json (step, state, session_id, result). A setInterval timer sends a heartbeat to the broker every 30 seconds. The model runs in the claude subprocess, so a long thinking turn still counts as alive."
+   ]
+  },
+  {
+   "h": "The options, part 1: model, tools, permissions",
+   "p": [
+    "Our three tools live in an in-process MCP server built with createSdkMcpServer and tool() (lesson p8-3). ask_human posts a question to the ticket's thread and ends the turn with status needs_answer. post_progress posts a short update. kb_search runs the kb search CLI from rnd-kb-tooling over a local rnd-kb mirror in $KB_DIR. Nova ranks pages exactly like people do."
+   ],
+   "because": "We list every allowed tool and use dontAsk, because nobody sits at a prompt in a VM.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/session.ts (part 1 of 2)",
+    "text": "// ai-agents/harness/src/session.ts: sketch. No key in the VM: the gateway adds it.\nimport { createSdkMcpServer, type Options, type SessionStore } from \"@anthropic-ai/claude-agent-sdk/core\";\n\nexport const buildOptions = (task: Task, hooks: Options[\"hooks\"], store: SessionStore): Options => {\n  const route = routeFor(task.job); // Opus 5.5 at medium unless the plan picked another row (G3-33)\n  return {\n    model: route.model,\n    effort: route.effort,\n    cwd: \"/work/fcp\", // the same on every VM, so a stored session resumes anywhere\n    settingSources: [\"project\"], // fcp's CLAUDE.md/AGENTS.md and .claude/; managed settings load anyway\n    allowedTools: [\"Read\", \"Grep\", \"Glob\", \"Edit\", \"Write\", \"Bash\", \"TodoWrite\",\n      \"Workflow\", \"mcp__nova__ask_human\", \"mcp__nova__post_progress\", \"mcp__nova__kb_search\"], // Workflow: G4-09, G4-19\n    disallowedTools: [\"WebFetch\", \"WebSearch\"], // the proxy blocks the web anyway; say so up front\n    permissionMode: \"dontAsk\", // nobody sits at a prompt: anything not allowed is refused\n    mcpServers: { nova: createSdkMcpServer({ name: \"nova\", tools: [askHuman, postProgress, kbSearch] }) }, // call the broker\n    hooks, // walls (G3-21) and the progress watcher (G3-32)\n    sessionStore: store, // transcripts to S3 through the broker (G3-23)\n    resume: task.resumeSessionId, // after a question, or on a fresh VM\n    pathToClaudeCodeExecutable: \"/usr/local/bin/claude\", // the pinned binary the nightly smoke test passed (G3-14)",
+    "notes": [
+     {
+      "line": 2,
+      "text": "From /core, because the harness is bundled. Options and SessionStore are types only."
+     },
+     {
+      "line": 4,
+      "text": "One function builds the options from the task, the hooks and the store, so tests can check them without starting a session."
+     },
+     {
+      "line": 5,
+      "text": "The routing table (G3-33) picks model and effort per job. The default is Opus 5.5 at medium."
+     },
+     {
+      "line": 9,
+      "text": "/work/fcp on every VM. The stored session's project key is built from cwd, so a different path would not resume."
+     },
+     {
+      "line": 10,
+      "text": "Load fcp's own CLAUDE.md, AGENTS.md and .claude/ settings. Managed settings from the image load anyway."
+     },
+     {
+      "line": 11,
+      "text": "The tools the model may use with no prompt. Workflow is there for the research and review-panel workflows (G4-09, G4-19)."
+     },
+     {
+      "line": 12,
+      "text": "MCP tool names are mcp__<server>__<tool>."
+     },
+     {
+      "line": 13,
+      "text": "The web tools are denied outright. The proxy blocks the web anyway; saying so up front saves the model a wasted turn."
+     },
+     {
+      "line": 14,
+      "text": "dontAsk: anything not allowed is refused, never sent to a person."
+     },
+     {
+      "line": 16,
+      "text": "The hooks: the walls in this lesson and the progress watcher (G3-32)."
+     },
+     {
+      "line": 17,
+      "text": "Where the transcript is mirrored (section 6)."
+     },
+     {
+      "line": 18,
+      "text": "Set after a question was answered, or when the run moves to a fresh VM."
+     },
+     {
+      "line": 19,
+      "text": "The pinned claude from the image, the exact binary the nightly smoke test passed (lesson g3-5)."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The options, part 2: no key in the VM",
+   "p": [
+    "The env option replaces the claude subprocess's whole environment. So it spreads process.env first, then sets our values on top. Two settings point Claude Code at the gateway instead of Anthropic. The gateway checks the run token, adds the real key and meters the spend (G0-13).",
+    "The ticket also sets CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1, which is off behind a gateway like tool search. With no API key, Claude Code cannot fetch feature flags. So the permission mode is set explicitly, and G4's W6 spike checks the Workflow tool works."
+   ],
+   "because": "We spread process.env before our values, because env replaces the environment, and a claude with no PATH or HOME cannot start.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/session.ts (part 2 of 2)",
+    "text": "    env: {\n      ...process.env, // env REPLACES the subprocess environment, so spread it first\n      ANTHROPIC_BASE_URL: GATEWAY_URL, // https://gateway.ai-agents.example.com:8443 over PrivateLink\n      ANTHROPIC_AUTH_TOKEN: task.gatewayToken, // G0-13 run token: not an Anthropic key, dies with the run\n      ...stepEnv(task.run, task.step), // G1-14: OTel tags and the x-ai-agents-step header; agent, jira, run ride in the token\n      ENABLE_TOOL_SEARCH: \"true\", // off by default behind a gateway (G0-13)\n      CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: \"1\", // helpers can't start helpers\n      CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS: String(WORKFLOW_AGENTS[task.size]), // 3 / 6 / 12\n      ...ROUTING_ENV, // output limit and cache TTL (G3-33)\n    },\n    // No maxTurns, no maxBudgetUsd, no taskBudget: work is never cut off mid-run.\n  };\n};",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Keep PATH, HOME and the proxy variables from the image. Our values below win where names clash."
+     },
+     {
+      "line": 3,
+      "text": "https://gateway.ai-agents.example.com:8443, reached over PrivateLink (lesson g3-3)."
+     },
+     {
+      "line": 4,
+      "text": "The run token: signed by the orchestrator, valid for this run only. It is not an Anthropic key."
+     },
+     {
+      "line": 5,
+      "text": "stepEnv (G1-14) adds OTel tags and the x-ai-agents-step header. Agent, Jira key and run ride inside the token."
+     },
+     {
+      "line": 6,
+      "text": "Tool search is off by default behind a gateway; we turn it back on."
+     },
+     {
+      "line": 7,
+      "text": "A helper agent cannot start helpers of its own."
+     },
+     {
+      "line": 8,
+      "text": "How many agents a workflow may run at once, by VM size: 3 on lite, 6 on full, 12 on wide."
+     },
+     {
+      "line": 9,
+      "text": "The routing table's output limit and cache TTL."
+     },
+     {
+      "line": 11,
+      "text": "The guide-don't-cage rule, written where the next person will see it."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "wall",
+    "text": "No maxTurns, no maxBudgetUsd, no taskBudget, no timer. Work is never cut off mid-run. Spend is watched at the gateway, and loops are caught by the progress watcher, not by a cap."
+   }
+  },
+  {
+   "h": "Wall hooks, part 1: refuse and say why",
+   "p": [
+    "Hooks are functions the SDK calls at fixed points (lesson p8-4). G3-21 adds three. PreToolUse refuses edits to protected paths and a few never-run commands. PostToolUse lints a file right after it is edited. Stop asks for proof before Nova may say done.",
+    "The protected paths come from ai-agents/settings/protected-paths.yaml, which release-harness.yml packs into the tarball. G0-18's locked-checks check reads the same file. It lists CI workflows, lint and type config, eval sets and the plan's QA checks. It is not a list in the prompt."
+   ],
+   "because": "We refuse with a calm reason and an alternative, because a model told only 'no' tries another way around.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/hooks.ts (part 1 of 2)",
+    "text": "// ai-agents/harness/src/hooks.ts: sketch. Walls only; how to work stays guidance.\nimport type { HookCallback, HookJSONOutput, PreToolUseHookInput, StopHookInput } from \"@anthropic-ai/claude-agent-sdk/core\";\n\nconst PROTECTED = loadGlobs(\"/opt/ai-agents/harness/settings/protected-paths.yaml\"); // this repo's block; G0-18 reads the same file\nconst NEVER_RUN =\n  /\\b(terraform|tofu|terragrunt)\\b.*\\b(apply|destroy)\\b|argocd\\s+app\\s+sync|gh\\s+workflow\\s+run|\\/dispatches\\b|169\\.254\\.169\\.254/;\n\nexport const blockWalls: HookCallback = async (input) => {\n  const { tool_name: tool, tool_input } = input as PreToolUseHookInput;\n  const args = tool_input as { file_path?: string; notebook_path?: string; command?: string };\n  const path = args.file_path ?? args.notebook_path;\n  if (path && matches(path, PROTECTED)) {\n    return refuse(tool, path, \"This file is one of the checks your work is judged by. \" +\n      \"Add a new test instead, or ask the requester with ask_human.\");\n  }\n  if (tool === \"Bash\" && args.command && NEVER_RUN.test(args.command)) {\n    return refuse(tool, args.command, \"Agents never apply, destroy, sync or dispatch. Leave a note for a person.\");\n  }\n  return {};\n};",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Types only, from /core. A hook is a plain async function of type HookCallback."
+     },
+     {
+      "line": 4,
+      "text": "The globs for this repo's block of protected-paths.yaml, read once at start."
+     },
+     {
+      "line": 6,
+      "text": "Never-run commands: infra apply or destroy, argocd app sync, gh workflow run, /dispatches, and the metadata address."
+     },
+     {
+      "line": 9,
+      "text": "The input names the tool and its arguments. The matcher (Edit|Write|MultiEdit|NotebookEdit, or Bash) decides which calls reach us."
+     },
+     {
+      "line": 11,
+      "text": "Edit and Write use file_path; NotebookEdit uses notebook_path."
+     },
+     {
+      "line": 13,
+      "text": "The reason the model reads, with the alternative: add a new test, or ask the requester."
+     },
+     {
+      "line": 16,
+      "text": "The same idea for Bash commands."
+     },
+     {
+      "line": 19,
+      "text": "An empty object means 'no opinion': the normal permission rules decide."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "why",
+    "text": "The real walls are elsewhere: no credentials in the VM, the broker's checks, GitHub refusing workflow edits without the workflows permission. The hook gives the model a clear answer and leaves a record."
+   }
+  },
+  {
+   "h": "Wall hooks, part 2: evidence and the ledger",
+   "p": [
+    "The Stop hook runs when the model wants to finish. fcp's own Stop hook (G7-14) already runs verify in this session, because settingSources loads fcp's project settings. So ours does not run it again. It checks that each check in the plan's QA plan has a passing run recorded after the last edit.",
+    "PostToolUse on Edit|Write runs the fast linter for that one file. That is biome check --write under frontend/, and black, isort and flake8 under cloud/, client/ and sdk/. Failures go back to the model as additionalContext."
+   ],
+   "because": "We let a stop through when the missing proof is not Nova's fault, because blocking on a flaky test loops forever.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/hooks.ts (part 2 of 2)",
+    "text": "export const requireEvidence: HookCallback = async (input) => {\n  const missing = planChecks().filter((check) => !ledger.passedAfterLastEdit(check));\n  if (missing.length === 0) return {};\n  if ((input as StopHookInput).stop_hook_active && ledger.notOurs(missing)) { // flaky, or main was already red\n    ledger.flagUnproven(missing); // shown in the PR, not looped on\n    return {};\n  }\n  return { decision: \"block\", reason: `Before you stop, run these and show them passing: ${missing.join(\", \")}` };\n};\n\nconst refuse = (tool: string, target: string, why: string): HookJSONOutput => {\n  ledger.refused(tool, target, why); // listed in the PR (G3-31)\n  return { hookSpecificOutput: { hookEventName: \"PreToolUse\", permissionDecision: \"deny\", permissionDecisionReason: why } };\n};",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The plan's checks with no passing run after the last edit."
+     },
+     {
+      "line": 3,
+      "text": "Nothing missing: allow the stop."
+     },
+     {
+      "line": 4,
+      "text": "stop_hook_active means we already blocked once. If the gap is not Nova's (a flaky test, main red at freshen)..."
+     },
+     {
+      "line": 5,
+      "text": "...flag it as unproven, with the reason. It shows in the PR, and the loop ends."
+     },
+     {
+      "line": 8,
+      "text": "Otherwise block, and tell the model exactly what to run and show."
+     },
+     {
+      "line": 12,
+      "text": "Every refusal goes into the refusal ledger, /run/nova/refusals.jsonl, uploaded with the artifacts. G3-31 lists it in the PR."
+     },
+     {
+      "line": 13,
+      "text": "The PreToolUse answer: deny, with the reason the model will read."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The store, part 1: append",
+   "p": [
+    "The VM is only a workbench. If the transcript lives only on its disk, a dead VM throws away the run's thinking. A SessionStore mirrors every transcript batch somewhere else (lesson p8-6). G3-23 copies Anthropic's TypeScript reference adapter, examples/session-stores/s3. It replaces its S3Client with broker-presigned URLs and fetch, because the VM has no AWS credentials.",
+    "Keys look like runs/<run_id>/sessions/<projectKey>/<sessionId>/[<subpath>/]part-<wall-clock ms>-<seq>.jsonl. Each append writes one new part file; nothing is ever rewritten."
+   ],
+   "because": "We name parts by wall-clock time, because a resumed run's counter starts at zero again on the new VM.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/store.ts (part 1 of 2)",
+    "text": "// ai-agents/harness/src/store.ts: sketch. Adapted from the Agent SDK's S3 reference adapter (examples/session-stores/s3);\n// the VM has no AWS keys, so every object goes through a URL the broker presigns for this run's prefix.\nimport type { SessionKey, SessionStore, SessionStoreEntry } from \"@anthropic-ai/claude-agent-sdk/core\";\n\nexport class BrokerS3SessionStore implements SessionStore {\n  readonly #seen = new Set<string>(); // entry uuids already stored\n  #seq = 0;\n  constructor(private readonly broker: BrokerClient) {}\n\n  #prefix(key: SessionKey): string {\n    return `sessions/${key.projectKey}/${key.sessionId}${key.subpath ? `/${key.subpath}` : \"\"}`;\n  }\n\n  async append(key: SessionKey, entries: SessionStoreEntry[]): Promise<void> {\n    const fresh = entries.filter((e) => !(typeof e.uuid === \"string\" && this.#seen.has(e.uuid))); // retried batches repeat\n    if (fresh.length === 0) return;\n    // Wall-clock time, not a per-process counter: parts written later on another VM must sort after these.\n    const name = `${this.#prefix(key)}/part-${Date.now()}-${String(this.#seq++).padStart(6, \"0\")}.jsonl`;\n    const res = await fetch(await this.broker.artifactUrl(name, { write: true }), { method: \"PUT\", body: fresh.map((e) => JSON.stringify(e)).join(\"\\n\") });\n    if (!res.ok) throw new Error(`session store PUT failed: ${res.status}`); // the SDK retries, then reports mirror_error\n    for (const e of fresh) if (typeof e.uuid === \"string\") this.#seen.add(e.uuid);\n  }",
+    "notes": [
+     {
+      "line": 3,
+      "text": "The store types, from /core."
+     },
+     {
+      "line": 6,
+      "text": "uuids of entries already stored. Retried batches can repeat entries, so we skip those."
+     },
+     {
+      "line": 7,
+      "text": "A counter for parts written in the same millisecond."
+     },
+     {
+      "line": 8,
+      "text": "The broker client is passed in, so tests can use a fake broker."
+     },
+     {
+      "line": 11,
+      "text": "sessions/<projectKey>/<sessionId>, plus a subpath for a subagent's transcript. The broker adds runs/<run_id>/ in front."
+     },
+     {
+      "line": 15,
+      "text": "Drop entries whose uuid we already stored."
+     },
+     {
+      "line": 18,
+      "text": "part-<ms since 1970>-<6-digit counter>.jsonl. Names sort by time across VMs."
+     },
+     {
+      "line": 19,
+      "text": "Ask the broker for a presigned PUT URL, then upload the entries as JSON lines."
+     },
+     {
+      "line": 20,
+      "text": "On failure, throw. The SDK retries, then reports a mirror_error message."
+     },
+     {
+      "line": 21,
+      "text": "Remember the uuids only after the upload succeeded."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The store, part 2: load and subkeys",
+   "p": [
+    "On resume the SDK calls load before the claude process even starts, so the new VM needs nothing on its disk. The workflow passes resume: <sessionId>, and cwd stays /work/fcp because the project key encodes it."
+   ],
+   "because": "We read the parts in name order, because name order is time order, and order matters in a conversation.",
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/store.ts (part 2 of 2)",
+    "text": "  async load(key: SessionKey): Promise<SessionStoreEntry[] | null> {\n    const parts = await this.broker.listArtifacts(`${this.#prefix(key)}/part-`); // sorted by name = by time\n    if (parts.length === 0) return null;\n    const entries: SessionStoreEntry[] = [];\n    for (const part of parts) {\n      const body = await (await fetch(await this.broker.artifactUrl(part, { write: false }))).text();\n      entries.push(...body.split(\"\\n\").filter(Boolean).map((line) => JSON.parse(line) as SessionStoreEntry));\n    }\n    return entries;\n  }\n\n  async listSubkeys(key: { projectKey: string; sessionId: string }): Promise<string[]> {\n    return this.broker.listSubkeys(this.#prefix(key)); // restores subagent transcripts too\n  }\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The broker lists this run's objects with that prefix, sorted by name, which is time."
+     },
+     {
+      "line": 3,
+      "text": "No parts: null tells the SDK there is nothing to resume."
+     },
+     {
+      "line": 6,
+      "text": "Each part through a presigned GET URL from the broker."
+     },
+     {
+      "line": 7,
+      "text": "Split into lines, drop empty ones, parse each as one entry."
+     },
+     {
+      "line": 12,
+      "text": "listSubkeys lets subagent transcripts resume too."
+     }
+    ]
+   },
+   "callout": {
+    "kind": "gotcha",
+    "text": "Leave enableFileCheckpointing off: the SDK refuses it together with a store. Watch for { type: \"system\", subtype: \"mirror_error\" } messages; count them and post_progress once if the store keeps failing. Retention is the bucket's 30-day expiry, because the SDK never deletes from a store."
+   }
+  }
+ ],
+ "lab": {
+  "title": "Test the wall hook with recorded tool inputs",
+  "youNeed": [
+   "Node 24 (node -v prints v24.x)",
+   "No Claude login: the hook is a plain function, and the test never starts claude"
+  ],
+  "worked": [
+   {
+    "do": "mkdir -p ~/academy/hooks-lab/src ~/academy/hooks-lab/test/inputs && cd ~/academy/hooks-lab && npm init -y >/dev/null && npm pkg set type=module",
+    "see": "(no output)"
+   },
+   {
+    "do": "npm i --save-exact --omit=optional -D tsx@4.20.3 typescript@5.9.3 @types/node@24.12.2 @anthropic-ai/claude-agent-sdk@0.3.296 zod@4 @anthropic-ai/sdk @modelcontextprotocol/sdk",
+    "see": "added 108 packages, and audited 109 packages in 34s\n(--omit=optional skips the SDK's own claude binary; we only need its types)"
+   },
+   {
+    "do": "Save src/hooks.ts: blockWalls and refuse from sections 4 and 5, with the globs inline instead of the YAML file, and matchesGlob from node:path:\n\nimport { matchesGlob } from \"node:path\";\nimport type { HookCallback, HookJSONOutput, PreToolUseHookInput } from \"@anthropic-ai/claude-agent-sdk/core\";\n\n// In the harness these come from settings/protected-paths.yaml; here they are inline.\nconst PROTECTED = [\".github/workflows/**\", \"frontend/biome.json\", \"frontend/tsconfig*.json\", \"frontend/e2e/pr/**\"];\nconst NEVER_RUN =\n  /\\b(terraform|tofu|terragrunt)\\b.*\\b(apply|destroy)\\b|argocd\\s+app\\s+sync|gh\\s+workflow\\s+run|\\/dispatches\\b|169\\.254\\.169\\.254/;\nexport const refusals: { tool: string; target: string; why: string }[] = [];\n\nconst matches = (path: string, globs: string[]) =>\n  globs.some((g) => matchesGlob(path.replace(/^\\/work\\/fcp\\//, \"\"), g));\n\nconst refuse = (tool: string, target: string, why: string): HookJSONOutput => {\n  refusals.push({ tool, target, why }); // the refusal ledger\n  return { hookSpecificOutput: { hookEventName: \"PreToolUse\", permissionDecision: \"deny\", permissionDecisionReason: why } };\n};\n\nexport const blockWalls: HookCallback = async (input) => {\n  const { tool_name: tool, tool_input } = input as PreToolUseHookInput;\n  const args = tool_input as { file_path?: string; notebook_path?: string; command?: string };\n  const path = args.file_path ?? args.notebook_path;\n  if (path && matches(path, PROTECTED)) {\n    return refuse(tool, path, \"This file is one of the checks your work is judged by. \" +\n      \"Add a new test instead, or ask the requester with ask_human.\");\n  }\n  if (tool === \"Bash\" && args.command && NEVER_RUN.test(args.command)) {\n    return refuse(tool, args.command, \"Agents never apply, destroy, sync or dispatch. Leave a note for a person.\");\n  }\n  return {};\n};",
+    "see": "(a file)"
+   },
+   {
+    "do": "Save three recorded PreToolUse inputs, the JSON the SDK hands a hook:\n\ntest/inputs/edit-workflow.json\n{ \"hook_event_name\": \"PreToolUse\", \"session_id\": \"s-1\", \"transcript_path\": \"/tmp/t.jsonl\", \"cwd\": \"/work/fcp\",\n  \"tool_name\": \"Edit\", \"tool_use_id\": \"toolu_01\",\n  \"tool_input\": { \"file_path\": \"/work/fcp/.github/workflows/frontend-ci.yml\", \"old_string\": \"npm test\", \"new_string\": \"true\" } }\n\ntest/inputs/bash-apply.json\n{ \"hook_event_name\": \"PreToolUse\", \"session_id\": \"s-1\", \"transcript_path\": \"/tmp/t.jsonl\", \"cwd\": \"/work/fcp\",\n  \"tool_name\": \"Bash\", \"tool_use_id\": \"toolu_02\",\n  \"tool_input\": { \"command\": \"cd infra && terragrunt run-all apply --auto-approve\" } }\n\ntest/inputs/edit-component.json\n{ \"hook_event_name\": \"PreToolUse\", \"session_id\": \"s-1\", \"transcript_path\": \"/tmp/t.jsonl\", \"cwd\": \"/work/fcp\",\n  \"tool_name\": \"Edit\", \"tool_use_id\": \"toolu_03\",\n  \"tool_input\": { \"file_path\": \"/work/fcp/frontend/src/components/Button.tsx\", \"old_string\": \"a\", \"new_string\": \"b\" } }",
+    "see": "(three files)"
+   },
+   {
+    "do": "Save test/hooks.test.ts:\n\nimport test from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { readFileSync } from \"node:fs\";\nimport { blockWalls, refusals } from \"../src/hooks.js\";\n\nconst recorded = (name: string) => JSON.parse(readFileSync(new URL(`./inputs/${name}.json`, import.meta.url), \"utf8\"));\nconst signal = new AbortController().signal;\nconst decide = async (name: string) => {\n  const out = await blockWalls(recorded(name), recorded(name).tool_use_id, { signal });\n  return (out as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision ?? \"no opinion\";\n};\n\ntest(\"an edit to a CI workflow is denied and recorded\", async () => {\n  assert.equal(await decide(\"edit-workflow\"), \"deny\");\n  assert.equal(refusals.at(-1)?.target, \"/work/fcp/.github/workflows/frontend-ci.yml\");\n});\n\ntest(\"terragrunt apply is denied\", async () => {\n  assert.equal(await decide(\"bash-apply\"), \"deny\");\n});\n\ntest(\"an edit to a normal component is left to the permission rules\", async () => {\n  assert.equal(await decide(\"edit-component\"), \"no opinion\");\n});",
+    "see": "(a file)"
+   },
+   {
+    "do": "node --import tsx --test test/*.test.ts",
+    "see": "✔ an edit to a CI workflow is denied and recorded (4.533375ms)\n✔ terragrunt apply is denied (16.998709ms)\n✔ an edit to a normal component is left to the permission rules (0.483208ms)\nℹ tests 3\nℹ pass 3\nℹ fail 0"
+   },
+   {
+    "do": "Check the SDK's types: npx tsc --noEmit --strict --module nodenext --moduleResolution nodenext --target es2023 --types node src/hooks.ts test/hooks.test.ts && echo types ok",
+    "see": "types ok"
+   }
+  ],
+  "faded": "Record a fourth input, bash-imds.json: a Bash call whose command is curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/. Add a test for it next to the others. The assertion is yours. The decision must be deny, and the last refusal's why must name apply, destroy, sync or dispatch.",
+  "alone": "Write lintHint, a PostToolUse hook in src/hooks.ts. It handles an Edit or Write under /work/fcp/frontend/. For those it returns { hookSpecificOutput: { hookEventName: \"PostToolUse\", additionalContext: \"Run: biome check --write <file>\" } } with the real path. For anything else it returns {}. The real hook runs the linter; the lab returns a hint. Record two PostToolUse inputs, one under frontend/ and one under cloud/, and test both.",
+  "done": "Five tests pass (three walls, the metadata call, and at least one lintHint case), and tsc prints no errors."
+ },
+ "quiz": [
+  {
+   "q": "A teammate writes env: { ANTHROPIC_BASE_URL: GATEWAY_URL, ANTHROPIC_AUTH_TOKEN: token } without ...process.env. What happens?",
+   "options": [
+    {
+     "text": "Nothing changes: env is merged with the parent environment.",
+     "correct": false,
+     "why": "env replaces the subprocess environment. That is why the sketch spreads process.env first."
+    },
+    {
+     "text": "The claude subprocess starts with no PATH, HOME or proxy variables, and fails or cannot reach anything.",
+     "correct": true,
+     "why": "Only the two variables exist. Spreading process.env keeps the image's environment."
+    },
+    {
+     "text": "Claude Code falls back to an Anthropic key from the VM.",
+     "correct": false,
+     "why": "There is no key in the VM to fall back to. That is the wall."
+    }
+   ]
+  },
+  {
+   "q": "Why must cwd be /work/fcp on every VM?",
+   "options": [
+    {
+     "text": "The stored session's project key is built from cwd; a different path would not find the session to resume.",
+     "correct": true,
+     "why": "Same path on every VM means a session stored on one VM resumes on any other."
+    },
+    {
+     "text": "Claude Code can only run inside a git checkout under /work.",
+     "correct": false,
+     "why": "It runs in any folder. The constraint comes from the session store's key."
+    },
+    {
+     "text": "The proxy allows file access only under /work.",
+     "correct": false,
+     "why": "The proxy filters network traffic, not files."
+    }
+   ]
+  },
+  {
+   "q": "Nova wants to stop. One QA check never passed because a known flaky test fails, and stop_hook_active is true. What does requireEvidence do?",
+   "options": [
+    {
+     "text": "Blocks again, until the test passes.",
+     "correct": false,
+     "why": "That loops forever on a failure that is not Nova's. The hook is a wall for proof, not a cage."
+    },
+    {
+     "text": "Runs the flaky test itself until it passes.",
+     "correct": false,
+     "why": "The hook only checks the ledger. Running tests is the model's job, and fcp's Stop hook runs verify."
+    },
+    {
+     "text": "Allows the stop and flags the check as unproven, with the reason, in the PR.",
+     "correct": true,
+     "why": "ledger.notOurs(missing) is true, so it flags and lets go. A person sees the gap."
+    }
+   ]
+  }
+ ],
+ "recall": [
+  "From g3-8: what does workInSandbox do when it reads a heartbeat older than 300 seconds?",
+  "From p8-6: on resume, when does the SDK call the store's load method?"
+ ],
+ "videos": [
+  {
+   "title": "You Can Build The Craziest Things with Claude's Agent SDK",
+   "url": "https://www.youtube.com/watch?v=ChaQ_tZDBFg",
+   "channel": "Traversy Media",
+   "minutes": 14,
+   "why": "Friendly first look at the Agent SDK from a well-known teacher."
+  }
+ ],
+ "words": [
+  {
+   "term": "harness",
+   "plain": "The code around the model: nova-worker, which sets the options, tools, hooks and store for a session."
+  },
+  {
+   "term": "run token",
+   "plain": "A token the orchestrator signs for one run. The gateway accepts it instead of an API key."
+  },
+  {
+   "term": "dontAsk",
+   "plain": "A permission mode: tools on the allowed list run, everything else is refused without a prompt."
+  },
+  {
+   "term": "protected-paths.yaml",
+   "plain": "The one list of files agents may not edit, read by the PreToolUse hook and by G0-18's check."
+  },
+  {
+   "term": "project key",
+   "plain": "Part of a stored session's key, built from cwd, so the same cwd is needed to resume."
+  },
+  {
+   "term": "part file",
+   "plain": "One JSON-lines file per append in the store, named by wall-clock time so parts sort across VMs."
+  }
+ ],
+ "tickets": [
+  {
+   "key": "G3-19",
+   "why": "This lesson explained the harness layout, the session options line by line, the gateway env and the three tools.",
+   "walk": [
+    "Create harness/src/main.ts (nova-worker run /run/nova/task.json, #!/usr/bin/env node). At start, put the gateway URL and run token into process.env.",
+    "Write session.ts (code above) importing from @anthropic-ai/claude-agent-sdk/core. Use no maxTurns, maxBudgetUsd or taskBudget.",
+    "Write tools.ts with createSdkMcpServer: ask_human (ends the turn with needs_answer), post_progress and kb_search (the kb CLI over $KB_DIR).",
+    "Set the env from the code plus CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1, and set the permission mode explicitly. Check the Workflow tool in G4's W6 spike.",
+    "Write /run/nova/status.json (step, state, session_id, result) and send a heartbeat to the broker every 30 s from a setInterval timer."
+   ]
+  },
+  {
+   "key": "G3-21",
+   "why": "This lesson explained the three hooks, hooks.ts line by line, the refusal ledger, and testing with recorded inputs.",
+   "walk": [
+    "Write harness/src/hooks.ts (code above), with loadGlobs reading the packed settings/protected-paths.yaml.",
+    "Register blockWalls on PreToolUse with matchers Edit|Write|MultiEdit|NotebookEdit and Bash.",
+    "Write the PostToolUse lint hook on Edit|Write: biome under frontend/, black, isort and flake8 under cloud/, client/ and sdk/. Return failures as additionalContext.",
+    "Write requireEvidence on Stop: plan checks need a passing run after the last edit; flag unproven when the failure is not Nova's.",
+    "Write every deny to /run/nova/refusals.jsonl and upload it with the artifacts (G3-31 lists it in the PR).",
+    "Add node:test cases for each hook with recorded tool inputs (the lab)."
+   ]
+  },
+  {
+   "key": "G3-23",
+   "why": "This lesson explained BrokerS3SessionStore line by line: the key layout, deduplication, wall-clock part names, load order and subkeys.",
+   "walk": [
+    "Copy examples/session-stores/s3 from claude-agent-sdk-typescript into harness/src/store.ts and replace S3Client with broker-presigned URLs and fetch (code above).",
+    "Pass sessionStore and, on resume, resume: <sessionId> from the workflow. Keep cwd /work/fcp and enableFileCheckpointing off.",
+    "Count mirror_error system messages and post_progress once if the store keeps failing.",
+    "Copy examples/session-stores/shared/conformance.ts into harness/test/ and run it against a fake broker.",
+    "Prove one real resume across two VMs. Retention is the bucket's 30-day expiry."
+   ]
+  }
+ ],
+ "remember": "The harness sets options, walls and a store, then gets out of the way: no key, no limits."
+}
