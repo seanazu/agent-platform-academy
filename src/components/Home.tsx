@@ -24,9 +24,15 @@ function Home() {
       <section className="hero">
         <ArtBox src={`${import.meta.env.BASE_URL}art/hero.webp`} ratio="21/9" accent="sky" seed="hero" className="hero-art" />
         <div className="hero-text">
-          <span className="eyebrow">A guided path</span>
+          <span className="eyebrow">A guided path · {course.parts.length} parts</span>
           <h1>{course.title}</h1>
           <p className="hero-goal">Learn to build Rhino Health's agent platform yourself: every one of the {course.ticketCount} tickets, explained from zero, one picture at a time.</p>
+          <dl className="title-block hero-stats">
+            <div><dt className="tb-label">Lessons</dt><dd>{course.lessonCount}</dd></div>
+            <div><dt className="tb-label">Tickets</dt><dd>{course.ticketCount}</dd></div>
+            <div><dt className="tb-label">Parts</dt><dd>{course.parts.length}</dd></div>
+            <div className="tb-accent"><dt className="tb-label">Done</dt><dd>{doneCount}</dd></div>
+          </dl>
         </div>
       </section>
 

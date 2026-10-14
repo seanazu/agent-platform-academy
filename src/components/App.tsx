@@ -6,6 +6,7 @@ import PartPage from './PartPage';
 import SearchPage from './SearchPage';
 import TicketsPage from './TicketsPage';
 import WordsPage from './WordsPage';
+import { course } from '../lib/course';
 import { useRoute } from '../lib/router';
 import { useTheme } from '../lib/theme';
 
@@ -30,7 +31,7 @@ function App() {
         {route.name === 'search' && <SearchPage initial={route.q} />}
       </main>
       <footer className="site-foot">
-        <span>Agent Platform Academy · lessons live in <code>content/lessons</code></span>
+        <span>Agent Platform Academy · drafting sheets for the agent platform · {course.lessonCount} lessons · {course.ticketCount} tickets</span>
       </footer>
     </div>
   );

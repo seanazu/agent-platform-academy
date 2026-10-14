@@ -14,7 +14,11 @@ function Header({ route, theme, onToggleTheme }: Props) {
   return (
     <header className="site-head">
       <a className="brand" href={href.home()}>
-        <span className="brand-mark" aria-hidden="true" />
+        <svg className="brand-mark" viewBox="0 0 28 28" aria-hidden="true">
+          <rect className="bm-glow" x="6" y="11" width="16" height="6" rx="3" />
+          <rect className="bm-head" x="3" y="5" width="22" height="18" rx="7" />
+          <rect className="bm-visor" x="7" y="11" width="14" height="6" rx="3" />
+        </svg>
         <span className="brand-name">Agent Platform Academy</span>
       </a>
       <nav className="site-nav" aria-label="Site">

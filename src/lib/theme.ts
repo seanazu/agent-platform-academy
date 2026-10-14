@@ -3,8 +3,8 @@ import { useCallback, useEffect, useState } from 'react';
 export type Theme = 'light' | 'dark';
 const KEY = 'apa.theme';
 
-const systemTheme = (): Theme =>
-  window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+// Night is the default: the page ground is the dioramas' own navy. Light (vellum) is one click away and remembered.
+const systemTheme = (): Theme => 'dark';
 
 const stored = (): Theme | undefined => {
   try {

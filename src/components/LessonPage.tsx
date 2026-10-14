@@ -8,7 +8,7 @@ import Section from './Section';
 import TicketCard from './TicketCard';
 import VideoCard from './VideoCard';
 import WordList from './WordList';
-import { findLesson, lessonNumber, neighbours } from '../lib/course';
+import { course, findLesson, lessonNumber, neighbours } from '../lib/course';
 import { getLesson, isSample } from '../lib/lessons';
 import { useProgress } from '../lib/progress';
 import { href } from '../lib/router';
@@ -43,10 +43,13 @@ function LessonPage({ id }: { id: string }) {
       <header className="lesson-head">
         <a className="eyebrow" href={href.part(part.id)}>{part.title}</a>
         <h1>{lesson.title}</h1>
+        <dl className="title-block lesson-title-block">
+          <div><dt className="tb-label">Sheet</dt><dd>{id}</dd></div>
+          <div><dt className="tb-label">Lesson</dt><dd>{lessonNumber(id)} / {course.lessonCount}</dd></div>
+          <div><dt className="tb-label">Time</dt><dd>{lesson.minutes} min</dd></div>
+          <div className={done ? 'tb-accent' : undefined}><dt className="tb-label">Status</dt><dd>{done ? 'Done' : 'Open'}</dd></div>
+        </dl>
         <div className="lesson-meta">
-          <span className="chip" data-tone="soft">Lesson {lessonNumber(id)}</span>
-          <span className="chip" data-tone="soft">{lesson.minutes} min</span>
-          {done && <span className="chip" data-tone="done">Done</span>}
           {isSample(id) && <span className="chip" data-tone="accent" title="Shown from src/sample because content/lessons has no file for this id yet">Sample lesson</span>}
         </div>
         {lesson.youNeed.length > 0 && (
@@ -72,20 +75,20 @@ function LessonPage({ id }: { id: string }) {
 
       <p className="lesson-intro">{lesson.intro}</p>
 
-      <h2 className="lesson-h2"><span className="h2-n">1</span>The picture</h2>
+      <h2 className="lesson-h2"><span className="h2-n">01</span>The picture</h2>
       <Picture picture={lesson.picture} lessonId={id} />
 
-      <h2 className="lesson-h2"><span className="h2-n">2</span>How it works</h2>
+      <h2 className="lesson-h2"><span className="h2-n">02</span>How it works</h2>
       <div className="lesson-sections">
         {lesson.sections.map((s, i) => (
           <Section key={i} section={s} index={i} />
         ))}
       </div>
 
-      <h2 className="lesson-h2"><span className="h2-n">3</span>The lab</h2>
+      <h2 className="lesson-h2"><span className="h2-n">03</span>The lab</h2>
       <Lab lab={lesson.lab} />
 
-      <h2 className="lesson-h2"><span className="h2-n">4</span>Check yourself</h2>
+      <h2 className="lesson-h2"><span className="h2-n">04</span>Check yourself</h2>
       <Quiz questions={lesson.quiz} answers={quizAnswers} onAnswer={(q, o) => answer(id, q, o)} />
 
       {lesson.recall.length > 0 && (
