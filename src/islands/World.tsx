@@ -25,11 +25,12 @@ type Props = {
   selected?: string;
   dimmed?: boolean;
   bloom?: string;
+  leftInset?: number;
   onSelect: (id: string) => void;
 };
 
 // The course as a map: islands on an endless dotted canvas. Drag or scroll to move, pinch or ctrl+scroll to zoom.
-function World({ ref, progress, revealed, selected, dimmed, bloom, onSelect }: Props) {
+function World({ ref, progress, revealed, selected, dimmed, bloom, leftInset = 0, onSelect }: Props) {
   const viewport = useRef<HTMLDivElement | null>(null);
   const [cam, setCam] = useState<Cam>({ x: 0, y: 0, s: 0.5 });
   const [flying, setFlying] = useState(false);
@@ -48,11 +49,13 @@ function World({ ref, progress, revealed, selected, dimmed, bloom, onSelect }: P
     window.setTimeout(() => setFlying(false), 900);
   }, []);
 
+  // Fit the whole world into the part of the screen that is not covered by the path card on the left.
   const fitCam = useCallback((): Cam => {
     const { w, h } = size();
-    const s = clamp(Math.min(w / (WORLD.w + 160), h / (WORLD.h + 160)), 0.28, 1);
-    return { s, x: (w - WORLD.w * s) / 2, y: (h - WORLD.h * s) / 2 };
-  }, []);
+    const inset = w > 1100 ? leftInset : 0;
+    const s = clamp(Math.min((w - inset) / (WORLD.w + 120), h / (WORLD.h + 160)), 0.28, 1);
+    return { s, x: inset + (w - inset - WORLD.w * s) / 2, y: (h - WORLD.h * s) / 2 };
+  }, [leftInset]);
 
   useLayoutEffect(() => setCam(fitCam()), [fitCam]);
 

@@ -172,3 +172,22 @@ export type TicketCardData = {
   rollback: string;
   prompt: string;
 };
+
+// ---------- Video clips and practice drills (content/clips/<lesson>.json) ----------
+export type Clip = {
+  videoId: string;
+  title: string;
+  channel: string;
+  start: number;
+  end: number;
+  minutes: number;
+  why: string;
+  look: string[];
+  after: string;
+  quote?: string;
+};
+export type ChoiceDrill = { kind: 'choice'; q: string; options: QuizOption[] };
+export type FillDrill = { kind: 'fill'; q: string; before?: string; after?: string; answers: string[]; hint?: string; why: string };
+export type OrderDrill = { kind: 'order'; q: string; items: string[]; why: string };
+export type Drill = ChoiceDrill | FillDrill | OrderDrill;
+export type ClipSet = { lesson: string; clips: Clip[]; practice: Drill[] };
