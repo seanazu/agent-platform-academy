@@ -8,6 +8,7 @@ export type Route =
   | { name: 'tickets'; key?: string }
   | { name: 'words' }
   | { name: 'cast' }
+  | { name: 'islands'; island?: string; lesson?: string }
   | { name: 'search'; q?: string };
 
 export const parseHash = (hash: string): Route => {
@@ -22,6 +23,7 @@ export const parseHash = (hash: string): Route => {
   if (head === 'tickets') return { name: 'tickets', key: params.get('k') ?? undefined };
   if (head === 'words') return { name: 'words' };
   if (head === 'cast') return { name: 'cast' };
+  if (head === 'islands') return { name: 'islands', island: id, lesson: parts[2] };
   if (head === 'search') return { name: 'search', q: params.get('q') ?? undefined };
   return { name: 'home' };
 };
@@ -44,5 +46,6 @@ export const href = {
   tickets: (key?: string) => (key ? `#/tickets?k=${encodeURIComponent(key)}` : '#/tickets'),
   words: () => '#/words',
   cast: () => '#/cast',
+  islands: (island?: string, lesson?: string) => `#/islands${island ? `/${island}` : ''}${lesson ? `/${lesson}` : ''}`,
   search: (q?: string) => (q ? `#/search?q=${encodeURIComponent(q)}` : '#/search'),
 };

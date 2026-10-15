@@ -1,3 +1,4 @@
+import IslandsApp from '../islands/IslandsApp';
 import CastPage from './v2/CastPage';
 import TicketCardPage from './v2/TicketCardPage';
 import { useEffect } from 'react';
@@ -20,6 +21,8 @@ function App() {
     if (route.name === 'tickets' && route.key) return;
     window.scrollTo({ top: 0 });
   }, [routeKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (route.name === 'islands') return <IslandsApp island={route.island} lesson={route.lesson} />;
 
   return (
     <div className="app">

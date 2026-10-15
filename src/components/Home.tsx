@@ -38,7 +38,7 @@ function Home() {
 
       <section className="pilot" aria-labelledby="pilot-title">
         <span id="pilot-title" className="eyebrow">New lesson format · pilot</span>
-        <p className="pilot-lead">Three lessons rebuilt to watch, play and do. Try them and tell me what works.</p>
+        <p className="pilot-lead">Three lessons rebuilt to watch, play and do. <a href={href.islands()}>Open the new Islands map →</a></p>
         <div className="pilot-links">
           {['p0-2', 'p7-4', 'g5-2'].map((pid) => {
             const ref = findLesson(pid);
