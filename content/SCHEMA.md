@@ -1,76 +1,92 @@
-# Lesson files: `content/lessons/<lesson id>.json`
+# Lesson files
 
-One file per lesson in `content/course.json`. The app renders exactly these fields. Validate with
-`python3 tools/check_content.py <lesson id>` (no arguments = every lesson).
+Every lesson has two files:
+
+- `content/lessons/<id>.json`: the lesson itself (story, explanation, lab, checkpoint).
+- `content/clips/<id>.json`: the video clips and the practice drills.
+
+The islands app (`#/islands`) shows a lesson in six steps the learner can open in any order:
+Story · Watch · Understand · Practice · Build · Checkpoint. Voice and shape: `content/STYLE.md`. Canon names and the
+journey of ticket RH-1234: `content/STORY.md`. Check both files with `python3 tools/check_v2.py <id>`.
+Model lessons: `p7-4` (written first, the reference for voice), `g5-2`, `p0-2`, with their clips files.
+
+## content/lessons/<id>.json
 
 ```jsonc
 {
-  "id": "p7-2",                       // from course.json; do not change
-  "title": "Writing a workflow",      // from course.json; do not change
-  "minutes": 35,                      // honest reading + lab time, 15–60
-  "youNeed": ["p7-1", "p1-6"],        // lesson ids to finish first (0–3). Foundations only name earlier lessons.
-  "bridge": "A Temporal workflow is like a React component as a state machine: a pure function re-run from its history. Except: it replays a stored event log, so no Date.now(), Math.random() or I/O inside it.",
-                                      // 1–3 sentences: "X is like Y you know, except Z". Z is required.
-  "intro": "2 or 3 short sentences: what this lesson is about and why it matters for the platform.",
-  "picture": {                        // the one drawing to understand before any code
-    "caption": "One sentence under the drawing.",
-    "nodes": [                        // 3–8 boxes. kind: person | agent | machine | service | file | cloud | check
-      { "id": "wf", "label": "ticketToPr workflow", "kind": "service" },
-      { "id": "act", "label": "acquireSandbox activity", "kind": "service" }
-    ],
-    "steps": [                        // 3–8 arrows, shown one at a time with a Next button
-      { "from": "wf", "to": "act", "text": "asks for a lite VM (an activity call)" }
-    ]
+  "v": 2,
+  "id": "p7-4",                      // from course.json
+  "title": "One ticket, one run",    // from course.json
+  "minutes": 40,                     // honest: clips + reading + practice + lab
+  "youNeed": ["p7-3"],               // 0-3 earlier lesson ids
+  "map": "temporal",                 // a platform-map.json piece id
+
+  "hook": {                          // Story step
+    "story": ["One or two short paragraphs: a scene with a problem the learner can feel."],
+    "question": "The question this lesson answers, in the learner's words."
   },
-  "sections": [                       // 4–8 sections, in teaching order
+
+  "play": {                          // optional: only when one of the simulators in src/widgets/index.ts fits
+    "widget": "id-policy", "intro": "One sentence.", "tasks": [ { "kind": "guess", "text": "..." } ]
+  },
+
+  "read": [                          // Understand step: 2-5 short sections in teaching order
     {
-      "h": "Short heading (≤ 8 words)",
-      "p": ["Paragraph of ≤ 4 sentences.", "Another paragraph."],   // 1–4 paragraphs
-      "because": "One sentence that starts with why we do this (optional, but required before any code block).",
-      "code": {                       // optional. ≤ 25 lines. Real code in the style of the tickets.
-        "lang": "typescript",         // typescript | javascript | yaml | hcl | python | bash | json | toml | markdown | text
-        "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts",
-        "text": "import { proxyActivities } from \"@temporalio/workflow\";\n...",
-        "notes": [                    // one note per important line (≥ 3 per block). line is 1-based.
-          { "line": 1, "text": "Plain words: what this line does and why it is here." }
-        ]
-      },
-      "see": "Optional: the exact output the reader should see after a command (≤ 8 lines).",
-      "ifInstead": "Optional: 'If instead you see X, then Y' for the one most likely error.",
-      "callout": { "kind": "why", "text": "..." }   // optional. kind: why | gotcha | tip | wall
+      "h": "Heading",
+      "p": ["Connected paragraphs."],
+      "code": { "lang": "typescript", "file": "path", "text": "...", "notes": [ { "line": 3, "text": "only lines that need it" } ] },
+      "see": "exact output after a command (optional)",
+      "deeper": { "h": "Go deeper: ...", "p": ["..."] }        // optional, closed by default
     }
   ],
-  "lab": {                            // hands-on on the laptop. Three rungs: worked, faded, alone.
-    "title": "Run a workflow on your laptop",
-    "youNeed": ["Node 24", "Docker Desktop", "temporal CLI (brew install temporal)"],
-    "worked": [                       // 4–10 steps, each with the command and what you should see
-      { "do": "temporal server start-dev", "see": "Server:  localhost:7233\nUI:      http://localhost:8233" }
-    ],
-    "faded": "The same task with the last step left to the reader: say exactly what is left out.",
-    "alone": "A new small task of the same shape, done without help. One paragraph.",
-    "done": "What success looks like, in one sentence the reader can check."
+
+  "lab": {                           // Build step
+    "id": "p7-4", "title": "...", "minutes": 25, "needs": ["Node 22+"], "goal": "One sentence.",
+    "mode": "guided",                // "checked" only when labs/<id>/ exists with ./academy check; otherwise "guided"
+    "guess": { "q": "...", "options": [ { "text": "...", "correct": true, "why": "..." } ] },
+    "follow": [ { "say": "why this step", "do": "the command or the edit", "see": "the output you should see" } ],
+    "build": "A new small task of the same shape, done without help.",
+    "checks": ["Guided labs: 3-6 things the learner can verify themselves, e.g. 'terraform plan shows 1 to add, 0 to change'."],
+    "solution": { "lang": "typescript", "file": "...", "text": "..." },   // guided labs: one possible answer
+    "fix": "A broken-on-purpose story: what is broken and what the learner should find.",
+    "explain": ["Three questions that make the learner explain why it works."],
+    "done": "One sentence the learner can check."
   },
-  "quiz": [                           // exactly 3. One correct answer each. Vary its position.
-    { "q": "...?", "options": [ { "text": "...", "correct": true, "why": "..." }, { "text": "...", "correct": false, "why": "..." }, { "text": "...", "correct": false, "why": "..." } ] }
-  ],
-  "recall": ["One question from the previous lesson.", "One from an earlier lesson."],   // 1–2, answered from memory
-  "videos": [                         // 0–3 real YouTube videos. Only from content/videos.json (verified) or verified yourself.
-    { "title": "...", "url": "https://www.youtube.com/watch?v=...", "channel": "...", "minutes": 12, "why": "≤ 16 words" }
-  ],
-  "words": [ { "term": "activity", "plain": "One sentence in plain words." } ],   // 3–7 new terms, each also explained in the text
-  "tickets": [                        // walkthrough lessons: every ticket in course.json's `covers`, in build order.
-    {                                 // foundation lessons: 0–4 tickets this lesson unlocks (title + why only).
-      "key": "G3-24",
-      "why": "One sentence: what this lesson taught that this ticket needs.",
-      "walk": [                       // walkthrough lessons only: 3–8 plain steps of how we will do the ticket, each naming the file or command.
-        "Create orchestrator/src/workflows/ticket-to-pr.ts with the workflow function (code above)."
-      ]
-    }
-  ],
-  "remember": "One sentence to remember from this lesson."
+
+  "check": [ { "q": "...", "options": [ { "text": "...", "correct": false, "why": "..." } ] } ],  // Checkpoint: exactly 3
+  "platform": { "p": ["How our platform uses this idea. Ticket keys are allowed here only."], "tickets": [ { "key": "G3-25", "why": "..." } ] },
+  "words": [ { "term": "conflict policy", "plain": "..." } ],     // 3-6, each also explained in the text
+  "review": [ { "q": "A small task that comes back later", "a": "What a good answer contains" } ],   // 2-3
+  "remember": "One sentence."
 }
 ```
 
-Rules the checker enforces: all required fields; sizes above; every code block has ≥ 3 notes and ≤ 25 lines; every
-`tickets[].key` of a walkthrough lesson matches `covers` in course.json; quiz has 3 questions with exactly one
-correct; sentences ≤ 22 words (warning); no em dashes; no "simply", "just", "obviously", "easy".
+Labs run only on the learner's laptop with free tools (Node, Docker, git, the temporal CLI, kind, terraform with no
+cloud, LocalStack, a scratch GitHub repo). Never real company systems, never anything that costs money.
+
+## content/clips/<id>.json
+
+```jsonc
+{
+  "lesson": "p7-4",
+  "clips": [                         // Watch step: 2-4 clips, about 6-15 minutes in total, in watching order
+    {
+      "videoId": "JpBNKuYMB10", "title": "exact video title", "channel": "...",
+      "start": 374, "end": 485, "minutes": 1.9,
+      "verified": "transcript",      // "transcript" when start/end/quote come from the transcript, "chapters" when from chapters
+      "why": "One sentence: why this clip is here.",
+      "look": ["2-3 short 'watch for' points tied to this lesson"],
+      "after": "One sentence that connects the clip back to our platform.",
+      "quote": "A short phrase (12 words or fewer) said inside the clip (transcript-verified clips only)."
+    }
+  ],
+  "practice": [                      // Practice step: 4-6 drills about the idea, not trivia
+    { "kind": "choice", "q": "...", "options": [ { "text": "...", "correct": true, "why": "..." } ] },
+    { "kind": "fill", "q": "...", "before": "text before the blank", "after": "text after", "answers": ["accepted", "answers"], "hint": "...", "why": "..." },
+    { "kind": "order", "q": "Put these in order", "items": ["first", "second", "third"], "why": "..." }
+  ]
+}
+```
+
+Find and check videos with `python3 tools/yt.py` (search, meta with chapters and embeddability, transcript, grep).
+Never invent a timestamp: every start and end comes from a transcript or from the video's chapters.

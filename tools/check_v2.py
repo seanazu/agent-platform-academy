@@ -24,10 +24,11 @@ PHRASAL = ['carry on', 'carries on', 'let go of', 'lets go of', 'step in', 'step
 def teaching_texts(d):
     """(where, text) for every part of the lesson that teaches, i.e. everything except the platform part."""
     yield 'hook', ' '.join(d['hook']['story']) + ' ' + d['hook']['question']
-    for ci, c in enumerate(d['watch']['chapters']):
+    for ci, c in enumerate((d.get('watch') or {}).get('chapters', [])):
         for li, l in enumerate(c['lines']):
             yield f'watch {ci + 1}.{li + 1}', l['say']
-    yield 'play', d['play']['intro'] + ' ' + ' '.join(t['text'] for t in d['play']['tasks'])
+    if d.get('play'):
+        yield 'play', d['play']['intro'] + ' ' + ' '.join(t['text'] for t in d['play']['tasks'])
     for s in d['read']:
         yield f'read "{s["h"]}"', ' '.join(s['p'])
         if s.get('deeper'):
@@ -44,7 +45,7 @@ def check(lid):
     d = json.load(open(path))
     if d.get('v') != 2:
         return None
-    for field in ['id', 'title', 'minutes', 'youNeed', 'map', 'hook', 'watch', 'play', 'read', 'lab', 'check', 'platform', 'words', 'videos', 'review', 'remember']:
+    for field in ['id', 'title', 'minutes', 'youNeed', 'map', 'hook', 'read', 'lab', 'check', 'platform', 'words', 'review', 'remember']:
         if field not in d:
             errors.append(f'missing field {field}')
     if errors:
@@ -56,7 +57,8 @@ def check(lid):
         elif order.index(y) >= order.index(lid):
             errors.append(f'youNeed {y} comes after this lesson')
 
-    scene = d['watch']['scene']
+    watch = d.get('watch') or {'scene': {'cols': 1, 'rows': 1, 'actors': [], 'links': []}, 'chapters': []}
+    scene = watch['scene']
     ids = {a['id'] for a in scene['actors']}
     spots = [tuple(a['at']) for a in scene['actors']]
     if len(spots) != len(set(spots)):
@@ -72,7 +74,7 @@ def check(lid):
             errors.append(f'link {l["from"]} loops to itself')
 
     total_words = 0
-    for ci, c in enumerate(d['watch']['chapters']):
+    for ci, c in enumerate(watch['chapters']):
         words = sum(len(l['say'].split()) for l in c['lines'])
         total_words += words
         if words / SPOKEN_WPM > 6:
@@ -104,10 +106,32 @@ def check(lid):
             if sum(o['correct'] for o in c['check']['options']) != 1:
                 errors.append(f'chapter {ci + 1} check needs exactly one correct option')
 
-    if WIDGETS and d['play']['widget'] not in WIDGETS:
-        errors.append(f'play widget "{d["play"]["widget"]}" is not in src/widgets/index.ts ({", ".join(sorted(WIDGETS))})')
-    if not any(t['kind'] == 'guess' for t in d['play']['tasks']):
-        warns.append('play has no guess task')
+    if d.get('play'):
+        if WIDGETS and d['play']['widget'] not in WIDGETS:
+            errors.append(f'play widget "{d["play"]["widget"]}" is not in src/widgets/index.ts ({", ".join(sorted(WIDGETS))})')
+    if d['lab'].get('mode') == 'guided' and not d['lab'].get('checks'):
+        errors.append('a guided lab needs a "checks" list the learner can tick off')
+    clips_file = ROOT / 'content/clips' / f'{lid}.json'
+    if not clips_file.exists():
+        errors.append('no content/clips/<id>.json (clips and practice drills)')
+    else:
+        cs = json.load(open(clips_file))
+        if not 1 <= len(cs.get('clips', [])) <= 5:
+            warns.append(f'{len(cs.get("clips", []))} clips (aim for 2-4)')
+        for c in cs.get('clips', []):
+            if not (0 <= c['start'] < c['end']):
+                errors.append(f'clip {c["videoId"]} has start {c["start"]} and end {c["end"]}')
+            if c['end'] - c['start'] > 9 * 60:
+                warns.append(f'clip {c["videoId"]} is {(c["end"] - c["start"]) / 60:.1f} min (keep clips short)')
+            if c.get('verified') not in ('transcript', 'chapters'):
+                errors.append(f'clip {c["videoId"]} needs "verified": "transcript" or "chapters"')
+        if not 4 <= len(cs.get('practice', [])) <= 8:
+            warns.append(f'{len(cs.get("practice", []))} practice drills (aim for 4-6)')
+        for q in cs.get('practice', []):
+            if q['kind'] == 'choice' and sum(o['correct'] for o in q['options']) != 1:
+                errors.append(f'drill "{q["q"][:40]}" needs exactly one correct option')
+            if q['kind'] == 'fill' and not q.get('answers'):
+                errors.append(f'fill drill "{q["q"][:40]}" has no answers')
 
     if not 2 <= len(d['check']) <= 3:
         errors.append(f'check has {len(d["check"])} questions (2-3)')
@@ -140,7 +164,7 @@ def check(lid):
             if re.search(rf'\b{re.escape(name)}\b', text):
                 warns.append(f'{where}: names {name}; say the role unless the cast introduces them here')
 
-    minutes = total_words / SPOKEN_WPM + d['lab']['minutes'] + 10
+    minutes = total_words / SPOKEN_WPM + d['lab']['minutes'] + 10 + (sum(c['end'] - c['start'] for c in json.load(open(clips_file)).get('clips', [])) / 60 if clips_file.exists() else 0)
     if abs(minutes - d['minutes']) > 15:
         warns.append(f'minutes is {d["minutes"]}, the parts add up to about {minutes:.0f}')
     return errors, warns

@@ -1,5 +1,6 @@
 import mapJson from '../../content/platform-map.json';
 import { allLessons, type LessonRef } from '../lib/course';
+import { getLesson, isV2 } from '../lib/lessons';
 
 export type Island = {
   id: string;
@@ -37,7 +38,12 @@ export const LINKS: [string, string][] = [
 export const JOURNEY = ['jira', 'temporal', 'pool', 'vm', 'gateway', 'broker', 'review', 'lighthouse'];
 
 // Lessons rebuilt for the new format. Everything else on an island is listed as coming soon.
-export const PLAYABLE = new Set(['p0-2', 'p7-4', 'g5-2']);
+export const PLAYABLE = new Set(
+  allLessons.filter((r) => {
+    const l = getLesson(r.lesson.id);
+    return l !== undefined && isV2(l);
+  }).map((r) => r.lesson.id),
+);
 
 const PIECE_TO_ISLAND: Record<string, string> = {
   jira: 'jira', slack: 'jira', poll: 'jira', github: 'review', temporal: 'temporal', 'vm-pool': 'pool',

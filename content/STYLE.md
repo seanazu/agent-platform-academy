@@ -66,38 +66,24 @@ or accident they stop. Elsewhere, refer to them in a phrase; do not repeat them 
 **Every part of a lesson makes him do something.** Guess before the reveal, click the simulator, run the command,
 fix the broken file. Reading alone is the weakest way to learn.
 
-## Writing for the ear (the narration)
+## The parts of a lesson (field names in `content/SCHEMA.md`)
 
-The `watch` script is spoken by a voice while the drawing moves. Write it to be heard:
-- One idea per line. A line is one to three sentences and at most about 40 words; longer lines are hard to follow
-  by ear, and splitting them gives each half its own moment in the drawing.
-- Never put code names in a spoken line: the voice reads `USE_EXISTING` or `signalWithStart` letter by letter. Say
-  "use existing" or "signal with start" and keep the code form in a `caption` cue.
-- Every sentence that describes a visible change ("claims a VM", "look at the slots") needs the cue on that same
-  line, and badges count exactly what the voice counts.
-- When an earlier term comes back, re-explain it in about five words ("a slot, one of Nova's three VMs"). Never use
-  one word for two things close together (a parked VM and a parked ticket).
-- Say numbers and symbols the way a person would: "nova colon RH-1234" the first time, then "the ticket's ID".
-- Repeat the key term a few times; a listener cannot glance back.
-- Point at the drawing: "Watch the Slack box", "See how the second start stops at Temporal".
-- Each chapter is under 6 minutes spoken and ends with the one thing to remember. Most lessons need 2 or 3 chapters.
-- No code read aloud. Name what the code does; the code lives in the read part.
+The learner opens six steps in any order, so each step must make sense on its own.
 
-## The parts of a lesson (field names in `content/SCHEMA-v2.md`)
+1. **Story** (`hook`): the problem scene in one or two short paragraphs, ending with the question this lesson answers.
+2. **Watch** (clips file): 2 to 4 parts of real YouTube videos by people who explain this well, each starting and
+   stopping on the minutes that matter. Say why each clip is there, what to watch for, and how it connects to our
+   platform. Pick clear speakers and good audio; prefer short and recent, but a classic beats a weak new video.
+3. **Understand** (`read`): the explanation in connected prose with code, short. Code notes only on lines that need
+   them. Details most readers can skip go in `deeper`.
+4. **Practice** (`play` if a simulator fits, plus the drills in the clips file): drills make the learner use the idea:
+   pick, fill in a blank in real code, or put steps in order. Every wrong option is a mistake people really make.
+5. **Build** (`lab`): Guess, Follow along, Build it, Fix it, Explain it, on the learner's laptop with free tools.
+   Real commands with the output the learner will really see. Guided labs end with a checklist the learner can tick.
+6. **Checkpoint** (`check`, `review`, `remember`): three questions about the one idea, never ticket trivia.
 
-1. **hook**: the problem scene in one or two short paragraphs, ending with the question this lesson answers.
-2. **watch**: the narrated drawing. The scene places the actors on a small grid so the story reads left to right and
-   top to bottom. Arrows always mean "sends to" or "starts". Every line may carry a cue that moves the drawing.
-3. **play**: one simulator from `src/widgets`, with tasks that start with a guess.
-4. **read**: the explanation in words with code, short. Code notes only on the lines that need them; no notes that
-   repeat the code. Details most readers can skip go in `deeper`.
-5. **lab**: Guess, Follow along, Build it, Fix it, Explain it, run with `./academy lab <id>`.
-6. **check**: two or three questions about the one idea of the lesson, never about ticket trivia. Every wrong option is
-   a mistake people really make, and every option explains itself.
-7. **platform**: how our platform uses the idea, and the tickets it unlocks.
-8. **review**: two or three small tasks that come back days and weeks later.
-
-Times must be honest: count about 150 spoken words a minute for watch, and the lab's real time.
+The **In our platform** part (`platform`) says how our platform uses the idea and lists the tickets it unlocks; it is
+the only place for ticket keys.
 
 ## Before and after
 

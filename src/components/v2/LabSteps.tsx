@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import CodeBlock from '../CodeBlock';
 import CommandBlock from '../CommandBlock';
 import Terminal from '../Terminal';
 import type { LabV2 } from '../../lib/types';
@@ -14,6 +15,7 @@ const passCode = async (id: string): Promise<string> => {
 // The lab as five plain steps. Everything runs on the learner's laptop through ./academy, and the check prints a
 // pass code that marks the lab done here.
 function LabSteps({ lab, passed, guess, onGuess, onPass }: Props) {
+  const guided = lab.mode === 'guided';
   const [code, setCode] = useState('');
   const [wrong, setWrong] = useState(false);
 
@@ -38,14 +40,20 @@ function LabSteps({ lab, passed, guess, onGuess, onPass }: Props) {
         </ul>
       </header>
 
-      <div className="lab2-start">
-        <p>Everything happens on your laptop, in <code>~/academy-labs</code>. From the course folder, start the lab:</p>
-        <CommandBlock command={`./academy lab ${lab.id}`} />
-        <details className="lab2-setup">
-          <summary>First time? Get the course folder</summary>
-          <CommandBlock command="git clone https://github.com/seanazu/agent-platform-academy.git && cd agent-platform-academy" />
-        </details>
-      </div>
+      {guided ? (
+        <div className="lab2-start">
+          <p>A guided lab: you run real commands on your laptop and check your result against the list in step 3. Nothing touches company systems.</p>
+        </div>
+      ) : (
+        <div className="lab2-start">
+          <p>Everything happens on your laptop, in <code>~/academy-labs</code>. From the course folder, start the lab:</p>
+          <CommandBlock command={`./academy lab ${lab.id}`} />
+          <details className="lab2-setup">
+            <summary>First time? Get the course folder</summary>
+            <CommandBlock command="git clone https://github.com/seanazu/agent-platform-academy.git && cd agent-platform-academy" />
+          </details>
+        </div>
+      )}
 
       <ol className="lab2-steps">
         <li className="lab2-step">
@@ -90,15 +98,33 @@ function LabSteps({ lab, passed, guess, onGuess, onPass }: Props) {
         <li className="lab2-step">
           <p className="lab2-step-name"><span>3</span>Build it</p>
           <p className="lab2-step-text">{lab.build}</p>
-          <CommandBlock command="./academy check" />
-          <p className="lab2-small">Stuck? <code>./academy hint</code> gives one hint at a time. <code>./academy diff</code> shows the solution next to your code.</p>
+          {guided ? (
+            <>
+              {lab.checks && lab.checks.length > 0 && (
+                <ul className="lab2-checks" aria-label="Check yourself">
+                  {lab.checks.map((c) => <li key={c}>{c}</li>)}
+                </ul>
+              )}
+              {lab.solution && (
+                <details className="lab2-setup">
+                  <summary>Stuck? Show one possible solution</summary>
+                  <CodeBlock code={{ ...lab.solution, notes: lab.solution.notes ?? [] }} />
+                </details>
+              )}
+            </>
+          ) : (
+            <>
+              <CommandBlock command="./academy check" />
+              <p className="lab2-small">Stuck? <code>./academy hint</code> gives one hint at a time. <code>./academy diff</code> shows the solution next to your code.</p>
+            </>
+          )}
         </li>
 
         {lab.fix && (
           <li className="lab2-step">
             <p className="lab2-step-name"><span>4</span>Fix it</p>
             <p className="lab2-step-text">{lab.fix}</p>
-            <CommandBlock command="./academy check --fix" />
+            {!guided && <CommandBlock command="./academy check --fix" />}
           </li>
         )}
 
@@ -109,8 +135,14 @@ function LabSteps({ lab, passed, guess, onGuess, onPass }: Props) {
               <li key={q}>{q}</li>
             ))}
           </ul>
-          <CommandBlock command="./academy explain" />
-          <p className="lab2-small">It saves your answers and prints a prompt you can paste into Claude to find what you missed.</p>
+          {guided ? (
+            <p className="lab2-small">Write your three answers down, then paste them into Claude with "Check my understanding of {lab.title}: what did I miss?"</p>
+          ) : (
+            <>
+              <CommandBlock command="./academy explain" />
+              <p className="lab2-small">It saves your answers and prints a prompt you can paste into Claude to find what you missed.</p>
+            </>
+          )}
         </li>
       </ol>
 
@@ -118,6 +150,8 @@ function LabSteps({ lab, passed, guess, onGuess, onPass }: Props) {
         <p><b>Done when:</b> {lab.done}</p>
         {passed ? (
           <p className="lab2-passed">✓ Lab passed</p>
+        ) : guided ? (
+          <button type="button" className="btn" onClick={onPass}>I finished this lab</button>
         ) : (
           <form
             className="lab2-code"

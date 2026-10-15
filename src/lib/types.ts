@@ -128,6 +128,9 @@ export type LabV2 = {
   fix?: string;
   explain: string[];
   done: string;
+  mode?: 'checked' | 'guided';
+  checks?: string[];
+  solution?: ReadCode;
 };
 
 export type VideoClip = Video & { start?: number; end?: number };
@@ -141,14 +144,14 @@ export type LessonV2 = {
   youNeed: string[];
   map: string;
   hook: { story: string[]; question: string };
-  watch: Watch;
-  play: Play;
+  watch?: Watch;
+  play?: Play;
   read: ReadSection[];
   lab: LabV2;
   check: QuizQuestion[];
   platform: { p: string[]; tickets: LessonTicket[] };
   words: Word[];
-  videos: VideoClip[];
+  videos?: VideoClip[];
   review: ReviewItem[];
   remember: string;
 };

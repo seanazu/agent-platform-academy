@@ -59,7 +59,7 @@ function LessonSheet({ lesson, island, onClose, onComplete }: Props) {
   const [seen, setSeen] = useState<Set<number>>(() => new Set([0, ...steps.read()]));
   const [watched, setWatched] = useState<Set<number>>(() => new Set(clipMemory.read()));
   const body = useRef<HTMLDivElement | null>(null);
-  const Widget = WIDGETS[lesson.play.widget];
+  const Widget = lesson.play ? WIDGETS[lesson.play.widget] : undefined;
   const set = clipsFor(id);
   const done = progress.done[id] === true;
 
@@ -186,12 +186,16 @@ function LessonSheet({ lesson, island, onClose, onComplete }: Props) {
         {current === 'practice' && (
           <section className="isl-step">
             <h2 className="isl-step-title">Practice</h2>
-            <p className="isl-step-lead">First play with the real behaviour, then a few quick drills. Get things wrong here on purpose: that is what this step is for.</p>
-            <h3 className="isl-sub">Try it: {lesson.play.intro}</h3>
-            {Widget ? <Widget config={lesson.play.config} /> : <p className="isl-empty">This simulator is being built.</p>}
+            <p className="isl-step-lead">{lesson.play ? 'First play with the real behaviour, then a few quick drills.' : 'A few quick drills.'} Get things wrong here on purpose: that is what this step is for.</p>
+            {lesson.play && Widget && (
+              <>
+                <h3 className="isl-sub">Try it: {lesson.play.intro}</h3>
+                <Widget config={lesson.play.config} />
+              </>
+            )}
             {set && set.practice.length > 0 && (
               <>
-                <h3 className="isl-sub">Quick drills</h3>
+                {lesson.play && <h3 className="isl-sub">Quick drills</h3>}
                 <Practice drills={set.practice} />
               </>
             )}
