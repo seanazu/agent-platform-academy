@@ -1,421 +1,326 @@
 {
+ "v": 2,
  "id": "p1-3",
  "title": "A web server with node:http",
- "minutes": 45,
+ "minutes": 50,
  "youNeed": [
+  "p1-1",
   "p1-2"
  ],
- "bridge": "A node:http server is like a Next.js API route without the framework: one function gets every request and writes the response. Except: there is no router, no body parser and no size limit until you write them. That is why the broker and the gateway stay small enough to review line by line.",
- "intro": "The broker and the gateway are plain node:http servers, like Byte's broker. No Express, no framework. This lesson builds a small service with routes, status codes and a 1 MiB body limit, the same shape they use.",
- "picture": {
-  "caption": "Every request reaches one handler; it picks a route, reads the body with a limit, and always answers with a status code.",
-  "nodes": [
-   {
-    "id": "client",
-    "label": "curl (later: the VM)",
-    "kind": "machine"
-   },
-   {
-    "id": "handler",
-    "label": "createServer handler",
-    "kind": "service"
-   },
-   {
-    "id": "route",
-    "label": "route: \"POST /v1/notes\"",
-    "kind": "check"
-   },
-   {
-    "id": "body",
-    "label": "readBody (1 MiB limit)",
-    "kind": "check"
-   },
-   {
-    "id": "store",
-    "label": "notes in memory",
-    "kind": "file"
-   },
-   {
-    "id": "res",
-    "label": "response: status + JSON",
-    "kind": "file"
-   }
+ "map": "broker",
+ "hook": {
+  "story": [
+   "The broker is our only door to GitHub, Jira and Slack: when Nova wants to push a branch or post a comment, it asks the broker, and the broker does it with credentials Nova never sees. Like the gateway, our door to Claude, it is a plain Node web server with no framework at all, so that a reviewer can read every line of it.",
+   "That has a price. On its first day a test script sends the broker a 2 GB request by mistake, the broker tries to hold all of it in memory, and it crashes. Every running Nova loses its door to GitHub at the same moment. The same week someone calls a path nobody wrote, and the request simply hangs until the caller stops waiting, because no line of code ever answered it."
   ],
-  "steps": [
-   {
-    "from": "client",
-    "to": "handler",
-    "text": "sends POST /v1/notes with a JSON body"
-   },
-   {
-    "from": "handler",
-    "to": "route",
-    "text": "builds the route string from method and path"
-   },
-   {
-    "from": "route",
-    "to": "body",
-    "text": "reads the body chunk by chunk and stops past 1 MiB"
-   },
-   {
-    "from": "body",
-    "to": "store",
-    "text": "parses the JSON and saves the note"
-   },
-   {
-    "from": "store",
-    "to": "res",
-    "text": "201 with the count; or 400, 404, 413 or 500"
-   },
-   {
-    "from": "res",
-    "to": "client",
-    "text": "the client reads the status first, then the body"
-   }
-  ]
+  "question": "When no framework does it for me, what must my own request handler do so that every request gets a clear answer and no caller can crash the service?"
  },
- "sections": [
+ "read": [
   {
-   "h": "The smallest server",
+   "h": "One function sees every request",
    "p": [
-    "createServer takes one function, the handler. Node calls it for every request with two objects: req, the incoming request, and res, the response you write. listen opens a port.",
-    "There is no routing at all. You look at req.method and req.url yourself."
+    "Node's built-in node:http module gives you createServer. You pass it one function, the handler, and Node calls that function for every request that arrives, whatever the path or method. The handler gets two objects: req, the incoming request with its method, URL and headers, and res, the response you write. listen(8080) opens the port. That is all a server is.",
+    "There is no router. If you want GET /health to answer ok and everything else to answer 404, you check req.method and req.url yourself. And there is no default answer either: a response is finished only when your code calls res.end(). If a request reaches a path where your handler never calls it, Node keeps the connection open and the caller waits, which is exactly the hanging request from the story."
    ],
-   "because": "We start with five lines because every server in the platform is this same function, grown carefully.",
    "code": {
     "lang": "typescript",
-    "file": "~/p1-lab/svc/src/hello.ts",
-    "text": "import { createServer } from \"node:http\";\n\nconst server = createServer((req, res) => {\n  if (req.method === \"GET\" && req.url === \"/health\") return void res.end(\"ok\");\n  res.writeHead(404).end();\n});\nserver.listen(8080, () => console.log(\"listening on :8080\"));",
+    "file": "src/hang.ts (a server with a hole in it)",
+    "text": "import { createServer } from \"node:http\";\n\nconst server = createServer((req, res) => {\n  if (req.method === \"GET\" && req.url === \"/health\") {\n    res.end(\"ok\");\n  }\n});\nserver.listen(8080, () => console.log(\"listening on :8080\"));",
     "notes": [
      {
-      "line": 1,
-      "text": "One handler for every request. req is an IncomingMessage, res a ServerResponse."
-     },
-     {
-      "line": 4,
-      "text": "Kubernetes calls GET /health to see if the pod is alive. It needs no auth in our services."
-     },
-     {
-      "line": 4,
-      "text": "end() sends the body and finishes. return stops the handler; void keeps the return type undefined."
+      "line": 3,
+      "text": "One handler for every request. req is an IncomingMessage and res a ServerResponse."
      },
      {
       "line": 5,
-      "text": "Status first, then end(). Every path through the handler must end the response."
+      "text": "end() sends the body and finishes the response. Status 200 is the default."
+     },
+     {
+      "line": 7,
+      "text": "Any other request falls out of the function without an answer, and the caller waits until it times out."
      }
     ]
    },
-   "see": "$ curl -s -w ' [%{http_code}]\\n' localhost:8080/health\nok [200]\n$ curl -s -w ' [%{http_code}]\\n' localhost:8080/x\n [404]",
-   "ifInstead": "If instead you see Error: listen EADDRINUSE: address already in use :::8080, another server holds the port: stop it, or use PORT=8081."
+   "see": "$ curl -sS --max-time 3 localhost:8080/v1/comments\ncurl: (28) Operation timed out after 3005 milliseconds with 0 bytes received"
   },
   {
-   "h": "Reading the body, with a limit",
+   "h": "A body is a stream, so count it as it arrives",
    "p": [
-    "A request body arrives as a stream of Buffer chunks (lesson p1-2). You read it with for await and join the chunks. Nothing stops a client from sending 10 GB, so you count bytes and give up past a limit.",
-    "Byte's broker allows 1 MiB, and the Nova broker keeps that. The gateway has no limit, because a long agent session sends several MB per call and Anthropic caps the size itself."
+    "The body of a POST request does not arrive as one string. req is a stream: the bytes come in chunks, as the client sends them, and you collect them yourself. for await over req gives you each chunk as a Buffer, the Node type for raw bytes, and Buffer.concat joins them at the end.",
+    "Nothing in Node limits how many chunks a client may send. If you simply collect everything, a 2 GB body becomes 2 GB of memory, and the process dies. So we count the bytes while they arrive and stop at a limit. The broker allows 1 MiB, 1,048,576 bytes, which is far more than any comment or run scope needs. Past that, readBody throws its own error, TooLarge, and the rest of the body is never stored."
    ],
-   "because": "We cap the body because an unlimited body lets any caller fill the service's memory.",
    "code": {
     "lang": "typescript",
-    "file": "~/p1-lab/svc/src/body.ts",
-    "text": "import type { IncomingMessage } from \"node:http\";\n\nexport const MAX_BODY = 1024 * 1024; // 1 MiB, like Byte's broker\nexport class TooLarge extends Error {}\n\nexport const readBody = async (req: IncomingMessage, limit = MAX_BODY): Promise<string> => {\n  const chunks: Buffer[] = [];\n  let size = 0;\n  for await (const chunk of req) { // a request is a stream of Buffer chunks\n    size += (chunk as Buffer).length;\n    if (size > limit) throw new TooLarge(`body over ${limit} bytes`);\n    chunks.push(chunk as Buffer);\n  }\n  return Buffer.concat(chunks).toString(\"utf8\");\n};",
+    "file": "src/body.ts",
+    "text": "import type { IncomingMessage } from \"node:http\";\n\nexport const MAX_BODY = 1024 * 1024;\nexport class TooLarge extends Error {}\n\nexport const readBody = async (req: IncomingMessage, limit = MAX_BODY) => {\n  const chunks: Buffer[] = [];\n  let size = 0;\n  for await (const chunk of req) {\n    size += chunk.length;\n    if (size > limit) throw new TooLarge(`body over ${limit} bytes`);\n    chunks.push(chunk);\n  }\n  return Buffer.concat(chunks).toString(\"utf8\");\n};",
     "notes": [
      {
       "line": 1,
-      "text": "Only the type is used, so it is an import type (verbatimModuleSyntax)."
-     },
-     {
-      "line": 3,
-      "text": "1 MiB is 1,048,576 bytes. A run scope or a comment is far smaller."
+      "text": "Only a type comes from node:http here, so it is an import type."
      },
      {
       "line": 4,
-      "text": "Our own error class, so the handler can tell it apart and answer 413."
+      "text": "Our own error class, so the handler can recognise it and answer 413."
      },
      {
       "line": 9,
-      "text": "Each chunk arrives as the client sends it. We count before we keep it."
+      "text": "Each chunk as the client sends it. We count before we keep it."
      },
      {
       "line": 11,
-      "text": "Stop reading at once. The rest of the body is never stored."
+      "text": "Stop at once. The bytes after this point are never held in memory."
      }
     ]
    }
   },
   {
-   "h": "Routes and status codes",
+   "h": "Every path ends with a status",
    "p": [
-    "We join method and path into one string, such as \"POST /v1/notes\", and compare. That is the whole router. The query string is in url.searchParams if a route needs it.",
-    "Every answer has a status code. 200 means OK and 201 created. 400 means your request is wrong, 401 who are you, 404 no such route. 413 means body too large, 500 our fault."
+    "Now the whole handler. We join the method and the path into one string, such as POST /v1/comments, and compare it with the routes we know, which is the entire router. Every path through the function ends by sending a status code, because callers and tests act on the status, not on the message. 200 means OK and 201 means created. 400 means your request is wrong, 401 means we do not know who you are, 404 means no such route, and 413 means the body is too large. 500 means the fault is ours.",
+    "The try and catch around the routes turn errors into statuses: our TooLarge becomes 413, a SyntaxError from JSON.parse becomes 400, and anything we did not expect becomes 500, so no error can leave a request hanging. The log line on a 500 names the route and never the body, because a body can hold a prompt or a token."
    ],
-   "because": "We answer with exact status codes, because callers and tests act on the status, never on the message.",
    "code": {
     "lang": "typescript",
-    "file": "~/p1-lab/svc/src/server.ts",
-    "text": "import { createServer, type ServerResponse } from \"node:http\";\nimport { readBody, TooLarge } from \"./body.js\";\nconst notes: string[] = [];\nconst send = (res: ServerResponse, status: number, body: unknown) =>\n  void res.writeHead(status, { \"content-type\": \"application/json\" }).end(JSON.stringify(body));\n\nexport const server = createServer(async (req, res) => {\n  const url = new URL(req.url ?? \"/\", \"http://localhost\");\n  const route = `${req.method} ${url.pathname}`;\n  try {\n    if (route === \"GET /health\") return void res.end(\"ok\");\n    if (route === \"GET /v1/notes\") return send(res, 200, { notes });\n    if (route === \"POST /v1/notes\") {\n      const { text } = JSON.parse(await readBody(req)) as { text: string };\n      notes.push(text);\n      return send(res, 201, { count: notes.length });\n    }\n    return send(res, 404, { error: \"not found\" });\n  } catch (error) {\n    if (error instanceof TooLarge) return send(res, 413, { error: error.message });\n    if (error instanceof SyntaxError) return send(res, 400, { error: \"body is not JSON\" });\n    console.error(route, \"failed\"); // log the route, never the body\n    return send(res, 500, { error: \"internal\" });\n  }\n});",
+    "file": "src/server.ts",
+    "text": "import { createServer, type ServerResponse } from \"node:http\";\nimport { readBody, TooLarge } from \"./body.js\";\n\nconst comments: string[] = [];\nconst send = (res: ServerResponse, status: number, body: unknown) =>\n  void res.writeHead(status, { \"content-type\": \"application/json\" }).end(JSON.stringify(body));\n\nexport const server = createServer(async (req, res) => {\n  const url = new URL(req.url ?? \"/\", \"http://localhost\");\n  const route = `${req.method} ${url.pathname}`;\n  try {\n    if (route === \"GET /health\") return void res.end(\"ok\");\n    if (route === \"GET /v1/comments\") return send(res, 200, { comments });\n    if (route === \"POST /v1/comments\") {\n      const { text } = JSON.parse(await readBody(req)) as { text: string };\n      comments.push(text);\n      return send(res, 201, { count: comments.length });\n    }\n    return send(res, 404, { error: \"not found\" });\n  } catch (error) {\n    if (error instanceof TooLarge) return send(res, 413, { error: error.message });\n    if (error instanceof SyntaxError) return send(res, 400, { error: \"body is not JSON\" });\n    console.error(route, \"failed\");\n    return send(res, 500, { error: \"internal\" });\n  }\n});",
     "notes": [
      {
-      "line": 4,
-      "text": "One helper for every JSON answer: status, content type, body."
-     },
-     {
-      "line": 8,
-      "text": "req.url is only the path and query. URL needs a base to parse it; the host part is ignored."
+      "line": 5,
+      "text": "One helper for every JSON answer: status, content type and body, then end()."
      },
      {
       "line": 9,
-      "text": "Method and path in one string: our router is a list of ifs."
+      "text": "req.url is only the path and the query. new URL needs a base to parse it; the host part is never used."
      },
      {
-      "line": 14,
-      "text": "Throws SyntaxError on bad JSON, caught below as 400. The cast checks nothing; p1-5 fixes that."
+      "line": 10,
+      "text": "Method and path in one string. Our router is a list of if statements."
      },
      {
-      "line": 18,
-      "text": "Anything we did not name is 404, like the gateway and the broker."
+      "line": 15,
+      "text": "A SyntaxError here becomes 400 below. The \"as\" only tells TypeScript what we hope; lesson p1-5 replaces it with a real check."
      },
      {
-      "line": 20,
-      "text": "Our error from readBody becomes 413 Payload Too Large."
+      "line": 19,
+      "text": "Anything we did not name gets a clear 404 instead of a hang."
      },
      {
-      "line": 22,
-      "text": "Never log a body: it may hold a prompt or a secret. The gateway has a test for this."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Starting and stopping",
-   "p": [
-    "main.ts starts the server. The port comes from the PORT environment variable, so a test or a container can change it.",
-    "Docker and Kubernetes stop a process by sending SIGTERM. Our handler closes the server, lets open requests finish, and exits with 0. Lesson p1-8 shows what happens without it."
-   ],
-   "because": "We keep listen() in main.ts, apart from server.ts, because tests import the server and start it on a port of their own.",
-   "code": {
-    "lang": "typescript",
-    "file": "~/p1-lab/svc/src/main.ts",
-    "text": "import { server } from \"./server.js\";\n\nconst port = Number(process.env.PORT ?? 8080);\nserver.listen(port, () => console.log(`listening on :${port}`));\nprocess.on(\"SIGTERM\", () => server.close(() => process.exit(0))); // Docker and Kubernetes stop with SIGTERM",
-    "notes": [
-     {
-      "line": 1,
-      "text": "server.ts only builds the server. Nothing listens until main.ts says so."
-     },
-     {
-      "line": 3,
-      "text": "Environment variables are strings or undefined, so Number() and a default."
-     },
-     {
-      "line": 5,
-      "text": "close() stops new connections and calls back when the open ones finish."
+      "line": 23,
+      "text": "Log the route, never the body."
      }
     ]
    },
-   "see": "listening on :8080"
-  },
-  {
-   "h": "The same shape in the gateway",
-   "p": [
-    "Here is the start of the gateway's handler from G0-13. You will know every line: URL, a /health route, 404 for anything else. Then a try around the work, and a status from the error type.",
-    "The gateway answers 401 when the run token is wrong (lesson p1-4) and 502 when Anthropic cannot be reached. The middle part streams the answer, as in p1-2."
-   ],
-   "because": "We read the real handler now because the broker and the gateway are this lesson plus one idea each.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/gateway/src/server.ts (G0-13, the frame of the handler)",
-    "text": "createServer(async (req, res) => {\n  const url = new URL(req.url ?? \"/\", \"http://gateway\");\n  if (req.method === \"GET\" && url.pathname === \"/health\") return void res.end(\"ok\");\n  if (req.method !== \"POST\" || !ROUTES.has(url.pathname)) return void res.writeHead(404).end();\n  try {\n    const claims = verifyRunToken(req.headers.authorization ?? \"\"); // RunTokenError if missing, expired or revoked\n    // ... forward to Anthropic and stream the answer back (p1-2)\n  } catch (error) {\n    if (!res.headersSent) res.writeHead(error instanceof RunTokenError ? 401 : 502).end();\n  }\n}).listen(8080); // access log (method, path, status, latency) only; no body is ever logged",
-    "notes": [
-     {
-      "line": 4,
-      "text": "A Set of the two Messages API paths. Anything else is 404."
-     },
-     {
-      "line": 6,
-      "text": "Reads the Authorization header. Lesson p1-4 builds this check."
-     },
-     {
-      "line": 9,
-      "text": "If streaming already started, the status is gone; we can only stop."
-     },
-     {
-      "line": 11,
-      "text": "The API port. Metrics go on 9090, a second server in the same process (G0-14)."
-     }
+   "see": "$ curl -s -w ' [%{http_code}]\\n' -X POST localhost:8080/v1/comments -d '{\"text\":\"Plan v2 is ready\"}'\n{\"count\":1} [201]\n$ curl -s -w ' [%{http_code}]\\n' -X POST localhost:8080/v1/comments --data-binary @big.json\n{\"error\":\"body over 1048576 bytes\"} [413]",
+   "deeper": {
+    "h": "Go deeper: why listen() lives in its own file",
+    "p": [
+     "server.ts only builds the server, and main.ts makes it listen on the port from the PORT environment variable. Tests import server.ts and start it on a port of their own, so two test files never fight over 8080 (lesson p1-6 does this with port 0, which asks the operating system for any free port).",
+     "main.ts is also where a real service listens for SIGTERM, the signal Docker and Kubernetes send to stop a process. On SIGTERM the service calls server.close(), which stops new connections and lets open requests finish, and then exits. Lesson p1-8 shows what happens to a container that ignores the signal."
     ]
    }
   }
  ],
  "lab": {
-  "title": "A notes service with routes and a body limit",
-  "youNeed": [
-   "~/p1-lab from p1-2",
+  "id": "p1-3",
+  "title": "A comments service that always answers",
+  "minutes": 25,
+  "mode": "guided",
+  "needs": [
+   "Node 22 or newer",
    "curl",
-   "Two terminals"
+   "Two terminal tabs"
   ],
-  "worked": [
+  "goal": "Build a small node:http service where every request gets a status, and a body over 1 MiB gets 413 instead of filling memory.",
+  "guess": {
+   "q": "src/hang.ts only answers GET /health. You send GET /v1/comments to it. What does curl get back?",
+   "options": [
+    {
+     "text": "A 404, because Node answers unknown paths for you.",
+     "correct": false,
+     "why": "Node has no idea which paths you meant to support. Only your handler can answer, and here it does not."
+    },
+    {
+     "text": "A 500, because the handler returned without a response.",
+     "correct": false,
+     "why": "Returning without calling end() is not an error to Node. The connection just stays open."
+    },
+    {
+     "text": "Nothing: the request hangs until curl stops waiting.",
+     "correct": true,
+     "why": "A response finishes only when your code calls res.end(). No end, no answer, and the caller waits."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "Create svc/src/body.ts, svc/src/server.ts and svc/src/main.ts from the sections above.",
-    "see": "(no output)"
+    "say": "Make the project. You need tsx to run the files and typescript to check them.",
+    "do": "mkdir -p ~/academy-labs/p1-3/src && cd ~/academy-labs/p1-3 && npm init -y > /dev/null && npm pkg set type=module && npm install -D --save-exact tsx@4.20.3 typescript@5.9.3 @types/node@24.12.2 > /dev/null && echo ready",
+    "see": "ready"
    },
    {
-    "do": "Terminal 1: cd ~/p1-lab && npx tsx svc/src/main.ts",
+    "say": "Write the server with a hole in it and start it in the first terminal. Leave it running.",
+    "do": "cat > src/hang.ts <<'EOF'\nimport { createServer } from \"node:http\";\n\nconst server = createServer((req, res) => {\n  if (req.method === \"GET\" && req.url === \"/health\") {\n    res.end(\"ok\");\n  }\n});\nserver.listen(8080, () => console.log(\"listening on :8080\"));\nEOF\nnpx tsx src/hang.ts",
     "see": "listening on :8080"
    },
    {
-    "do": "Terminal 2: curl -s -w ' [%{http_code}]\\n' localhost:8080/health",
-    "see": "ok [200]"
+    "say": "In the second terminal, ask for the health check and then for a path the handler never answers.",
+    "do": "cd ~/academy-labs/p1-3 && curl -s -w ' [%{http_code}]\\n' localhost:8080/health && curl -sS --max-time 3 localhost:8080/v1/comments",
+    "see": "ok [200]\ncurl: (28) Operation timed out after 3005 milliseconds with 0 bytes received"
    },
    {
-    "do": "curl -s -w ' [%{http_code}]\\n' -X POST localhost:8080/v1/notes -d '{\"text\":\"first note\"}' && curl -s -w ' [%{http_code}]\\n' localhost:8080/v1/notes",
-    "see": "{\"count\":1} [201]\n{\"notes\":[\"first note\"]} [200]"
+    "say": "Stop the server with Ctrl+C in the first terminal. Write the body reader, the real handler and main.ts, then start main.ts there.",
+    "do": "cat > src/body.ts <<'EOF'\nimport type { IncomingMessage } from \"node:http\";\n\nexport const MAX_BODY = 1024 * 1024;\nexport class TooLarge extends Error {}\n\nexport const readBody = async (req: IncomingMessage, limit = MAX_BODY) => {\n  const chunks: Buffer[] = [];\n  let size = 0;\n  for await (const chunk of req) {\n    size += chunk.length;\n    if (size > limit) throw new TooLarge(`body over ${limit} bytes`);\n    chunks.push(chunk);\n  }\n  return Buffer.concat(chunks).toString(\"utf8\");\n};\nEOF\ncat > src/server.ts <<'EOF'\nimport { createServer, type ServerResponse } from \"node:http\";\nimport { readBody, TooLarge } from \"./body.js\";\n\nconst comments: string[] = [];\nconst send = (res: ServerResponse, status: number, body: unknown) =>\n  void res.writeHead(status, { \"content-type\": \"application/json\" }).end(JSON.stringify(body));\n\nexport const server = createServer(async (req, res) => {\n  const url = new URL(req.url ?? \"/\", \"http://localhost\");\n  const route = `${req.method} ${url.pathname}`;\n  try {\n    if (route === \"GET /health\") return void res.end(\"ok\");\n    if (route === \"GET /v1/comments\") return send(res, 200, { comments });\n    if (route === \"POST /v1/comments\") {\n      const { text } = JSON.parse(await readBody(req)) as { text: string };\n      comments.push(text);\n      return send(res, 201, { count: comments.length });\n    }\n    return send(res, 404, { error: \"not found\" });\n  } catch (error) {\n    if (error instanceof TooLarge) return send(res, 413, { error: error.message });\n    if (error instanceof SyntaxError) return send(res, 400, { error: \"body is not JSON\" });\n    console.error(route, \"failed\");\n    return send(res, 500, { error: \"internal\" });\n  }\n});\nEOF\ncat > src/main.ts <<'EOF'\nimport { server } from \"./server.js\";\n\nconst port = Number(process.env.PORT ?? 8080);\nserver.listen(port, () => console.log(`listening on :${port}`));\nEOF\nnpx tsx src/main.ts",
+    "see": "listening on :8080"
    },
    {
-    "do": "curl -s -w ' [%{http_code}]\\n' localhost:8080/nope && curl -s -w ' [%{http_code}]\\n' -X POST localhost:8080/v1/notes -d 'not json'",
-    "see": "{\"error\":\"not found\"} [404]\n{\"error\":\"body is not JSON\"} [400]"
+    "say": "In the second terminal, post a comment, read the list, and try a path that does not exist.",
+    "do": "curl -s -w ' [%{http_code}]\\n' -X POST localhost:8080/v1/comments -d '{\"text\":\"Plan v2 is ready\"}'\ncurl -s -w ' [%{http_code}]\\n' localhost:8080/v1/comments\ncurl -s -w ' [%{http_code}]\\n' localhost:8080/v1/nope",
+    "see": "{\"count\":1} [201]\n{\"comments\":[\"Plan v2 is ready\"]} [200]\n{\"error\":\"not found\"} [404]"
    },
    {
-    "do": "head -c 2000000 /dev/zero | tr '\\0' a > runs/big.txt && curl -s -w ' [%{http_code}]\\n' -X POST localhost:8080/v1/notes --data-binary @runs/big.txt",
-    "see": "{\"error\":\"body over 1048576 bytes\"} [413]"
-   },
-   {
-    "do": "Terminal 1: press Ctrl+C. Then npm run typecheck",
-    "see": "> tsc -p tsconfig.json --noEmit\n(no errors)"
+    "say": "Now the two mistakes a caller can make: a body that is not JSON, and a body of 2 MB.",
+    "do": "curl -s -w ' [%{http_code}]\\n' -X POST localhost:8080/v1/comments -d 'not json'\nnode -e 'process.stdout.write(JSON.stringify({ text: \"a\".repeat(2_000_000) }))' > big.json\ncurl -s -w ' [%{http_code}]\\n' -X POST localhost:8080/v1/comments --data-binary @big.json",
+    "see": "{\"error\":\"body is not JSON\"} [400]\n{\"error\":\"body over 1048576 bytes\"} [413]"
    }
   ],
-  "faded": "Add DELETE /v1/notes. It empties the list and answers 204 with no body. Left to you: the route line, emptying the array, and sending 204. send() always writes JSON, so use res.writeHead(204).end().",
-  "alone": "Give the service a second port, like the gateway's metrics port. In main.ts, start another createServer on 9090. It answers GET /metrics with the text lab_notes_total <n>, where n is the note count. Export a small function from server.ts that returns the count.",
-  "done": "curl shows 200, 201, 400, 404 and 413 exactly as above, and typecheck is clean."
+  "build": "Add an answer for a known path with the wrong method. Today DELETE /v1/comments gets 404, which is misleading, because the path exists. Make it answer 405 Method Not Allowed with an Allow header that says GET, POST, and an empty body; every other unknown route must still get 404. Restart the server, then check it with curl -s -i -X DELETE localhost:8080/v1/comments (the -i prints the status line and the headers). Stop the server with Ctrl+C when you are done.",
+  "checks": [
+   "src/hang.ts answered /health with ok [200] and let /v1/comments time out.",
+   "POST /v1/comments with a JSON body answered [201], and GET /v1/comments then listed the comment.",
+   "A body that is not JSON got [400], and the 2 MB body got [413] with body over 1048576 bytes.",
+   "curl -s -i -X DELETE localhost:8080/v1/comments starts with HTTP/1.1 405 Method Not Allowed and shows allow: GET, POST.",
+   "localhost:8080/v1/nope still answers [404]."
+  ],
+  "solution": {
+   "lang": "typescript",
+   "file": "src/server.ts (the lines before the 404)",
+   "text": "    if (url.pathname === \"/v1/comments\") return void res.writeHead(405, { allow: \"GET, POST\" }).end();\n    return send(res, 404, { error: \"not found\" });"
+  },
+  "fix": "A long comment from a person got 413, so someone made the limit \"generous\": readBody(req, Infinity). Make the same change, restart, and send big.json again: it is accepted with 201, and GET /v1/comments now sends 2 MB back. Explain what a 2 GB body would do to the broker and to every Nova run that needs it, then put the 1 MiB limit back and answer the person's problem another way.",
+  "explain": [
+   "Why does a request to a path your handler does not handle hang, instead of getting an error?",
+   "Why do we count the body's bytes while the chunks arrive, instead of checking the length after reading it all?",
+   "Which status does each of these get, and why: an unknown path, bad JSON, a 2 MB body, and a bug in our code?"
+  ],
+  "done": "Every curl in the lab gets a status (200, 201, 400, 404, 405 or 413), none of them hangs, and the server is stopped."
  },
- "quiz": [
+ "check": [
   {
-   "q": "A client POSTs 2 MB to the Nova broker. What status comes back?",
+   "q": "Your handler only has if statements for GET /health and POST /v1/comments. A caller sends GET /v1/comment (a typo). What should your code do, and why?",
    "options": [
     {
-     "text": "400, because the body is wrong",
+     "text": "Nothing; Node answers 404 for paths you did not register",
      "correct": false,
-     "why": "The body may be valid JSON; its size is the problem."
+     "why": "node:http has no list of registered paths. Without your own answer the request hangs until the caller stops waiting."
     },
     {
-     "text": "413, because the broker reads at most 1 MiB",
+     "text": "End the handler with a 404 for every route it did not match",
      "correct": true,
-     "why": "readBody stops at the limit and the handler answers 413."
+     "why": "Every path through the handler must end the response. A final 404 turns a typo into a clear answer instead of a hang."
     },
     {
-     "text": "500, because the server ran out of memory",
+     "text": "Answer 500, because the caller hit a bug",
      "correct": false,
-     "why": "The limit exists so that never happens."
+     "why": "500 says the fault is ours. A wrong path is the caller's mistake, and 404 says exactly that."
     }
    ]
   },
   {
-   "q": "Why do the broker and gateway use node:http instead of a web framework?",
+   "q": "Why does readBody count bytes inside the for await loop instead of reading the whole body and then checking body.length?",
    "options": [
     {
-     "text": "Because a framework cannot stream responses",
-     "correct": false,
-     "why": "Frameworks can stream. The reason is review and dependencies."
-    },
-    {
-     "text": "Few dependencies and small code that Security can read line by line; Byte's broker already works this way, with tests",
+     "text": "Because by the time you could check the length, a huge body would already be in memory",
      "correct": true,
-     "why": "These services hold keys, so every line and every dependency matters."
+     "why": "Counting while the chunks arrive lets you stop after 1 MiB. Checking afterwards means a 2 GB body has already filled the memory you wanted to protect."
     },
     {
-     "text": "Because node:http is faster to write than Express",
+     "text": "Because body.length counts characters, not bytes",
      "correct": false,
-     "why": "It is more lines, not fewer. We accept that for control."
+     "why": "That difference is real for text with accents or emoji, but it is not the reason. The point is to stop before storing the body."
+    },
+    {
+     "text": "Because the content-length header is always correct, so the loop is only a backup",
+     "correct": false,
+     "why": "The header is whatever the caller wrote, and a chunked request has none. Only counting real bytes can be trusted."
     }
    ]
   },
   {
-   "q": "Your handler has a path that never calls res.end(). What does the client see?",
+   "q": "A caller sends {\"text\": \"hi\" (the closing brace is missing). Which answer is right?",
    "options": [
     {
-     "text": "An empty 200 answer",
+     "text": "500, because JSON.parse threw an exception",
      "correct": false,
-     "why": "Nothing is sent until you end the response."
+     "why": "An exception in our code is not always our fault. Here the caller sent broken JSON, and 500 would send us looking for a bug we do not have."
     },
     {
-     "text": "A 404 from Node",
+     "text": "413, because the body could not be read",
      "correct": false,
-     "why": "Node adds no default answer."
+     "why": "413 means too large. This body is tiny; it is just not valid JSON."
     },
     {
-     "text": "It waits until it times out",
+     "text": "400, because the request itself is wrong",
      "correct": true,
-     "why": "Every path must end the response; that is why each branch returns send() or end()."
+     "why": "The catch turns a SyntaxError from JSON.parse into 400: the caller can fix it by sending valid JSON."
     }
    ]
   }
  ],
- "recall": [
-  "From p1-2: what does pipeline do when one stream in the chain fails?",
-  "From p1-1: why does main.ts import \"./server.js\" and not \"./server\"?"
- ],
- "videos": [
-  {
-   "title": "Node.js Ultimate Beginner's Guide in 7 Easy Steps",
-   "url": "https://www.youtube.com/watch?v=ENrzD9HAZK4",
-   "channel": "Fireship",
-   "minutes": 16,
-   "why": "Fast tour of Node runtime, modules, http server and npm for browser-only devs."
-  },
-  {
-   "title": "Node.js Tutorial - 24 - Streams and Buffers",
-   "url": "https://www.youtube.com/watch?v=br8VB99qPzE",
-   "channel": "Codevolution",
-   "minutes": 10,
-   "why": "Clear, slow-paced explanation of streams and buffers with simple code examples."
-  }
- ],
+ "platform": {
+  "p": [
+   "The broker and the gateway are plain node:http servers, like Byte's broker that ours starts from: one handler, a route string, /health without authentication for Kubernetes, 404 for anything unknown, and a status chosen from the error type. The broker keeps Byte's 1 MiB body limit. The gateway has no limit of its own, because an agent session sends several megabytes per call and Anthropic limits the size itself.",
+   "The gateway also runs a second small server in the same process, on port 9090, for its metrics. Its access log holds the method, path, status and time of each request and never a body, and a test fails if any request text reaches the logs."
+  ],
+  "tickets": [
+   {
+    "key": "G3-07",
+    "why": "The broker keeps Byte's node:http core: /health without auth, 401 for the rest, and the 1 MiB body limit."
+   },
+   {
+    "key": "G0-13",
+    "why": "The gateway's handler: /health, two POST routes, 404 for the rest, and 401 or 502 chosen from the error type."
+   },
+   {
+    "key": "G3-10",
+    "why": "The broker's git proxy adds routes to the same server and streams the push through."
+   },
+   {
+    "key": "G0-14",
+    "why": "The metrics port is a second createServer in the same process."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "node:http",
-   "plain": "Node's built-in HTTP module: createServer, IncomingMessage, ServerResponse."
-  },
-  {
    "term": "handler",
-   "plain": "The one function createServer calls for every request, with req and res."
+   "plain": "The one function createServer calls for every request, with req (what came in) and res (what you send back)."
   },
   {
    "term": "route",
-   "plain": "Here, the string of method and path, such as POST /v1/notes, that picks the code to run."
+   "plain": "A method plus a path, such as POST /v1/comments, that your handler knows how to answer."
   },
   {
    "term": "status code",
-   "plain": "The number that says how a request went: 200, 201, 400, 401, 404, 413, 500."
+   "plain": "The number at the start of every response: 2xx worked, 4xx the caller's mistake, 5xx ours."
   },
   {
    "term": "body limit",
-   "plain": "The most bytes a server will read from one request; the broker's is 1 MiB."
+   "plain": "The most bytes a request body may have before the server stops reading and answers 413."
   },
   {
-   "term": "health check",
-   "plain": "GET /health, answered without auth, so Kubernetes can tell the pod is alive."
-  },
-  {
-   "term": "SIGTERM",
-   "plain": "The signal Docker and Kubernetes send to stop a process; we close the server and exit."
+   "term": "Buffer",
+   "plain": "Node's type for raw bytes. A request body arrives as a stream of Buffer chunks."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G0-13",
-   "why": "The gateway is a node:http server: /health, two POST routes, 404, and 401 or 502 from the error type."
+   "q": "From memory: which status does each of these get, 201, 400, 401, 404, 405, 413 or 500? A new comment, a missing token, a body over 1 MiB, a broken JSON body, an unknown path, DELETE on a path that only allows GET and POST, and a bug in our code.",
+   "a": "201 created, 401 missing token, 413 body too large, 400 broken JSON, 404 unknown path, 405 wrong method on a known path, 500 our bug."
   },
   {
-   "key": "G3-07",
-   "why": "The broker keeps Byte's node:http core: /health without auth, 401 for the rest, and the 1 MiB limit."
-  },
-  {
-   "key": "G3-10",
-   "why": "The git proxy adds routes to the same server and streams the push through."
-  },
-  {
-   "key": "G0-14",
-   "why": "The metrics port is a second createServer in the same process."
+   "q": "A teammate proposes Express for the broker \"so we get routing and body parsing without writing them\". What would you say?",
+   "a": "The broker holds the credentials, so every line in it should be readable in one review. node:http with a route string, a counted body and a status on every path is a few dozen lines, has no dependencies to audit, and matches Byte's broker that ours starts from. Express's body parser would still need its limit set by hand."
   }
  ],
- "remember": "One handler per server: a route string, a body read with a limit, and an exact status code on every path."
+ "remember": "One handler sees every request: match the route yourself, count the body against a limit, and end every path with a status."
 }

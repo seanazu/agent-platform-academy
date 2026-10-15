@@ -1,485 +1,317 @@
 {
+ "v": 2,
  "id": "p3-2",
  "title": "Networks: VPC, subnets and endpoints",
  "minutes": 50,
  "youNeed": [
   "p3-1"
  ],
- "bridge": "A VPC is like your office network: your own address range, rooms called subnets, and a router table. Except 'private' in AWS means there is no route out, not that a firewall blocks the traffic. The firewall is a separate thing, the security group on each machine.",
- "intro": "A sandbox VM reads untrusted text, so it must have no way to send our code anywhere. This lesson builds the network for that: private subnets, no internet gateway, no NAT. Then it opens only the doors a VM needs. Those are endpoints to AWS services, the proxy, and DNS for a short list of names.",
- "picture": {
-  "caption": "Inside the sandbox VPC every packet follows the route table; only named doors lead anywhere.",
-  "nodes": [
-   {
-    "id": "vm",
-    "label": "sandbox VM (10.60.x.x)",
-    "kind": "machine"
-   },
-   {
-    "id": "rt",
-    "label": "route table: local + S3 only",
-    "kind": "file"
-   },
-   {
-    "id": "s3ep",
-    "label": "S3 gateway endpoint (our buckets)",
-    "kind": "service"
-   },
-   {
-    "id": "ifep",
-    "label": "interface endpoints: ssm, ecr, logs",
-    "kind": "service"
-   },
-   {
-    "id": "dns",
-    "label": "DNS firewall",
-    "kind": "check"
-   },
-   {
-    "id": "proxy",
-    "label": "egress proxy :3128",
-    "kind": "service"
-   },
-   {
-    "id": "net",
-    "label": "the internet",
-    "kind": "cloud"
-   }
+ "map": "egress",
+ "hook": {
+  "story": [
+   "A poisoned Jira comment tells Nova to upload the fcp repo to a paste site, and Nova tries. The first attempt goes through the egress proxy, which refuses it because the site is not on its short list (a later lesson builds that proxy). So Nova tries again with a script that connects to the site directly. This time nothing refuses anything. The command waits, and after a while it fails with a timeout. Nobody wrote a rule about paste sites, and no log line says \"blocked\". The packets simply had nowhere to go, because the network Nova's VM sits on has no road to the internet at all.",
+   "Yet the same VM is not cut off from everything. A minute earlier it received its task through AWS Systems Manager, and later it will save its notes to an S3 bucket. Both of those are AWS services that normally live at public internet addresses."
   ],
-  "steps": [
-   {
-    "from": "vm",
-    "to": "rt",
-    "text": "sends a packet; the route table decides where it may go"
-   },
-   {
-    "from": "rt",
-    "to": "s3ep",
-    "text": "S3 traffic goes to the gateway endpoint; its policy allows only our buckets"
-   },
-   {
-    "from": "vm",
-    "to": "ifep",
-    "text": "AWS API calls (SSM, ECR, logs) go to private IPs inside the VPC, port 443"
-   },
-   {
-    "from": "vm",
-    "to": "dns",
-    "text": "every name lookup passes the DNS firewall; names off the list get NXDOMAIN"
-   },
-   {
-    "from": "vm",
-    "to": "proxy",
-    "text": "web traffic for allowed names goes to the proxy on port 3128"
-   },
-   {
-    "from": "proxy",
-    "to": "net",
-    "text": "only the proxy has a route to the internet (p4-5)"
-   },
-   {
-    "from": "rt",
-    "to": "net",
-    "text": "no 0.0.0.0/0 route: any other packet to the internet has nowhere to go"
-   }
-  ]
+  "question": "How do you build a network where a machine cannot reach the internet, but can still reach the few AWS services it needs?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Start from the network you are on",
+   "h": "Your own network, with your own addresses",
    "p": [
-    "Your laptop has a private address, like 192.168.1.23, given by your home router. The router knows one extra route: anything that is not local goes to the internet. Remove that route and your laptop still talks to the printer, but nothing else.",
-    "A VPC (virtual private cloud) is that home network inside AWS. You choose its address range and you write every route yourself. Nothing leaves unless a route says where."
+    "A VPC, a virtual private cloud, is a private network inside your AWS account. Machines you start get addresses from its range, and nothing reaches them or leaves them unless you build the path. You write the range as a CIDR block: a start address, a slash and a number that says how many of the first bits are fixed. In 10.60.0.0/16 the first 16 bits (10.60) are fixed and the other 16 are free, so the block holds every address from 10.60.0.0 to 10.60.255.255, 65,536 in all. A bigger number after the slash means a smaller block: a /18 holds 16,384 addresses and a /28 holds only 16.",
+    "A VPC is cut into subnets, smaller blocks that each live in one availability zone. The sandbox VPC uses 10.60.0.0/16, a range no other network of ours uses, and splits it into four /18 blocks: three for VMs, one in each zone, and the fourth kept for the egress proxy that a later lesson builds. OpenTofu, the tool our infrastructure code is written in, has a function that does the cutting, and you can try it with no cloud at all."
    ],
-   "because": "We look at your own routes first because a VPC route table works the same way.",
    "code": {
     "lang": "bash",
-    "file": "your laptop (macOS)",
-    "text": "ipconfig getifaddr en0          # your private address on Wi-Fi\nnetstat -rn -f inet | head -4   # your route table\n# 'default' is the route to the internet, through your router",
+    "file": "your terminal (OpenTofu installed)",
+    "text": "echo '[for n in range(3) : cidrsubnet(\"10.60.0.0/16\", 2, n)]' | tofu console\necho 'cidrsubnet(\"10.60.0.0/16\", 2, 3)' | tofu console",
     "notes": [
      {
       "line": 1,
-      "text": "en0 is usually the Wi-Fi card on a Mac. The address is private: it only means something at home."
+      "text": "cidrsubnet(range, extra bits, number): 2 extra bits turn a /16 into four /18 blocks, numbered 0 to 3. These are the three VM subnets."
      },
      {
       "line": 2,
-      "text": "The route table: for each destination, where to send the packet."
-     },
-     {
-      "line": 3,
-      "text": "The line starting with default is the way out. A sandbox subnet has no such line."
+      "text": "Block number 3, the spare one for the proxy."
      }
     ]
    },
-   "see": "192.168.1.23\nRouting tables\n\nInternet:\nDestination        Gateway            Flags\ndefault            192.168.1.1        UGScg\n(your numbers differ)"
+   "see": "[\n  \"10.60.0.0/18\",\n  \"10.60.64.0/18\",\n  \"10.60.128.0/18\",\n]\n\"10.60.192.0/18\""
   },
   {
-   "h": "CIDR: an address range in one line",
+   "h": "The route table decides where packets can go",
    "p": [
-    "A CIDR block writes a range as a start address and a size. 10.60.0.0/16 means the first 16 bits are fixed: every address from 10.60.0.0 to 10.60.255.255, 65,536 in all. A bigger number after the slash means a smaller range: a /18 holds 16,384, a /28 holds 16.",
-    "G3-04 gives the sandbox VPC 10.60.0.0/16, a range no other network of ours uses. G3-03 cuts it into four /18s: three for VMs, one per AZ, and the fourth kept for the proxy. OpenTofu's cidrsubnet() does the cutting, and you can try it without any cloud."
+    "Before the AWS version, look at one you already have. Every container on your laptop has a route table, and you can print it. The first container below is on Docker's normal network, the second on a network created with --internal."
    ],
-   "because": "We compute subnets with cidrsubnet() because hand-typed ranges overlap sooner or later.",
    "code": {
     "lang": "bash",
-    "file": "your laptop (OpenTofu installed)",
-    "text": "echo 'cidrsubnet(\"10.60.0.0/16\", 2, 0)' | tofu console\necho '[for n in range(3) : cidrsubnet(\"10.60.0.0/16\", 2, n)]' | tofu console\necho 'cidrsubnet(cidrsubnet(\"10.60.0.0/16\", 2, 3), 10, 0)' | tofu console",
+    "file": "your terminal (Docker running)",
+    "text": "docker run --rm alpine:3.20 sh -c 'ip route; wget -q -T 3 --spider http://1.1.1.1 && echo \"1.1.1.1 is reachable\"'\n\ndocker network create --internal sandbox-net\ndocker run --rm --network sandbox-net alpine:3.20 sh -c 'ip route; wget -q -T 3 --spider http://1.1.1.1 && echo \"1.1.1.1 is reachable\"'",
     "notes": [
      {
       "line": 1,
-      "text": "Add 2 bits to /16 to get a /18, and take block number 0 of the four."
-     },
-     {
-      "line": 2,
-      "text": "The three VM subnets, exactly the expression in modules/aws-vpc-private."
+      "text": "ip route prints the container's route table; wget tries to reach a public address."
      },
      {
       "line": 3,
-      "text": "Take the fourth /18, add 10 more bits (a /28), take the first: a proxy subnet (G3-09)."
+      "text": "--internal creates a network with no route out of your laptop."
      }
     ]
    },
-   "see": "\"10.60.0.0/18\"\n[\n  \"10.60.0.0/18\",\n  \"10.60.64.0/18\",\n  \"10.60.128.0/18\",\n]\n\"10.60.192.0/28\""
-  },
-  {
-   "h": "Subnets and route tables",
-   "p": [
-    "A subnet is a slice of the VPC's range in one AZ. Each subnet uses a route table. A new VPC's route table has one route: the VPC's own range goes to 'local'.",
-    "A public subnet adds 0.0.0.0/0 to an internet gateway (IGW), the VPC's door to the internet. A private subnet in most VPCs adds 0.0.0.0/0 to a NAT gateway, which lets machines call out but not be called. Our modules/aws-vpc builds both, with public IPs on launch.",
-    "Sandboxes get neither. G3-03 copies the module as aws-vpc-private: no public subnets, no IGW, no NAT, no public IPs. The SCP from p3-1 stops anyone adding a NAT later."
-   ],
-   "because": "We build the VPC by hand once so the route table you read later in Terraform is not a mystery.",
-   "code": {
-    "lang": "bash",
-    "file": "~/academy/aws (moto running, source moto.env)",
-    "text": "VPC=$(aws ec2 create-vpc --cidr-block 10.60.0.0/16 --query Vpc.VpcId --output text)\nfor i in 0 1 2; do\n  aws ec2 create-subnet --vpc-id $VPC --cidr-block 10.60.$((i * 64)).0/18 \\\n    --availability-zone us-east-1$(echo abc | cut -c$((i + 1))) \\\n    --query 'Subnet.[SubnetId,CidrBlock,AvailabilityZone]' --output text\ndone\naws ec2 describe-route-tables --filters Name=vpc-id,Values=$VPC \\\n  --query 'RouteTables[].Routes[]' --output table",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Creates the VPC and keeps its ID in a shell variable."
-     },
-     {
-      "line": 3,
-      "text": "Three /18 subnets: 10.60.0.0, 10.60.64.0 and 10.60.128.0."
-     },
-     {
-      "line": 4,
-      "text": "One per AZ: us-east-1a, b and c."
-     },
-     {
-      "line": 7,
-      "text": "Reads the routes. There is only the local one: no way out."
-     }
+   "see": "default via 172.17.0.1 dev eth0\n172.17.0.0/16 dev eth0 scope link  src 172.17.0.5\n1.1.1.1 is reachable\n\n172.21.0.0/16 dev eth0 scope link  src 172.21.0.2\nwget: can't connect to remote host (1.1.1.1): Network unreachable",
+   "deeper": {
+    "h": "Go deeper: security groups, a firewall on each machine",
+    "p": [
+     "Routes say where a packet can go. A security group says which connections a machine accepts and starts, and it is attached to the machine's network card. Ingress rules say what may come in, egress rules what may go out, and replies to an allowed connection always get back. Security groups have no deny rules: you block something by not allowing it, and a new group allows all egress until you remove that rule.",
+     "The sandbox security group has no ingress rules at all, so nobody can connect to a sandbox. Its egress rules allow only three destinations: the egress proxy on port 3128, the endpoints on port 443, and the private path to our own services. Routes and security groups are two separate walls, and each one would stop the paste-site upload by itself."
     ]
-   },
-   "see": "subnet-b0ac914765e8fad8a\t10.60.0.0/18\tus-east-1a\nsubnet-26f24e0e78b8bc75c\t10.60.64.0/18\tus-east-1b\nsubnet-eb054d60af686ea2f\t10.60.128.0/18\tus-east-1c\n|  10.60.0.0/16  |  local  |  CreateRouteTable  |  active |"
+   }
   },
   {
-   "h": "Gateway endpoint: S3 without the internet",
+   "h": "No default route, no way out",
    "p": [
-    "A VPC endpoint is a private door from your VPC to an AWS service. The S3 kind is a gateway endpoint. It adds a route to a prefix list, AWS's named list of S3's address ranges. S3 traffic then stays inside AWS.",
-    "An endpoint has its own policy. The current modules/aws-vpc allows '*', so a VM could use a presigned URL to anyone's bucket. That is a way out for our code. G3-03 allows only our buckets: the runs bucket, and the bucket where ECR keeps image layers."
+    "The difference between the two outputs is one line. The first table has a default route, a catch-all for every address that matches nothing more specific, and it sends that traffic to a gateway that leads to the internet. The second table knows only its own block, so a packet for 1.1.1.1 matches no route, and the container gives up at once with \"Network unreachable\".",
+    "In a VPC every subnet has a route table that works the same way, with one row per destination and target. A new VPC starts with a single route: its own range goes to local, which means the machines inside can reach each other. A public subnet adds a default route, written 0.0.0.0/0, to an internet gateway, the VPC's door to the internet. A typical private subnet adds 0.0.0.0/0 to a NAT gateway instead, which lets machines call out without anyone calling in. The sandbox subnets get neither, so their only route is local. Here the Docker example stops matching. On a VM, the operating system sends every outside packet to the VPC's router, and the subnet's route table is applied there, inside the AWS network. With no matching route, AWS drops the packet without a word, so the VM sees a timeout instead of \"Network unreachable\", as in the story. And because that table lives in AWS, even root on the VM cannot add a road the subnet does not have."
+   ]
+  },
+  {
+   "h": "Endpoints: private doors to AWS services",
+   "p": [
+    "A VM with only a local route still needs a few AWS services. The SSM agent on it must receive commands from AWS Systems Manager, Docker must pull images from ECR, and the run's notes go to S3. Those services answer at public addresses, so without help the VM could not reach them either. A VPC endpoint is a private path from your VPC to one AWS service, and it comes in two kinds.",
+    "An interface endpoint is a network card with a private address in each of your subnets. With private DNS turned on, a name like ssm.us-east-1.amazonaws.com resolves inside the VPC to that private address, so the SSM agent connects to it without any route to the internet. A gateway endpoint exists only for S3 and DynamoDB. Instead of a network card, it adds a route to the route table whose destination is a prefix list, an AWS-managed list of S3's address ranges, so S3 traffic stays inside AWS. Gateway endpoints are free; interface endpoints cost a small amount per hour.",
+    "An endpoint has its own policy, a third check after the route table and the security group (the firewall on each machine, explained in a panel above). If the S3 endpoint allowed every bucket, a fooled agent could upload our code to a bucket that belongs to somebody else, through a link that person gave it, and the traffic would look like ordinary S3. So the sandbox's S3 endpoint allows only our own buckets."
    ],
-   "because": "We list buckets in the endpoint policy because an open S3 endpoint is an exit to every bucket in the world.",
    "code": {
     "lang": "json",
-    "file": "~/academy/aws/s3-endpoint-policy.json",
-    "text": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [{\n    \"Effect\": \"Allow\",\n    \"Principal\": \"*\",\n    \"Action\": [\"s3:GetObject\", \"s3:PutObject\"],\n    \"Resource\": [\n      \"arn:aws:s3:::rhino-ai-agents-runs/*\",\n      \"arn:aws:s3:::prod-us-east-1-starport-layer-bucket/*\"\n    ]\n  }]\n}",
+    "file": "s3-endpoint-policy.json (the policy of the S3 gateway endpoint)",
+    "text": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Effect\": \"Allow\",\n      \"Principal\": \"*\",\n      \"Action\": [\"s3:GetObject\", \"s3:PutObject\"],\n      \"Resource\": \"arn:aws:s3:::rhino-ai-agents-runs/*\"\n    }\n  ]\n}",
     "notes": [
      {
-      "line": 5,
-      "text": "Anyone inside the VPC, because the VM has no AWS identity of its own for S3 (p3-6)."
-     },
-     {
       "line": 6,
-      "text": "Read and write objects. No list, no delete, no bucket settings."
+      "text": "Principal \"*\": the endpoint does not care who calls; IAM still checks the caller afterwards."
      },
      {
       "line": 8,
-      "text": "Our runs bucket, where presigned uploads go (p3-6)."
-     },
-     {
-      "line": 9,
-      "text": "ECR stores image layers in this AWS-owned bucket. Without it, docker pull from ECR fails."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Interface endpoints: private doors to AWS APIs",
-   "p": [
-    "Most AWS services use interface endpoints instead. Each one is a network card with a private IP in your subnets. With private DNS on, a name like ssm.us-east-1.amazonaws.com resolves to that private IP inside the VPC.",
-    "G3-04 lists what a sandbox needs. ssm, ssmmessages and ec2messages let the SSM agent take commands (p3-5). ecr.api and ecr.dkr let Docker pull our images. logs sends logs, and autoscaling lets a VM finish its lifecycle hook (p3-4). A security group lets in port 443 from the VPC only."
-   ],
-   "because": "We create one interface endpoint by hand because the other six differ only in the service name.",
-   "code": {
-    "lang": "bash",
-    "file": "~/academy/aws (moto running)",
-    "text": "ESG=$(aws ec2 create-security-group --group-name endpoints \\\n  --description \"443 from the VPC\" --vpc-id $VPC --query GroupId --output text)\naws ec2 authorize-security-group-ingress --group-id $ESG --protocol tcp --port 443 --cidr 10.60.0.0/16\naws ec2 create-vpc-endpoint --vpc-id $VPC --vpc-endpoint-type Interface \\\n  --service-name com.amazonaws.us-east-1.ssm --private-dns-enabled \\\n  --subnet-ids $(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC --query 'Subnets[].SubnetId' --output text) \\\n  --security-group-ids $ESG --query 'VpcEndpoint.[VpcEndpointType,ServiceName]' --output text",
-    "notes": [
-     {
-      "line": 1,
-      "text": "A security group for the endpoints themselves."
-     },
-     {
-      "line": 3,
-      "text": "Only HTTPS, only from addresses inside the VPC."
-     },
-     {
-      "line": 5,
-      "text": "The service name is com.amazonaws.<region>.<service>. Private DNS makes the normal name point here."
-     },
-     {
-      "line": 6,
-      "text": "One network card per subnet, so each AZ has its own copy."
+      "text": "Only objects in our runs bucket. Any other bucket, even one with a valid link, is refused at the endpoint."
      }
     ]
    },
-   "see": "true\nInterface\tcom.amazonaws.us-east-1.ssm",
-   "ifInstead": "If instead you see InvalidSubnetID.NotFound with three IDs in one string, your shell did not split them. Keep the $( ) inline as shown; zsh does not split a variable."
-  },
-  {
-   "h": "Security groups: a firewall on each VM",
-   "p": [
-    "A security group is a firewall attached to a machine's network card. Ingress rules say what may come in; egress rules say what may go out. It is stateful: replies to an allowed request always get back.",
-    "G3-11's sandbox group has no ingress at all: nobody can connect to a sandbox. Egress goes only to the proxy on 3128, the endpoints on 443, and the PrivateLink endpoint to our services on inf (p4-5). A new group allows all egress by default, so step one is to remove that rule."
-   ],
-   "because": "We revoke the default egress rule first because a new security group lets everything out.",
-   "code": {
-    "lang": "bash",
-    "file": "~/academy/aws (moto running)",
-    "text": "SG=$(aws ec2 create-security-group --group-name sandbox \\\n  --description \"sandbox: no ingress\" --vpc-id $VPC --query GroupId --output text)\naws ec2 revoke-security-group-egress --group-id $SG \\\n  --ip-permissions '[{\"IpProtocol\":\"-1\",\"IpRanges\":[{\"CidrIp\":\"0.0.0.0/0\"}]}]'\naws ec2 authorize-security-group-egress --group-id $SG \\\n  --ip-permissions '[{\"IpProtocol\":\"tcp\",\"FromPort\":3128,\"ToPort\":3128,\"IpRanges\":[{\"CidrIp\":\"10.60.192.0/24\"}]}]'\naws ec2 describe-security-groups --group-ids $SG \\\n  --query 'SecurityGroups[0].[length(IpPermissions), IpPermissionsEgress[0].FromPort]' --output text",
-    "notes": [
-     {
-      "line": 1,
-      "text": "A new group has no ingress rules. We never add one."
-     },
-     {
-      "line": 3,
-      "text": "Removes the default 'all traffic to anywhere' egress rule."
-     },
-     {
-      "line": 5,
-      "text": "Allows TCP 3128 to the proxy's range only. In G3-11 the target is the proxy's network load balancer (NLB), not a whole /24."
-     },
-     {
-      "line": 7,
-      "text": "0 ingress rules, and the one egress port is 3128."
-     }
-    ]
-   },
-   "see": "{\n    \"Return\": true\n}\n0\t3128\n(the authorize call also prints the new rule; output trimmed)",
-   "callout": {
-    "kind": "gotcha",
-    "text": "Security groups have no deny rules. To block something, you remove the allow. That is why the default egress rule must go."
-   }
-  },
-  {
-   "h": "DNS firewall: the last quiet way out",
-   "p": [
-    "Even with no route out, a VM can ask the VPC's DNS resolver for a name. The resolver asks the internet on the VM's behalf. A lookup for c2VjcmV0.attacker.com carries data in the name itself: that is DNS exfiltration.",
-    "G3-04 closes it with Route 53 Resolver DNS Firewall. One domain list holds the allowed names: the proxy allow-list, *.amazonaws.com and *.ai-agents.example.com. An ALLOW rule lets those through; a BLOCK rule answers NXDOMAIN ('no such name') for everything else. Queries are logged to CloudWatch.",
-    "G3-04 also adds a private DNS zone, ai-agents.example.com, visible only inside the VPC. It holds proxy., broker., gateway. and otel. names."
-   ],
-   "because": "We block DNS by default because a lookup is the one packet that leaves even when no route does.",
-   "code": {
-    "lang": "bash",
-    "file": "AWS CLI shape from the Route 53 Resolver docs (moto does not emulate this part)",
-    "text": "LIST=$(aws route53resolver create-firewall-domain-list --name allowed \\\n  --creator-request-id allowed-1 --query FirewallDomainList.Id --output text)\naws route53resolver update-firewall-domains --firewall-domain-list-id $LIST --operation ADD \\\n  --domains nexus.example.com '*.amazonaws.com' '*.ai-agents.example.com'\nALL=$(aws route53resolver create-firewall-domain-list --name everything \\\n  --creator-request-id everything-1 --query FirewallDomainList.Id --output text)\naws route53resolver update-firewall-domains --firewall-domain-list-id $ALL --operation ADD --domains '*'\nGROUP=$(aws route53resolver create-firewall-rule-group --name sandbox-dns \\\n  --creator-request-id group-1 --query FirewallRuleGroup.Id --output text)\naws route53resolver create-firewall-rule --firewall-rule-group-id $GROUP --firewall-domain-list-id $LIST \\\n  --priority 100 --action ALLOW --name allow-list --creator-request-id rule-1\naws route53resolver create-firewall-rule --firewall-rule-group-id $GROUP --firewall-domain-list-id $ALL \\\n  --priority 200 --action BLOCK --block-response NXDOMAIN --name block-rest --creator-request-id rule-2\naws route53resolver associate-firewall-rule-group --firewall-rule-group-id $GROUP --vpc-id $VPC \\\n  --priority 101 --name sandbox-vpc --creator-request-id assoc-1",
-    "notes": [
-     {
-      "line": 1,
-      "text": "A domain list is a named set of names. creator-request-id makes a retried call safe."
-     },
-     {
-      "line": 4,
-      "text": "The allowed names. Today the proxy list is only nexus.example.com (p4-5)."
-     },
-     {
-      "line": 7,
-      "text": "A second list with '*', meaning every name."
-     },
-     {
-      "line": 10,
-      "text": "Lower priority numbers run first: allowed names match here and stop."
-     },
-     {
-      "line": 12,
-      "text": "Everything else gets NXDOMAIN, as if the name did not exist."
-     },
-     {
-      "line": 14,
-      "text": "Attaches the rules to the sandbox VPC. G3-04 does all of this in Terraform."
-     }
+   "see": "10.60.0.0/16\tlocal\npl-5b445bd3f7bc20506\tvpce-c9e6f205668944939",
+   "deeper": {
+    "h": "Go deeper: DNS, the last quiet way out",
+    "p": [
+     "Even with no route out, a VM can still ask the VPC's DNS resolver for a name, and the resolver asks the internet on the VM's behalf. An attacker who owns a domain can read every lookup for it, so a lookup for c2VjcmV0.attacker.example carries data inside the name itself. This is called DNS exfiltration.",
+     "The sandbox VPC closes it with a DNS firewall, a Route 53 Resolver feature. One list holds the names the VMs may look up: the proxy's allow-list, *.amazonaws.com and our own service names. An ALLOW rule lets those through, and a BLOCK rule answers NXDOMAIN, \"no such name\", for everything else."
     ]
    }
   }
  ],
  "lab": {
-  "title": "A private VPC on a fake AWS",
-  "youNeed": [
-   "moto and moto.env from the p3-1 lab",
-   "OpenTofu (brew install opentofu), only for tofu console",
-   "AWS CLI v2"
+  "id": "p3-2",
+  "title": "A network with no way out",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "Docker Desktop running",
+   "AWS CLI v2 and the LocalStack image from the p3-1 lab",
+   "OpenTofu (brew install opentofu), only for tofu console"
   ],
-  "worked": [
+  "goal": "Build the sandbox VPC on a practice AWS, prove its only route is local, and add private doors to S3 and Systems Manager without opening a road to the internet.",
+  "guess": {
+   "q": "A subnet's route table has one route: 10.60.0.0/16 to local. A VM in that subnet runs curl https://example.com. What happens?",
+   "options": [
+    {
+     "text": "A firewall blocks the request and writes it to a log.",
+     "correct": false,
+     "why": "No firewall is needed. The packet matches no route, so it never leaves the subnet."
+    },
+    {
+     "text": "The request fails, because no route matches the address.",
+     "correct": true,
+     "why": "Private in AWS means no route out. Only addresses inside 10.60.0.0/16, and any endpoints you add, have a path."
+    },
+    {
+     "text": "It works, because AWS gives every VPC a path to the internet by default.",
+     "correct": false,
+     "why": "A new VPC has only the local route. A path out exists only if someone adds an internet gateway or a NAT gateway."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "Tab 1: start moto as in p3-1. Tab 2: cd ~/academy/aws && source moto.env && curl -s -X POST localhost:5055/moto-api/reset",
-    "see": "{\"status\": \"ok\"}"
+    "say": "Feel the idea on your laptop first: one container with a default route and one without.",
+    "do": "docker run --rm alpine:3.20 sh -c 'ip route; wget -q -T 3 --spider http://1.1.1.1 && echo \"1.1.1.1 is reachable\"'\ndocker network create --internal sandbox-net\ndocker run --rm --network sandbox-net alpine:3.20 sh -c 'ip route; wget -q -T 3 --spider http://1.1.1.1 && echo \"1.1.1.1 is reachable\"'",
+    "see": "default via 172.17.0.1 dev eth0\n172.17.0.0/16 dev eth0 scope link  src 172.17.0.5\n1.1.1.1 is reachable\n(the network ID)\n172.21.0.0/16 dev eth0 scope link  src 172.21.0.2\nwget: can't connect to remote host (1.1.1.1): Network unreachable"
    },
    {
+    "say": "Plan the addresses before you create anything, because subnets cannot be resized later.",
     "do": "echo '[for n in range(3) : cidrsubnet(\"10.60.0.0/16\", 2, n)]' | tofu console",
     "see": "[\n  \"10.60.0.0/18\",\n  \"10.60.64.0/18\",\n  \"10.60.128.0/18\",\n]"
    },
    {
-    "do": "Run the block from section 3: create the VPC, the three subnets, and read the routes",
-    "see": "three subnet lines, then a table with one route: 10.60.0.0/16  local  active"
+    "say": "Start LocalStack again (skip the first line if it is still running from p3-1), and point the AWS CLI at it in this terminal.",
+    "do": "docker run --rm -d --name localstack -p 4566:4566 localstack/localstack:4.9 && sleep 15\nexport AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:4566",
+    "see": "(a container ID, then nothing: the export prints no output)"
    },
    {
-    "do": "aws ec2 describe-internet-gateways --filters Name=attachment.vpc-id,Values=$VPC --query 'length(InternetGateways)'",
-    "see": "0"
+    "say": "Create the VPC and one subnet per availability zone. Keep this terminal open, because $VPC is used in every later step.",
+    "do": "VPC=$(aws ec2 create-vpc --cidr-block 10.60.0.0/16 --query Vpc.VpcId --output text) && echo $VPC\naws ec2 create-subnet --vpc-id $VPC --cidr-block 10.60.0.0/18 --availability-zone us-east-1a --query 'Subnet.[CidrBlock,AvailabilityZone]' --output text\naws ec2 create-subnet --vpc-id $VPC --cidr-block 10.60.64.0/18 --availability-zone us-east-1b --query 'Subnet.[CidrBlock,AvailabilityZone]' --output text\naws ec2 create-subnet --vpc-id $VPC --cidr-block 10.60.128.0/18 --availability-zone us-east-1c --query 'Subnet.[CidrBlock,AvailabilityZone]' --output text",
+    "see": "vpc-8d31a58a977d3ad69\n10.60.0.0/18\tus-east-1a\n10.60.64.0/18\tus-east-1b\n10.60.128.0/18\tus-east-1c\n(your VPC ID is different)"
    },
    {
-    "do": "Save s3-endpoint-policy.json (section 4). RT=$(aws ec2 describe-route-tables --filters Name=vpc-id,Values=$VPC --query 'RouteTables[0].RouteTableId' --output text) && aws ec2 create-vpc-endpoint --vpc-id $VPC --vpc-endpoint-type Gateway --service-name com.amazonaws.us-east-1.s3 --route-table-ids $RT --policy-document file://s3-endpoint-policy.json --query 'VpcEndpoint.[VpcEndpointType,State]' --output text",
-    "see": "Gateway\tavailable"
+    "say": "Read the routes, and count the doors to the internet, because \"no way out\" should be something you can check, not something you believe.",
+    "do": "aws ec2 describe-route-tables --filters Name=vpc-id,Values=$VPC --query 'RouteTables[].Routes[].[DestinationCidrBlock || DestinationPrefixListId, GatewayId]' --output text\necho \"internet gateways: $(aws ec2 describe-internet-gateways --filters Name=attachment.vpc-id,Values=$VPC --query 'length(InternetGateways)'), NAT gateways: $(aws ec2 describe-nat-gateways --filter Name=vpc-id,Values=$VPC --query 'length(NatGateways)')\"",
+    "see": "10.60.0.0/16\tlocal\ninternet gateways: 0, NAT gateways: 0"
    },
    {
-    "do": "aws ec2 describe-route-tables --route-table-ids $RT --query 'RouteTables[0].Routes[].[DestinationCidrBlock,DestinationPrefixListId,GatewayId]' --output text",
-    "see": "10.60.0.0/16\tNone\tlocal\nNone\tpl-36c794c934f07bb16\tvpce-ae9f066257d553c47"
-   },
-   {
-    "do": "Run the block from section 6: the sandbox security group",
-    "see": "0\t3128 on the last line: no ingress, one egress port"
+    "say": "Add the S3 gateway endpoint with a policy that allows only the runs bucket, and see the route it adds.",
+    "do": "Save the endpoint policy from Understand as s3-endpoint-policy.json, then:\nRT=$(aws ec2 describe-route-tables --filters Name=vpc-id,Values=$VPC --query 'RouteTables[0].RouteTableId' --output text)\naws ec2 create-vpc-endpoint --vpc-id $VPC --vpc-endpoint-type Gateway --service-name com.amazonaws.us-east-1.s3 --route-table-ids $RT --policy-document file://s3-endpoint-policy.json --query 'VpcEndpoint.[VpcEndpointType,State]' --output text\naws ec2 describe-route-tables --filters Name=vpc-id,Values=$VPC --query 'RouteTables[].Routes[].[DestinationCidrBlock || DestinationPrefixListId, GatewayId]' --output text",
+    "see": "Gateway\tavailable\n10.60.0.0/16\tlocal\npl-5b445bd3f7bc20506\tvpce-c9e6f205668944939\n(the pl- line is the new route: S3's address list goes to the endpoint, not to the internet)"
    }
   ],
-  "faded": "Add the interface endpoint for SSM with the block from section 5. Then add two more, ssmmessages and ec2messages, the same way. Left to you: one describe-vpc-endpoints command that prints the type and service name of every endpoint in $VPC. You should see one Gateway line and three Interface lines.",
-  "alone": "G3-09 needs two /28 subnets for the proxy, cut from the spare fourth /18. Compute both with tofu console (cidrsubnet of cidrsubnet, block 0 and block 1). Create them in us-east-1a and us-east-1b. Then write down the one route the proxy subnets get that the sandbox subnets never get, and what it points to.",
-  "done": "Your VPC has three /18 subnets and no internet gateway. Its route table has only the local route and the S3 route. The sandbox group has no ingress and one egress port."
+  "build": "The SSM agent on the VM needs three interface endpoints: ssm, ssmmessages and ec2messages (the service names are com.amazonaws.us-east-1.<name>). Create all three in the three subnets with private DNS turned on; you can get the subnet IDs with aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC --query 'Subnets[].SubnetId' --output text. Then write one describe-vpc-endpoints command that prints the type, the service name and the number of network cards of every endpoint in $VPC. Last, read the routes again: did the interface endpoints add any route?",
+  "checks": [
+   "The first container prints a default route and reaches 1.1.1.1; the one on sandbox-net has no default route and prints Network unreachable.",
+   "Your VPC has three /18 subnets in us-east-1a, b and c.",
+   "Before the endpoint, the route table has only 10.60.0.0/16 to local, with 0 internet gateways and 0 NAT gateways.",
+   "After the S3 endpoint, there is one extra route from a pl- prefix list to a vpce- endpoint.",
+   "describe-vpc-endpoints prints one Gateway line and three Interface lines, each Interface endpoint with 3 network cards, and the route table did not change.",
+   "You stopped LocalStack (docker stop localstack) and removed the Docker network (docker network rm sandbox-net)."
+  ],
+  "solution": {
+   "lang": "bash",
+   "file": "the same terminal, with $VPC set",
+   "text": "for svc in ssm ssmmessages ec2messages; do\n  aws ec2 create-vpc-endpoint --vpc-id $VPC --vpc-endpoint-type Interface \\\n    --service-name com.amazonaws.us-east-1.$svc --private-dns-enabled \\\n    --subnet-ids $(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC --query 'Subnets[].SubnetId' --output text) \\\n    --query 'VpcEndpoint.ServiceName' --output text\ndone\n\naws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=$VPC \\\n  --query 'VpcEndpoints[].[VpcEndpointType,ServiceName,length(NetworkInterfaceIds)]' --output text\n# Gateway    com.amazonaws.us-east-1.s3           0\n# Interface  com.amazonaws.us-east-1.ssm          3\n# Interface  com.amazonaws.us-east-1.ssmmessages  3\n# Interface  com.amazonaws.us-east-1.ec2messages  3\n# The routes are unchanged: interface endpoints are reached through the local route."
+  },
+  "fix": "A teammate copied the network from the product's VPC module, which builds public subnets, and \"fixed\" a slow npm install by adding a road out. Recreate their change: IGW=$(aws ec2 create-internet-gateway --query InternetGateway.InternetGatewayId --output text), then aws ec2 attach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC, then aws ec2 create-route --route-table-id $RT --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW. Read the routes and find the line that breaks the wall. Remove it with delete-route, then detach and delete the internet gateway, and prove with your two checking commands that the VPC is back to local plus the S3 route, with 0 internet gateways.",
+  "explain": [
+   "Why does a curl to a paste site fail on a sandbox VM even though no rule mentions paste sites?",
+   "What is the difference between a gateway endpoint and an interface endpoint, and why does only one of them change the route table?",
+   "Why does the S3 endpoint list our bucket, when S3 is an AWS service and not the open internet?"
+  ],
+  "done": "Your VPC has three subnets, only the local route plus the S3 endpoint route, one gateway and three interface endpoints, and no internet gateway."
  },
- "quiz": [
+ "check": [
   {
-   "q": "A subnet's route table has no 0.0.0.0/0 route. What does that mean for its VMs?",
+   "q": "A sandbox subnet's route table has 10.60.0.0/16 to local and an S3 prefix list to an endpoint. A fooled agent sends the repo to a paste site. What stops it first?",
    "options": [
     {
-     "text": "A firewall drops their internet traffic and logs it",
-     "correct": false,
-     "why": "No firewall is involved. Packets have no route; flow logs and security groups are separate."
-    },
-    {
-     "text": "Packets to the internet have nowhere to go; local traffic and endpoints still work",
+     "text": "The packet matches no route, so it never leaves the subnet",
      "correct": true,
-     "why": "Private in AWS means no route out. The local route and endpoint routes still apply."
+     "why": "There is no default route and no internet gateway or NAT gateway. AWS drops the packets and the request times out, before any firewall is involved."
     },
     {
-     "text": "The VMs cannot start until a NAT gateway exists",
+     "text": "The S3 endpoint policy refuses the upload",
      "correct": false,
-     "why": "VMs start fine in private subnets; they only lack a path out."
+     "why": "The endpoint policy only sees traffic that goes to S3. A paste site is not S3, so the packet never reaches the endpoint."
+    },
+    {
+     "text": "The IAM role of the VM has no permission for the paste site",
+     "correct": false,
+     "why": "IAM only checks calls to AWS APIs. It has nothing to say about a request to some other website."
     }
    ]
   },
   {
-   "q": "Why does the S3 gateway endpoint policy list our buckets and nothing else?",
+   "q": "Why does the sandbox VM need interface endpoints for ssm, ssmmessages and ec2messages?",
    "options": [
     {
-     "text": "S3 charges extra for endpoint traffic to other buckets",
+     "text": "So people can connect to the VM over SSH through the endpoint",
      "correct": false,
-     "why": "Gateway endpoints cost nothing; the reason is security."
+     "why": "Endpoints let the VM reach an AWS service. They open no way for anyone to connect to the VM."
     },
     {
-     "text": "Without the list, our own bucket would not be reachable",
+     "text": "Because without them the VM cannot start",
      "correct": false,
-     "why": "An open policy reaches our bucket too. The list closes the others."
+     "why": "The VM starts fine. It would only be unreachable for Systems Manager, so no one could send it commands."
     },
     {
-     "text": "Otherwise a presigned URL to anyone's bucket would work from inside: a way out for our code",
+     "text": "So the SSM agent can reach Systems Manager with private addresses, without any route to the internet",
      "correct": true,
-     "why": "That is the gap G3-03 names in the current module, which allows '*'."
+     "why": "With private DNS on, the service names resolve to network cards inside the subnets, which the local route already covers."
     }
    ]
   },
   {
-   "q": "No IGW and no NAT. How could data still leave the VPC, and what closes that?",
+   "q": "A teammate wants the S3 endpoint policy to allow every bucket, because \"it is only S3 after all\". What is the risk?",
    "options": [
     {
-     "text": "In DNS lookups that carry data in the name; the DNS firewall answers NXDOMAIN for names off the list",
+     "text": "Our own bucket stops working",
+     "correct": false,
+     "why": "An open policy reaches our bucket too. The problem is everything else it also reaches."
+    },
+    {
+     "text": "A fooled agent could upload our code to someone else's bucket with a link they provide",
      "correct": true,
-     "why": "The resolver asks the internet for the VM. The firewall stops that for any name not allowed."
+     "why": "S3 is a service anyone can have a bucket in. Listing only our buckets closes that quiet way out."
     },
     {
-     "text": "Through ICMP pings; the security group closes that",
+     "text": "Gateway endpoints become expensive with an open policy",
      "correct": false,
-     "why": "Pings to the internet have no route either."
-    },
-    {
-     "text": "Through the interface endpoints; the SCP closes that",
-     "correct": false,
-     "why": "Interface endpoints reach AWS services in our account and region, not arbitrary hosts."
+     "why": "Gateway endpoints cost nothing either way. The reason is safety, not money."
     }
    ]
   }
  ],
- "recall": [
-  "From p3-1: what does an SCP do that a role's own permission policy cannot?"
- ],
- "videos": [
-  {
-   "title": "Learn AWS IAM in less than 10 minutes",
-   "url": "https://www.youtube.com/watch?v=9Pk2J_5qnlk",
-   "channel": "AWS Developers",
-   "minutes": 9,
-   "why": "Official, recent AWS explainer of users, roles and policies."
-  },
-  {
-   "title": "AWS VPC & Subnets For Beginners",
-   "url": "https://www.youtube.com/watch?v=TUTqYEZZUdc",
-   "channel": "Sam Meech-Ward",
-   "minutes": 17,
-   "why": "Visual explanation of VPC, public/private subnets, NAT and EC2 placement."
-  }
- ],
+ "platform": {
+  "p": [
+   "The sandbox network is a private-only copy of our usual VPC module, built in the ai-agents account with the range 10.60.0.0/16: three /18 subnets, no internet gateway, no NAT, no public addresses, flow logs always on, an S3 gateway endpoint limited to our buckets and the interface endpoints a sandbox needs. A DNS firewall and a private DNS zone for our service names come with it, and the account's SCPs stop anyone from adding a NAT gateway or a peering later.",
+   "The only machines in the account with a route to the internet are the two egress proxy servers, in their own small subnets cut from the spare /18. The sandbox security group lets a VM reach the proxy, the endpoints and the private path to the broker, the gateway and the telemetry collector, and nothing else."
+  ],
+  "tickets": [
+   {
+    "key": "G3-03",
+    "why": "The private-only VPC module: three /18 subnets, no internet gateway or NAT, a narrow S3 endpoint and interface endpoints."
+   },
+   {
+    "key": "G3-04",
+    "why": "Builds the sandbox VPC on 10.60.0.0/16 with the DNS firewall, the private zone and the runs bucket."
+   },
+   {
+    "key": "G3-11",
+    "why": "The sandbox security group: no ingress, egress only to the proxy, the endpoints and the private path."
+   },
+   {
+    "key": "G3-09",
+    "why": "The proxy subnets: the only route to the internet in the account."
+   }
+  ]
+ },
  "words": [
   {
    "term": "VPC",
-   "plain": "A private network in AWS with your own address range, subnets and route tables."
+   "plain": "Virtual private cloud: your own private network in an AWS account, with an address range you choose."
   },
   {
    "term": "CIDR block",
-   "plain": "An address range written as start/size, like 10.60.0.0/16; a bigger number after the slash is a smaller range."
+   "plain": "An address range written as start/size, like 10.60.0.0/16; a bigger number after the slash means fewer addresses."
   },
   {
    "term": "subnet",
-   "plain": "A slice of the VPC's range in one availability zone."
+   "plain": "A slice of the VPC's range in one availability zone, with its own route table."
   },
   {
    "term": "route table",
-   "plain": "The list that tells a subnet where packets for each destination go; no 0.0.0.0/0 route means no way out."
+   "plain": "The list of destination and target pairs that decides where packets from a subnet may go."
   },
   {
    "term": "VPC endpoint",
-   "plain": "A private door to an AWS service: a route (gateway kind, S3) or a private IP (interface kind)."
-  },
-  {
-   "term": "security group",
-   "plain": "A stateful firewall on a machine's network card, with allow rules only."
-  },
-  {
-   "term": "DNS firewall",
-   "plain": "Route 53 Resolver rules that answer only allowed names and NXDOMAIN for the rest."
+   "plain": "A private path from the VPC to one AWS service: a route (gateway) or a network card (interface)."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-03",
-   "why": "The private-only VPC module: three /18s, no IGW or NAT, an S3 endpoint limited to our buckets, interface endpoints."
+   "q": "Write the route table of a sandbox subnet from memory, and say which route an internet gateway would add.",
+   "a": "10.60.0.0/16 to local, plus S3's prefix list to the S3 gateway endpoint. An internet gateway would add 0.0.0.0/0 to igw-..., which the sandbox never gets."
   },
   {
-   "key": "G3-04",
-   "why": "Builds the sandbox network in the ai-agents account: 10.60.0.0/16, DNS firewall, private zone and the runs bucket."
+   "q": "Explain to a teammate why we use endpoints instead of a NAT gateway to reach SSM and S3.",
+   "a": "A NAT gateway is a road to the whole internet. An endpoint reaches exactly one AWS service through private addresses, and the S3 one has a policy that limits it to our buckets."
   },
   {
-   "key": "G3-11",
-   "why": "The sandbox security group: no ingress, egress only to the proxy, the endpoints and PrivateLink."
+   "q": "How many addresses does a /18 hold, and why does the sandbox VPC have four of them?",
+   "a": "16,384. Three hold VMs, one per availability zone, and the fourth is kept for the egress proxy's own subnets."
   }
  ],
- "remember": "Private means no route out. Then open only named doors: endpoints for AWS, and the proxy and DNS for one short list."
+ "remember": "A machine can only send packets where its subnet's route table points, so a sandbox subnet has only the local route, and endpoints are the private doors to the AWS services it needs."
 }

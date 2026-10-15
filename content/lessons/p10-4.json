@@ -1,139 +1,77 @@
 {
+ "v": 2,
  "id": "p10-4",
  "title": "Fakes, not mocks",
- "minutes": 55,
+ "minutes": 60,
  "youNeed": [
-  "p10-2",
-  "p10-3"
+  "p10-2"
  ],
- "bridge": "A fake is like MSW's in-memory request handlers instead of vi.fn(). It is a small, real implementation of the service that keeps state and answers like the real one. Except: a fake needs its own proof that it behaves like the real service. That proof is a contract suite: the same tests run against the fake and against the real thing.",
- "intro": "fcp's cloud talks to three things a unit test cannot run. They are on-prem clients over gRPC, an object store (S3 or MinIO) and Celery workers. Today the tests mock them in about 100 places, and the mocks drift. G7 replaces them with three fakes, each pinned by a contract suite. This lesson shows how to write one and how to keep it honest.",
- "picture": {
-  "caption": "The same contract tests run against the in-memory fake and against the real service. A difference fails the suite, so the fake is fixed.",
-  "nodes": [
-   {
-    "id": "test",
-    "label": "API test",
-    "kind": "check"
-   },
-   {
-    "id": "code",
-    "label": "cloud code (StorageService)",
-    "kind": "service"
-   },
-   {
-    "id": "fake",
-    "label": "InMemoryStore (fake)",
-    "kind": "service"
-   },
-   {
-    "id": "real",
-    "label": "MinIO in Docker (real)",
-    "kind": "cloud"
-   },
-   {
-    "id": "contract",
-    "label": "contract suite",
-    "kind": "file"
-   }
+ "map": "github",
+ "hook": {
+  "story": [
+   "A backend function imports a scan: it uploads the file to object storage (S3 in production, MinIO on laptops and in CI) and then counts the files in the workgroup's folder. Its test replaces the storage client with a mock, a stand-in that accepts any call and returns whatever the test told it to. Last week someone changed the upload to a new bucket called scans. The test stayed green. In production every import failed with NoSuchBucket, because nobody had created that bucket.",
+   "The fix was one word: use the datasets bucket that every environment already has. And now the test is red, although the code finally works. The mock was wrong in both directions: green while production was broken, red as soon as the code was right."
   ],
-  "steps": [
-   {
-    "from": "test",
-    "to": "code",
-    "text": "calls the endpoint; the code wants to upload a file"
-   },
-   {
-    "from": "code",
-    "to": "fake",
-    "text": "a fixture swapped the real provider for the fake at the seam, so the bytes land in a dict"
-   },
-   {
-    "from": "contract",
-    "to": "fake",
-    "text": "the contract tests run against the fake: put, get, list, missing bucket"
-   },
-   {
-    "from": "contract",
-    "to": "real",
-    "text": "the same tests run against MinIO when MINIO_URL is set"
-   },
-   {
-    "from": "real",
-    "to": "fake",
-    "text": "every behaviour MinIO shows and the fake lacks becomes a failing test, then a fix in the fake"
-   }
-  ]
+  "question": "How do you replace a real service in tests with something that behaves like the real one, and how do you know it still does next month?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Why mocks drift",
+   "h": "A mock records calls; a fake does the work",
    "p": [
-    "A mock is a stand-in that records calls and returns what the test told it to. vi.fn().mockResolvedValue(x) is a mock. It proves that the code called something. It proves nothing about whether the real service would accept those arguments or return that shape. When the real service changes, the mock keeps smiling.",
-    "rhinoCore/tests has 69 mock.patch calls on AgentRpcClient and 24 on StorageService. 11 test classes set CELERY_TASK_ALWAYS_EAGER, which runs Celery tasks inside the caller and skips the broker's serialization. G7-01 lists these numbers as the reason for the fakes.",
-    "A fake is different: it is a small real implementation. An in-memory store keeps the bytes in a dict and returns them on get.",
-    "A fake client serves the real gRPC service in-process. A fake queue records tasks and runs them when you ask. The code under test cannot tell the difference, and the test asserts on outcomes, not on calls."
-   ]
-  },
-  {
-   "h": "Write the fake behind the real interface",
-   "p": [
-    "Start from the interface the production code already uses. fcp's storage code calls a CloudStorageServiceProviderBase with methods like list_objects and upload_file; the AWS provider implements it with boto3. The fake implements the same methods with a dict. In the lab, the interface is a small ObjectStore class and the fake is InMemoryStore.",
-    "Two habits from the tickets: be loud about gaps, and keep the fake honest about errors. When a handler is missing, G7-04's fake returns an error that names the method. So a gap fails a test instead of silently passing. G7-05's fake lets a missing bucket raise, because MinIO does."
+    "Here is the test from the story. MagicMock, from Python's unittest.mock, is the same idea as vi.fn(): an object that accepts any method call, returns what you configured, and remembers how it was called. The test then checks the call itself, assert_called_once_with(\"scans\", ...). So the test proves that the code called put with these arguments. It proves nothing about whether real storage would accept the call, which is how the missing bucket got past the test. And because it checks how the code works instead of what it achieves, it breaks when the code changes in a harmless way.",
+    "A fake is a different kind of stand-in: a small, real implementation of the service that keeps its state in memory. A fake object store keeps the files in a dictionary, refuses to write into a bucket that does not exist, and returns the keys it really holds. The code under test cannot tell the difference, and the test can check outcomes instead of calls: after two imports, the workgroup has two files."
    ],
-   "because": "The fake must sit behind the same interface as the real thing, or the production code would need a test-only branch.",
    "code": {
     "lang": "python",
-    "file": "lab4/store/memory.py",
-    "text": "from .base import ObjectStore\n\n\nclass InMemoryStore(ObjectStore):\n    \"\"\"S3-shaped store in a dict. Pinned by tests/test_store_contract.py, which also runs on MinIO.\"\"\"\n\n    def __init__(self) -> None:\n        self.buckets: dict[str, dict[str, bytes]] = {}\n\n    def create_bucket(self, bucket: str) -> None:\n        self.buckets.setdefault(bucket, {})\n\n    def put(self, bucket: str, key: str, data: bytes) -> None:\n        self.buckets[bucket][key] = data  # a missing bucket raises KeyError, like MinIO raises NoSuchBucket\n\n    def get(self, bucket: str, key: str) -> bytes:\n        return self.buckets[bucket][key]\n\n    def list_keys(self, bucket: str, prefix: str = \"\") -> list[str]:\n        return sorted(key for key in self.buckets[bucket] if key.startswith(prefix))",
+    "file": "tests/test_imports.py (the mock version)",
+    "text": "from unittest.mock import MagicMock\n\nfrom imports import import_scan\n\n\ndef test_import_scan_with_a_mock():\n    store = MagicMock()\n    store.list_keys.return_value = [\"wg-1/a.csv\"]\n    assert import_scan(store, \"wg-1\", \"a.csv\", b\"x\") == 1\n    store.put.assert_called_once_with(\"scans\", \"wg-1/a.csv\", b\"x\")",
     "notes": [
      {
-      "line": 4,
-      "text": "Subclassing the same base class the real store subclasses. The code under test only knows the base."
-     },
-     {
-      "line": 5,
-      "text": "The docstring names the contract suite. G7-05's fake does the same, so the next person knows what pins it."
+      "line": 7,
+      "text": "MagicMock accepts any method with any arguments, so a missing bucket can never fail here."
      },
      {
       "line": 8,
-      "text": "All the state: bucket name to (key to bytes). No network, no disk."
+      "text": "The test decides what storage \"contains\". Real storage is never asked."
      },
      {
-      "line": 14,
-      "text": "Honest about errors: self.buckets[bucket] raises when the bucket is missing. The first version used setdefault here and the contract suite caught it."
-     },
-     {
-      "line": 20,
-      "text": "sorted, because S3 returns keys in order and the contract tests compare lists."
+      "line": 10,
+      "text": "This checks how the code works, not what it achieves, so a correct refactor turns it red."
      }
     ]
-   }
+   },
+   "see": "$ uv run pytest -q tests/test_imports.py     (after the fix to the datasets bucket)\nE           AssertionError: expected call not found.\nE           Expected: put('scans', 'wg-1/a.csv', b'x')\nE             Actual: put('datasets', 'wg-1/a.csv', b'x')\nFAILED tests/test_imports.py::test_import_scan_with_a_mock - AssertionError: ..."
   },
   {
-   "h": "Swap it in at the seam",
+   "h": "Write the fake behind the same interface",
    "p": [
-    "A seam is the one place where production code creates or reaches the real service. You replace the real thing there, with monkeypatch, and nowhere else. G7-05: StorageService.__init__ builds AWSStorageServiceProvider() at call time, so the fixture patches storage_service.AWSStorageServiceProvider.",
-    "G7-07: Task.apply_async ends in app.send_task, so the fixture patches app.send_task. G7-04: AgentRpcClient reads two env vars for the proxy host and port every time it is created. So the fixture points them at the fake server.",
-    "Patch the attribute on the module that reads it, never the name a test imported. And write the seam down in the fake's docstring: G7-05 also has to patch requests.get for presigned URLs, and says so."
+    "A fake starts from the interface that the production code already uses, here a small ObjectStore class with create_bucket, put, get and list_keys. Python marks such an interface with ABC (abstract base class) and @abstractmethod, which is close to a TypeScript interface that a class must implement: a subclass that forgets a method cannot be created. The real adapter, S3Store, implements the methods with boto3, the AWS library for Python, and the fake, InMemoryStore, implements them with a dictionary of dictionaries.",
+    "Two habits make a fake worth having. First, be loud about errors, the way the real service is: a missing bucket raises NoSuchBucket in both implementations, because that is what S3 does, and a fake that quietly creates the bucket would hide exactly the bug from the story. Second, keep it small. A fake only needs the behaviour the code under test relies on, and it says in its docstring which tests prove it."
    ],
-   "because": "Patching at the seam means production code does not change. The test still runs the real code on both sides of it.",
    "code": {
     "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/conftest.py (G7-05 fixture, sketch)",
-    "text": "import pytest\n\nfrom rhinoCloud.rhinoCore.services.cloud_services import storage_service\n\nfrom fakes.object_store import InMemoryStorageProvider\n\n\n@pytest.fixture\ndef object_store(monkeypatch):\n    store = InMemoryStorageProvider()\n    # StorageService.__init__ calls AWSStorageServiceProvider() when CLOUD_PROVIDER is AWS (the test env)\n    monkeypatch.setattr(storage_service, \"AWSStorageServiceProvider\", lambda: store)\n    return store",
+    "file": "store/memory.py (shortened)",
+    "text": "class InMemoryStore(ObjectStore):\n    def __init__(self) -> None:\n        self.buckets: dict[str, dict[str, bytes]] = {}\n\n    def create_bucket(self, bucket: str) -> None:\n        self.buckets.setdefault(bucket, {})\n\n    def put(self, bucket: str, key: str, data: bytes) -> None:\n        self._bucket(bucket)[key] = data\n\n    def list_keys(self, bucket: str, prefix: str = \"\") -> list[str]:\n        return sorted(key for key in self._bucket(bucket) if key.startswith(prefix))\n\n    def _bucket(self, bucket: str) -> dict[str, bytes]:\n        if bucket not in self.buckets:\n            raise NoSuchBucket(bucket)  # loud, like S3: a missing bucket is an error, not an empty one\n        return self.buckets[bucket]",
     "notes": [
      {
+      "line": 1,
+      "text": "Inherits the interface, so it must implement every abstract method."
+     },
+     {
       "line": 3,
-      "text": "Import the module that holds the seam, not the class. The patch must land where production code looks it up."
+      "text": "The whole \"storage\": bucket name to (key to bytes)."
+     },
+     {
+      "line": 9,
+      "text": "Goes through _bucket, so writing into a missing bucket fails as it does on S3."
      },
      {
       "line": 12,
-      "text": "The seam: every StorageService created during this test gets the fake. monkeypatch undoes it after the test."
+      "text": "Sorted, because S3 returns keys in sorted order and the code may rely on it."
      },
      {
-      "line": 13,
-      "text": "Return the fake so the test can look inside it (store.buckets) when an outcome is not visible through the API."
+      "line": 16,
+      "text": "The same error type the real adapter raises, so callers handle one exception, not two."
      }
     ]
    }
@@ -141,304 +79,282 @@
   {
    "h": "The contract suite keeps the fake honest",
    "p": [
-    "A contract suite is one set of tests with a parametrized fixture that yields the fake or the real service. Each test runs twice.",
-    "The real side runs only when the real service is reachable. In the lab, that is when MINIO_URL is set. In fcp, it runs under the contract marker in the CI job that has the MinIO and Redis services. It also runs against FCP Lab with --target lab (G7-26).",
-    "The suite does not need to be big. It pins the behaviours the code under test relies on. Examples: a missing bucket, list with a prefix, overwrite, delete, the error type for an offline agent, the order of drained tasks. When MinIO does something the fake does not, you add a test, watch the fake fail, and fix the fake."
+    "A fake has the same weakness as a mock in the long run: the real service can change, or the fake can be \"simplified\" by someone in a hurry, and nothing notices. The answer is a contract suite: one set of tests that describes how the service behaves, run against the fake and against the real thing. In pytest that is a parametrized fixture. It yields the fake for one run of each test and a real MinIO for the second run, so every test runs twice.",
+    "The real side runs only when a real service is available. In the lab that means the MINIO_URL variable is set; in CI it is a job that already starts MinIO next to the tests. When the real service does something the fake does not, you add a contract test, watch it fail on the fake, and fix the fake. Then every test that uses the fake inherits the fix. A contract suite also catches bugs in the real adapter: S3 returns at most 1,000 keys per list call, and a contract test with 1,100 keys shows at once which side forgot to ask for the next page."
    ],
-   "because": "Without the real side, a fake is a mock with more lines; the contract suite is what makes it trustworthy.",
    "code": {
     "lang": "python",
-    "file": "lab4/tests/test_store_contract.py",
-    "text": "import os\nimport uuid\n\nimport pytest\n\nfrom store.memory import InMemoryStore\nfrom store.s3 import S3Store\n\nTARGETS = [\"memory\"] + ([\"minio\"] if os.environ.get(\"MINIO_URL\") else [])\n\n\n@pytest.fixture(params=TARGETS)\ndef store(request):\n    if request.param == \"memory\":\n        store = InMemoryStore()\n    else:\n        store = S3Store(os.environ[\"MINIO_URL\"], \"minioadmin\", \"minioadmin\")\n    store.create_bucket(\"lab\")\n    return store\n\n\ndef test_put_into_a_missing_bucket_raises(store):\n    with pytest.raises(Exception):\n        store.put(\"no-such-bucket\", f\"contract/{uuid.uuid4()}\", b\"x\")",
-    "notes": [
-     {
-      "line": 9,
-      "text": "The real target joins only when the environment says where it is. On a laptop without MinIO the suite still runs on the fake."
-     },
-     {
-      "line": 12,
-      "text": "params on a fixture: every test that asks for store runs once per param. pytest names them test_x[memory] and test_x[minio]."
-     },
-     {
-      "line": 18,
-      "text": "Setup that both sides need, done through the interface, so the test never touches boto3 directly."
-     },
-     {
-      "line": 22,
-      "text": "This test came from MinIO. The first fake created buckets on put; MinIO raised NoSuchBucket; the fake was wrong."
-     }
-    ]
-   },
-   "see": "$ MINIO_URL=http://localhost:9000 uv run pytest -v\ntests/test_store_contract.py::test_put_then_get_returns_the_same_bytes[memory] PASSED\ntests/test_store_contract.py::test_put_then_get_returns_the_same_bytes[minio] PASSED\n...\ntests/test_store_contract.py::test_put_into_a_missing_bucket_raises[minio] PASSED\n============================== 8 passed in 0.45s ===============================",
-   "ifInstead": "If instead the minio tests show ERROR with EndpointConnectionError, MinIO is not up on port 9000. Run docker ps and docker logs lab-minio."
-  },
-  {
-   "h": "FakeOnPremClient: a gRPC servicer in memory",
-   "p": [
-    "gRPC is a remote-call protocol. A .proto file defines services and messages, and a code generator writes the client and the server base class (the servicer). The bytes on the wire are protobuf. The cloud reaches every on-prem client through one proxy service, RhinoCloudInternalRpcProxy, and AgentRpcClient wraps the call.",
-    "G7-04's fake subclasses the real generated servicer and starts a real grpc.server on 127.0.0.1 inside the test process. Cloud code under test goes through the real AgentRpcClient, the real protobuf encoding and a real socket. It lands in a Python method that returns an in-memory answer. A mock would skip all of that, which is where the 69 mocks drift.",
-    "Two rules in that fake. Handlers run on a gRPC server thread outside the test's database transaction, so they never touch the database. And finishing a task is explicit: the test calls complete_task(), which runs the same handle_task_response function the production worker runs."
-   ],
-   "because": "The fake must serve the real wire format, or it proves nothing about the encoding and dispatch that the real client does.",
-   "code": {
-    "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/fakes/onprem_client.py (G7-04, the dispatch method)",
-    "text": "class FakeOnPremClient(RhinoCloudInternalRpcProxyServicer):\n    def __init__(self):\n        self.calls: list[tuple[str, str]] = []  # (rhino_agent_id, method_name)\n        self.offline_agents: set[str] = set()\n        self.scheduled: list[onprem.ScheduleTaskRequest] = []\n\n    def AgentRpc(self, request, context):  # runs on a gRPC server thread: never touch the database here\n        self.calls.append((request.rhino_agent_id, request.method_name))\n        if request.rhino_agent_id in self.offline_agents:\n            return AgentRpcResponse(error_message=\"agent not connected\", error_type=AgentRpcResponse.ErrorType.TIMEOUT)\n        handler = getattr(self, f\"_{request.method_name}\", None)\n        if handler is None:  # loud on purpose: add the method here and a case to the contract suite\n            return AgentRpcResponse(error_message=f\"FakeOnPremClient does not implement {request.method_name}\")\n        request_type = getattr(onprem, METHODS[request.method_name].input_type.name)\n        return AgentRpcResponse(response_data=handler(request_type.FromString(request.request_data)).SerializeToString())\n\n    def _HealthCheck(self, request):\n        return onprem.HealthCheckResponse(is_healthy=True)",
+    "file": "tests/test_store_contract.py (shortened)",
+    "text": "TARGETS = [\"memory\"] + ([\"minio\"] if os.environ.get(\"MINIO_URL\") else [])\n\n\n@pytest.fixture(params=TARGETS)\ndef store(request):\n    if request.param == \"memory\":\n        store = InMemoryStore()\n    else:\n        store = S3Store(os.environ[\"MINIO_URL\"], \"minioadmin\", \"minioadmin\")\n    bucket = f\"contract-{uuid.uuid4().hex[:12]}\"\n    store.create_bucket(bucket)\n    return store, bucket\n\n\ndef test_list_keys_filters_by_prefix_and_sorts(store):\n    store, bucket = store\n    for key in [\"wg-2/b.csv\", \"wg-1/b.csv\", \"wg-1/a.csv\"]:\n        store.put(bucket, key, b\"x\")\n    assert store.list_keys(bucket, prefix=\"wg-1/\") == [\"wg-1/a.csv\", \"wg-1/b.csv\"]\n\n\ndef test_put_into_a_missing_bucket_raises(store):\n    store, _ = store\n    with pytest.raises(NoSuchBucket):\n        store.put(\"no-such-bucket\", \"k\", b\"x\")",
     "notes": [
      {
       "line": 1,
-      "text": "The real generated base class. add_RhinoCloudInternalRpcProxyServicer_to_server registers it on a grpc.server in the fixture."
+      "text": "The fake always runs. The real MinIO joins only when MINIO_URL is set, so the suite works on any laptop."
      },
      {
       "line": 4,
-      "text": "State the test can set: put an agent id here and the fake answers with the TIMEOUT error the real proxy returns."
-     },
-     {
-      "line": 7,
-      "text": "One entry point for every method: the proxy carries the method name and the encoded request."
-     },
-     {
-      "line": 11,
-      "text": "getattr looks up a method by name at run time: _HealthCheck for HealthCheck. Missing means a loud error, not a silent pass."
-     },
-     {
-      "line": 14,
-      "text": "The same descriptor lookup AgentRpcClient uses, so the fake decodes exactly what the real client encodes."
-     },
-     {
-      "line": 15,
-      "text": "Decode, call the handler, encode. The protobuf round-trip is real."
-     }
-    ]
-   }
-  },
-  {
-   "h": "FakeTaskQueue: record, then drain",
-   "p": [
-    "Celery is a background job queue, like BullMQ. A task is a plain function registered by import path. Code sends it with apply_async, and a broker (Redis in fcp) stores it serialized.",
-    "A worker process imports the same code and runs it. CELERY_TASK_ALWAYS_EAGER runs the task inside the caller at send time, skipping the broker and the serialization. Celery's own docs say it is not for testing.",
-    "G7-07's fake replaces app.send_task. send_task serializes the arguments with the app's real serializer (pickle in fcp) and deserializes them back. So an argument a broker could not carry fails in the test.",
-    "It records the task and returns an AsyncResult. Nothing runs until the test calls drain(). drain() runs the recorded tasks oldest first with Task.apply and re-raises a task's own error. It also follows Celery's chain option, which the vocabulary indexing flow uses."
-   ],
-   "because": "The order of tasks and the serialization are the two things eager mode hides, and both have bitten production.",
-   "code": {
-    "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/fakes/task_queue.py (G7-07, shortened)",
-    "text": "class FakeTaskQueue:\n    def __init__(self):\n        self.sent: list[SentTask] = []\n        self.ran: list[SentTask] = []\n\n    def send_task(self, name, args=None, kwargs=None, task_id=None, **options):  # replaces app.send_task\n        content_type, encoding, body = dumps((args or (), kwargs or {}), serializer=app.conf.task_serializer)\n        args, kwargs = loads(body, content_type, encoding, accept=app.conf.accept_content)\n        self.sent.append(SentTask(name, tuple(args), kwargs, options, task_id or str(uuid.uuid4())))\n        return app.AsyncResult(self.sent[-1].task_id)  # callers read .id; tests call drain(), never .get()\n\n    def drain(self) -> list[SentTask]:\n        while self.sent:\n            task = self.sent.pop(0)\n            result = app.tasks[task.name].apply(task.args, task.kwargs, task_id=task.task_id, headers=task.options.get(\"headers\"))\n            result.get(propagate=True)  # the task's own exception, raised in the test\n            if chain := list(task.options.get(\"chain\") or []):\n                next_sig = maybe_signature(chain.pop(), app=app)  # Celery keeps the rest of a chain reversed\n                next_sig.apply_async(() if next_sig.immutable else (result.result,), chain=chain or None)\n            self.ran.append(task)\n        return self.ran",
-    "notes": [
-     {
-      "line": 6,
-      "text": "The seam: monkeypatch.setattr(app, \"send_task\", queue.send_task). apply_async ends here, so RhinoTask's header injection still runs."
-     },
-     {
-      "line": 7,
-      "text": "kombu's dumps with the real serializer: the arguments go through pickle as they would on Redis."
+      "text": "params makes pytest run every test that uses this fixture once per target, with ids [memory] and [minio]."
      },
      {
       "line": 10,
-      "text": "Production code often reads result.id; nobody waits on it. The test decides when things run."
+      "text": "A fresh bucket per test, so tests never see each other's keys on the shared MinIO."
      },
      {
-      "line": 14,
-      "text": "Oldest first. The order is the point; eager mode runs tasks in the middle of the caller."
-     },
-     {
-      "line": 15,
-      "text": "Task.apply runs the task function in this process, with the recorded headers, so the metadata context is restored."
-     },
-     {
-      "line": 17,
-      "text": "A chain is a list of tasks where each feeds the next. The walrus := assigns and tests in one line."
+      "line": 22,
+      "text": "The behaviour the story needed: a missing bucket is an error on both sides."
      }
     ]
    },
-   "callout": {
-    "kind": "wall",
-    "text": "Fake data only. Builders use Faker names and emails and generated passwords. Never copy rows from QA or prod into a test, and no PHI anywhere in the test layer."
-   }
+   "see": "$ MINIO_URL=http://localhost:9000 uv run pytest -v tests/test_store_contract.py\ntests/test_store_contract.py::test_put_then_get_returns_the_same_bytes[memory] PASSED [ 12%]\ntests/test_store_contract.py::test_put_then_get_returns_the_same_bytes[minio] PASSED [ 25%]\n…\ntests/test_store_contract.py::test_put_into_a_missing_bucket_raises[memory] PASSED [ 87%]\ntests/test_store_contract.py::test_put_into_a_missing_bucket_raises[minio] PASSED [100%]\n============================== 8 passed in 0.45s ==============================="
   },
   {
-   "h": "Assert on what the caller sees",
+   "h": "Put the fake in at the seam",
    "p": [
-    "With fakes in place, tests stop asserting that a mock was called with certain arguments. They assert on status codes, error text, fields and row counts, the things a UI or SDK user would see. G7-18 writes this rule down for the ported tests. It matches the frontend rule in G7-10: test ids, roles, visible text, never class names or internal state.",
-    "When an outcome is not visible through the API, look inside the fake. Use task_queue.sent for a queued chain (G7-27), and onprem_client.scheduled for a scheduled import task (G7-08). That is still an outcome, not a call count."
-   ]
+    "In the lab, import_scan receives the store as a parameter, so a test can simply pass the fake. Real code often builds its own client instead, deep inside a service class. Then you look for the seam: the one place where production code creates or reaches the real service. You replace it there, and only there, with monkeypatch from the pytest lesson, so the rest of the code runs exactly as in production.",
+    "Remember the monkeypatch trap: replace the name in the module that uses it. If imports.py calls get_store(), you patch imports.get_store, and the fixture writes down in a comment why that is the seam. A fixture like this one is how every test that needs storage gets the fake, with no mock in sight."
+   ],
+   "code": {
+    "lang": "python",
+    "file": "imports.py and tests/conftest.py (a sketch)",
+    "text": "# imports.py, when the code builds its own client\ndef get_store() -> ObjectStore:\n    return S3Store(os.environ[\"S3_URL\"], os.environ[\"S3_KEY\"], os.environ[\"S3_SECRET\"])\n\n\n# tests/conftest.py\n@pytest.fixture\ndef store(monkeypatch):\n    fake = InMemoryStore()\n    fake.create_bucket(\"datasets\")\n    monkeypatch.setattr(imports, \"get_store\", lambda: fake)\n    return fake",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The seam: the only place that builds the real client."
+     },
+     {
+      "line": 10,
+      "text": "Set up what every environment has, so the fake starts in a realistic state."
+     },
+     {
+      "line": 11,
+      "text": "Replace get_store in the module that calls it. monkeypatch undoes this when the test ends."
+     }
+    ]
+   },
+   "deeper": {
+    "h": "Go deeper: fakes for a remote call and a job queue",
+    "p": [
+     "The same idea works for services that are harder to imagine in memory. For a gRPC service (a remote-call protocol where a .proto file defines the methods and generated code sends them), the fake can be a real gRPC server inside the test process whose methods return in-memory answers, so the real client, the real encoding and a real socket are all tested. When it receives a method it does not implement, it answers with an error that names the method, so a gap fails a test instead of passing silently.",
+     "For a background job queue such as Celery, the fake records each job when the code sends it, after passing the arguments through the same serializer the real queue uses, and runs nothing until the test calls drain(). Then the test decides when the work happens, and an argument the real queue could not carry fails in the test, not in production."
+    ]
+   }
   }
  ],
  "lab": {
-  "title": "A fake object store with a contract suite against MinIO",
-  "youNeed": [
+  "id": "p10-4",
+  "title": "A fake object store with a contract suite",
+  "minutes": 35,
+  "needs": [
    "uv",
-   "Docker Desktop running",
-   "the pytest words from p10-2"
+   "Docker running",
+   "The pytest words from p10-2"
   ],
-  "worked": [
+  "goal": "Watch a mock pass a broken import and fail a correct one, then write an in-memory fake whose contract suite runs against both the fake and a real MinIO.",
+  "guess": {
+   "q": "import_scan now uploads to a scans bucket that no environment has. The mock test and a test that uses the in-memory fake both run. What happens?",
+   "options": [
+    {
+     "text": "Both fail, because the bucket does not exist.",
+     "correct": false,
+     "why": "The mock has no idea what buckets exist. It accepts any call."
+    },
+    {
+     "text": "The mock test passes and the fake test fails with NoSuchBucket, just like production.",
+     "correct": true,
+     "why": "The fake keeps real state and is loud about a missing bucket, so it fails where S3 fails. The mock only checks that put was called."
+    },
+    {
+     "text": "Both pass, because neither talks to real storage.",
+     "correct": false,
+     "why": "Not talking to real storage is fine. Behaving like it is what matters, and only the fake does."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "docker run -d --name lab-minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin public.ecr.aws/u7h0g2s9/rhinofcp/minio:2025.2.7",
-    "see": "A container id. This is the public MinIO image fcp's own CI test job uses; docker logs lab-minio ends with ** Starting MinIO **."
+    "say": "Start a real MinIO, the S3-compatible store fcp's CI uses, from the same image. If an earlier lab left a container with this name, remove it first with docker rm -f lab-minio.",
+    "do": "docker run -d --name lab-minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin public.ecr.aws/u7h0g2s9/rhinofcp/minio:2025.2.7 && sleep 8 && curl -s -o /dev/null -w '%{http_code}\\n' http://localhost:9000/minio/health/live",
+    "see": "22445cd02a69…   (a container ID)\n200"
    },
    {
-    "do": "uv init --python 3.13 --bare lab4 && cd lab4 && uv add boto3 && uv add --dev pytest && mkdir store tests && touch store/__init__.py && printf '[pytest]\\npythonpath = .\\n' > pytest.ini",
-    "see": " + boto3==1.x\n + pytest==9.1.1"
+    "say": "Make the project: boto3 talks to S3 and MinIO, pytest runs the tests.",
+    "do": "mkdir -p ~/academy-labs/p10-4/store ~/academy-labs/p10-4/tests && cd ~/academy-labs/p10-4 && uv init --bare --python 3.13 && uv add boto3 && uv add --dev pytest && printf '\\n[tool.pytest.ini_options]\\npythonpath = [\".\"]\\n' >> pyproject.toml && touch store/__init__.py",
+    "see": " + boto3==1.43.114\n + botocore==1.43.114\n …\n + pytest==9.1.1"
    },
    {
-    "do": "Create store/base.py: an abstract ObjectStore with create_bucket, put, get and list_keys (use abc.ABC and @abstractmethod). Create store/memory.py from the code block above.",
-    "see": "Two files; nothing runs yet."
+    "say": "Write the interface and the fake.",
+    "do": "cat > store/base.py <<'EOF'\nfrom abc import ABC, abstractmethod\n\n\nclass NoSuchBucket(Exception):\n    pass\n\n\nclass ObjectStore(ABC):\n    @abstractmethod\n    def create_bucket(self, bucket: str) -> None: ...\n\n    @abstractmethod\n    def put(self, bucket: str, key: str, data: bytes) -> None: ...\n\n    @abstractmethod\n    def get(self, bucket: str, key: str) -> bytes: ...\n\n    @abstractmethod\n    def list_keys(self, bucket: str, prefix: str = \"\") -> list[str]: ...\nEOF\ncat > store/memory.py <<'EOF'\nfrom .base import NoSuchBucket, ObjectStore\n\n\nclass InMemoryStore(ObjectStore):\n    \"\"\"An S3-shaped store in a dict. tests/test_store_contract.py runs the same tests on it and on MinIO.\"\"\"\n\n    def __init__(self) -> None:\n        self.buckets: dict[str, dict[str, bytes]] = {}\n\n    def create_bucket(self, bucket: str) -> None:\n        self.buckets.setdefault(bucket, {})\n\n    def put(self, bucket: str, key: str, data: bytes) -> None:\n        self._bucket(bucket)[key] = data\n\n    def get(self, bucket: str, key: str) -> bytes:\n        return self._bucket(bucket)[key]\n\n    def list_keys(self, bucket: str, prefix: str = \"\") -> list[str]:\n        return sorted(key for key in self._bucket(bucket) if key.startswith(prefix))\n\n    def _bucket(self, bucket: str) -> dict[str, bytes]:\n        if bucket not in self.buckets:\n            raise NoSuchBucket(bucket)  # loud, like S3: a missing bucket is an error, not an empty one\n        return self.buckets[bucket]\nEOF",
+    "see": "(no output: store/base.py and store/memory.py exist)"
    },
    {
-    "do": "Create store/s3.py: S3Store(endpoint_url, access_key, secret_key) with a boto3 client (region_name=\"us-east-1\"); create_bucket catches self.s3.exceptions.BucketAlreadyOwnedByYou; put is put_object; get is get_object()[\"Body\"].read(); list_keys is list_objects_v2 with Prefix.",
-    "see": "The real side, about 25 lines."
+    "say": "Write the real adapter, which turns S3's error into the same NoSuchBucket.",
+    "do": "cat > store/s3.py <<'EOF'\nimport boto3\nfrom botocore.exceptions import ClientError\n\nfrom .base import NoSuchBucket, ObjectStore\n\n\nclass S3Store(ObjectStore):\n    def __init__(self, endpoint_url: str, access_key: str, secret_key: str) -> None:\n        self.s3 = boto3.client(\n            \"s3\",\n            endpoint_url=endpoint_url,\n            aws_access_key_id=access_key,\n            aws_secret_access_key=secret_key,\n            region_name=\"us-east-1\",\n        )\n\n    def create_bucket(self, bucket: str) -> None:\n        try:\n            self.s3.create_bucket(Bucket=bucket)\n        except self.s3.exceptions.BucketAlreadyOwnedByYou:\n            pass\n\n    def put(self, bucket: str, key: str, data: bytes) -> None:\n        self._call(self.s3.put_object, Bucket=bucket, Key=key, Body=data)\n\n    def get(self, bucket: str, key: str) -> bytes:\n        return self._call(self.s3.get_object, Bucket=bucket, Key=key)[\"Body\"].read()\n\n    def list_keys(self, bucket: str, prefix: str = \"\") -> list[str]:\n        page = self._call(self.s3.list_objects_v2, Bucket=bucket, Prefix=prefix)\n        return [item[\"Key\"] for item in page.get(\"Contents\", [])]\n\n    def _call(self, method, **kwargs):\n        try:\n            return method(**kwargs)\n        except ClientError as error:\n            if error.response[\"Error\"][\"Code\"] == \"NoSuchBucket\":\n                raise NoSuchBucket(kwargs[\"Bucket\"]) from error\n            raise\nEOF",
+    "see": "(no output: store/s3.py exists)"
    },
    {
-    "do": "Create tests/test_store_contract.py from the block above, plus tests for put-then-get, overwrite and list-with-prefix. Then: uv run pytest -q",
-    "see": "....                                                                     [100%]\n4 passed in 0.25s"
+    "say": "Write the code from the story, with its bug, and two tests: one with a mock and one with the fake.",
+    "do": "cat > imports.py <<'EOF'\nfrom store.base import ObjectStore\n\n\ndef import_scan(store: ObjectStore, workgroup: str, name: str, data: bytes) -> int:\n    store.put(\"scans\", f\"{workgroup}/{name}\", data)\n    return len(store.list_keys(\"scans\", prefix=f\"{workgroup}/\"))\nEOF\ncat > tests/test_imports.py <<'EOF'\nfrom unittest.mock import MagicMock\n\nimport pytest\n\nfrom imports import import_scan\nfrom store.memory import InMemoryStore\n\n\ndef test_import_scan_with_a_mock():\n    store = MagicMock()\n    store.list_keys.return_value = [\"wg-1/a.csv\"]\n    assert import_scan(store, \"wg-1\", \"a.csv\", b\"x\") == 1\n    store.put.assert_called_once_with(\"scans\", \"wg-1/a.csv\", b\"x\")\n\n\n@pytest.fixture\ndef store():\n    store = InMemoryStore()\n    store.create_bucket(\"datasets\")  # the only bucket every environment has\n    return store\n\n\ndef test_import_scan_with_a_fake(store):\n    assert import_scan(store, \"wg-1\", \"a.csv\", b\"x\") == 1\n    assert import_scan(store, \"wg-1\", \"b.csv\", b\"x\") == 2\nEOF\nuv run pytest -q tests/test_imports.py",
+    "see": ">           raise NoSuchBucket(bucket)  # loud, like S3: a missing bucket is an error, not an empty one\nE           store.base.NoSuchBucket: scans\n…\nFAILED tests/test_imports.py::test_import_scan_with_a_fake - store.base.NoSuc...\n1 failed, 1 passed in 0.03s"
    },
    {
-    "do": "MINIO_URL=http://localhost:9000 uv run pytest -v",
-    "see": "test_put_then_get_returns_the_same_bytes[memory] PASSED\ntest_put_then_get_returns_the_same_bytes[minio] PASSED\n...\n============================== 8 passed in 0.45s ==============================="
+    "say": "Fix the code the way the story did, with the bucket every environment has, and run the same two tests.",
+    "do": "sed -i '' 's/\"scans\"/\"datasets\"/g' imports.py && uv run pytest -q tests/test_imports.py",
+    "see": "E           AssertionError: expected call not found.\nE           Expected: put('scans', 'wg-1/a.csv', b'x')\nE             Actual: put('datasets', 'wg-1/a.csv', b'x')\nFAILED tests/test_imports.py::test_import_scan_with_a_mock - AssertionError: ...\n1 failed, 1 passed in 0.04s"
    },
    {
-    "do": "Break the fake: in memory.py change put to self.buckets.setdefault(bucket, {})[key] = data. Run the suite with MINIO_URL again.",
-    "see": "FAILED tests/test_store_contract.py::test_put_into_a_missing_bucket_raises[memory]\n1 failed, 7 passed in 0.36s"
+    "say": "Write the contract suite and run it on the fake only, as it runs on a laptop without MinIO.",
+    "do": "cat > tests/test_store_contract.py <<'EOF'\nimport os\nimport uuid\n\nimport pytest\n\nfrom store.base import NoSuchBucket\nfrom store.memory import InMemoryStore\nfrom store.s3 import S3Store\n\nTARGETS = [\"memory\"] + ([\"minio\"] if os.environ.get(\"MINIO_URL\") else [])\n\n\n@pytest.fixture(params=TARGETS)\ndef store(request):\n    if request.param == \"memory\":\n        store = InMemoryStore()\n    else:\n        store = S3Store(os.environ[\"MINIO_URL\"], \"minioadmin\", \"minioadmin\")\n    bucket = f\"contract-{uuid.uuid4().hex[:12]}\"\n    store.create_bucket(bucket)\n    return store, bucket\n\n\ndef test_put_then_get_returns_the_same_bytes(store):\n    store, bucket = store\n    store.put(bucket, \"wg-1/scan.csv\", b\"id,age\\n1,42\\n\")\n    assert store.get(bucket, \"wg-1/scan.csv\") == b\"id,age\\n1,42\\n\"\n\n\ndef test_list_keys_filters_by_prefix_and_sorts(store):\n    store, bucket = store\n    for key in [\"wg-2/b.csv\", \"wg-1/b.csv\", \"wg-1/a.csv\"]:\n        store.put(bucket, key, b\"x\")\n    assert store.list_keys(bucket, prefix=\"wg-1/\") == [\"wg-1/a.csv\", \"wg-1/b.csv\"]\n\n\ndef test_put_overwrites(store):\n    store, bucket = store\n    store.put(bucket, \"k\", b\"old\")\n    store.put(bucket, \"k\", b\"new\")\n    assert store.get(bucket, \"k\") == b\"new\"\n\n\ndef test_put_into_a_missing_bucket_raises(store):\n    store, _ = store\n    with pytest.raises(NoSuchBucket):\n        store.put(\"no-such-bucket\", \"k\", b\"x\")\nEOF\nuv run pytest -q tests/test_store_contract.py",
+    "see": "....                                                                     [100%]\n4 passed in 0.28s"
    },
    {
-    "do": "Undo the change. When you are done: docker rm -f lab-minio",
-    "see": "lab-minio"
+    "say": "Now point it at the real MinIO too. Every test runs twice, once per target.",
+    "do": "MINIO_URL=http://localhost:9000 uv run pytest -v tests/test_store_contract.py",
+    "see": "tests/test_store_contract.py::test_put_then_get_returns_the_same_bytes[memory] PASSED [ 12%]\ntests/test_store_contract.py::test_put_then_get_returns_the_same_bytes[minio] PASSED [ 25%]\n…\ntests/test_store_contract.py::test_put_into_a_missing_bucket_raises[minio] PASSED [100%]\n============================== 8 passed in 0.45s ==============================="
    }
   ],
-  "faded": "Add delete(bucket, key) to the interface and to both stores (boto3: delete_object(Bucket=..., Key=...)). Add a contract test that puts a key and deletes it. It checks that get raises and that list_keys no longer shows it. The memory implementation is the step left for you; the suite tells you when it matches MinIO.",
-  "alone": "Put 1,100 keys under one prefix through the interface and assert that list_keys returns all 1,100, on both targets. One side will surprise you: find out which. Read the boto3 docs for list_objects_v2 (look for MaxKeys and ContinuationToken), and fix the store that is wrong. Write one sentence in the fake's docstring about what you learned.",
-  "done": "The contract suite passes on memory and on MinIO, and breaking the fake makes a memory test fail. Your 1,100-key test passes on both sides."
+  "build": "Add delete(bucket, key) to the interface, to S3Store (boto3's delete_object) and to InMemoryStore. Write two contract tests: deleting a key removes it from list_keys, and deleting a key that never existed is not an error. Run the suite with MINIO_URL set. One test will fail on [memory] only: discover what real S3 does that your fake did not, and change the fake until all tests pass on both targets. Delete the mock test from tests/test_imports.py, since the fake test now covers it.",
+  "checks": [
+   "Before the fix, the mock test passed and the fake test failed with NoSuchBucket: scans.",
+   "After switching to datasets, the mock test failed with expected call not found, and the fake test passed.",
+   "Without MINIO_URL the contract suite runs 4 tests; with it, 8, each marked [memory] or [minio].",
+   "Your delete tests pass on both targets, including a delete of a key that never existed.",
+   "When you are done, docker rm -f lab-minio removes the container."
+  ],
+  "solution": {
+   "lang": "python",
+   "file": "delete on both stores and its contract tests",
+   "text": "# store/base.py: add to ObjectStore\n    @abstractmethod\n    def delete(self, bucket: str, key: str) -> None: ...\n\n# store/s3.py: add to S3Store\n    def delete(self, bucket: str, key: str) -> None:\n        self._call(self.s3.delete_object, Bucket=bucket, Key=key)\n\n# store/memory.py: add to InMemoryStore\n    def delete(self, bucket: str, key: str) -> None:\n        self._bucket(bucket).pop(key, None)  # S3 answers 204 for a key that never existed\n\n# tests/test_store_contract.py\ndef test_delete_removes_the_key(store):\n    store, bucket = store\n    store.put(bucket, \"wg-1/scan.csv\", b\"x\")\n    store.delete(bucket, \"wg-1/scan.csv\")\n    assert store.list_keys(bucket) == []\n\n\ndef test_deleting_a_missing_key_is_not_an_error(store):\n    store, bucket = store\n    store.delete(bucket, \"never-existed\")"
+  },
+  "fix": "Someone made the fake \"friendlier\": in store/memory.py, put now runs self.buckets.setdefault(bucket, {})[key] = data, so writing into a missing bucket creates it. Make that change, change imports.py back to the scans bucket, and run uv run pytest -q. The fake test from the story passes again, so the fake now hides the production bug. Which test still catches it, and on which target? Undo the change so the fake is loud again.",
+  "explain": [
+   "Why did the mock test pass when production failed, and fail when the code was fixed?",
+   "What does the contract suite prove that the fake's own tests could not?",
+   "The minio side runs only when MINIO_URL is set. Why is that acceptable, and where must it run so the fake stays honest?"
+  ],
+  "done": "The contract suite, including your delete tests, passes 12 tests with MINIO_URL set, the fake is loud about missing buckets again, and lab-minio is removed."
  },
- "quiz": [
+ "check": [
   {
-   "q": "A test patches rhinoCloud.rhinoCore.views.dataset.StorageService with a mock and asserts upload_file was called once. What does the test prove about production?",
+   "q": "A test patches the storage client with a MagicMock and asserts put was called with (\"scans\", key, data). What does a green run prove?",
    "options": [
     {
-     "text": "That the upload works end to end.",
-     "correct": false,
-     "why": "No bytes went anywhere; only a call was recorded."
-    },
-    {
-     "text": "That the view called upload_file. Nothing about whether the arguments would be accepted or what a user would see afterwards.",
+     "text": "That the code called put with those arguments, and nothing about whether real storage would accept them.",
      "correct": true,
-     "why": "This is the drift problem: the real provider can change and the mock keeps passing."
+     "why": "A mock accepts every call. It cannot know the bucket is missing, so production can fail while the test passes."
     },
     {
-     "text": "That the presigned URL is valid.",
+     "text": "That the file was stored and can be read back.",
      "correct": false,
-     "why": "A mock returns whatever the test said; it never generated a URL."
+     "why": "Nothing was stored anywhere. The mock only recorded the call."
+    },
+    {
+     "text": "That the scans bucket exists, because the mock would raise otherwise.",
+     "correct": false,
+     "why": "A MagicMock never raises unless you tell it to. It knows nothing about buckets."
     }
    ]
   },
   {
-   "q": "Where does the object_store fixture patch, and why there?",
+   "q": "Your contract suite has 10 tests, and they all pass on [memory]. MinIO is never started in any CI job. What is the weakness?",
    "options": [
     {
-     "text": "On the test module, by importing AWSStorageServiceProvider and replacing the name.",
+     "text": "Nothing; passing on the fake is the goal.",
      "correct": false,
-     "why": "The test's copy of the name is not what production code reads; the patch would do nothing."
+     "why": "Passing on the fake only proves the fake agrees with itself. The suite exists to compare it with the real service."
     },
     {
-     "text": "On storage_service.AWSStorageServiceProvider, because StorageService.__init__ creates the provider there at call time.",
+     "text": "The suite is too small; it needs at least 50 tests.",
+     "correct": false,
+     "why": "Size is not the issue. A small suite run on both sides is worth more than a big one run on one side."
+    },
+    {
+     "text": "The real side never runs, so nobody would notice when the fake and the real service drift apart.",
      "correct": true,
-     "why": "Patch the seam where production creates the real thing, and production code stays unchanged."
-    },
-    {
-     "text": "On boto3.client, so every AWS call is faked.",
-     "correct": false,
-     "why": "Too low: the fake would then have to speak boto3's whole API instead of the small provider interface."
+     "why": "A contract only keeps the fake honest if the same tests also run against the real thing somewhere, for example in a CI job that already starts MinIO."
     }
    ]
   },
   {
-   "q": "Why does FakeTaskQueue serialize the arguments with kombu before recording them?",
+   "q": "On the real MinIO, deleting a key that never existed succeeds. Your fake raises KeyError, and a new contract test shows it. What do you change?",
    "options": [
     {
-     "text": "To make the fake slower, like a real broker.",
+     "text": "Mark the test to run only on [minio], because the fake is stricter and that is safer.",
      "correct": false,
-     "why": "Speed is not the point; faithfulness is."
+     "why": "A fake that is stricter than the real service fails tests that would work in production. It must behave like the real thing, not like your guess."
     },
     {
-     "text": "So an argument the real broker could not carry fails in the test, not in production. Examples: an open connection, or a model instance that cannot pickle.",
+     "text": "The fake, so it also accepts deleting a missing key (for example with dict.pop(key, None)).",
      "correct": true,
-     "why": "This is exactly what CELERY_TASK_ALWAYS_EAGER skips."
+     "why": "The real service is the reference. Fix the fake, and every test that uses it gets the real behaviour."
     },
     {
-     "text": "Because Celery refuses unserialized arguments in tests.",
+     "text": "The real adapter, so it also raises when the key is missing.",
      "correct": false,
-     "why": "Celery does not check; the fake does, on purpose."
+     "why": "That would make S3Store disagree with S3 itself, and production code would get errors S3 never sends."
     }
    ]
   }
  ],
- "recall": [
-  "From p10-2: what does a fixture with params do to the tests that ask for it?",
-  "From p10-3: why do rows created through the API prove more than rows created by a factory?"
- ],
- "videos": [
-  {
-   "title": "Unit Tests and Test Doubles like Mocks, Stubs & Fakes",
-   "url": "https://www.youtube.com/watch?v=NPp2pvhGbkM",
-   "channel": "The Theory Of Code",
-   "minutes": 18,
-   "why": "Patient explanation of each test double and when to use it."
-  },
-  {
-   "title": "Stubs vs Mocks vs Fake | In a nutshell",
-   "url": "https://www.youtube.com/watch?v=4AxXWjBSIdY",
-   "channel": "Keploy",
-   "minutes": 3,
-   "why": "Three-minute recap to keep the three terms straight."
-  }
- ],
+ "platform": {
+  "p": [
+   "fcp's cloud talks to three things a unit test cannot run: the on-prem clients over gRPC, object storage (S3, or MinIO in CI) and Celery workers. Today the unit tests mock them in many places: 69 mock.patch calls on the gRPC client and 11 uses of CELERY_TASK_ALWAYS_EAGER, which runs a job inside the caller and skips the queue's serialization. The plan replaces those mocks in the new API test layer with three fakes, each pinned by a contract suite marked contract.",
+   "The object-store fake is this lab in fcp's own interface: it replaces AWSStorageServiceProvider at the seam where StorageService creates it, and its contract suite runs against the MinIO service that the cloud CI job already starts. The gRPC fake and the queue fake follow the ideas in the Go deeper panel."
+  ],
+  "tickets": [
+   {
+    "key": "G7-05",
+    "why": "InMemoryStorageProvider and its contract suite against MinIO: this lab in fcp's interface."
+   },
+   {
+    "key": "G7-04",
+    "why": "FakeOnPremClient: a real gRPC server in the test process that is loud about methods it does not implement."
+   },
+   {
+    "key": "G7-07",
+    "why": "FakeTaskQueue: records jobs through Celery's own serializer and runs them on drain(), checked against a real worker."
+   },
+   {
+    "key": "G7-01",
+    "why": "The rule for the new layer: no mock.patch of the gRPC client or storage, and no CELERY_TASK_ALWAYS_EAGER."
+   }
+  ]
+ },
  "words": [
   {
    "term": "mock",
-   "plain": "A stand-in that records calls and returns canned answers; it proves a call happened, not that the real service would accept it."
+   "plain": "A stand-in that accepts any call, returns what the test configured and records how it was called."
   },
   {
    "term": "fake",
-   "plain": "A small real implementation of a service, usually in memory, behind the same interface as the real one."
-  },
-  {
-   "term": "seam",
-   "plain": "The one place where production code creates or reaches the real service; the fixture swaps the fake in there."
+   "plain": "A small, working implementation of a service that keeps its state in memory and behaves like the real one."
   },
   {
    "term": "contract suite",
-   "plain": "One set of tests run against both the fake and the real service, so the two cannot drift apart."
+   "plain": "One set of tests run against both the fake and the real service, so the two cannot drift apart unnoticed."
   },
   {
-   "term": "gRPC servicer",
-   "plain": "The server-side base class generated from a .proto file; subclass it and implement the methods."
+   "term": "seam",
+   "plain": "The one place where production code creates or reaches a real service, and where a test swaps in the fake."
   },
   {
-   "term": "Celery task",
-   "plain": "A plain Python function registered by import path that a worker runs from a queue; sent with apply_async."
-  },
-  {
-   "term": "drain()",
-   "plain": "The fake queue's method that runs the recorded tasks oldest first, when the test decides."
+   "term": "abstract base class",
+   "plain": "Python's way to declare an interface: a class whose @abstractmethod methods every subclass must implement."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G7-04",
-   "why": "FakeOnPremClient is the gRPC servicer fake with the loud-gap rule and the explicit complete_task shown here."
+   "q": "In one sentence each: what does a mock test prove, and what does a fake test prove?",
+   "a": "A mock test proves the code made certain calls. A fake test proves the code reaches the right outcome against something that behaves like the real service."
   },
   {
-   "key": "G7-05",
-   "why": "InMemoryStorageProvider and its MinIO contract suite are the lab in fcp's own interface."
+   "q": "Sketch the fixture that runs a contract suite on a fake and, when available, on the real service.",
+   "a": "@pytest.fixture(params=[\"memory\"] + ([\"minio\"] if os.environ.get(\"MINIO_URL\") else [])), build the fake or the real adapter from request.param, give each test a fresh bucket, and return it."
   },
   {
-   "key": "G7-07",
-   "why": "FakeTaskQueue is the record-then-drain fake, pinned by a contract run on a real Celery worker."
-  },
-  {
-   "key": "G7-08",
-   "why": "The dataset builder uses onprem_client.scheduled and complete_task, so you need the fake's shape."
+   "q": "The real service starts returning a new error for a case your fake accepts. What are your three steps?",
+   "a": "Write a contract test for that case, watch it fail on the fake (and pass on the real side), then change the fake until both sides pass."
   }
  ],
- "remember": "A fake is a small real thing behind the real interface, swapped in at the seam. A contract suite run against the real service keeps it honest."
+ "remember": "Test outcomes against a fake that keeps real state, and run one contract suite on the fake and the real service so the fake stays honest."
 }

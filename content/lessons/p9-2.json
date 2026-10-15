@@ -1,420 +1,337 @@
 {
+ "v": 2,
  "id": "p9-2",
  "title": "Jira from code",
- "minutes": 45,
+ "minutes": 55,
  "youNeed": [
-  "p7-5",
-  "p2-5"
+  "p7-4",
+  "p7-5"
  ],
- "bridge": "Jira's REST API v3 is like the GitHub API you used with Octokit: JSON over HTTPS with a token. Except: we use no typed client, only fetch through shared/src/jira.ts. Search takes JQL and pages with a nextPageToken, and comments are ADF trees, not markdown.",
- "intro": "Nova finds its tickets, its requester and its commands in Jira, all by polling. This lesson writes the few calls that needs. Search with JQL, read and write issue properties, read the changelog, and respect Jira's rate limits. It is the code behind G3-28's poll and G4-04's hand-off.",
- "picture": {
-  "caption": "Search finds the ticket, and a property or the changelog names the requester. The run starts with that person as owner.",
-  "nodes": [
-   {
-    "id": "poll",
-    "label": "startMatches (orchestrator activity)",
-    "kind": "service"
-   },
-   {
-    "id": "search",
-    "label": "POST /rest/api/3/search/jql",
-    "kind": "cloud"
-   },
-   {
-    "id": "prop",
-    "label": "issue property nova.requester",
-    "kind": "file"
-   },
-   {
-    "id": "log",
-    "label": "GET .../issue/RH-1234/changelog",
-    "kind": "cloud"
-   },
-   {
-    "id": "run",
-    "label": "ticketToPr { key, requester }",
-    "kind": "service"
-   }
+ "map": "jira",
+ "hook": {
+  "story": [
+   "Every minute, the Jira poll asks Jira one question: which RH tickets are assigned to Nova, our ticket-to-PR agent? This morning the answer includes RH-1234. Before a run can start, the poll needs one more fact: the requester, the person who handed the ticket to Nova. The requester is the only person who may approve Nova's plan, and the one person who may never approve Nova's PR, so getting the name wrong breaks a safety rule.",
+   "RH-1234 has a messy history. Omer, a teammate, wrote it last month. A week ago Dana, another teammate, assigned it to Nova by mistake and took it back one minute later. This morning Sean assigned it to Nova for real. The reporter field says Omer, the first hand-over says Dana, and the latest one says Sean."
   ],
-  "steps": [
-   {
-    "from": "poll",
-    "to": "search",
-    "text": "JQL: assignee = currentUser(), as the Nova service account; page with nextPageToken"
-   },
-   {
-    "from": "poll",
-    "to": "prop",
-    "text": "was it handed over in Slack? then nova.requester holds the person"
-   },
-   {
-    "from": "poll",
-    "to": "log",
-    "text": "otherwise: the author of the latest change that set assignee to Nova"
-   },
-   {
-    "from": "poll",
-    "to": "run",
-    "text": "startRun with the Handoff; no requester found means no run"
-   }
-  ]
+  "question": "How does code find Nova's tickets in Jira, and how does it know for sure who handed each one over?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Who you are to Jira",
+   "h": "Two facts, two calls",
    "p": [
-    "Every Jira user has an accountId, a long ID like 712020:4c1d0e.... The API uses it everywhere: assignee, comment author, changelog author. GET /rest/api/3/myself tells you yours. For Nova this is the Nova service account, a Jira user that belongs to a program.",
-    "On your own free site you call Jira with Basic auth: your email and an API token. Nova uses a scoped token of its service account, stored in Vault infrastructure/ai-agents/jira-nova and synced only to the orchestrator workers. Scoped tokens go through api.atlassian.com/ex/jira/<cloudId>; G4-04 says to check this. A VM never holds a Jira token: inside a run, the broker's one-issue scope is used."
-   ],
-   "see": "{\"accountId\":\"712020:4c1d0e...\",\"displayName\":\"Sean Lab\",\"active\":true, ...}   (output trimmed)",
-   "ifInstead": "If instead you get 401, the email and token do not match, or the token was copied with a space. Create a new token and export it again."
+    "The poll needs two facts from Jira, and it gets each one from a different place. Which tickets are Nova's comes from a search. Who handed each ticket over comes from the ticket's changelog, the list Jira keeps of every change to an issue. Both are plain HTTPS calls to Jira's REST API (version 3) with JSON in and out, the same shape of API you already know from GitHub.",
+    "The poll calls Jira as Nova. Nova is a Jira user of its own, a service account, which means an account that belongs to a program instead of a person. Jira names every user by an accountId, a long string like 712020:4c1d0e…, and uses it everywhere: in the assignee field, as a comment's author, and in the changelog. GET /rest/api/3/myself returns the caller's own accountId, so the poll asks once who it is and remembers the answer."
+   ]
   },
   {
-   "h": "One fetch function for every call",
+   "h": "Find the work with JQL",
    "p": [
-    "We use Node's global fetch, wrapped once in shared/src/jira.ts. The wrapper adds the auth header, turns errors into exceptions, and handles two cases every caller needs. A 404 becomes undefined, because a missing property is normal. A 429 means too many requests: Jira's Retry-After header says how many seconds to wait.",
-    "Temporal adds a second layer. startMatches runs with the PEOPLE_APIS retry policy, so a Jira outage is also retried at the activity level (p7-2)."
+    "JQL, the Jira Query Language, is the filter text you can type into Jira's search box, and the API accepts the same text. Nova's query asks for RH tickets assigned to the caller that are not done yet, oldest change first. Because the poll runs as Nova, currentUser() means Nova. Sorting by updated ASC makes the ticket that has waited longest come first.",
+    "The search endpoint is POST /rest/api/3/search/jql. It answers in pages. When there are more results than fit in one page, the answer includes a nextPageToken, and you send the same request again with that token to get the next page. This is a cursor: a bookmark that the server gives you, instead of a page number you compute yourself. Stop only when an answer has no token. A poll that reads only the first page does not fail with an error; it quietly never sees the tickets on page two."
    ],
-   "because": "We wrap fetch once because auth, rate limits and errors must behave the same in every Jira call.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/shared/src/jira.ts (sketch)",
-    "text": "// ai-agents/shared/src/jira.ts (sketch): every Jira call goes through one small function\nconst BASE = process.env.JIRA_BASE_URL!; // https://rhino-fcp.atlassian.net, or the api.atlassian.com form for scoped tokens\nconst AUTH = \"Basic \" + Buffer.from(`${process.env.JIRA_EMAIL}:${process.env.JIRA_API_TOKEN}`).toString(\"base64\");\n\nexport const jiraFetch = async <T>(path: string, init: RequestInit = {}): Promise<T | undefined> => {\n  for (let attempt = 1; ; attempt++) {\n    const res = await fetch(`${BASE}${path}`, { ...init, headers: { Authorization: AUTH, Accept: \"application/json\",\n      \"Content-Type\": \"application/json\", ...init.headers } });\n    if (res.status === 429 && attempt < 5) { // rate limited: wait as long as Jira asks\n      const wait = Number(res.headers.get(\"Retry-After\") ?? 5) * 1000;\n      await new Promise((r) => setTimeout(r, wait));\n      continue;\n    }\n    if (res.status === 404) return undefined; // for example an issue property that was never set\n    if (!res.ok) throw new Error(`Jira ${init.method ?? \"GET\"} ${path}: ${res.status} ${await res.text()}`);\n    return res.status === 204 ? undefined : ((await res.json()) as T);\n  }\n};",
+    "file": "shared/src/jira.ts",
+    "text": "const NOVA_JQL = \"project = RH AND assignee = currentUser() AND statusCategory != Done ORDER BY updated ASC\";\n\nexport const searchAll = async (jql: string, fields = [\"summary\", \"status\", \"assignee\"]) => {\n  const issues: JiraIssue[] = [];\n  let nextPageToken: string | undefined;\n  do {\n    const page = await jiraFetch<SearchPage>(\"/rest/api/3/search/jql\", {\n      method: \"POST\",\n      body: JSON.stringify({ jql, fields, maxResults: 100, nextPageToken }),\n    });\n    issues.push(...(page?.issues ?? []));\n    nextPageToken = page?.nextPageToken;\n  } while (nextPageToken);\n  return issues;\n};",
     "notes": [
      {
-      "line": 2,
-      "text": "The site URL. With a scoped service-account token it is the api.atlassian.com form; check G4-04."
+      "line": 1,
+      "text": "Runs as the Nova service account, so currentUser() is Nova."
      },
      {
       "line": 3,
-      "text": "Basic auth is email:token in base64. The token comes from the environment, never from code."
+      "text": "Ask only for the fields the poll needs. Never attachments: they can hold customer data."
      },
      {
       "line": 9,
-      "text": "429: Jira is rate limiting us. Retrying at once would make it worse."
-     },
-     {
-      "line": 10,
-      "text": "Retry-After is in seconds. Wait exactly that, then try again."
-     },
-     {
-      "line": 14,
-      "text": "404 is an answer, not an error, for lookups like issue properties."
-     },
-     {
-      "line": 15,
-      "text": "Anything else that is not 2xx throws. The activity's retry policy takes it from there."
-     },
-     {
-      "line": 16,
-      "text": "204 No Content has no body, for example after setting the assignee."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Search with JQL",
-   "p": [
-    "JQL, Jira Query Language, is the filter text you type in Jira's search box. Nova's is project = RH AND assignee = currentUser() AND statusCategory != Done ORDER BY updated ASC. currentUser() is whoever calls the API, so for the service account it means Nova.",
-    "The search endpoint is POST /rest/api/3/search/jql. The older /rest/api/3/search with startAt is retired. Each page returns issues and, if there is more, a nextPageToken; send it back to get the next page. Ask only for the fields you need: it is faster, and it keeps data we must not see out of the response."
-   ],
-   "because": "We page until nextPageToken is gone because a poll that reads only the first page silently drops tickets.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/shared/src/jira.ts (search)",
-    "text": "// ai-agents/shared/src/jira.ts (search): POST /rest/api/3/search/jql, paged with nextPageToken\ninterface SearchPage { issues: JiraIssue[]; nextPageToken?: string }\n\nexport const searchAll = async (jql: string, fields = [\"summary\", \"status\", \"assignee\", \"updated\"]) => {\n  const all: JiraIssue[] = [];\n  let nextPageToken: string | undefined;\n  do {\n    const page = await jiraFetch<SearchPage>(\"/rest/api/3/search/jql\", {\n      method: \"POST\", body: JSON.stringify({ jql, fields, maxResults: 100, nextPageToken }),\n    });\n    all.push(...(page?.issues ?? []));\n    nextPageToken = page?.nextPageToken;\n  } while (nextPageToken);\n  return all;\n};",
-    "notes": [
-     {
-      "line": 2,
-      "text": "The page shape we use: the issues, and a token when another page exists."
-     },
-     {
-      "line": 4,
-      "text": "fields: only what the poll needs. Never attachments: they may hold customer data."
-     },
-     {
-      "line": 8,
-      "text": "POST with a JSON body, not GET with a query string, so long JQL fits."
-     },
-     {
-      "line": 9,
-      "text": "maxResults is a request; Jira may return fewer. nextPageToken is undefined on the first call."
+      "text": "On the first call nextPageToken is undefined, so JSON.stringify leaves it out."
      },
      {
       "line": 13,
-      "text": "No token means the last page."
+      "text": "No token in the answer means this was the last page."
      }
     ]
    }
   },
   {
-   "h": "Issue properties: hidden notes on a ticket",
+   "h": "Who handed it over: the changelog",
    "p": [
-    "An issue property is a small JSON value an app stores on an issue under a key. People do not see it in the UI, and it does not notify anyone. Nova uses one: nova.requester, set when someone hands a ticket over with /nova in Slack.",
-    "Then the Slack hand-off looks exactly like a Jira hand-off: the property names the person, and the ticket is assigned to Nova. The poll does the rest, the same way for both."
+    "Back to the messy history of RH-1234. The reporter is the person who wrote the ticket, and that is not the same as the person who asked Nova to do it. Comments prove nothing either, because anyone can write one. The changelog is different: Jira writes it itself, every time a field changes, with the author and the time. Nobody can edit it.",
+    "GET /rest/api/3/issue/RH-1234/changelog returns the changes oldest first. Each entry has an author and a list of items, one per changed field, with from and to. For the assignee field, from and to are accountIds. So the rule is: keep the entries that set the assignee to Nova, and take the author of the last one. For RH-1234 that skips Dana's mistake from last week and names Sean. If no entry matches, there is no requester, and no run starts."
    ],
-   "because": "We store the Slack requester as a property because our app makes that assignee change. So the changelog would not name the person.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/shared/src/jira.ts (issue properties)",
-    "text": "// ai-agents/shared/src/jira.ts (issue properties): small JSON values an app stores on an issue\nconst propPath = (key: string, name: string) => `/rest/api/3/issue/${key}/properties/${encodeURIComponent(name)}`;\n\nexport const issueProperty = async <T>(key: string, name: string): Promise<T | undefined> =>\n  (await jiraFetch<{ key: string; value: T }>(propPath(key, name)))?.value; // 404: undefined\n\nexport const setIssueProperty = (key: string, name: string, value: unknown) =>\n  jiraFetch(propPath(key, name), { method: \"PUT\", body: JSON.stringify(value) });\n\n// /nova RH-1234 in Slack (G4-05): record the requester, then assign the ticket to Nova\nawait setIssueProperty(\"RH-1234\", \"nova.requester\", dana.jira);\nawait jiraFetch(\"/rest/api/3/issue/RH-1234/assignee\", { method: \"PUT\", body: JSON.stringify({ accountId: NOVA_ID }) });",
+    "file": "orchestrator/src/triggers/nova.ts",
+    "text": "export async function requesterOf(key: string): Promise<string | undefined> {\n  const fromSlack = await jira.issueProperty<string>(key, \"nova.requester\");\n  if (fromSlack) return fromSlack;\n  const history = await jira.changelog(key); // oldest first\n  const toNova = history.filter((c) => c.items.some((i) => i.field === \"assignee\" && i.to === jira.me));\n  return toNova.at(-1)?.author.accountId;\n}",
     "notes": [
      {
       "line": 2,
-      "text": "The property key goes in the URL, so encode it."
+      "text": "The Slack path, explained just below: our app wrote the requester onto the ticket."
      },
      {
       "line": 5,
-      "text": "The GET returns { key, value }. Missing: 404, so undefined."
-     },
-     {
-      "line": 8,
-      "text": "PUT stores any JSON value. A string is fine."
-     },
-     {
-      "line": 11,
-      "text": "dana.jira: her accountId from config/people.yaml (p9-1)."
-     },
-     {
-      "line": 12,
-      "text": "Assigning to Nova is what the poll looks for. The property tells it who asked."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The changelog: who changed what",
-   "p": [
-    "Jira keeps a changelog per issue: every field change with its author and time, oldest first. Each entry has items, one per field: field, from and to. For the assignee field, from and to are accountIds.",
-    "requesterOf reads it when there is no property. It keeps the entries that set the assignee to Nova and takes the last one's author. If someone unassigned and assigned again, the latest person is the requester. No entry means no requester, and no run starts."
-   ],
-   "because": "We read the changelog because Jira records who assigned the ticket, and that person must own the run.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/shared/src/jira.ts + orchestrator/src/triggers/nova.ts",
-    "text": "// ai-agents/shared/src/jira.ts (changelog): every field change, oldest first, 100 per page\ninterface ChangeItem { field: string; from: string | null; to: string | null }\ninterface Change { author: { accountId: string }; created: string; items: ChangeItem[] }\n\nexport const changelog = async (key: string): Promise<Change[]> => {\n  const all: Change[] = [];\n  for (let startAt = 0; ; startAt += 100) {\n    const page = await jiraFetch<{ values: Change[]; isLast: boolean }>(`/rest/api/3/issue/${key}/changelog?startAt=${startAt}&maxResults=100`);\n    all.push(...(page?.values ?? []));\n    if (!page || page.isLast) return all;\n  }\n};\n\n// ai-agents/orchestrator/src/triggers/nova.ts (G4-04): who handed the ticket to Nova\nexport async function requesterOf(key: string): Promise<string | undefined> {\n  const fromSlack = await jira.issueProperty<string>(key, \"nova.requester\"); // set by /nova in Slack\n  if (fromSlack) return fromSlack;\n  const history = await jira.changelog(key); // oldest first\n  const toNova = history.filter((h) => h.items.some((i) => i.field === \"assignee\" && i.to === jira.me));\n  return toNova.at(-1)?.author.accountId;\n}",
-    "notes": [
-     {
-      "line": 2,
-      "text": "One changed field. For assignee, to is the new assignee's accountId."
-     },
-     {
-      "line": 8,
-      "text": "This endpoint pages with startAt and isLast, unlike search."
-     },
-     {
-      "line": 16,
-      "text": "The Slack path first: the property set by /nova."
-     },
-     {
-      "line": 19,
       "text": "jira.me is Nova's own accountId, read once from /myself."
      },
      {
-      "line": 20,
-      "text": "The last matching entry: the most recent hand-over wins."
+      "line": 6,
+      "text": "at(-1) is the last match: the most recent hand-over wins. at(0) would name Dana."
      }
+    ]
+   },
+   "see": "who: Dana  2026-10-05T09:00  assignee -> 712020:nova\nwho: Dana  2026-10-05T09:01  assignee -> null\nwho: Omer  2026-10-07T14:00  status -> 3\nwho: Sean  2026-10-13T08:58  assignee -> 712020:nova      <- the requester",
+   "deeper": {
+    "h": "Go deeper: the Slack path and issue properties",
+    "p": [
+     "People can also hand a ticket over by typing /nova RH-1234 in Slack. Then our Slack app, not a person, changes the assignee, so the changelog would name Nova itself. To keep the person's name, the app first stores it on the ticket as an issue property: a small JSON value that an app keeps on an issue under a key, here nova.requester. People do not see properties in Jira's screens, and setting one notifies nobody.",
+     "The calls are PUT and GET /rest/api/3/issue/RH-1234/properties/nova.requester. When the property was never set, the GET answers 404, which here is an answer and not an error, so the client turns it into undefined. That is why requesterOf looks at the property first and only then reads the changelog."
     ]
    }
   },
   {
-   "h": "Comments, assignee and ADF",
+   "h": "Polling without hurting anyone",
    "p": [
-    "Writing back is three calls. POST /rest/api/3/issue/{key}/comment adds a comment, PUT .../comment/{id} edits it, and PUT .../assignee changes the assignee. Comment bodies are ADF, Atlassian Document Format: a JSON tree of paragraphs, text and mention nodes.",
-    "Nova keeps one status comment per ticket and edits it with notifyUsers=false, so watchers are not pinged at every step (G4-11). It assigns the ticket back to the requester when the PR is marked ready, so a person always owns it (G4-05)."
+    "A poll calls Jira every minute, forever, so it must be polite and safe to repeat. Polite means it respects Jira's rate limits. When Jira gets too many requests it answers 429 Too Many Requests with a Retry-After header that says how many seconds to wait. The client waits exactly that long and tries again. Retrying at once only makes the limit last longer.",
+    "Safe to repeat means the poll can see RH-1234 sixty times in an hour without doing anything sixty times. That comes from the lesson on run names: the poll starts the run through startRun with the ID nova:RH-1234, so every later sighting joins the open run. And the poll must never react to its own actions. When Nova assigns the ticket back to Sean or edits its status comment, those changes are Nova's, and the code skips them by checking the author against Nova's accountId."
    ],
-   "callout": {
-    "kind": "wall",
-    "text": "PHI never enters a prompt. The broker's Jira scope returns summary, description and comments only, never attachments such as screenshots or logs."
-   }
-  },
-  {
-   "h": "Polling safely",
-   "p": [
-    "One direction only: we call Jira, Jira never calls us. Poll on a schedule with overlap SKIP, so a slow poll never stacks (p7-5). Make every action idempotent: startRun's workflow ID turns the 60th sighting of a ticket into nothing.",
-    "Order by updated ASC, so the oldest change is handled first. Ask for few fields, page to the end, and honour Retry-After. Never react to Nova's own comments or assignee changes, or Nova talks to itself. parseCommand skips Nova's author ID, and Nova's assign-back is not a stop."
-   ],
-   "callout": {
-    "kind": "tip",
-    "text": "To read @Nova commands, the poll lists open ticketToPr runs with a visibility query and reads only those tickets' new comments (G4-05)."
+   "code": {
+    "lang": "typescript",
+    "file": "shared/src/jira.ts",
+    "text": "export const jiraFetch = async <T>(path: string, init: RequestInit = {}): Promise<T | undefined> => {\n  for (let attempt = 1; ; attempt++) {\n    const res = await fetch(`${BASE}${path}`, { ...init, headers: { Authorization: AUTH,\n      Accept: \"application/json\", \"Content-Type\": \"application/json\" } });\n    if (res.status === 429 && attempt < 5) {\n      const seconds = Number(res.headers.get(\"Retry-After\") ?? 5);\n      await new Promise((r) => setTimeout(r, seconds * 1000));\n      continue;\n    }\n    if (res.status === 404) return undefined;\n    if (!res.ok) throw new Error(`Jira ${init.method ?? \"GET\"} ${path}: ${res.status}`);\n    return res.status === 204 ? undefined : ((await res.json()) as T);\n  }\n};",
+    "notes": [
+     {
+      "line": 3,
+      "text": "One function adds the auth header for every Jira call, so no caller can forget it."
+     },
+     {
+      "line": 6,
+      "text": "Retry-After is in seconds. Wait exactly that long."
+     },
+     {
+      "line": 10,
+      "text": "For lookups like an issue property, 404 means \"not set\"."
+     },
+     {
+      "line": 11,
+      "text": "Anything else that fails throws. The Temporal activity around the poll retries it later."
+     }
+    ]
    }
   }
  ],
  "lab": {
-  "title": "Find your requester in a real Jira",
-  "youNeed": [
-   "A free Jira Cloud site of your own (atlassian.com, Jira Free), never the company site",
-   "An API token from id.atlassian.com, Security, API tokens",
-   "Node 24 and ~/temporal-lab (for tsx)"
+  "id": "p9-2",
+  "title": "Find the requester in a pretend Jira",
+  "minutes": 30,
+  "needs": [
+   "Node 22+",
+   "curl and jq",
+   "Two terminal tabs"
   ],
-  "worked": [
+  "goal": "Run one poll against a local Jira with recorded answers: read every page of a JQL search, survive a 429, and name the right requester from the changelog.",
+  "mode": "guided",
+  "guess": {
+   "q": "RH-1234's changelog says: Dana assigned it to Nova, Dana unassigned it a minute later, and a week later Sean assigned it to Nova. Omer is the reporter. Who should the poll name as the requester?",
+   "options": [
+    {
+     "text": "Omer, because he wrote the ticket.",
+     "correct": false,
+     "why": "Writing a ticket is not handing it to Nova. The reporter is never read for this."
+    },
+    {
+     "text": "Dana, because she handed it to Nova first.",
+     "correct": false,
+     "why": "Her hand-over was undone a minute later. Taking the first match is a real bug, and the Fix it step shows what it causes."
+    },
+    {
+     "text": "Sean, because his is the latest change that set the assignee to Nova.",
+     "correct": true,
+     "why": "The last matching changelog entry wins, so the person who handed it over most recently owns the run."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "In your site, open the project the site created and note its key (for example KAN). Create two issues by hand: KAN-1 and KAN-2.",
-    "see": "Two issues in the board's first column"
+    "say": "Make a folder, then create the pretend Jira. It answers the few endpoints the poll uses with recorded data, and it rate-limits the first search on purpose.",
+    "do": "mkdir -p ~/academy-labs/scratch/jira-lab && cd ~/academy-labs/scratch/jira-lab\ncat > fake-jira.mjs <<'EOF'\n// A pretend Jira Cloud with recorded answers. You are the Nova service account.\nimport { createServer } from \"node:http\";\n\nconst NOVA = { accountId: \"712020:nova\", displayName: \"Nova\" };\nconst SEAN = { accountId: \"712020:sean\", displayName: \"Sean\" };\nconst DANA = { accountId: \"712020:dana\", displayName: \"Dana\" };\nconst OMER = { accountId: \"712020:omer\", displayName: \"Omer\" };\nconst assign = (id, author, created, from, to) =>\n  ({ id, author, created, items: [{ field: \"assignee\", from: from?.accountId ?? null, to: to?.accountId ?? null }] });\n\nconst issue = (key, summary) => ({ key, fields: { summary, assignee: NOVA } });\nconst PAGES = {\n  first: { issues: [issue(\"RH-1234\", \"Empty projects table should show a \\\"No projects yet\\\" card\"),\n                    issue(\"RH-1239\", \"Sort workgroups by name\")], nextPageToken: \"page-2\", isLast: false },\n  \"page-2\": { issues: [issue(\"RH-1241\", \"Typo on the login page\")], isLast: true },\n};\nconst CHANGELOG = {\n  \"RH-1234\": [assign(\"10\", DANA, \"2026-10-05T09:00:00Z\", null, NOVA), assign(\"11\", DANA, \"2026-10-05T09:01:00Z\", NOVA, null),\n              { id: \"12\", author: OMER, created: \"2026-10-07T14:00:00Z\", items: [{ field: \"status\", from: \"10000\", to: \"3\" }] },\n              assign(\"13\", SEAN, \"2026-10-13T08:58:00Z\", null, NOVA)],\n  \"RH-1239\": [assign(\"20\", OMER, \"2026-10-12T16:30:00Z\", null, NOVA)],\n  \"RH-1241\": [assign(\"30\", NOVA, \"2026-10-13T09:10:00Z\", null, NOVA)],\n};\nconst PROPERTIES = { \"RH-1241\": { \"nova.requester\": OMER.accountId } };\n\nlet searches = 0;\nconst send = (res, status, body, headers = {}) => {\n  res.writeHead(status, { \"content-type\": \"application/json\", ...headers });\n  res.end(body === undefined ? \"\" : JSON.stringify(body));\n};\ncreateServer((req, res) => {\n  let body = \"\";\n  req.on(\"data\", (c) => (body += c));\n  req.on(\"end\", () => {\n    const url = new URL(req.url, \"http://x\");\n    console.log(req.method, url.pathname + url.search);\n    if (url.pathname === \"/rest/api/3/myself\") return send(res, 200, NOVA);\n    if (url.pathname === \"/rest/api/3/search/jql\" && req.method === \"POST\") {\n      if (++searches === 1) return send(res, 429, { errorMessages: [\"Rate limit exceeded.\"] }, { \"Retry-After\": \"2\" });\n      return send(res, 200, PAGES[JSON.parse(body).nextPageToken ?? \"first\"]);\n    }\n    const m = url.pathname.match(/^\\/rest\\/api\\/3\\/issue\\/([A-Z]+-\\d+)\\/(changelog|properties\\/(.+))$/);\n    if (m && m[2] === \"changelog\") {\n      const values = CHANGELOG[m[1]] ?? [];\n      return send(res, 200, { startAt: 0, maxResults: 100, total: values.length, isLast: true, values });\n    }\n    const value = m?.[3] && PROPERTIES[m[1]]?.[decodeURIComponent(m[3])];\n    if (value) return send(res, 200, { key: m[3], value });\n    send(res, 404, { errorMessages: [\"Not found.\"] });\n  });\n}).listen(process.env.JIRA_PORT ?? 4000, () => console.log(`fake Jira on http://localhost:${process.env.JIRA_PORT ?? 4000}`));\nEOF",
+    "see": "(no output; the file exists)"
    },
    {
-    "do": "export JIRA_BASE_URL=https://<your-site>.atlassian.net JIRA_EMAIL=<your email> JIRA_API_TOKEN=<the token>",
-    "see": "(no output)"
+    "say": "Start it in the first terminal and leave it open. It prints every request it receives.",
+    "do": "node fake-jira.mjs",
+    "see": "fake Jira on http://localhost:4000"
    },
    {
-    "do": "curl -s -u \"$JIRA_EMAIL:$JIRA_API_TOKEN\" \"$JIRA_BASE_URL/rest/api/3/myself\"",
-    "see": "{\"accountId\":\"712020:...\",\"displayName\":\"<you>\",\"active\":true, ...}"
+    "say": "In the second terminal, ask who you are. The poll does this once, because it needs Nova's own accountId to read the changelog.",
+    "do": "curl -s localhost:4000/rest/api/3/myself",
+    "see": "{\"accountId\":\"712020:nova\",\"displayName\":\"Nova\"}"
    },
    {
-    "do": "Create src/jira.ts with jiraFetch, searchAll, issueProperty, setIssueProperty and changelog from the blocks above. Define JiraIssue as { key: string; fields: Record<string, unknown> }.",
-    "see": "(no output)"
+    "say": "Search the way the poll does. The first search is rate-limited, so look at the status line and the Retry-After header.",
+    "do": "curl -si -X POST localhost:4000/rest/api/3/search/jql -H 'Content-Type: application/json' -d '{\"jql\":\"assignee = currentUser()\"}' | head -3",
+    "see": "HTTP/1.1 429 Too Many Requests\ncontent-type: application/json\nRetry-After: 2"
    },
    {
-    "do": "Create src/jira-lab.ts that prints (await searchAll('project = KAN ORDER BY updated ASC')).map((i) => i.key). Run: npx tsx src/jira-lab.ts",
-    "see": "[ 'KAN-1', 'KAN-2' ]"
+    "say": "Wait two seconds and search again. This time you get the first page and a token for the next one.",
+    "do": "curl -s -X POST localhost:4000/rest/api/3/search/jql -H 'Content-Type: application/json' -d '{\"jql\":\"assignee = currentUser()\"}' | jq -c '{keys: [.issues[].key], nextPageToken}'",
+    "see": "{\"keys\":[\"RH-1234\",\"RH-1239\"],\"nextPageToken\":\"page-2\"}"
    },
    {
-    "do": "In Jira, assign KAN-1 to yourself, then to Unassigned, then to yourself again",
-    "see": "Three entries in the issue's History tab"
+    "say": "Read RH-1234's changelog, one line per change, and find the requester yourself before the code does.",
+    "do": "curl -s localhost:4000/rest/api/3/issue/RH-1234/changelog | jq -c '.values[] | {who: .author.displayName, created, field: .items[0].field, to: .items[0].to}'",
+    "see": "{\"who\":\"Dana\",\"created\":\"2026-10-05T09:00:00Z\",\"field\":\"assignee\",\"to\":\"712020:nova\"}\n{\"who\":\"Dana\",\"created\":\"2026-10-05T09:01:00Z\",\"field\":\"assignee\",\"to\":null}\n{\"who\":\"Omer\",\"created\":\"2026-10-07T14:00:00Z\",\"field\":\"status\",\"to\":\"3\"}\n{\"who\":\"Sean\",\"created\":\"2026-10-13T08:58:00Z\",\"field\":\"assignee\",\"to\":\"712020:nova\"}"
    },
    {
-    "do": "Print the changelog: for each change, author.accountId and the assignee items' from and to",
-    "see": "712020:... null -> 712020:...\n712020:... 712020:... -> null\n712020:... null -> 712020:...   (output trimmed)"
-   },
-   {
-    "do": "Write requesterOf with jira.me set to your own accountId and run it for KAN-1, then for KAN-2",
-    "see": "KAN-1: 712020:...\nKAN-2: undefined"
+    "say": "Now the poll itself: one fetch function that waits on 429, a search that reads every page, and requesterOf. Stop the fake Jira with Ctrl+C and start it again first, so the poll meets the rate limit too.",
+    "do": "cat > poll.mjs <<'EOF'\n// One run of Nova's Jira poll: find Nova's tickets, then find who handed each one over.\nconst BASE = `http://localhost:${process.env.JIRA_PORT ?? 4000}`;\nconst JQL = \"project = RH AND assignee = currentUser() AND statusCategory != Done ORDER BY updated ASC\";\n\nconst jiraFetch = async (path, init = {}) => {\n  for (;;) {\n    const res = await fetch(BASE + path, { ...init, headers: { \"Content-Type\": \"application/json\", Accept: \"application/json\" } });\n    if (res.status === 429) {\n      const seconds = Number(res.headers.get(\"Retry-After\") ?? 5);\n      console.log(`Jira said 429, waiting ${seconds} s`);\n      await new Promise((r) => setTimeout(r, seconds * 1000));\n      continue;\n    }\n    if (res.status === 404) return undefined;\n    if (!res.ok) throw new Error(`Jira ${path}: ${res.status}`);\n    return res.json();\n  }\n};\n\nconst searchAll = async (jql) => {\n  const issues = [];\n  let nextPageToken;\n  do {\n    const page = await jiraFetch(\"/rest/api/3/search/jql\", { method: \"POST\",\n      body: JSON.stringify({ jql, fields: [\"summary\", \"assignee\"], maxResults: 2, nextPageToken }) });\n    issues.push(...page.issues);\n    nextPageToken = page.nextPageToken;\n  } while (nextPageToken);\n  return issues;\n};\n\nconst requesterOf = async (key, me) => {\n  const { values } = await jiraFetch(`/rest/api/3/issue/${key}/changelog`);\n  const toNova = values.filter((c) => c.items.some((i) => i.field === \"assignee\" && i.to === me));\n  const last = toNova.at(-1)?.author;\n  return last && last.accountId !== me ? last : undefined;\n};\n\nconst me = (await jiraFetch(\"/rest/api/3/myself\")).accountId;\nfor (const issue of await searchAll(JQL)) {\n  const who = await requesterOf(issue.key, me);\n  console.log(who ? `start nova:${issue.key} for ${who.displayName}` : `skip  ${issue.key}: no requester found`);\n}\nEOF\nnode poll.mjs",
+    "see": "Jira said 429, waiting 2 s\nstart nova:RH-1234 for Sean\nstart nova:RH-1239 for Omer\nskip  RH-1241: no requester found"
    }
   ],
-  "faded": "Hand KAN-2 over the Slack way: setIssueProperty('KAN-2', 'nova.requester', '<an accountId>') from a script. Left to you: run requesterOf('KAN-2') again and explain which branch of the function answered.",
-  "alone": "Write pollOnce(jql) that searches, and for each issue logs 'start lab:<key> for <requester>' or 'skip <key>: no requester'. Run it three times in a row and confirm it is safe to repeat. Then lower maxResults to 1 and confirm you still get every issue through nextPageToken.",
-  "done": "Your code paged through a JQL search, read and wrote an issue property, and named who last assigned a ticket."
+  "build": "RH-1241 was handed over in Slack, so its only assignee change was made by Nova itself, and the poll skips it. Our Slack app stored the person as the issue property nova.requester. Look at it with curl -s localhost:4000/rest/api/3/issue/RH-1241/properties/nova.requester, then change requesterOf so it reads that property first (jiraFetch gives back undefined on a 404) and falls back to the changelog. Run node poll.mjs again.",
+  "checks": [
+   "node poll.mjs prints three lines, one for each of RH-1234, RH-1239 and RH-1241, so the second page was read.",
+   "RH-1234 starts for Sean, not for Dana or Omer.",
+   "RH-1241 starts for 712020:omer, the accountId from the issue property.",
+   "The fake Jira's terminal shows the search being sent again after the 429, and not sooner than two seconds later.",
+   "Running node poll.mjs twice prints the same lines both times: the poll is safe to repeat."
+  ],
+  "solution": {
+   "lang": "javascript",
+   "file": "poll.mjs (requesterOf)",
+   "text": "const requesterOf = async (key, me) => {\n  const fromSlack = await jiraFetch(`/rest/api/3/issue/${key}/properties/nova.requester`);\n  if (fromSlack) return { accountId: fromSlack.value, displayName: fromSlack.value };\n  const { values } = await jiraFetch(`/rest/api/3/issue/${key}/changelog`);\n  const toNova = values.filter((c) => c.items.some((i) => i.field === \"assignee\" && i.to === me));\n  const last = toNova.at(-1)?.author;\n  return last && last.accountId !== me ? last : undefined;\n};"
+  },
+  "fix": "Someone changed toNova.at(-1) to toNova.at(0) \"to respect who asked first\". Make that change and run node poll.mjs: RH-1234 now starts for Dana, who gave the ticket back a week ago. In the real platform she would be asked to approve Sean's plan, and Sean, the person who really asked, could approve the PR alone. Put at(-1) back and explain in one sentence why the last hand-over must win.",
+  "explain": [
+   "Why does the poll read the changelog instead of the ticket's reporter field?",
+   "What happens to a ticket on page two if the search reads only one page, and why would nobody notice?",
+   "The poll sees RH-1234 every minute. What makes the sixtieth sighting do nothing?"
+  ],
+  "done": "node poll.mjs starts all three tickets with the right requester, and you stopped the fake Jira with Ctrl+C."
  },
- "quiz": [
+ "check": [
   {
-   "q": "A search returns 100 issues and a nextPageToken. What do you do next?",
+   "q": "A search answers with 100 issues and a nextPageToken. What should the poll do?",
    "options": [
     {
-     "text": "Send the same request with startAt: 100",
+     "text": "Stop: one page is enough for a poll that runs every minute",
      "correct": false,
-     "why": "startAt belongs to the retired search endpoint; search/jql pages with tokens."
+     "why": "The tickets on later pages would never start a run, and no error would ever say so."
     },
     {
-     "text": "Send the same request again with that nextPageToken, until none comes back",
+     "text": "Send the same search again with that nextPageToken, and repeat until an answer has no token",
      "correct": true,
-     "why": "The token is the cursor; no token means the last page."
+     "why": "The token is a cursor from the server. No token means the last page."
     },
     {
-     "text": "Stop: 100 is the most a poll should read",
+     "text": "Send the same search again with startAt: 100",
      "correct": false,
-     "why": "Then tickets past the first page would never start a run."
+     "why": "This endpoint pages with a token, not with an offset you compute yourself."
     }
    ]
   },
   {
-   "q": "Jira answers 429 with Retry-After: 30. What should jiraFetch do?",
+   "q": "Why does the poll take the requester from the changelog instead of from the newest comment that says \"@Nova please do this\"?",
    "options": [
     {
-     "text": "Wait 30 seconds, then send the request again",
+     "text": "Anyone can write a comment, but only Jira writes the changelog, and assigning a ticket needs a permission",
      "correct": true,
-     "why": "Honour the header; retrying sooner only extends the limit."
+     "why": "The changelog is Jira's own record of who changed the assignee. A comment is text anyone could type, including text pasted from somewhere else."
     },
     {
-     "text": "Retry at once, up to five times",
+     "text": "Comments cannot be read through the API",
      "correct": false,
-     "why": "Hammering a rate-limited API makes the limit last longer."
+     "why": "They can. The problem is that a comment proves nothing about who handed the ticket over."
     },
     {
-     "text": "Fail the whole run",
+     "text": "The changelog is faster to read",
      "correct": false,
-     "why": "A rate limit is temporary; the run must not die for it."
+     "why": "Speed is not the reason. Trust is."
     }
    ]
   },
   {
-   "q": "Dana assigned RH-7 to Nova, then unassigned it. A day later Omer assigned it to Nova again. Who does requesterOf return?",
+   "q": "Jira answers a search with 429 and Retry-After: 30. What is right?",
    "options": [
     {
-     "text": "Dana, the first person who handed it over",
+     "text": "Retry at once, up to five times, to get the data quickly",
      "correct": false,
-     "why": "requesterOf takes the last matching change, not the first."
+     "why": "Hammering a rate-limited API makes the limit last longer for everyone, us included."
     },
     {
-     "text": "The ticket's reporter",
+     "text": "Fail the poll; it runs again in a minute anyway",
      "correct": false,
-     "why": "The reporter is not read at all; only assignee changes to Nova count."
+     "why": "A failed activity is retried too, but without waiting it would just hit the limit again. Waiting the time Jira asks for is the fix."
     },
     {
-     "text": "Omer, the author of the latest change that set the assignee to Nova",
+     "text": "Wait 30 seconds, then send the same request again",
      "correct": true,
-     "why": "toNova.at(-1): the most recent hand-over wins."
+     "why": "Jira tells you exactly how long to wait. The client honours it and tries again."
     }
    ]
   }
  ],
- "recall": [
-  "In p7-5, why do we poll Jira instead of receiving a webhook?",
-  "In p9-1, which file maps a Slack user to a Jira accountId?"
- ],
- "videos": [
-  {
-   "title": "Jira REST API 2024: A Complete Guide",
-   "url": "https://www.youtube.com/watch?v=2ahOpLVcYqQ",
-   "channel": "Rai Gurukul",
-   "minutes": 10,
-   "why": "API token, auth header and create/update issue calls, recent version."
-  },
-  {
-   "title": "How to write a JQL query in Jira | Jira Software tutorial",
-   "url": "https://www.youtube.com/watch?v=3QAuueP947k",
-   "channel": "Atlassian",
-   "minutes": 4,
-   "why": "Official Atlassian four-minute JQL basics."
-  }
- ],
+ "platform": {
+  "p": [
+   "The Jira client lives in shared/src/jira.ts in the ai-agents repo and uses Node's own fetch with Jira REST v3; it pages every search, reads changelogs and comments, and honours Retry-After. Nova's poll is one entry in the orchestrator's registry of Jira queries, which ensureSchedules turns into the Temporal schedule poll-jira-nova: every minute, overlap SKIP. Each match goes through startRun, so nova:RH-1234 is started once and joined after that.",
+   "The poll runs as the Nova service account with a scoped API token from Vault (infrastructure/ai-agents/jira-nova), synced only to the orchestrator workers. A VM never holds a Jira token: inside a run, Jira calls go through the broker's one-issue scope. The same client keeps one Nova status comment per ticket, edited with notifyUsers=false, and sets the Nova state field."
+  ],
+  "tickets": [
+   {
+    "key": "G3-28",
+    "why": "The Jira client (search with pages, changelog, rate limits) and the registry of Jira queries run by schedules."
+   },
+   {
+    "key": "G4-04",
+    "why": "The Nova service account, NOVA_JQL and requesterOf: the property first, then the latest assignee change to Nova."
+   },
+   {
+    "key": "G4-05",
+    "why": "/nova in Slack sets nova.requester and assigns the ticket; the poll reads @Nova commands in new comments."
+   },
+   {
+    "key": "G4-11",
+    "why": "One status comment edited in place and the Nova state field, through the same client."
+   }
+  ]
+ },
  "words": [
   {
    "term": "JQL",
-   "plain": "Jira Query Language: the filter text that finds issues, like SQL for tickets."
+   "plain": "Jira Query Language: the filter text that finds issues, typed in the search box or sent to the API."
   },
   {
    "term": "accountId",
-   "plain": "Jira's ID for a user; used for assignees, authors and the changelog."
+   "plain": "Jira's ID for a user, used for the assignee, comment authors and the changelog."
   },
   {
    "term": "nextPageToken",
-   "plain": "The cursor search/jql returns when more results exist; send it back for the next page."
+   "plain": "The cursor a search returns when more results exist; send it back to get the next page."
+  },
+  {
+   "term": "changelog",
+   "plain": "Jira's own list of every change to an issue, with the author and the time, oldest first."
+  },
+  {
+   "term": "Retry-After",
+   "plain": "The header on a 429 answer that says how many seconds to wait before trying again."
   },
   {
    "term": "issue property",
    "plain": "A small hidden JSON value an app stores on an issue under a key, like nova.requester."
-  },
-  {
-   "term": "changelog",
-   "plain": "Jira's per-issue list of every field change, with author and time, oldest first."
-  },
-  {
-   "term": "Retry-After",
-   "plain": "The header on a 429 answer that says how many seconds to wait before retrying."
-  },
-  {
-   "term": "ADF",
-   "plain": "Atlassian Document Format: the JSON tree Jira uses for comment bodies."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G4-04",
-   "why": "Nova's poll runs NOVA_JQL as the service account and finds the requester in a property or the changelog."
+   "q": "From memory: the JQL Nova's poll runs, and why currentUser() means Nova.",
+   "a": "project = RH AND assignee = currentUser() AND statusCategory != Done ORDER BY updated ASC. The poll calls Jira as the Nova service account, so the current user is Nova."
   },
   {
-   "key": "G3-28",
-   "why": "orchestrator/src/jira.ts searches with pagination, reads changelogs and comments, and respects rate limits."
+   "q": "Explain requesterOf in two sentences to a teammate.",
+   "a": "First it reads the nova.requester property, which our Slack app sets when someone hands over with /nova. Otherwise it reads the changelog and takes the author of the latest change that set the assignee to Nova; no such change means no run."
   },
   {
-   "key": "G4-05",
-   "why": "/nova sets nova.requester and assigns the ticket; the poll reads new comments for @Nova commands."
-  },
-  {
-   "key": "G4-11",
-   "why": "One status comment edited with notifyUsers=false, and a Nova state field set through the same client."
+   "q": "Name two ways a poll can hurt Jira or itself, and the fix for each.",
+   "a": "Ignoring 429 (fix: wait for Retry-After); reacting to its own changes, like Nova's assign-back (fix: skip changes whose author is Nova). Also: reading only the first page (fix: loop until no nextPageToken)."
   }
  ],
- "remember": "Call Jira, never be called: page JQL to the end, honour Retry-After, and find the requester in nova.requester or the changelog."
+ "remember": "Search with JQL to the last page, and take the requester from the changelog's latest hand-over to Nova, never from what someone wrote."
 }

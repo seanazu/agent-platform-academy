@@ -1,419 +1,320 @@
 {
+ "v": 2,
  "id": "p7-3",
  "title": "Signals, queries, conditions and timers",
  "minutes": 45,
  "youNeed": [
+  "p7-1",
   "p7-2"
  ],
- "bridge": "A signal is like dispatching an action to a reducer in a component that stays mounted for days. A query is like a selector. Except: the signal is written to the history before your handler runs, so it survives restarts. And a query is never recorded, so it must not change anything.",
- "intro": "Most of a Nova run is waiting for a person: an Approve, an answer, a review. This lesson shows how a workflow waits for days at no cost and reacts the moment a button is pressed. These are the pieces behind every Slack button and every reminder on the platform.",
- "picture": {
-  "caption": "The Approve click becomes a signal; the handler sets state; condition() sees it and the run goes on. If nobody clicks, a durable timer reminds and then parks.",
-  "nodes": [
-   {
-    "id": "person",
-    "label": "requester",
-    "kind": "person"
-   },
-   {
-    "id": "slack",
-    "label": "Slack app (a client)",
-    "kind": "service"
-   },
-   {
-    "id": "server",
-    "label": "Temporal Service",
-    "kind": "service"
-   },
-   {
-    "id": "wf",
-    "label": "ticketToPr: condition(decided, 1 day)",
-    "kind": "service"
-   },
-   {
-    "id": "act",
-    "label": "notify / parkTicket activities",
-    "kind": "service"
-   }
+ "map": "temporal",
+ "hook": {
+  "story": [
+   "Monday, 09:25. Nova posts its plan for RH-1234 in the ticket's Slack thread, with three buttons: Approve, Change and Stop. The VM that wrote the plan has already been released. But you left for a long weekend at 09:10, so nobody presses anything until Thursday.",
+   "The run now has three things to wait for at the same time: your click, which should start the build the moment it comes; one day passing, so Nova can remind you; and three days passing, so Nova can hand the ticket back to you. A loop that checks a database every minute would cost something every minute, and a setTimeout would die with the next deploy."
   ],
-  "steps": [
-   {
-    "from": "wf",
-    "to": "server",
-    "text": "waits: condition() starts a 1-day timer; no code runs, no VM is up"
-   },
-   {
-    "from": "person",
-    "to": "slack",
-    "text": "clicks Approve on plan v2"
-   },
-   {
-    "from": "slack",
-    "to": "server",
-    "text": "signals decidePlan to nova:RH-1234; the service writes it to the history"
-   },
-   {
-    "from": "server",
-    "to": "wf",
-    "text": "a worker runs the handler; decision is set and condition() returns true"
-   },
-   {
-    "from": "wf",
-    "to": "act",
-    "text": "no click in a day: condition() returns false, so notify reminds; after 3 days parkTicket"
-   }
-  ]
+  "question": "How does a run wait three days for one click, react the moment it comes, and remind you if it does not?"
  },
- "sections": [
+ "read": [
   {
-   "h": "A plan waits for a person",
+   "h": "The click becomes a signal",
    "p": [
-    "Nova posts plan v2 for RH-1234 with Approve, Change and Stop buttons. Then nothing happens for a day. The lite VM was released when the plan was posted, so nothing is running and nothing costs money.",
-    "G3-38 sets the rules for every wait on a person. A plan: remind after 1 day, park after 3. A question: remind after 1 day, park after 2. A PR review: remind after 2 days, close with a note after 14. On drill tickets the same numbers are minutes, so a drill finishes in an hour.",
-    "Parking a ticket means: post why, move it back in Jira, and end the run as 'parked'. A later assignment starts a fresh run with the same ID."
-   ]
-  },
-  {
-   "h": "Signals: messages into a running workflow",
-   "p": [
-    "A signal is a named message a client sends to one run. defineSignal names it and types its arguments. setHandler attaches a function inside the workflow. The handler runs on a worker and changes workflow state; it should not call activities.",
-    "A query is a named question the run answers from its state. Set every handler at the top of the workflow, before the first await. Then no early message arrives before its handler exists."
+    "When you press Approve, the Slack app, our small service that turns Slack actions into messages for runs, sends a signal to the run. A signal is a named message that a client sends to one open run, which it finds by the workflow ID. The Temporal Service writes the signal into the run's history before anything else happens, so it is safe even when no worker is running at that moment: the next worker that handles the run delivers it.",
+    "Inside the workflow you declare the signal with defineSignal and attach a handler with setHandler. The handler does one small job: it stores the decision in a variable. It does not call activities and does not wait for anything, because the body of the workflow does the real work once it sees the new value. The button also carries the plan's version, so a click on an old message cannot approve a newer plan."
    ],
-   "because": "We turn every button and reply into a signal because the decision must reach the waiting run at once and be recorded.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (handlers)",
-    "text": "// ai-agents/orchestrator/src/workflows/ticket-to-pr.ts: the messages a run accepts\nimport { defineQuery, defineSignal, setHandler } from \"@temporalio/workflow\";\nimport type { Handoff, PlanDecision, RunState } from \"@rhinohealth/ai-agents-shared\";\n\nexport const decidePlan = defineSignal<[PlanDecision]>(\"decidePlan\"); // Slack buttons, @Nova approve\nexport const answerQuestion = defineSignal<[text: string, by: string]>(\"answerQuestion\"); // a reply in the thread\nexport const stop = defineSignal<[by: string]>(\"stop\"); // Stop button, /nova stop, unassign\nexport const status = defineQuery<string>(\"status\"); // /nova status RH-1234\n\nexport async function ticketToPr(t: Handoff): Promise<string> {\n  const run: RunState = { stopped: false };\n  let decision: PlanDecision | undefined;\n  let state = \"Checking\";\n  setHandler(decidePlan, (d) => { decision ??= d; }); // the first decision wins (G3-35)\n  setHandler(answerQuestion, (text) => { run.answer = run.answer ? `${run.answer}\\n${text}` : text; });\n  setHandler(stop, () => { run.stopped = true; });\n  setHandler(status, () => state); // a query only reads\n  // ... plan, wait, build: the rest of G3-24\n}",
+    "file": "orchestrator/src/workflows/ticket-to-pr.ts",
+    "text": "import { condition, defineQuery, defineSignal, setHandler } from \"@temporalio/workflow\";\n\nexport const decidePlan = defineSignal<[PlanDecision]>(\"decidePlan\");\nexport const status = defineQuery<string>(\"status\");\n\nexport async function ticketToPr(t: Handoff): Promise<string> {\n  let state = \"Awaiting approval\";\n  let decision: PlanDecision | undefined;\n  setHandler(decidePlan, (d) => { decision = d; });\n  setHandler(status, () => state);\n  // ...post the plan, then wait for the decision (next section)\n}\n\n// In the Slack app, when you press Approve on plan version 2:\nawait client.workflow.getHandle(\"nova:RH-1234\").signal(decidePlan, { kind: \"approve\", by: \"sean\", version: 2 });",
     "notes": [
      {
-      "line": 5,
-      "text": "The name in quotes is what clients send. Keep it the camelCase of the handler, as the tickets do."
-     },
-     {
-      "line": 6,
-      "text": "Typed arguments: a signal may carry several. Here the answer text and who wrote it."
-     },
-     {
-      "line": 7,
-      "text": "Stop has many doors (button, command, unassign) and one signal."
-     },
-     {
-      "line": 8,
-      "text": "A query has a return type and no arguments here."
-     },
-     {
-      "line": 14,
-      "text": "??= keeps the first decision. An old button pressed later changes nothing (G3-35)."
-     },
-     {
-      "line": 15,
-      "text": "Several replies before Nova resumes are joined into one answer."
-     },
-     {
-      "line": 17,
-      "text": "The query handler returns state. It must not change anything or await anything."
-     }
-    ]
-   }
-  },
-  {
-   "h": "condition(): wait until something is true",
-   "p": [
-    "condition(fn) waits until fn returns true. The worker checks fn again after every signal. With a second argument, a timeout, it returns a boolean: true if fn became true, false if the time ran out first.",
-    "That timeout is a durable timer, like sleep() in p7-1. The service holds it, so a three-day wait survives every deploy. waitForPerson uses two of them: one to remind, one to park."
-   ],
-   "because": "We wait with condition() and a timeout because one call gives us both the answer and the reminder deadline.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/waiting.ts",
-    "text": "// ai-agents/orchestrator/src/waiting.ts: workflow code. Waiting costs nothing in Temporal.\nimport { condition } from \"@temporalio/workflow\";\nimport { act } from \"./policies.js\";\n\nconst DAY = 24 * 60 * 60 * 1000;\nconst WAITS: Record<Wait, [remindAfterMs: number, parkAfterMs: number]> = {\n  plan: [1 * DAY, 3 * DAY],\n  question: [1 * DAY, 2 * DAY],\n  review: [2 * DAY, 14 * DAY],\n};\n\n/** True when the person acted; false when the ticket was parked. Stop always wins. */\nexport const waitForPerson = async (wf: RunState, what: Wait, done: () => boolean, t: Handoff): Promise<boolean> => {\n  const [remind, park] = scaled(WAITS[what], t.drill); // minutes instead of days on drill tickets\n  if (await condition(() => done() || wf.stopped, remind)) return !wf.stopped;\n  await act.notify(t, REMINDERS[what](t.requester)); // Slack thread, Jira if Slack is down\n  if (await condition(() => done() || wf.stopped, park - remind)) return !wf.stopped;\n  await act.parkTicket(t, PARK_NOTES[what]); // G4 decides the Jira status and assignee\n  return false;\n};",
-    "notes": [
-     {
-      "line": 5,
-      "text": "Plain arithmetic is fine in a workflow. No clock is read here."
-     },
-     {
-      "line": 6,
-      "text": "One row per kind of wait: when to remind and when to give up."
-     },
-     {
-      "line": 14,
-      "text": "scaled() turns days into minutes when the ticket is a drill (G3-41)."
-     },
-     {
-      "line": 15,
-      "text": "Done or stopped within the reminder time: return. Stop always wins, so stopped returns false."
-     },
-     {
-      "line": 16,
-      "text": "The reminder is outside work, so it is an activity."
-     },
-     {
-      "line": 17,
-      "text": "The second wait is the rest of the time: park minus remind."
-     },
-     {
-      "line": 18,
-      "text": "No answer at all: park the ticket and end the wait with false."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The question loop: park the VM while people think",
-   "p": [
-    "When the agent asks a question, workInSandbox returns with needsAnswer. Most answers come within minutes, so the VM stays up for 10 idle minutes. After that we park the VM: stop it and keep its disk, so it costs almost nothing. That is a different 'park' from parking the ticket.",
-    "When the answer signal arrives, the VM wakes and the stored session resumes with the reply."
-   ],
-   "because": "We clear the answer before the agent runs because a reply can arrive while the agent is still writing its question.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (question loop)",
-    "text": "// inside inSandbox (G3-24): the agent stopped because it needs an answer\nrun.answer = undefined; // cleared before the run, so a quick reply to its question is never lost\nlet result = await act.workInSandbox(vm, task);\nwhile (result.needsAnswer) {\n  const idle = !(await condition(() => run.answer !== undefined, \"10 minutes\")); // no answer yet\n  if (idle) await act.parkSandbox(vm); // stop the VM and keep its disk while a person thinks\n  if (!(await waitForPerson(run, \"question\", () => run.answer !== undefined, t))) return { ...result, parked: true };\n  if (idle) await act.wakeSandbox(vm); // start it again, freshen if main moved\n  const reply = run.answer ?? \"\"; run.answer = undefined;\n  result = await act.workInSandbox(vm, resumeTask(task, result.sessionId, reply));\n}",
-    "notes": [
-     {
-      "line": 2,
-      "text": "If we cleared it after workInSandbox, a fast reply that arrived meanwhile would be wiped."
-     },
-     {
-      "line": 5,
-      "text": "A short condition: 10 minutes. false means nobody answered yet."
-     },
-     {
-      "line": 6,
-      "text": "Parking the VM: stopped, disk kept, lease extended (G3-20)."
-     },
-     {
-      "line": 7,
-      "text": "The long wait with reminder and ticket parking. false: the run ends as parked."
+      "line": 3,
+      "text": "The signal's name and the type of its message. The Slack app and the workflow import the same definition."
      },
      {
       "line": 9,
-      "text": "Take the answer and clear it, ready for the next question."
+      "text": "The handler only stores the decision. Set handlers at the top, before the first await."
      },
      {
       "line": 10,
-      "text": "Resume the same agent session with the reply."
+      "text": "A query handler only reads. The last section explains why."
+     },
+     {
+      "line": 15,
+      "text": "A handle by workflow ID is enough. The signal reaches whichever run of nova:RH-1234 is open."
      }
     ]
    }
   },
   {
-   "h": "Sending signals and queries from outside",
+   "h": "condition(): wait until it is true, or until time runs out",
    "p": [
-    "A client sends both by workflow ID through a handle. The Slack app does this when a button is clicked, and the Jira poll does it for @Nova commands.",
-    "A signal is accepted by the service even when no worker is running. It waits in the history and the handler runs when a worker comes back. A query needs a live worker, because a worker computes the answer. During a full outage of workers, /nova status hangs and times out."
+    "Now the workflow has to wait until decision has a value. condition(fn) does exactly that: it waits until fn returns true, and Temporal checks fn again every time something happens in the run, such as a signal arriving. With a timeout as the second argument it gives back a boolean: true if fn became true in time, false if the time ran out first. The timeout is a durable timer, kept by the Temporal Service like sleep in the first lesson, so a three-day wait survives every deploy, and while it waits, no code runs.",
+    "Two calls to condition give us the whole rule for a plan: wait one day, remind, wait two more days, hand the ticket back. Our platform keeps that rule in one helper, so every wait on a person behaves the same way.",
+    "The history shows how cheap this is. Here is a run from the lab where you approved within a few seconds: one timer, one signal, and the timer is cancelled because nobody needs it any more. Three days of waiting would look the same, with a longer gap between the lines."
    ],
-   "because": "We address runs by workflow ID because the ID is the ticket; any tool that knows the ticket reaches its run.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/slack-app/src/actions.ts (sketch of the calls)",
-    "text": "// a client, for example the Slack app (G3-35): signals and queries by workflow ID\nconst handle = client.workflow.getHandle(\"nova:RH-1234\"); // no run ID needed\nawait handle.signal(decidePlan, { kind: \"approve\", by: \"dana@example.com\", version: \"v2\" });\nawait handle.signal(answerQuestion, \"Use the empty-state card\", \"dana@example.com\");\nconst now = await handle.query(status); // a worker answers from the run's current state\nconsole.log(now); // \"Awaiting approval\"",
+    "file": "orchestrator/src/waiting.ts",
+    "text": "import { condition } from \"@temporalio/workflow\";\n\nconst DAY = 24 * 60 * 60 * 1000;\n\n/** True when the person acted in time, false when the ticket was parked. */\nexport const waitForPerson = async (done: () => boolean, t: Handoff): Promise<boolean> => {\n  if (await condition(done, 1 * DAY)) return true;\n  await act.notify(t, `Reminder: the plan for ${t.key} is still waiting for you.`);\n  if (await condition(done, 2 * DAY)) return true;\n  await act.parkTicket(t, \"Nobody decided on the plan in 3 days.\");\n  return false;\n};\n\n// in ticketToPr:\nif (!(await waitForPerson(() => decision !== undefined, t))) return \"parked\";",
     "notes": [
      {
-      "line": 2,
-      "text": "getHandle does no network call. It points at the open run with this ID."
+      "line": 7,
+      "text": "Waits up to one day. If you click within that day, it returns true at once, and the run continues."
      },
      {
-      "line": 3,
-      "text": "Typed: TypeScript checks the payload against PlanDecision."
+      "line": 8,
+      "text": "The day passed with no click, so Nova reminds you once, in the thread and on Jira."
      },
      {
-      "line": 4,
-      "text": "Every signal carries who did it, so Jira and the PR record the person."
-     },
-     {
-      "line": 5,
-      "text": "The query waits for a worker to answer from the current state."
+      "line": 10,
+      "text": "Two days after the reminder, the ticket goes back to you, and the run ends as parked."
      }
     ]
-   }
+   },
+   "see": "$ temporal workflow show -w nova:RH-1234 | grep -v WorkflowTask\n    1  WorkflowExecutionStarted\n    7  ActivityTaskCompleted        ← the plan was posted\n   11  TimerStarted                 ← the reminder timer of condition()\n   12  WorkflowExecutionSignaled    ← you pressed Approve\n   16  TimerCanceled                ← the timer is no longer needed\n   17  WorkflowExecutionCompleted"
   },
   {
-   "h": "Rules for handlers",
+   "h": "Asking without changing: queries",
    "p": [
-    "Signal handlers change state and return. Do the work in the workflow body, after condition() wakes up. Query handlers only read: they are not recorded, so any change they made would vanish on replay.",
-    "Temporal also has updates, a message that returns a result to the sender. We do not use them in the tickets; signals plus a status query cover our needs."
+    "When you type /nova status RH-1234, Slack must answer without disturbing the run. That is a query: a named question that a worker answers from the run's current state, at that moment. A query is not written to the history, so its handler must only read. If it changed a variable, the change would disappear on the next replay, because nothing recorded it.",
+    "There is one more difference, and it matters during an outage. A signal is stored by the Temporal Service, so it is accepted even when every worker is down. A query is answered by a worker, so with no worker running it waits and then fails. In the lab you stop the worker and see both: the approval is accepted, and the status question fails."
    ],
-   "callout": {
-    "kind": "wall",
-    "text": "Stop always wins. Every condition() also checks run.stopped, so a Stop ends any wait at once, keeps the branch and notes, and releases the VM."
+   "see": "$ temporal workflow signal -w nova:RH-1236 --name decidePlan --input '{\"kind\":\"approve\",\"by\":\"sean\"}'\nSignal workflow succeeded\n$ temporal workflow query -w nova:RH-1236 --name status\nError: querying workflow failed: query timed out before a worker could process it",
+   "deeper": {
+    "h": "Go deeper: the question loop, and a cheaper VM while people think",
+    "p": [
+     "Questions during the build use the same tools. When Nova asks something, workInSandbox returns with needsAnswer, and the workflow waits for the answerQuestion signal. Most answers come within minutes, so the VM stays on for 10 minutes. After that the workflow parks the VM: it stops the machine and keeps its disk, which costs almost nothing. When the answer arrives, it wakes the VM and the same session continues with your reply.",
+     "Temporal also has updates, a message that changes the run and returns a result to the sender. Our platform does not use them: signals for changes and one status query cover what Slack and Jira need."
+    ],
+    "code": {
+     "lang": "typescript",
+     "file": "orchestrator/src/workflows/ticket-to-pr.ts",
+     "text": "let result = await act.workInSandbox(vm, task);\nwhile (result.needsAnswer) {\n  const idle = !(await condition(() => run.answer !== undefined, \"10 minutes\"));\n  if (idle) await act.parkSandbox(vm); // stop the VM, keep its disk\n  if (!(await waitForPerson(() => run.answer !== undefined, t))) return { ...result, parked: true };\n  if (idle) await act.wakeSandbox(vm);\n  result = await act.workInSandbox(vm, resumeTask(task, result.sessionId, run.answer));\n}"
+    }
    }
   }
  ],
  "lab": {
-  "title": "Approve a waiting run, with and without a worker",
-  "youNeed": [
-   "~/temporal-lab from p7-2",
-   "The dev server running"
+  "id": "p7-3",
+  "title": "Approve a waiting run, or let it park",
+  "minutes": 25,
+  "mode": "guided",
+  "needs": [
+   "Node 22+",
+   "The temporal CLI (brew install temporal)",
+   "The p7-1 lab folder, for worker.mjs and start.mjs",
+   "Three terminal tabs"
   ],
-  "worked": [
+  "goal": "Make a run wait for a plan decision with a reminder and a time limit, send the decision as a signal, and read the run's state with a query.",
+  "guess": {
+   "q": "The run waits with condition(() => decision !== undefined, '20 seconds'). Five seconds after it starts, you send the decidePlan signal. When does the run continue?",
+   "options": [
+    {
+     "text": "After the full 20 seconds, when the timer fires.",
+     "correct": false,
+     "why": "That is what sleep would do. condition checks the function again when the signal arrives, so it does not wait for the timer."
+    },
+    {
+     "text": "Right away, and the 20-second timer is cancelled.",
+     "correct": true,
+     "why": "The signal sets decision, Temporal checks the condition again, it is true, and the timer is no longer needed. The history shows TimerCanceled."
+    },
+    {
+     "text": "Never, because the signal arrived while the workflow was waiting and was lost.",
+     "correct": false,
+     "why": "Signals are recorded in the history first, so they are never lost, even with no worker running."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "Replace hello in src/workflows.ts with this version (keep longJob and its proxy):\nimport { condition, defineQuery, defineSignal, proxyActivities, setHandler } from \"@temporalio/workflow\";\nimport type * as activities from \"./activities.js\";\n\nconst { greet } = proxyActivities<typeof activities>({ startToCloseTimeout: \"1 minute\" });\nexport const approve = defineSignal<[by: string]>(\"approve\");\nexport const status = defineQuery<string>(\"status\");\n\nexport async function hello(name: string): Promise<string> {\n  let state = \"waiting\";\n  let approvedBy: string | undefined;\n  setHandler(approve, (by) => { approvedBy = by; });\n  setHandler(status, () => state);\n  const inTime = await condition(() => approvedBy !== undefined, \"1 day\"); // false after a day\n  if (!inTime) { state = \"parked\"; return \"parked\"; }\n  state = \"working\";\n  return `${await greet(name)} (approved by ${approvedBy})`;\n}",
-    "see": "(no output)"
+    "say": "Keep the dev server running from the last lab, or start it again in the first tab.",
+    "do": "temporal server start-dev",
+    "see": "Temporal Server:      localhost:7233\nTemporal UI:          http://localhost:8233"
    },
    {
-    "do": "Change workflowId in src/start.ts to lab:sig-1. Restart the worker in tab 2, then in tab 3: npx tsx src/start.ts",
-    "see": "started lab:sig-1"
+    "say": "In a second tab, make the lab folder, install the packages and borrow the worker and the client from p7-1.",
+    "do": "mkdir -p ~/academy-labs/p7-3 && cd ~/academy-labs/p7-3\nnpm init -y > /dev/null && npm pkg set type=module\nnpm install @temporalio/client@1.24.0 @temporalio/worker@1.24.0 @temporalio/workflow@1.24.0\ncp ../p7-1/worker.mjs ../p7-1/start.mjs .",
+    "see": "added 150 packages, and audited 151 packages in 9s"
    },
    {
-    "do": "temporal workflow query --namespace ai-agents --workflow-id lab:sig-1 --name status",
-    "see": "Query result:\n  QueryResult  \"waiting\""
+    "say": "Write two activities that stand in for Slack and Jira. They print what they would post.",
+    "do": "cat > activities.mjs <<'EOF'\n// Stand-ins for Slack and Jira: they print what they would post.\nexport const notify = async (text) => {\n  console.log(`[slack] ${text}`);\n};\n\nexport const parkTicket = async (ticket) => {\n  console.log(`[jira] ${ticket} goes back to the requester: nobody decided on the plan`);\n};\nEOF"
    },
    {
-    "do": "temporal workflow signal --namespace ai-agents --workflow-id lab:sig-1 --name approve --input '\"sean\"'",
-    "see": "Signal workflow succeeded"
+    "say": "Write the workflow: a signal for the decision, a query for the status, and two waits with condition. The drill times are seconds: 20 before the reminder, 40 more before it parks.",
+    "do": "cat > workflows.mjs <<'EOF'\n// Nova's run, cut down to the wait for the plan decision. Drill times: seconds instead of days.\nimport { condition, defineQuery, defineSignal, proxyActivities, setHandler } from '@temporalio/workflow';\n\nconst { notify, parkTicket } = proxyActivities({ startToCloseTimeout: '1 minute' });\n\nexport const decidePlan = defineSignal('decidePlan'); // the Approve and Change buttons\nexport const status = defineQuery('status'); // /nova status\n\nconst REMIND_AFTER = '20 seconds'; // 1 day in real life\nconst PARK_AFTER = '40 seconds'; // the other 2 days\n\nexport async function ticketToPr(ticket) {\n  let state = 'Awaiting approval';\n  let decision;\n  setHandler(decidePlan, (d) => {\n    decision = d;\n  });\n  setHandler(status, () => state);\n\n  await notify(`The plan for ${ticket} is ready. Approve, Change or Stop?`);\n  if (!(await condition(() => decision !== undefined, REMIND_AFTER))) {\n    await notify(`Reminder: the plan for ${ticket} is still waiting for you.`);\n    if (!(await condition(() => decision !== undefined, PARK_AFTER))) {\n      state = 'Parked';\n      await parkTicket(ticket);\n      return 'parked';\n    }\n  }\n  state = 'Working';\n  return `${decision.kind} by ${decision.by}`;\n}\nEOF"
    },
    {
-    "do": "temporal workflow result --namespace ai-agents --workflow-id lab:sig-1",
-    "see": "  Status          COMPLETED\n  Result          \"Hello, Sean! (approved by sean)\""
+    "say": "Start the worker in the second tab, then start a run in a third tab and ask for its status.",
+    "do": "node worker.mjs\n\n# third tab\ncd ~/academy-labs/p7-3 && node start.mjs\ntemporal workflow query -w nova:RH-1234 --name status",
+    "see": "Started nova:RH-1234. The worker does the rest.\nQuery result:\n  QueryResult  \"Awaiting approval\""
    },
    {
-    "do": "Change the ID to lab:sig-2 and start it. Then press Ctrl+C in tab 2 to stop the worker, and send the approve signal again for lab:sig-2",
-    "see": "Signal workflow succeeded   (the service accepts it with no worker)"
+    "say": "Press Approve, the CLI way: send the decidePlan signal with a small JSON message. Then ask for the result.",
+    "do": "temporal workflow signal -w nova:RH-1234 --name decidePlan --input '{\"kind\":\"approve\",\"by\":\"sean\"}'\ntemporal workflow result -w nova:RH-1234",
+    "see": "Signal workflow succeeded\nResults:\n  Status          COMPLETED\n  Result          \"approve by sean\""
    },
    {
-    "do": "Query lab:sig-2's status with no worker running. Press Ctrl+C after 10 seconds.",
-    "see": "Nothing for a while: a query needs a worker to answer"
+    "say": "Look at the history without the worker's own lines, and find the timer that was cancelled by your click.",
+    "do": "temporal workflow show -w nova:RH-1234 | grep -v WorkflowTask",
+    "see": "   11  2026-10-15T23:04:44Z  TimerStarted\n   12  2026-10-15T23:04:47Z  WorkflowExecutionSignaled\n   16  2026-10-15T23:04:47Z  TimerCanceled\n   17  2026-10-15T23:04:47Z  WorkflowExecutionCompleted"
    },
    {
-    "do": "Start the worker again, then ask for lab:sig-2's result",
-    "see": "  Status          COMPLETED\n  Result          \"Hello, Sean! (approved by sean)\""
+    "say": "Now be the requester on holiday: start a run for RH-1235 and send nothing. Watch the worker tab for a minute.",
+    "do": "node start.mjs RH-1235\n# wait about a minute\ntemporal workflow result -w nova:RH-1235",
+    "see": "(in the worker tab)\n[slack] The plan for RH-1235 is ready. Approve, Change or Stop?\n[slack] Reminder: the plan for RH-1235 is still waiting for you.\n[jira] RH-1235 goes back to the requester: nobody decided on the plan\n\nResults:\n  Status          COMPLETED\n  Result          \"parked\""
    },
    {
-    "do": "Change \"1 day\" to \"20 seconds\", restart the worker, start lab:sig-3 and send nothing",
-    "see": "After 20 seconds the result is \"parked\", and the history shows TimerStarted then TimerFired"
+    "say": "Last, an outage. Start a run for RH-1236, stop the worker with Ctrl+C, and then send the approval and ask for the status. The query waits about 30 seconds before it fails.",
+    "do": "node start.mjs RH-1236\n# now press Ctrl+C in the worker tab\ntemporal workflow signal -w nova:RH-1236 --name decidePlan --input '{\"kind\":\"approve\",\"by\":\"sean\"}'\ntemporal workflow query -w nova:RH-1236 --name status",
+    "see": "Signal workflow succeeded\nError: querying workflow failed: query timed out before a worker could process it"
+   },
+   {
+    "say": "Start the worker again. The approval was kept the whole time, so the run finishes at once.",
+    "do": "node worker.mjs\n\n# third tab\ntemporal workflow result -w nova:RH-1236",
+    "see": "Results:\n  Status          COMPLETED\n  Result          \"approve by sean\""
    }
   ],
-  "faded": "Add a stop signal (defineSignal<[by: string]>(\"stop\")) whose handler sets a stopped flag, and make the run return \"stopped\" when it was stopped. Left to you: the change to the condition() expression, so a Stop ends the wait at once. Also the CLI command that sends stop.",
-  "alone": "Write remindThenPark(). Wait for approval with a 20-second condition. If it times out, call a notify activity that logs 'reminder sent'. Then wait 40 more seconds and return 'parked'. Run it once with an approval after 30 seconds and once with none. Check in each history how many TimerStarted events there are.",
-  "done": "A run took a signal sent while no worker ran, answered a status query, and parked itself when nobody approved."
+  "build": "Add a Stop button. Define a second signal, stop, whose message is the name of the person who stopped the run, and store it in a variable. Change both waits so that a Stop ends them at once, just like a decision does, and make the run return \"stopped by <name>\" with the status Stopped. Restart the worker, start a run for RH-1237 and stop it with temporal workflow signal -w nova:RH-1237 --name stop --input '\"sean\"'.",
+  "checks": [
+   "The query for nova:RH-1234 answered \"Awaiting approval\" before you sent the signal.",
+   "The history of nova:RH-1234 shows WorkflowExecutionSignaled followed by TimerCanceled.",
+   "nova:RH-1235 printed one reminder and ended with the result \"parked\", without any signal.",
+   "With the worker stopped, the signal for nova:RH-1236 succeeded and the query failed; after the restart the result was \"approve by sean\".",
+   "For your build: temporal workflow result -w nova:RH-1237 shows \"stopped by sean\" within a second or two of the signal, not after the timers."
+  ],
+  "solution": {
+   "lang": "javascript",
+   "file": "workflows.mjs",
+   "text": "import { condition, defineQuery, defineSignal, proxyActivities, setHandler } from '@temporalio/workflow';\n\nconst { notify, parkTicket } = proxyActivities({ startToCloseTimeout: '1 minute' });\n\nexport const decidePlan = defineSignal('decidePlan');\nexport const stop = defineSignal('stop');\nexport const status = defineQuery('status');\n\nexport async function ticketToPr(ticket) {\n  let state = 'Awaiting approval';\n  let decision;\n  let stoppedBy;\n  setHandler(decidePlan, (d) => {\n    decision = d;\n  });\n  setHandler(stop, (by) => {\n    stoppedBy = by;\n  });\n  setHandler(status, () => state);\n\n  const answered = () => decision !== undefined || stoppedBy !== undefined;\n  await notify(`The plan for ${ticket} is ready. Approve, Change or Stop?`);\n  if (!(await condition(answered, '20 seconds'))) {\n    await notify(`Reminder: the plan for ${ticket} is still waiting for you.`);\n    if (!(await condition(answered, '40 seconds'))) {\n      state = 'Parked';\n      await parkTicket(ticket);\n      return 'parked';\n    }\n  }\n  if (stoppedBy) {\n    state = 'Stopped';\n    return `stopped by ${stoppedBy}`;\n  }\n  state = 'Working';\n  return `${decision.kind} by ${decision.by}`;\n}"
+  },
+  "fix": "A teammate found condition hard to read and rewrote the wait with plain timers: await sleep('20 seconds'), then if (!decision) send the reminder and await sleep('40 seconds'), then park if there is still no decision. It looks the same, and the reminder still works. But today you approved a plan five minutes after it was posted, /nova status kept saying Awaiting approval, and Nova started the build only a day later. Make that change, start a run for RH-1300, approve it at once, and see the result arrive only when the first timer fires. Then put condition back.",
+  "explain": [
+   "Why can a run wait three days for a click without costing anything, and where is the timer during that time?",
+   "Why does the decision reach the run when no worker is running, while the status question fails?",
+   "Why must a query handler only read, and never change a variable?"
+  ],
+  "done": "A run continued the moment it got the decidePlan signal, another one reminded and parked on its own, the approval survived a stopped worker, and you stopped the worker and the dev server."
  },
- "quiz": [
+ "check": [
   {
-   "q": "condition(() => decided, \"1 day\") returns false. What does that mean?",
+   "q": "The plan waits with condition(() => decision !== undefined, 1 day). You press Approve after 10 minutes. What happens to the one-day timer?",
    "options": [
     {
-     "text": "A signal arrived but carried false",
-     "correct": false,
-     "why": "Signals set state; condition only reports whether fn became true in time."
-    },
-    {
-     "text": "A day passed and decided never became true",
+     "text": "It is cancelled, and the run continues at once",
      "correct": true,
-     "why": "false means the timeout fired first; waitForPerson then reminds or parks."
+     "why": "The signal sets decision, Temporal checks the condition again, and since it is true the timer is no longer needed."
     },
     {
-     "text": "The worker crashed during the wait",
+     "text": "It keeps running, and the run continues when it fires",
      "correct": false,
-     "why": "A crash does not end a wait; the timer lives on the service."
+     "why": "That is how sleep followed by a check behaves. condition reacts to the signal immediately."
+    },
+    {
+     "text": "It restarts, so the next reminder is a day after your click",
+     "correct": false,
+     "why": "Nothing restarts. You decided, so there is nothing left to remind you about."
     }
    ]
   },
   {
-   "q": "The Slack app sends decidePlan while every worker is down for a deploy. What happens?",
+   "q": "All orchestrator workers are down for ten minutes. You press Approve in Slack, then type /nova status RH-1234. What happens?",
    "options": [
     {
-     "text": "The service stores the signal; the handler runs when a worker is back",
+     "text": "Both fail until a worker comes back",
+     "correct": false,
+     "why": "The signal does not need a worker: the Temporal Service records it in the history right away."
+    },
+    {
+     "text": "Both work, because the Temporal Service answers both",
+     "correct": false,
+     "why": "The service never runs your code, and the status comes from a query handler in your code, so a worker must answer it."
+    },
+    {
+     "text": "The approval is recorded and delivered later; the status query waits and then fails",
      "correct": true,
-     "why": "Signals go into the history first; no decision is lost."
-    },
-    {
-     "text": "The signal is lost and the Slack app must retry later",
-     "correct": false,
-     "why": "Delivery needs only the service, not a worker; the app retries only if the service itself is down."
-    },
-    {
-     "text": "The service rejects it because no worker polls the queue",
-     "correct": false,
-     "why": "Only queries need a worker; signals do not."
+     "why": "Signals are stored by the service. Queries are computed by a worker from the run's state, so they need a live worker."
     }
    ]
   },
   {
-   "q": "Why does the question loop set run.answer = undefined before calling workInSandbox?",
+   "q": "A teammate wants the status query handler to count how often people ask, with asked += 1. Why is that a bad idea?",
    "options": [
     {
-     "text": "To free memory in the workflow",
-     "correct": false,
-     "why": "It is one small field; memory is not the reason."
-    },
-    {
-     "text": "Because signal handlers cannot set a field that has a value",
-     "correct": false,
-     "why": "Handlers can set any state; the order is the point."
-    },
-    {
-     "text": "So a reply that arrives while the agent is still running is kept, not wiped",
+     "text": "Queries are not recorded in the history, so the count is lost on the next replay",
      "correct": true,
-     "why": "Clearing after the activity would erase an answer that came early."
+     "why": "A replay rebuilds state from the history only. Anything a query changed is not there, so the workflow would see different values."
+    },
+    {
+     "text": "Query handlers cannot read variables of the workflow",
+     "correct": false,
+     "why": "They can read them; reading the run's state is exactly their job."
+    },
+    {
+     "text": "Every query adds an event to the history, so the history grows too fast",
+     "correct": false,
+     "why": "It is the other way round: queries add nothing to the history. That is why they must not change anything."
     }
    ]
   }
  ],
- "recall": [
-  "In p7-2, why must workflow code never call fetch()?",
-  "In p7-1, where does a durable timer live while no worker is running?"
- ],
- "videos": [
-  {
-   "title": "Temporal for React Developers",
-   "url": "https://www.youtube.com/watch?v=Cxaf8E00GMM",
-   "channel": "Temporal",
-   "minutes": 27,
-   "why": "TypeScript SDK introduced at a React conference, for frontend developers."
-  },
-  {
-   "title": "Temporal Live Coding Demo: Handling Failures & Human Interaction",
-   "url": "https://www.youtube.com/watch?v=dNVmRfWsNkM",
-   "channel": "Temporal",
-   "minutes": 14,
-   "why": "Live-codes retries, worker crashes, signals and a timer race."
-  }
- ],
+ "platform": {
+  "p": [
+   "ticketToPr accepts three signals, decidePlan from the plan buttons, answerQuestion from a reply in the ticket's thread and stop from the Stop button or /nova stop, and one query, status, for /nova status. Only the requester's decision counts; anyone else who clicks is told that only the requester can decide this plan.",
+   "Every wait on a person goes through waitForPerson, with fixed times: a plan is reminded after 1 day and parked after 3, a question after 1 day and 2, a PR review after 2 days and closed with a note after 14. Drill tickets use the same numbers in minutes. A parked ticket goes back to the requester, and a later assignment starts a fresh run with the same ID."
+  ],
+  "tickets": [
+   {
+    "key": "G3-24",
+    "why": "ticketToPr's signals and its status query, and the question loop that parks the VM while a person thinks."
+   },
+   {
+    "key": "G3-38",
+    "why": "waitForPerson: remind, then park, with durable timers for every wait on a person."
+   },
+   {
+    "key": "G3-35",
+    "why": "The Slack buttons that send decidePlan, with the plan version on each button."
+   }
+  ]
+ },
  "words": [
   {
    "term": "signal",
-   "plain": "A named, recorded message a client sends into one running workflow."
+   "plain": "A named message a client sends to one open run. Temporal records it, so it is never lost."
   },
   {
-   "term": "query",
-   "plain": "A named question a running workflow answers from its state; not recorded, needs a worker."
+   "term": "signal handler",
+   "plain": "The small function in the workflow that runs when a signal arrives. It only changes state."
   },
   {
-   "term": "setHandler",
-   "plain": "Attaches the function that handles a signal or answers a query inside a workflow."
-  },
-  {
-   "term": "condition()",
-   "plain": "Waits until a function returns true; with a timeout it returns false when time runs out."
+   "term": "condition",
+   "plain": "Waits until a function returns true, optionally with a timeout; gives back false if the time ran out."
   },
   {
    "term": "durable timer",
-   "plain": "A timer kept by the Temporal Service, so it fires even if every worker restarted."
+   "plain": "A timer kept by the Temporal Service, so it fires even if every worker restarted in between."
   },
   {
-   "term": "parking",
-   "plain": "A VM: stopped with its disk kept while people think. A ticket: moved back in Jira and the run ended."
+   "term": "query",
+   "plain": "A question a worker answers from the run's current state. It is not recorded and must not change anything."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-38",
-   "why": "waitForPerson is condition() with two timeouts: remind, then park; Stop always wins."
+   "q": "Write the two condition calls that remind after one day and park after three.",
+   "a": "if (await condition(done, 1 day)) continue; else notify; then if (await condition(done, 2 days)) continue; else park. The second wait is two days, because one has already passed."
   },
   {
-   "key": "G3-35",
-   "why": "Every Slack button and thread reply becomes a signal that records who did it."
+   "q": "Why does the Slack app use a signal for Approve and a query for /nova status?",
+   "a": "Approve changes the run, so it must be recorded and must survive an outage: a signal. Status only reads the current state and must not change anything: a query."
   },
   {
-   "key": "G4-12",
-   "why": "The grill step posts questions and waits for answerQuestion with waitForPerson, with no VM running."
-  },
-  {
-   "key": "G3-24",
-   "why": "ticketToPr defines decidePlan, answerQuestion, stop and a status query, and parks the VM after 10 idle minutes."
+   "q": "What is wrong with sleep(1 day) followed by if (!decision)?",
+   "a": "The run does not react to the click until the timer fires, so an approval can wait a whole day. condition with a timeout continues the moment the condition is true."
   }
  ],
- "remember": "A wait on a person is condition() with a durable timeout: signals wake it at once, and false means remind or park."
+ "remember": "A signal records the click, condition waits for it with a durable timer as the deadline, and a query only reads."
 }

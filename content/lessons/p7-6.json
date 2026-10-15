@@ -1,380 +1,319 @@
 {
+ "v": 2,
  "id": "p7-6",
  "title": "Safe changes and long histories",
- "minutes": 40,
+ "minutes": 45,
  "youNeed": [
-  "p7-3",
-  "p7-4"
+  "p7-1",
+  "p7-3"
  ],
- "bridge": "Changing workflow code while runs are open is like migrating a live table: old rows were written by old code. Except: Temporal replays each old history through your new code, so a mismatch does not give a slow query. It stops the run with a non-determinism error until you fix the code.",
- "intro": "Nova runs live for days, so every deploy of the orchestrator lands in the middle of some run. This lesson shows which changes break open runs, and how patched() lets old and new runs share one file. Then continueAsNew keeps a workflow that lives forever small.",
- "picture": {
-  "caption": "An open run's history was written by the old code. The new worker replays it; patched() tells the new code which path that history took.",
-  "nodes": [
-   {
-    "id": "old",
-    "label": "run RH-1234, started on v1, waiting for Approve",
-    "kind": "service"
-   },
-   {
-    "id": "deploy",
-    "label": "deploy v2: grill step added",
-    "kind": "person"
-   },
-   {
-    "id": "worker",
-    "label": "worker with v2 code",
-    "kind": "machine"
-   },
-   {
-    "id": "hist",
-    "label": "RH-1234's event history",
-    "kind": "file"
-   },
-   {
-    "id": "new",
-    "label": "run RH-1300, started on v2",
-    "kind": "service"
-   }
+ "map": "temporal",
+ "hook": {
+  "story": [
+   "Wednesday. The team adds the grill step: before Nova writes a plan, it may ask the requester a few questions. You add one activity call at the top of ticketToPr, the tests pass, and you deploy at 14:00. At that moment twelve runs are open, and RH-1234 has been waiting since Monday for you to approve its plan.",
+   "At 14:05 you finally press Approve. The new worker replays RH-1234's history with the new code. The new code asks for the grill first, but the history says the first step was writing the plan. RH-1234 stops moving, and the worker logs a line that starts with [TMPRL1100] Nondeterminism error. So do the other eleven runs, one by one, as each of them gets its next signal or timer."
   ],
-  "steps": [
-   {
-    "from": "deploy",
-    "to": "worker",
-    "text": "the orchestrator restarts with new workflow code"
-   },
-   {
-    "from": "old",
-    "to": "worker",
-    "text": "Approve arrives; the v2 worker must rebuild RH-1234's state"
-   },
-   {
-    "from": "worker",
-    "to": "hist",
-    "text": "replays: patched(\"grill-step\") is false, because the history has no marker"
-   },
-   {
-    "from": "worker",
-    "to": "old",
-    "text": "the old run skips the grill and matches its history; no error"
-   },
-   {
-    "from": "new",
-    "to": "worker",
-    "text": "a new run gets true, records the marker, and takes the grill step"
-   }
-  ]
+  "question": "How do you change a workflow's code while runs that started on the old code are still open?"
  },
- "sections": [
+ "read": [
   {
-   "h": "What breaks an open run",
+   "h": "Why a new step breaks an old run",
    "p": [
-    "On replay, the worker runs your new code against the old history and compares the steps. A step is a command to the service: schedule an activity, start a timer, start a child, signal another workflow. If the new code asks for a different step than the history has, the run fails with a non-determinism error.",
-    "Breaking: adding, removing or reordering activity calls, timers or condition() timeouts before the point an open run has reached. Safe: changing the code inside an activity, changing log lines, renaming local variables. Activity code is never replayed; only its recorded result is used."
+    "Remember how replay works: a worker runs the workflow from the top and answers every finished step from the history. While it does that, it also checks the code against the history. Each await on an activity, a timer or a condition with a timeout is a command, a request to the Temporal Service, and the commands must come in the same order as the events the history recorded. If the code asks for grill where the history says writePlan was scheduled, the worker cannot know what is true, so it refuses to continue. That refusal is a non-determinism error.",
+    "The run does not fail and is not lost. It stays open, and the worker retries it again and again, failing each time, until a worker with compatible code arrives. So the damage is a stuck run, not a broken one, and the fix is in the code.",
+    "The rule for what breaks is about commands, not about lines of code. Adding, removing or reordering activity calls, timers or waits before the point an open run has reached breaks it. Changing the code inside an activity is safe, because activity code is never replayed; only its recorded result is used. So are new log lines and renamed variables."
    ],
-   "because": "We break a run on purpose in the lab because you should recognize this error before you meet it in production.",
-   "code": {
-    "lang": "typescript",
-    "file": "~/temporal-lab/src/workflows.ts (the breaking change)",
-    "text": "// ~/temporal-lab/src/workflows.ts: a change deployed while lab:patch is waiting\nexport async function hello(name: string): Promise<string> {\n  await greet(\"first\"); // NEW: a step the open run never took\n  let state = \"waiting\";\n  let approvedBy: string | undefined;\n  setHandler(approve, (by) => { approvedBy = by; });\n  setHandler(status, () => state);\n  const inTime = await condition(() => approvedBy !== undefined, \"1 day\");\n  // ... unchanged\n}",
-    "notes": [
-     {
-      "line": 3,
-      "text": "The open run's history has a TimerStarted here, from condition(). The new code asks for an activity first."
-     },
-     {
-      "line": 8,
-      "text": "Everything below is unchanged, but replay never gets this far."
-     },
-     {
-      "line": 9,
-      "text": "The run stays Running, retrying its workflow task, until a worker has code that matches."
-     }
+   "see": "WARN temporalio_sdk_core::worker::workflow: Failing workflow task\n  [TMPRL1100] Nondeterminism error: Activity type of scheduled event 'writePlan'\n  does not match activity type of activity command 'grill'\n(trimmed)",
+   "deeper": {
+    "h": "Go deeper: running old and new code side by side",
+    "p": [
+     "Temporal has a second way to change workflows, called Worker Deployments. Every worker says which build it runs, and a run can be pinned to the build it started on, so old runs never meet new code. The price is that the old workers must keep running until the last old run closes, which for us can be more than two weeks, because a PR can wait 14 days for its review.",
+     "That is why our platform uses patching, which you learn next, together with a replay test in CI. Worker Deployments stay an option for a rewrite that is too big to patch."
     ]
-   },
-   "see": "WARN temporalio_sdk_core::worker::workflow: Failing workflow task ... [TMPRL1100] Nondeterminism error: Activity machine does not handle this event: HistoryEvent(id: 5, TimerStarted)   (output trimmed)",
-   "ifInstead": "If instead nothing fails, the worker still had the run in its cache and did not replay. Stop the worker, start it again, then send the signal."
+   }
   },
   {
    "h": "patched(): two paths in one file",
    "p": [
-    "patched(\"greet-first\") returns true for a run that reaches it fresh, and records a marker in the history. On replay of a history that has the marker, it returns true again. On replay of an older history without the marker, it returns false. So old runs take the old path and new runs the new one.",
-    "The ID is a string you choose. Make it name the change, and never reuse it."
+    "patched lets the old and the new code live in one file. You wrap the new step in if (patched(\"grill-step\")), where grill-step is an ID you choose for this change. When a run reaches that line for the first time, patched returns true and also writes a marker into the history. When a worker replays a history that has the marker, patched returns true again. When it replays an older history without the marker, it returns false. So RH-1234, which started on Monday, skips the grill and continues with the plan it already has, and every run that starts after the deploy asks its questions first.",
+    "Give the ID a name that says what changed, and never use the same ID for a second change. A run that has the marker from the first change would take the second change's path too."
    ],
-   "because": "We wrap a new step in patched() so open runs finish on the old path and new runs take the new one.",
    "code": {
     "lang": "typescript",
-    "file": "~/temporal-lab/src/workflows.ts (the fix)",
-    "text": "import { condition, defineQuery, defineSignal, patched, proxyActivities, setHandler } from \"@temporalio/workflow\";\n\nexport async function hello(name: string): Promise<string> {\n  if (patched(\"greet-first\")) await greet(\"first\"); // new runs: true; old histories: false\n  let state = \"waiting\";\n  // ... unchanged\n}",
+    "file": "orchestrator/src/workflows/ticket-to-pr.ts",
+    "text": "import { patched } from \"@temporalio/workflow\";\n\nexport async function ticketToPr(t: Handoff): Promise<string> {\n  // ...signal handlers\n  if (patched(\"grill-step\")) {\n    if (!(await readinessAndGrill(t, run))) return \"parked\";\n  }\n  const plan = await inSandbox(planTask(t), \"lite\");\n  // ...the rest is unchanged\n}",
     "notes": [
      {
-      "line": 1,
-      "text": "patched comes from @temporalio/workflow, like everything workflow-side."
-     },
-     {
-      "line": 4,
-      "text": "Old runs replay with false and skip the call; new runs get true and call it."
+      "line": 5,
+      "text": "True for runs that reach this line after the deploy; false when replaying a history from before it."
      },
      {
       "line": 6,
-      "text": "The rest stays the same. One file serves both kinds of run."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The life of a patch: three deploys",
-   "p": [
-    "A patch is temporary, and G3-29 gives the steps. Deploy 1 adds patched() around the new step.",
-    "When no run from before deploy 1 is still open, deploy 2 swaps it for deprecatePatch(). That keeps the marker but always takes the new path. When no run that started before deploy 2 is open, deploy 3 removes the line.",
-    "Our runs can wait up to 14 days for a review, so a patch can live for two weeks. Find the old runs with a visibility query on StartTime before the deploy."
-   ],
-   "because": "We remove patches in steps because a run that started before a step must still find the code it expects.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (a patch over time)",
-    "text": "// ai-agents/orchestrator/src/workflows/ticket-to-pr.ts: adding G4-12's grill step to live runs\n// deploy 1: both paths. Runs started before this deploy skip the grill on replay.\nif (patched(\"grill-step\")) {\n  if (!(await readinessAndGrill(t, run))) return \"parked\";\n}\n\n// deploy 2, when no run started before deploy 1 is still open: new path only, marker kept\ndeprecatePatch(\"grill-step\");\nif (!(await readinessAndGrill(t, run))) return \"parked\";\n\n// deploy 3, when no run started before deploy 2 is still open: plain code\nif (!(await readinessAndGrill(t, run))) return \"parked\";",
-    "notes": [
-     {
-      "line": 3,
-      "text": "Deploy 1. A run waiting for Approve since last week replays with false and never sees the grill."
-     },
-     {
-      "line": 4,
-      "text": "readinessAndGrill is G4-12's block; false means parked or stopped."
+      "text": "The new step: up to five questions to the requester before the plan."
      },
      {
       "line": 8,
-      "text": "Deploy 2. deprecatePatch still writes the marker, so histories from deploy 1 replay cleanly."
-     },
-     {
-      "line": 12,
-      "text": "Deploy 3. Only runs from deploy 2 on are open, and they all took this path."
+      "text": "Everything after the patch is the same for old and new runs."
      }
     ]
-   }
+   },
+   "see": "$ temporal workflow show -w nova:RH-1235 | grep -v WorkflowTask      (a run started after the deploy)\n    1  WorkflowExecutionStarted\n    5  MarkerRecorded                   ← patched(\"grill-step\") said true, and wrote it down\n    6  UpsertWorkflowSearchAttributes   ← the patch ID is also saved as a search attribute\n    9  ActivityTaskCompleted            ← grill\n   15  ActivityTaskCompleted            ← writePlan"
   },
   {
-   "h": "The replay test catches it before deploy",
+   "h": "Removing a patch, in two more deploys",
    "p": [
-    "You do not want to learn about non-determinism from a stuck run. G3-29 adds a replay test to CI: saved histories in test/histories/*.json run through Worker.runReplayHistory on every PR. A breaking change without patched() fails the PR, not a customer's ticket.",
-    "Save a new history for each path worth protecting: plan approved, plan changed, question answered, VM lost. p7-7 writes this test."
+    "A patch is temporary, and removing it takes care, because the old path is still needed by any run that started before the patch. So a patch lives through three deploys. Deploy 1 adds patched. When no run that started before deploy 1 is still open, deploy 2 replaces it with deprecatePatch, which keeps writing the marker but always takes the new path. When no run that started before deploy 2 is still open, deploy 3 deletes the line, and the code is plain again.",
+    "You find old runs with a list query on their start time, for example ExecutionStatus='Running' AND StartTime < '2026-10-14T14:00:00Z'. Our runs can wait up to 14 days for a PR review, so a patch usually lives for about two weeks. And you do not want to learn about a forgotten patch from a stuck run: a replay test in CI, the topic of the next lesson, replays saved histories with the new code before every merge."
    ],
-   "callout": {
-    "kind": "tip",
-    "text": "Before you change a workflow, ask: could a run that is open right now be past this line? If yes, patch it."
-   }
-  },
-  {
-   "h": "continueAsNew: a fresh history for long lives",
-   "p": [
-    "Every step adds events to the history. A ticket run ends after days, so its history stays small. The slots workflow never ends: it hands out VM slots for one agent forever. Its history would grow until Temporal refuses it, at about 50,000 events or 50 MB (check the docs for your server's limits).",
-    "continueAsNew ends the current run and starts a new run with the same workflow ID and a fresh, empty history. Only the arguments you pass carry over. workflowInfo().continueAsNewSuggested also tells you when the service thinks it is time."
-   ],
-   "because": "We continue as new at 5000 events because a short history replays fast and never hits the limit.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/workflows/slots.ts",
-    "text": "// ai-agents/orchestrator/src/workflows/slots.ts (G3-25): ID \"slots:<agent>\"; lives forever\nexport async function slots(agent: string, holders: string[] = [], waiting: string[] = []): Promise<void> {\n  setHandler(request, (id) => { waiting.push(id); });\n  setHandler(release, (id) => { holders = holders.filter((h) => h !== id); });\n  while (workflowInfo().historyLength < 5000) {\n    await condition(() => waiting.length > 0 && holders.length < (SLOTS[agent] ?? 1));\n    const holder = waiting.shift()!;\n    holders.push(holder);\n    await getExternalWorkflowHandle(holder).signal(slotGranted);\n  }\n  await continueAsNew<typeof slots>(agent, holders, waiting); // carries holders and waiting along\n}",
+    "file": "orchestrator/src/workflows/ticket-to-pr.ts",
+    "text": "// Deploy 1: both paths. Runs that started before this deploy skip the grill.\nif (patched(\"grill-step\")) {\n  if (!(await readinessAndGrill(t, run))) return \"parked\";\n}\n\n// Deploy 2, once no run that started before deploy 1 is open: only the new path, marker still written.\ndeprecatePatch(\"grill-step\");\nif (!(await readinessAndGrill(t, run))) return \"parked\";\n\n// Deploy 3, once no run that started before deploy 2 is open: plain code.\nif (!(await readinessAndGrill(t, run))) return \"parked\";",
     "notes": [
      {
-      "line": 2,
-      "text": "The state comes in as arguments, with defaults for the very first run."
-     },
-     {
-      "line": 5,
-      "text": "historyLength from workflowInfo(): deterministic, so it is fine to branch on."
-     },
-     {
-      "line": 6,
-      "text": "Wait until someone waits and a slot is free."
-     },
-     {
-      "line": 9,
-      "text": "Signal the run that got the slot: it can now claim its VM."
-     },
-     {
-      "line": 11,
-      "text": "End this run and start a fresh one with the same ID, passing the state along."
+      "line": 7,
+      "text": "deprecatePatch keeps the marker, so a run started after deploy 1 still replays cleanly."
      }
     ]
    }
   },
   {
-   "h": "Worker Deployments: the other tool",
+   "h": "A run that never ends needs a fresh history",
    "p": [
-    "Temporal can also run old and new code side by side. With Worker Deployments, each worker says which build it runs.",
-    "A PINNED run stays on the build it started on; AUTO_UPGRADE moves to the newest. The older Worker Versioning with build IDs (the buildId and useVersioning worker options, with build-ID compatibility sets) is deprecated in SDK 1.24. workerDeploymentOptions replaces it, so older notes that say 'build IDs' mean this.",
-    "PINNED would mean keeping old workers alive for as long as our longest run, two weeks or more. So the tickets use patched() and the replay test as the default. Keep this tool for a rewrite too big to patch, and agree it with the G3-29 owner first."
+    "Long lives cause a second problem: the history itself. A ticket run ends after days, so its history stays small. But one of our workflows never ends: slots, which hands out the VM slots of one agent, for example the three that Nova may use at once. Every request and every release adds events to its history, and a history cannot grow forever. Temporal stops a run whose history reaches 51,200 events or 50 MB, and a long history also makes every replay slower.",
+    "continueAsNew solves this. It ends the current run and starts a new run with the same workflow ID and an empty history, and the only things that carry over are the arguments you pass. So slots counts its own history and, once it has 5,000 events, continues as new with the current holders and the waiting line as arguments. To everyone who sends it signals, it is still slots:nova."
    ],
-   "because": "We show the option so you recognise it, not because the tickets use it.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/main.ts (an option, not the plan)",
-    "text": "// orchestrator worker with Worker Deployments (an option, not the plan): check the docs before using it\nconst worker = await Worker.create({\n  connection, namespace: \"ai-agents\", taskQueue: \"ai-agents-nova\", workflowsPath, activities,\n  workerDeploymentOptions: {\n    useWorkerVersioning: true,\n    version: { deploymentName: \"ai-agents-orchestrator\", buildId: process.env.GIT_SHA ?? \"dev\" },\n    defaultVersioningBehavior: \"AUTO_UPGRADE\", // or \"PINNED\": a run stays on the build it started on\n  },\n});",
+    "file": "orchestrator/src/workflows/slots.ts",
+    "text": "export async function slots(agent: string, holders: string[] = [], waiting: string[] = []): Promise<void> {\n  setHandler(request, (id) => { waiting.push(id); });\n  setHandler(release, (id) => { holders = holders.filter((h) => h !== id); });\n  while (workflowInfo().historyLength < 5000) {\n    await condition(() => waiting.length > 0 && holders.length < (SLOTS[agent] ?? 1));\n    const holder = waiting.shift()!;\n    holders.push(holder);\n    await getExternalWorkflowHandle(holder).signal(slotGranted);\n  }\n  await continueAsNew<typeof slots>(agent, holders, waiting);\n}",
     "notes": [
      {
       "line": 4,
-      "text": "workerDeploymentOptions replaces the deprecated buildId and useVersioning options."
+      "text": "workflowInfo().historyLength is the number of events so far. 5,000 keeps the history far below the limits."
      },
      {
-      "line": 6,
-      "text": "A deployment name plus a build ID, here the git SHA of the image."
-     },
-     {
-      "line": 7,
-      "text": "Required when versioning is on. PINNED never replays a run on new code."
+      "line": 10,
+      "text": "A new run of slots:<agent> with an empty history, which starts with the same holders and the same waiting line."
      }
     ]
    }
   }
  ],
  "lab": {
+  "id": "p7-6",
   "title": "Break an open run, then patch it",
-  "youNeed": [
-   "~/temporal-lab from p7-5, worker running",
-   "hello with the approve signal from p7-3, waiting \"1 day\""
+  "minutes": 25,
+  "mode": "guided",
+  "needs": [
+   "Node 22+",
+   "The temporal CLI (brew install temporal)",
+   "The p7-1 lab folder, for worker.mjs and start.mjs",
+   "Three terminal tabs"
   ],
-  "worked": [
-   {
-    "do": "temporal workflow start --namespace ai-agents --task-queue ai-agents-lab --type hello --workflow-id lab:patch --input '\"Sean\"'",
-    "see": "Running execution:\n  WorkflowId  lab:patch   (output trimmed)"
-   },
-   {
-    "do": "Stop the worker (Ctrl+C in tab 2). Add await greet(\"first\"); as the first line of hello, as in the first block.",
-    "see": "(no output)"
-   },
-   {
-    "do": "Start the worker, then signal: temporal workflow signal --namespace ai-agents --workflow-id lab:patch --name approve --input '\"dana\"'",
-    "see": "Signal workflow succeeded\n(tab 2) WARN ... [TMPRL1100] Nondeterminism error: ... HistoryEvent(id: 5, TimerStarted)"
-   },
-   {
-    "do": "Open lab:patch in the UI",
-    "see": "Status Running, with a failing workflow task; it does not finish"
-   },
-   {
-    "do": "Stop the worker. Change the line to if (patched(\"greet-first\")) await greet(\"first\"); and add patched to the import. Start the worker.",
-    "see": "greet called for Sean\n(no 'greet called for first': the old run skipped the new step)"
-   },
-   {
-    "do": "temporal workflow result --namespace ai-agents --workflow-id lab:patch",
-    "see": "  Status          COMPLETED\n  Result          \"Hello, Sean! (approved by dana)\""
-   },
-   {
-    "do": "Start a new run lab:patch2 with the same command",
-    "see": "(tab 2) greet called for first\n(the new run took the new path)"
-   }
-  ],
-  "faded": "Do deploy 2 of the patch: approve lab:patch2 so it finishes, then replace the patched() line with deprecatePatch(\"greet-first\"); followed by await greet(\"first\");. Left to you: a visibility query that shows no run from before your patch is open. Then prove a new run lab:patch3 still works.",
-  "alone": "Write a workflow counter(count = 0). It adds 1 on every bump signal and continues as new after every 10 bumps, passing count. Send 25 bumps with a shell loop. Check with temporal workflow list that the ID lab:counter has several runs, and add a status query that returns 25.",
-  "done": "You saw the non-determinism error and fixed it with patched(). The old run finished on the old path; a new run took the new one."
- },
- "quiz": [
-  {
-   "q": "Which change to ticketToPr needs patched() while runs are open?",
+  "goal": "Deploy a new step while a run is waiting, see the non-determinism error, and fix it with patched so the old run finishes on the old path and new runs take the new one.",
+  "guess": {
+   "q": "nova:RH-1234 wrote its plan and is waiting for approval. You add await grill(ticket) before writePlan, restart the worker and approve the run. What happens to RH-1234?",
    "options": [
     {
-     "text": "Rewording the reminder text inside the notify activity",
+     "text": "It runs grill now, then continues and opens the PR.",
      "correct": false,
-     "why": "Activity code is never replayed; only its result is in the history."
+     "why": "The history says writePlan came first. The worker cannot fit grill into a history that already went past that point."
     },
     {
-     "text": "Adding a new activity call before waitForPerson",
+     "text": "It fails, and you must start it again from the beginning.",
+     "correct": false,
+     "why": "It does not fail. It stays open and keeps retrying, which is why a fix in the code can still save it."
+    },
+    {
+     "text": "It stops moving: the worker reports a non-determinism error and keeps retrying until the code matches the history again.",
      "correct": true,
-     "why": "Open runs past that point have no record of it, so replay would not match."
+     "why": "Replay found a command (schedule grill) that does not match the recorded event (writePlan scheduled), so it refuses to continue."
+    }
+   ]
+  },
+  "follow": [
+   {
+    "say": "Start from an empty board, because runs left open by earlier labs would be replayed with this lab's code. The dev server keeps everything in memory, so stop it with Ctrl+C and start it again.",
+    "do": "temporal server start-dev",
+    "see": "Temporal Server:      localhost:7233\nTemporal Persistence: in-memory\nTemporal UI:          http://localhost:8233"
+   },
+   {
+    "say": "In a second tab, make the lab folder, install the packages and borrow the worker and the client from p7-1.",
+    "do": "mkdir -p ~/academy-labs/p7-6 && cd ~/academy-labs/p7-6\nnpm init -y > /dev/null && npm pkg set type=module\nnpm install @temporalio/client@1.24.0 @temporalio/worker@1.24.0 @temporalio/workflow@1.24.0\ncp ../p7-1/worker.mjs ../p7-1/start.mjs .",
+    "see": "added 150 packages, and audited 151 packages in 9s"
+   },
+   {
+    "say": "Write the activities, the grill included. Adding an activity function changes no run, because activity code is never replayed.",
+    "do": "cat > activities.mjs <<'EOF'\n// Stand-ins for the real steps. Each one prints a line, so you can see which path a run takes.\nexport const grill = async (ticket) => console.log(`grill: asked the requester of ${ticket} two questions`);\nexport const writePlan = async (ticket) => console.log(`writePlan: wrote a plan for ${ticket}`);\nexport const openPr = async (ticket) => console.log(`openPr: opened a PR for ${ticket}`);\nEOF"
+   },
+   {
+    "say": "Write version 1 of the workflow: plan, wait for approval, open the PR.",
+    "do": "cat > workflows.mjs <<'EOF'\n// Version 1 of the run: plan, wait for approval, open the PR.\nimport { condition, defineSignal, proxyActivities, setHandler } from '@temporalio/workflow';\n\nconst { writePlan, openPr } = proxyActivities({ startToCloseTimeout: '1 minute' });\n\nexport const approve = defineSignal('approve');\n\nexport async function ticketToPr(ticket) {\n  let approvedBy;\n  setHandler(approve, (who) => {\n    approvedBy = who;\n  });\n  await writePlan(ticket);\n  await condition(() => approvedBy !== undefined, '1 day');\n  await openPr(ticket);\n  return `${ticket}: approved by ${approvedBy}`;\n}\nEOF"
+   },
+   {
+    "say": "Start the worker, then start RH-1234 from a third tab. It writes its plan and waits for your approval.",
+    "do": "node worker.mjs\n\n# third tab\ncd ~/academy-labs/p7-6 && node start.mjs",
+    "see": "Started nova:RH-1234. The worker does the rest.\n\n(in the worker tab)\nwritePlan: wrote a plan for RH-1234"
+   },
+   {
+    "say": "Now deploy the grill without any care: stop the worker with Ctrl+C, write version 2 with grill before writePlan, and start the worker again.",
+    "do": "cat > workflows.mjs <<'EOF'\n// Version 2: ask the requester a few questions before planning.\nimport { condition, defineSignal, proxyActivities, setHandler } from '@temporalio/workflow';\n\nconst { grill, writePlan, openPr } = proxyActivities({ startToCloseTimeout: '1 minute' });\n\nexport const approve = defineSignal('approve');\n\nexport async function ticketToPr(ticket) {\n  let approvedBy;\n  setHandler(approve, (who) => {\n    approvedBy = who;\n  });\n  await grill(ticket);\n  await writePlan(ticket);\n  await condition(() => approvedBy !== undefined, '1 day');\n  await openPr(ticket);\n  return `${ticket}: approved by ${approvedBy}`;\n}\nEOF\nnode worker.mjs",
+    "see": "Worker is running. Ctrl+C stops it."
+   },
+   {
+    "say": "Approve RH-1234 from the third tab, and watch the worker tab.",
+    "do": "temporal workflow signal -w nova:RH-1234 --name approve --input '\"sean\"'\ntemporal workflow list",
+    "see": "Signal workflow succeeded\n  Status    WorkflowId      Type       StartTime\n  Running  nova:RH-1234  ticketToPr  11 seconds ago\n\n(in the worker tab)\nWARN temporalio_sdk_core::worker::workflow: Failing workflow task\n  [TMPRL1100] Nondeterminism error: Activity type of scheduled event 'writePlan'\n  does not match activity type of activity command 'grill'\n(trimmed)"
+   },
+   {
+    "say": "Fix it the safe way: stop the worker, wrap the grill in patched('grill-step'), and start the worker again. RH-1234 replays without the grill and finishes.",
+    "do": "cat > workflows.mjs <<'EOF'\n// Version 2, safely: new runs ask questions first, runs that started on version 1 do not.\nimport { condition, defineSignal, patched, proxyActivities, setHandler } from '@temporalio/workflow';\n\nconst { grill, writePlan, openPr } = proxyActivities({ startToCloseTimeout: '1 minute' });\n\nexport const approve = defineSignal('approve');\n\nexport async function ticketToPr(ticket) {\n  let approvedBy;\n  setHandler(approve, (who) => {\n    approvedBy = who;\n  });\n  if (patched('grill-step')) {\n    await grill(ticket);\n  }\n  await writePlan(ticket);\n  await condition(() => approvedBy !== undefined, '1 day');\n  await openPr(ticket);\n  return `${ticket}: approved by ${approvedBy}`;\n}\nEOF\nnode worker.mjs",
+    "see": "Worker is running. Ctrl+C stops it.\nopenPr: opened a PR for RH-1234"
+   },
+   {
+    "say": "Check RH-1234's result, then start a new run, RH-1235, which takes the new path. Its history has the marker that patched wrote.",
+    "do": "temporal workflow result -w nova:RH-1234\nnode start.mjs RH-1235\ntemporal workflow show -w nova:RH-1235 | grep -v WorkflowTask",
+    "see": "  Status          COMPLETED\n  Result          \"RH-1234: approved by sean\"\n\n(in the worker tab)\ngrill: asked the requester of RH-1235 two questions\nwritePlan: wrote a plan for RH-1235\n\n    5  MarkerRecorded\n    6  UpsertWorkflowSearchAttributes\n    9  ActivityTaskCompleted"
+   }
+  ],
+  "build": "Do deploy 2 of the patch. First prove that no run from before your patched deploy is open: temporal workflow list --query \"ExecutionStatus='Running' AND StartTime < '<the time of your patched deploy>'\" must print no runs (temporal workflow show gives you the times). Then replace the if (patched(...)) block with deprecatePatch('grill-step') followed by a plain await grill(ticket), and add deprecatePatch to the import. Restart the worker, approve RH-1235 so it finishes, and start RH-1236.",
+  "checks": [
+   "After the careless deploy, the worker logged [TMPRL1100] Nondeterminism error and nova:RH-1234 stayed Running.",
+   "After the patched deploy, RH-1234 completed with \"approved by sean\" and never printed a grill line.",
+   "RH-1235's history shows MarkerRecorded, and its first line in the worker tab is the grill.",
+   "For your build: the list query for old runs printed nothing, RH-1235 completed with deprecatePatch in place, and RH-1236 printed the grill line first."
+  ],
+  "solution": {
+   "lang": "javascript",
+   "file": "workflows.mjs",
+   "text": "// workflows.mjs, deploy 2 of the patch: only the new path, and the marker is still written\nimport { condition, defineSignal, deprecatePatch, proxyActivities, setHandler } from '@temporalio/workflow';\n\nconst { grill, writePlan, openPr } = proxyActivities({ startToCloseTimeout: '1 minute' });\n\nexport const approve = defineSignal('approve');\n\nexport async function ticketToPr(ticket) {\n  let approvedBy;\n  setHandler(approve, (who) => {\n    approvedBy = who;\n  });\n  deprecatePatch('grill-step');\n  await grill(ticket);\n  await writePlan(ticket);\n  await condition(() => approvedBy !== undefined, '1 day');\n  await openPr(ticket);\n  return `${ticket}: approved by ${approvedBy}`;\n}\n\n// before you deploy it, this must print no runs (use the time of your first patched deploy):\n// temporal workflow list --query \"ExecutionStatus='Running' AND StartTime < '2026-10-15T23:17:30Z'\""
+  },
+  "fix": "A teammate saw patched in the code on the day it shipped and thought it was clutter, so they replaced it with a plain await grill(ticket). But RH-1300 had started on version 1 that morning and was still waiting for its approval. Replay it: write version 1 again, restart the worker, start RH-1300 with node start.mjs RH-1300, then stop the worker, write the teammate's plain version 2, start the worker and approve RH-1300. The non-determinism error is back. Put the patch back so RH-1300 finishes, and explain to the teammate when the line can really go.",
+  "explain": [
+   "Why did adding one activity call break a run that was only waiting for an approval?",
+   "How does patched know which path a run should take, both the first time and during a replay?",
+   "When is it safe to replace patched with deprecatePatch, and when is it safe to delete the line?"
+  ],
+  "done": "An open run survived a code change thanks to patched, a new run took the new path with a marker in its history, and you stopped the worker and the dev server."
+ },
+ "check": [
+  {
+   "q": "Which change to ticketToPr can break runs that are already open?",
+   "options": [
+    {
+     "text": "Changing the text that the writePlan activity posts to Slack",
+     "correct": false,
+     "why": "That is code inside an activity. Activity code is never replayed; only its recorded result is used."
+    },
+    {
+     "text": "Adding an activity call before a point that open runs have already passed",
+     "correct": true,
+     "why": "On replay the new code asks for a step the history does not have, so the worker reports a non-determinism error."
     },
     {
      "text": "Renaming a local variable in the workflow",
      "correct": false,
-     "why": "Names are not steps; replay compares commands, not code."
+     "why": "Names do not appear in the history. Only commands do: activities, timers and other requests to the service."
     }
    ]
   },
   {
-   "q": "When may deploy 3 delete the deprecatePatch line?",
+   "q": "A run started before the deploy reaches if (patched(\"grill-step\")) during a replay. What does patched return, and why?",
    "options": [
     {
-     "text": "Right after deploy 2 is out",
+     "text": "true, because the new code is now deployed",
      "correct": false,
-     "why": "Runs started on deploy 1 may still be open and need the marker."
+     "why": "Then old runs would take the new path and break. patched looks at the history, not at the deploy."
     },
     {
-     "text": "Never; patches stay forever",
+     "text": "It throws, because old runs cannot run patched code",
      "correct": false,
-     "why": "They are removed in steps once no old run is open."
+     "why": "Old runs can. That is the whole point of patched: one file serves old and new runs."
     },
     {
-     "text": "When no run that started before deploy 2 is still open",
+     "text": "false, because the history has no marker for grill-step",
      "correct": true,
-     "why": "Then every open run took the new path and none needs the marker."
+     "why": "The marker is written only when a run reaches the line for the first time with the new code. An old history does not have it, so the old path is taken."
     }
    ]
   },
   {
-   "q": "slots calls continueAsNew(agent, holders, waiting). What does the new run start with?",
+   "q": "Deploy 1 added patched(\"grill-step\") on Monday. When can deploy 2 replace it with deprecatePatch?",
    "options": [
     {
-     "text": "Only the arguments passed: agent, holders and waiting",
+     "text": "When no run that started before Monday's deploy is still open",
      "correct": true,
-     "why": "The history is fresh; state survives only through the arguments."
+     "why": "Only those runs need the old path. A list query on ExecutionStatus and StartTime tells you when they are all closed."
     },
     {
-     "text": "The whole old history, copied",
+     "text": "The next day, because every run has replayed by then",
      "correct": false,
-     "why": "A fresh history is the point of continueAsNew."
+     "why": "A run can wait 14 days for a review, and it replays whenever a new worker handles it."
     },
     {
-     "text": "Nothing; holders and waiting are empty again",
+     "text": "Right after deploy 1, since patched already wrote the markers",
      "correct": false,
-     "why": "They would be empty only if you did not pass them."
+     "why": "Runs from before Monday have no marker. With deprecatePatch they would take the new path and break."
     }
    ]
   }
  ],
- "recall": [
-  "In p7-5, why does a schedule's catchup window equal its interval?",
-  "In p7-1, what does a worker do with a recorded activity result during replay?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "The orchestrator is deployed while runs are days into their life, so every change to workflow code follows one rule: wrap a new or changed step in patched with an ID that names the change, then deprecatePatch, and delete the line only when no run from before the previous deploy is open. A replay test in CI runs saved histories against every pull request, so a change that would break an open run fails the PR instead of a ticket.",
+   "Two kinds of workflow live forever: slots, one per agent, which hands out VM slots by signal, and the polls that schedules start again and again. slots continues as new after 5,000 events and passes its holders and its waiting line along."
+  ],
+  "tickets": [
+   {
+    "key": "G3-29",
+    "why": "The patching rule for workflow changes and the replay test that guards it in CI."
+   },
+   {
+    "key": "G3-25",
+    "why": "The slots workflow, which lives forever and continues as new."
+   },
+   {
+    "key": "G4-12",
+    "why": "The grill step: a new step added at the top of a workflow with open runs."
+   }
+  ]
+ },
  "words": [
   {
+   "term": "command",
+   "plain": "A request the workflow sends to the Temporal Service, such as scheduling an activity or starting a timer."
+  },
+  {
    "term": "non-determinism error",
-   "plain": "Replay found the new code asking for a different step than the history recorded; the run stops moving."
+   "plain": "The worker's refusal to continue a run when the code asks for different steps than the history recorded."
   },
   {
-   "term": "patched()",
-   "plain": "Returns true for new runs and false when replaying a history from before the change."
+   "term": "patched",
+   "plain": "A check that lets old runs take the old path and new runs the new one, using a marker in the history."
   },
   {
-   "term": "deprecatePatch()",
-   "plain": "The second step of a patch: keeps the marker and always takes the new path."
+   "term": "deprecatePatch",
+   "plain": "The second step of removing a patch: always the new path, but the marker is still written."
   },
   {
    "term": "continueAsNew",
-   "plain": "Ends a run and starts a fresh one with the same ID and an empty history, passing state as arguments."
-  },
-  {
-   "term": "history length",
-   "plain": "The number of events in a run's history; workflowInfo().historyLength."
-  },
-  {
-   "term": "Worker Deployments",
-   "plain": "Temporal's way to run old and new builds side by side; an option we do not use by default."
+   "plain": "Ends the run and starts a fresh one with the same ID and an empty history, passing on only its arguments."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-29",
-   "why": "Safe deploys: patched(), then deprecatePatch, and a replay test on every PR."
+   "q": "List the three deploys that take a patch from added to gone, and the condition before deploys 2 and 3.",
+   "a": "1: patched around the new step. 2: deprecatePatch, once no run from before deploy 1 is open. 3: plain code, once no run from before deploy 2 is open."
   },
   {
-   "key": "G3-25",
-   "why": "The slots workflow lives forever and continues as new before its history grows long."
+   "q": "Why does changing the body of the writePlan activity never need a patch?",
+   "a": "Activity code is not replayed. A replay uses the recorded result, and only workflow commands are compared with the history."
   },
   {
-   "key": "G4-12",
-   "why": "Adding the grill step to ticketToPr while runs are open is exactly a three-deploy patch."
+   "q": "What does slots pass to continueAsNew, and what would happen if it passed nothing?",
+   "a": "The agent, the holders and the waiting line. With nothing, the new run would forget who holds a slot and who waits, and hand out too many VMs or lose requests."
   }
  ],
- "remember": "If an open run could be past the line you change, use patched(); a workflow that lives forever continues as new."
+ "remember": "A run can outlive your code: wrap every new step in patched until the old runs are gone, and let a never-ending workflow continue as new."
 }

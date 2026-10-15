@@ -1,437 +1,304 @@
 {
+ "v": 2,
  "id": "p8-4",
  "title": "Hooks are walls",
- "minutes": 45,
+ "minutes": 50,
  "youNeed": [
   "p8-2"
  ],
- "bridge": "A hook is like Express middleware on agent events: your function runs at a fixed point and can change what happens next. Except: it runs per event (before a tool, after a tool, when the agent wants to stop), not per request. And PreToolUse runs even when permissions would auto-allow the call.",
- "intro": "Permissions decide by tool name. Hooks decide by content: which file, which command, what evidence exists. This lesson builds the three hooks the harness uses. One refuses edits to protected paths. One lints a file right after it is edited. One demands proof before the agent may say done. These are the walls; everything else stays guidance.",
- "picture": {
-  "caption": "There are three fixed points in a turn where your function runs. Before a tool, after a tool, and when the agent wants to stop.",
-  "nodes": [
-   {
-    "id": "model",
-    "label": "the model",
-    "kind": "agent"
-   },
-   {
-    "id": "pre",
-    "label": "PreToolUse hook",
-    "kind": "check"
-   },
-   {
-    "id": "tool",
-    "label": "the tool (Write)",
-    "kind": "service"
-   },
-   {
-    "id": "post",
-    "label": "PostToolUse hook",
-    "kind": "check"
-   },
-   {
-    "id": "stop",
-    "label": "Stop hook",
-    "kind": "check"
-   },
-   {
-    "id": "ledger",
-    "label": "refusals.jsonl",
-    "kind": "file"
-   }
+ "map": "skills",
+ "hook": {
+  "story": [
+   "Nova, our ticket-to-PR agent, writes the checks for RH-1234 before it writes the product code: a test that expects the card \"No projects yet\". An hour later the test still fails, because the card shows \"Loading\" for an empty workgroup. The quickest way to a green build is not to fix the code. It is to change the test so it expects \"Loading\".",
+   "A model under pressure can take that shortcut, and a prompt that says \"never edit the tests\" is only a request. Permissions do not help much either: they decide by tool name and path pattern, and they cannot ask \"has this agent proved its work?\" before it says it is done. We need our own code at the moments that matter, with the power to say no."
   ],
-  "steps": [
-   {
-    "from": "model",
-    "to": "pre",
-    "text": "asks to Write a file; the hook sees the path"
-   },
-   {
-    "from": "pre",
-    "to": "ledger",
-    "text": "protected path: deny with a reason, write the ledger line"
-   },
-   {
-    "from": "pre",
-    "to": "tool",
-    "text": "other path: no opinion, the tool runs"
-   },
-   {
-    "from": "tool",
-    "to": "post",
-    "text": "the hook sees the tool's input and output"
-   },
-   {
-    "from": "post",
-    "to": "model",
-    "text": "adds lint output as extra context for the next turn"
-   },
-   {
-    "from": "model",
-    "to": "stop",
-    "text": "says it is done"
-   },
-   {
-    "from": "stop",
-    "to": "model",
-    "text": "missing proof: block with a reason, the model keeps working"
-   }
-  ]
+  "question": "How do I run my own code inside the agent loop, so some things are impossible however the model is convinced?"
  },
- "sections": [
+ "read": [
   {
-   "h": "What a hook is",
+   "h": "Your code at fixed moments of the loop",
    "p": [
-    "A hook is a function you give the session. The SDK calls it when an event happens and waits for its answer. The type is HookCallback. It gets the event input, the tool use id and an AbortSignal, and returns a promise of a small result object.",
-    "You register hooks per event name under the hooks option. Each entry has an optional matcher, a regex on the tool name, and a list of hooks. PreToolUse with matcher 'Edit|Write' runs for those two tools only.",
-    "Return {} when the hook has no opinion. Return a specific object to deny, to add context, or to block a stop."
+    "A hook is a function you give the session, and the SDK calls it when a certain event happens: PreToolUse just before a tool runs, PostToolUse just after, Stop when the model wants to end its turn, and about thirty more. The SDK waits for your answer before it continues. The hooks run in your own process, not inside the model's context, so they cost no tokens and the model cannot change them.",
+    "A hook receives the event's input (for PreToolUse, the tool name and its arguments) and returns a small object. An empty object means \"no opinion\": the normal checks decide. To refuse a call, a PreToolUse hook returns a permission decision of \"deny\" with a reason, and the model reads that reason instead of the tool's output. Hooks also run first in the order of permission checks, before any allow rule or permission mode, and a deny from a hook stops the call even in bypassPermissions."
    ],
-   "callout": {
-    "kind": "why",
-    "text": "Permissions know the tool name. Only a hook sees the file path and the command text. That is why protected paths and never-run commands are hooks."
-   }
-  },
-  {
-   "h": "PreToolUse: deny with a reason",
-   "p": [
-    "PreToolUse runs before a tool. Its input has tool_name and tool_input. For Write and Edit, tool_input has file_path. The hook returns hookSpecificOutput with permissionDecision 'deny' and a permissionDecisionReason the model reads.",
-    "The reason matters. A calm sentence with an alternative keeps the model working: 'add a new test instead, or ask the requester'. A bare 'denied' makes it try the same thing five more ways."
-   ],
-   "because": "We deny inside a hook, with a reason, so the model knows what to do instead. We also get a record of every refusal.",
    "code": {
     "lang": "typescript",
-    "file": "~/sdk-lab/src/lab4-hooks.ts (protectPaths)",
-    "text": "import { existsSync } from \"node:fs\";\nimport { query, type HookCallback, type PreToolUseHookInput, type StopHookInput } from \"@anthropic-ai/claude-agent-sdk\";\n\nconst protectPaths: HookCallback = async (input) => {\n  const { tool_input } = input as PreToolUseHookInput;\n  const path = (tool_input as { file_path?: string }).file_path ?? \"\";\n  if (!path.includes(\"/protected/\")) return {}; // empty object = no opinion, the normal rules apply\n  return {\n    hookSpecificOutput: {\n      hookEventName: \"PreToolUse\",\n      permissionDecision: \"deny\",\n      permissionDecisionReason: \"protected/ holds the checks you are judged by. Write under scratch/ instead.\",\n    },\n  };\n};",
+    "file": "~/sdk-lab/src/hooks.ts (the PreToolUse wall)",
+    "text": "import { execFile } from \"node:child_process\";\nimport { existsSync } from \"node:fs\";\nimport { promisify } from \"node:util\";\nimport type { HookCallback, PreToolUseHookInput, StopHookInput } from \"@anthropic-ai/claude-agent-sdk\";\n\nconst PROTECTED = [\"test/\", \".github/workflows/\"];\nconst NEVER_RUN = /\\b(terraform|tofu)\\b.*\\b(apply|destroy)\\b|gh\\s+workflow\\s+run/;\n\nconst deny = (reason: string) => ({\n  hookSpecificOutput: { hookEventName: \"PreToolUse\" as const, permissionDecision: \"deny\" as const, permissionDecisionReason: reason },\n});\n\nexport const guardWalls: HookCallback = async (input) => {\n  const { tool_name, tool_input } = input as PreToolUseHookInput;\n  const args = tool_input as { file_path?: string; command?: string };\n  if (args.file_path && PROTECTED.some((p) => args.file_path!.includes(p))) {\n    return deny(\"That file is one of the checks your work is judged by. Change the code, or add a new test file.\");\n  }\n  if (tool_name === \"Bash\" && args.command && NEVER_RUN.test(args.command)) {\n    return deny(\"Agents never apply, destroy or dispatch. Write a note for a person instead.\");\n  }\n  return {};\n};",
     "notes": [
      {
-      "line": 4,
-      "text": "HookCallback is the SDK's function type. One type for every event; you narrow the input yourself."
-     },
-     {
-      "line": 5,
-      "text": "input is a union of all event inputs. The cast says: in this hook it is a PreToolUse input."
-     },
-     {
       "line": 6,
-      "text": "tool_input is unknown; we read file_path from it. Edit, Write and NotebookEdit use that name (notebook_path for notebooks)."
+      "text": "The paths our work is judged by. In the platform this list comes from one shared file, not from code."
      },
      {
       "line": 7,
-      "text": "Most calls are fine. Return {} fast and let allowedTools and the mode decide."
+      "text": "Commands agents never run. The hook gives a clear answer; missing credentials are the real wall behind it."
      },
      {
-      "line": 12,
-      "text": "The reason goes to the model. Say why and what to do instead."
-     }
-    ]
-   }
-  },
-  {
-   "h": "PostToolUse: hand the model what it needs next",
-   "p": [
-    "PostToolUse runs after a tool finished. Its input adds tool_response, the tool's output. The hook returns hookSpecificOutput with additionalContext: text the model reads in its next turn.",
-    "The harness uses this to lint a file right after it is edited. It runs biome check --write under frontend/, and black, isort and flake8 under the backend folders. Failures come back as context, so the model fixes them now, not after CI."
-   ],
-   "because": "We lint in a hook because feedback one second after the edit is cheaper than a red CI run twenty minutes later.",
-   "code": {
-    "lang": "typescript",
-    "file": "~/sdk-lab/src/lab4-hooks.ts (lintAfterEdit)",
-    "text": "const lintAfterEdit: HookCallback = async () => ({\n  hookSpecificOutput: { hookEventName: \"PostToolUse\", additionalContext: \"lint: ok (0 problems)\" }, // the model reads this\n});",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The lab fakes the linter. The real hook runs execFile('biome', ['check', '--write', path]) and returns its output."
+      "line": 10,
+      "text": "The deny shape: the event name, the decision and a reason the model will read."
      },
      {
-      "line": 2,
-      "text": "hookEventName must match the event the hook is registered under."
-     },
-     {
-      "line": 2,
-      "text": "additionalContext is plain text. Keep it short: it lands in the model's context every time."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Stop: proof before done",
-   "p": [
-    "Stop runs when the model wants to end the turn. Return { decision: 'block', reason } and the model is sent back to work with your reason as its next instruction. Return {} and it stops.",
-    "The input has stop_hook_active: true when this stop was already blocked once by a hook. Use it to avoid an endless loop. The harness lets the stop through on the second try and flags the checks as unproven instead of looping."
-   ],
-   "because": "We block the stop because 'done' must mean the checks in the plan passed after the last edit. It must not mean that the model feels finished.",
-   "code": {
-    "lang": "typescript",
-    "file": "~/sdk-lab/src/lab4-hooks.ts (proofBeforeDone)",
-    "text": "const proofBeforeDone: HookCallback = async (input) => {\n  if ((input as StopHookInput).stop_hook_active) return {}; // we already sent it back once: let it stop\n  if (existsSync(\"scratch/notes.txt\")) return {};\n  return { decision: \"block\", reason: \"Before you stop, create scratch/notes.txt and show that it exists.\" };\n};",
-    "notes": [
-     {
-      "line": 2,
-      "text": "Without this guard a model that cannot satisfy you is blocked forever. One retry, then let it stop and flag it."
-     },
-     {
-      "line": 3,
-      "text": "The lab's proof is a file. The harness checks a ledger of passing check runs after the last edit."
-     },
-     {
-      "line": 4,
-      "text": "decision 'block' plus reason: the model continues with the reason as its instruction."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Wire the hooks into the options",
-   "p": [
-    "The hooks option maps event names to lists of matchers. A matcher is a regex on the tool name; leave it out to run for every tool. The Stop event has no tool, so no matcher.",
-    "The lab prompt asks for a write under protected/. The hook denies it, the model reports the refusal, and when it tries to stop the Stop hook asks for scratch/notes.txt. It writes that file, the lint hook adds its note, and the second stop passes."
-   ],
-   "because": "We register hooks in the options object because they belong to the harness, not to the repo: a repo cannot remove them.",
-   "code": {
-    "lang": "typescript",
-    "file": "~/sdk-lab/src/lab4-hooks.ts (the session)",
-    "text": "for await (const msg of query({\n  prompt: \"Write the word hello into protected/notes.txt. If that is refused, say so and stop.\",\n  options: {\n    model: \"claude-haiku-5-5\",\n    effort: \"low\",\n    cwd: process.cwd(),\n    settingSources: [],\n    allowedTools: [\"Read\", \"Glob\", \"Write\", \"Bash\"],\n    permissionMode: \"dontAsk\",\n    hooks: {\n      PreToolUse: [{ matcher: \"Write|Edit\", hooks: [protectPaths] }], // matcher: which tools, by name\n      PostToolUse: [{ matcher: \"Write|Edit\", hooks: [lintAfterEdit] }],\n      Stop: [{ hooks: [proofBeforeDone] }],\n    },\n  },\n})) {\n  if (msg.type === \"result\") console.log(\"result\", msg.subtype, \"denied:\", msg.permission_denials.map((d) => d.tool_name));\n}",
-    "notes": [
-     {
-      "line": 8,
-      "text": "Write is allowed. The hook, not the permission list, decides by path. That is the point."
-     },
-     {
-      "line": 11,
-      "text": "A regex on the tool name. The harness also matches MultiEdit and NotebookEdit."
-     },
-     {
-      "line": 13,
-      "text": "No matcher: Stop has no tool. One hook list per event."
+      "line": 15,
+      "text": "Edit and Write put the path in file_path. Matchers only see tool names, so the path check lives here."
      },
      {
       "line": 17,
-      "text": "A hook deny is not listed in permission_denials; it is recorded by your own ledger. Watch the transcript instead."
-     }
-    ]
-   },
-   "see": "result success denied: []\n(and the file scratch/notes.txt now exists; protected/notes.txt does not)",
-   "ifInstead": "If instead protected/notes.txt exists, the matcher did not match. Print input.tool_name at the top of protectPaths and check the exact tool name the model used."
-  },
-  {
-   "h": "Nova's walls (G3-21), part 1: refuse and record",
-   "p": [
-    "The harness hook reads the protected globs from ai-agents/settings/protected-paths.yaml. It is the same file the locked-checks check (G0-18) reads, so the agent and CI agree on what is protected. That means CI workflows, lint and type config, eval sets, and the QA checks approved in the plan.",
-    "On Bash it refuses the commands agents never run. Those are terraform, tofu or terragrunt apply and destroy, argocd app sync, gh workflow run and dispatches. Calls to the metadata address 169.254.169.254 are refused too. The real walls are elsewhere (no credentials, the broker). The hook gives a clear answer and a record."
-   ],
-   "because": "We read the protected list from one shared file because a list in the prompt is only guidance. A wall must not depend on the model reading carefully.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/harness/src/hooks.ts (blockWalls)",
-    "text": "import type { HookCallback, HookJSONOutput, PreToolUseHookInput, StopHookInput } from \"@anthropic-ai/claude-agent-sdk/core\";\n\nconst PROTECTED = loadGlobs(\"/opt/ai-agents/harness/settings/protected-paths.yaml\"); // this repo's block; G0-18 reads the same file\nconst NEVER_RUN =\n  /\\b(terraform|tofu|terragrunt)\\b.*\\b(apply|destroy)\\b|argocd\\s+app\\s+sync|gh\\s+workflow\\s+run|\\/dispatches\\b|169\\.254\\.169\\.254/;\n\nexport const blockWalls: HookCallback = async (input) => {\n  const { tool_name: tool, tool_input } = input as PreToolUseHookInput;\n  const args = tool_input as { file_path?: string; notebook_path?: string; command?: string };\n  const path = args.file_path ?? args.notebook_path;\n  if (path && matches(path, PROTECTED)) {\n    return refuse(tool, path, \"This file is one of the checks your work is judged by. \" +\n      \"Add a new test instead, or ask the requester with ask_human.\");\n  }\n  if (tool === \"Bash\" && args.command && NEVER_RUN.test(args.command)) {\n    return refuse(tool, args.command, \"Agents never apply, destroy, sync or dispatch. Leave a note for a person.\");\n  }\n  return {};\n};",
-    "notes": [
-     {
-      "line": 3,
-      "text": "The harness tarball carries a copy of protected-paths.yaml (release-harness.yml packs it)."
+      "text": "A calm reason with an alternative keeps the model working. A bare \"denied\" makes it try five other ways."
      },
      {
-      "line": 5,
-      "text": "One regex for the never-run commands. 169.254.169.254 is the cloud metadata service: credentials live there."
-     },
-     {
-      "line": 8,
-      "text": "Rename tool_name to tool for short code; TypeScript narrows after the cast."
-     },
-     {
-      "line": 11,
-      "text": "matches() tests the path against the globs. The reason offers two alternatives."
-     },
-     {
-      "line": 18,
-      "text": "Everything else: no opinion. The hook is a wall, not a reviewer."
+      "line": 22,
+      "text": "An empty object: this hook has no opinion, and the normal permission checks decide."
      }
     ]
    }
   },
   {
-   "h": "Nova's walls, part 2: evidence and the ledger",
+   "h": "Wire the hooks to events",
    "p": [
-    "requireEvidence runs on Stop. For each check in the plan's QA plan it looks for a passing run recorded after the last edit.",
-    "Anything missing blocks the stop with the list. Say the stop was already blocked once, and the failure is not Nova's (a flaky test, main already red). Then it lets the stop through and flags the checks as unproven.",
-    "refuse() writes a line to /run/nova/refusals.jsonl and returns the deny object. The ledger is uploaded with the artifacts and listed in the PR (G3-31). So reviewers see what the agent was not allowed to do."
+    "The hooks option maps an event name to a list of matchers. A matcher is a pattern for the tool name, such as \"Edit|Write|Bash\", plus the hooks to run when it matches; without a pattern, the hooks run for every call. Several hooks can match the same call. They run in parallel, and for permission decisions the strictest answer wins: one deny blocks the call whatever the others say.",
+    "PostToolUse hooks get the tool's input and its output, and they can hand the model new information through additionalContext. Here, after every edit, we run the TypeScript compiler and, if it finds problems, give the model the errors at once, instead of letting it learn about them at the end from CI. That is guidance, not a wall: it makes the right path faster."
    ],
-   "because": "We keep a ledger because a refusal nobody can see is a mystery in a PR. A refusal everybody can see is a fact.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/harness/src/hooks.ts (requireEvidence, refuse)",
-    "text": "export const requireEvidence: HookCallback = async (input) => {\n  const missing = planChecks().filter((check) => !ledger.passedAfterLastEdit(check));\n  if (missing.length === 0) return {};\n  if ((input as StopHookInput).stop_hook_active && ledger.notOurs(missing)) { // flaky, or main was already red\n    ledger.flagUnproven(missing); // shown in the PR, not looped on\n    return {};\n  }\n  return { decision: \"block\", reason: `Before you stop, run these and show them passing: ${missing.join(\", \")}` };\n};\n\nconst refuse = (tool: string, target: string, why: string): HookJSONOutput => {\n  ledger.refused(tool, target, why); // listed in the PR (G3-31)\n  return { hookSpecificOutput: { hookEventName: \"PreToolUse\", permissionDecision: \"deny\", permissionDecisionReason: why } };\n};",
+    "file": "~/sdk-lab/src/fix-cart.ts",
+    "text": "import { query } from \"@anthropic-ai/claude-agent-sdk\";\nimport { guardWalls, proofBeforeDone, typecheckAfterEdit } from \"./hooks.js\";\n\nfor await (const msg of query({\n  prompt: \"The test in test/cart.test.ts fails. Make it pass.\",\n  options: {\n    model: \"claude-haiku-5-5\",\n    settingSources: [],\n    allowedTools: [\"Read\", \"Glob\", \"Grep\", \"Edit\", \"Write\", \"Bash\"],\n    permissionMode: \"dontAsk\",\n    hooks: {\n      PreToolUse: [{ matcher: \"Edit|Write|Bash\", hooks: [guardWalls] }],\n      PostToolUse: [{ matcher: \"Edit|Write\", hooks: [typecheckAfterEdit] }],\n      Stop: [{ hooks: [proofBeforeDone] }],\n    },\n  },\n})) {\n  if (msg.type === \"result\" && msg.subtype === \"success\") console.log(\"said:\", msg.result);\n}",
+    "notes": [
+     {
+      "line": 12,
+      "text": "Run the wall before every Edit, Write and Bash call."
+     },
+     {
+      "line": 13,
+      "text": "After each edit, typecheckAfterEdit runs npx tsc and returns any errors as additionalContext."
+     },
+     {
+      "line": 14,
+      "text": "Stop has no tool, so no matcher. This hook decides whether the model may end its turn."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Proof before done",
+   "p": [
+    "The Stop hook runs when the model wants to finish. If it returns decision \"block\" with a reason, the model does not stop: it gets the reason as its next instruction and returns to work. That is how we demand proof. Before Nova may say it is done, the hook checks for evidence, and if the evidence is missing, the answer is \"run these checks first\".",
+    "One field keeps this from looping forever. stop_hook_active is true when this stop comes right after a stop that a hook already blocked. A careful Stop hook lets the second stop through and records the problem for people, instead of sending the model round and round.",
+    "There is a hole you should see clearly. The PreToolUse wall reads file_path, but a Bash command such as sed -i that rewrites a test file has no file_path, only command text, and pattern-matching every possible shell command is a losing game. So the real check happens at the end: the Stop hook compares the protected files with their state at the start, and it does not matter which tool changed them."
+   ],
+   "code": {
+    "lang": "typescript",
+    "file": "~/sdk-lab/src/hooks.ts (the Stop wall)",
+    "text": "export const proofBeforeDone: HookCallback = async (input) => {\n  if ((input as StopHookInput).stop_hook_active) return {};\n  if (existsSync(\"proof/tests-passed.txt\")) return {};\n  return { decision: \"block\", reason: \"Before you stop, run the tests and save their output to proof/tests-passed.txt.\" };\n};",
     "notes": [
      {
       "line": 2,
-      "text": "planChecks() reads the QA plan from .nova/plan.json (G4-07). The ledger records check runs with timestamps."
+      "text": "This stop follows one we already blocked. Let it through, and let people see the problem."
      },
      {
       "line": 4,
-      "text": "stop_hook_active guards the loop; notOurs decides whether blocking again would help."
-     },
-     {
-      "line": 8,
-      "text": "The reason names the checks. The model runs them and shows the output; the Stop hook in fcp (G7-14) runs verify."
-     },
-     {
-      "line": 11,
-      "text": "HookJSONOutput is the return type of a hook. refuse() builds the deny object in one place."
-     },
-     {
-      "line": 12,
-      "text": "One JSON line per refusal: tool, target, why, time."
+      "text": "block plus a reason: the model keeps working, and the reason is its next instruction."
      }
     ]
    },
-   "callout": {
-    "kind": "wall",
-    "text": "Agents never change the checks they are judged by, and never apply, destroy, sync or dispatch. The hook says no; the missing credentials make sure."
+   "deeper": {
+    "h": "Go deeper: timeouts and hooks that only watch",
+    "p": [
+     "Each hook runs with a timeout, 600 seconds by default for most events; set timeout (in seconds) on the matcher to change it. When a PreToolUse hook times out, the tool does not run and the model is told the hook did not answer. A timed-out Stop hook counts as no decision.",
+     "A hook that only records something, such as a log line or a metric, can return { async: true } so the agent does not wait for it. Such a hook cannot block or add context, because the agent has already moved on."
+    ]
    }
   }
  ],
  "lab": {
-  "title": "Three hooks on one session",
-  "youNeed": [
-   "The ~/sdk-lab project",
-   "A Claude Code login"
+  "id": "p8-4",
+  "title": "Three hooks and the tests that trust them",
+  "minutes": 35,
+  "needs": [
+   "The ~/sdk-lab project from p8-1",
+   "For one step only: your own Anthropic API key"
   ],
-  "worked": [
+  "goal": "Write a wall, a helper and a proof check as hooks, test them with recorded inputs and no model, find the hole a shell command opens, and close it at Stop.",
+  "mode": "guided",
+  "guess": {
+   "q": "A session runs in bypassPermissions mode with allowedTools: [\"Edit\"]. A PreToolUse hook returns permissionDecision \"deny\" for an edit to test/cart.test.ts. Does the edit happen?",
+   "options": [
+    {
+     "text": "Yes, bypass mode approves everything, and Edit is even pre-approved.",
+     "correct": false,
+     "why": "Hooks run before the permission mode and the allow rules. A hook deny wins in every mode."
+    },
+    {
+     "text": "No, the hook's deny stops the call and the model reads the reason.",
+     "correct": true,
+     "why": "Hooks are the first check. A deny from any hook blocks the call, even in bypassPermissions."
+    },
+    {
+     "text": "It depends on which runs first, the hook or the allow rule.",
+     "correct": false,
+     "why": "The order is fixed: hooks first, then deny rules, ask rules, the mode, allow rules and canUseTool."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "mkdir -p protected scratch",
-    "see": "Two empty folders in ~/sdk-lab"
+    "say": "Write src/hooks.ts: the guardWalls wall from the Understand step, the proofBeforeDone Stop hook, and this typecheckAfterEdit helper between them.",
+    "do": "cd ~/sdk-lab   # the full file:\ncat > src/hooks.ts <<'EOF'\nimport { execFile } from \"node:child_process\";\nimport { existsSync } from \"node:fs\";\nimport { promisify } from \"node:util\";\nimport type { HookCallback, PreToolUseHookInput, StopHookInput } from \"@anthropic-ai/claude-agent-sdk\";\n\nconst PROTECTED = [\"test/\", \".github/workflows/\"];\nconst NEVER_RUN = /\\b(terraform|tofu)\\b.*\\b(apply|destroy)\\b|gh\\s+workflow\\s+run/;\n\nconst deny = (reason: string) => ({\n  hookSpecificOutput: { hookEventName: \"PreToolUse\" as const, permissionDecision: \"deny\" as const, permissionDecisionReason: reason },\n});\n\nexport const guardWalls: HookCallback = async (input) => {\n  const { tool_name, tool_input } = input as PreToolUseHookInput;\n  const args = tool_input as { file_path?: string; command?: string };\n  if (args.file_path && PROTECTED.some((p) => args.file_path!.includes(p))) {\n    return deny(\"That file is one of the checks your work is judged by. Change the code, or add a new test file.\");\n  }\n  if (tool_name === \"Bash\" && args.command && NEVER_RUN.test(args.command)) {\n    return deny(\"Agents never apply, destroy or dispatch. Write a note for a person instead.\");\n  }\n  return {};\n};\n\nexport const typecheckAfterEdit: HookCallback = async () => {\n  const run = await promisify(execFile)(\"npx\", [\"tsc\"]).then(() => null, (e: { stdout: string }) => e.stdout);\n  if (!run) return {};\n  return { hookSpecificOutput: { hookEventName: \"PostToolUse\" as const, additionalContext: `tsc found problems:\\n${run}` } };\n};\n\nexport const proofBeforeDone: HookCallback = async (input) => {\n  if ((input as StopHookInput).stop_hook_active) return {};\n  if (existsSync(\"proof/tests-passed.txt\")) return {};\n  return { decision: \"block\", reason: \"Before you stop, run the tests and save their output to proof/tests-passed.txt.\" };\n};\nEOF\nnpx tsc && echo clean",
+    "see": "clean"
    },
    {
-    "do": "Create src/lab4-hooks.ts with the three hooks and the session from above",
-    "see": "A 45-line file with protectPaths, lintAfterEdit, proofBeforeDone"
+    "say": "Hooks are plain functions, so you can test them with recorded inputs and no session at all. These tests build the same input objects the SDK would send.",
+    "do": "cat > test/hooks.test.ts <<'EOF'\nimport assert from \"node:assert/strict\";\nimport { test } from \"node:test\";\nimport type { PreToolUseHookInput, StopHookInput } from \"@anthropic-ai/claude-agent-sdk\";\nimport { guardWalls, proofBeforeDone } from \"../src/hooks.js\";\n\nconst base = { session_id: \"s1\", transcript_path: \"/tmp/t.jsonl\", cwd: process.cwd() };\nconst pre = (tool_name: string, tool_input: object): PreToolUseHookInput =>\n  ({ ...base, hook_event_name: \"PreToolUse\", tool_name, tool_input, tool_use_id: \"toolu_1\" });\nconst stop = (stop_hook_active: boolean): StopHookInput => ({ ...base, hook_event_name: \"Stop\", stop_hook_active });\nconst signal = new AbortController().signal;\n\ntest(\"an edit to a test file is refused with a reason\", async () => {\n  const out = await guardWalls(pre(\"Edit\", { file_path: \"test/unit/cart.test.ts\" }), \"toolu_1\", { signal });\n  assert.equal((out as any).hookSpecificOutput.permissionDecision, \"deny\");\n});\n\ntest(\"an edit to app code passes through\", async () => {\n  assert.deepEqual(await guardWalls(pre(\"Edit\", { file_path: \"src/cart.ts\" }), \"toolu_2\", { signal }), {});\n});\n\ntest(\"terraform apply is refused, terraform plan is not\", async () => {\n  const apply = await guardWalls(pre(\"Bash\", { command: \"cd infra && terraform apply -auto-approve\" }), \"t\", { signal });\n  const plan = await guardWalls(pre(\"Bash\", { command: \"terraform plan\" }), \"t\", { signal });\n  assert.equal((apply as any).hookSpecificOutput.permissionDecision, \"deny\");\n  assert.deepEqual(plan, {});\n});\n\ntest(\"the first stop without proof is blocked, the second is let through\", async () => {\n  assert.equal(((await proofBeforeDone(stop(false), undefined, { signal })) as any).decision, \"block\");\n  assert.deepEqual(await proofBeforeDone(stop(true), undefined, { signal }), {});\n});\nEOF\nnode --import tsx --test --test-reporter=spec test/hooks.test.ts",
+    "see": "✔ an edit to a test file is refused with a reason (0.401458ms)\n✔ an edit to app code passes through (0.287834ms)\n✔ terraform apply is refused, terraform plan is not (0.416ms)\n✔ the first stop without proof is blocked, the second is let through (0.281417ms)\nℹ tests 4\nℹ pass 4"
    },
    {
-    "do": "npx tsx src/lab4-hooks.ts",
-    "see": "result success denied: []"
+    "say": "Now look for the hole. Add one more test that sends a sed command which rewrites the test file, and see what the wall says.",
+    "do": "cat >> test/hooks.test.ts <<'EOF'\n\ntest(\"a sed command that rewrites a test file slips through\", async () => {\n  const out = await guardWalls(pre(\"Bash\", { command: \"sed -i 's/No projects yet/Loading/' test/cart.test.ts\" }), \"t\", { signal });\n  assert.deepEqual(out, {});\n});\nEOF\nnode --import tsx --test --test-reporter=spec test/hooks.test.ts",
+    "see": "…\n✔ a sed command that rewrites a test file slips through (0.104625ms)\nℹ tests 5"
    },
    {
-    "do": "ls protected scratch",
-    "see": "protected:\n\nscratch:\nnotes.txt"
-   },
-   {
-    "do": "Add console.log(input.hook_event_name, (input as PreToolUseHookInput).tool_name) as the first line of protectPaths and run again",
-    "see": "PreToolUse Write   (once for the refused write, once for the allowed one)"
+    "say": "Give the session a real temptation: a small function that says \"Loading\" and a test that expects \"No projects yet\". Write src/fix-cart.ts from the Understand step and run it with your key. Add a console.log in guardWalls before each deny if you want to watch the refusals.",
+    "do": "cat > src/cart.ts <<'EOF'\nexport const emptyText = (projects: string[]) => (projects.length === 0 ? \"Loading\" : `${projects.length} projects`);\nEOF\ncat > test/cart.test.ts <<'EOF'\nimport assert from \"node:assert/strict\";\nimport { test } from \"node:test\";\nimport { emptyText } from \"../src/cart.js\";\n\ntest(\"an empty workgroup says No projects yet\", () => assert.equal(emptyText([]), \"No projects yet\"));\nEOF\nexport ANTHROPIC_API_KEY=sk-ant-...   # your own key\nnpx tsx src/fix-cart.ts; grep -c \"No projects yet\" test/cart.test.ts src/cart.ts",
+    "see": "(Needs your key; the model's path will differ.) If it tries to edit test/cart.test.ts, the edit is refused with your reason. When it tries to stop without proof/tests-passed.txt, the Stop hook sends it back once. The test file still contains 'No projects yet'."
    }
   ],
-  "faded": "Make lintAfterEdit real: read file_path from tool_input, run execFile('wc', ['-l', path]) with promisify, and return the output as additionalContext. Ask the model to tell you the line count it was given. Left to you: the import of execFile and promisify (see G4-18's review.ts for the pattern).",
-  "alone": "Write src/alone4.ts: a PreToolUse hook on Bash that denies any command containing 'rm -rf' with a calm reason. Add a ledger: append one JSON line per refusal to refusals.jsonl with tool, command and reason. Ask the model to delete the scratch folder with rm -rf and then to list it. Check refusals.jsonl has one line and the folder still exists.",
-  "done": "protected/ stays empty, scratch/notes.txt exists, and you can point at the line in each hook that decided it."
+  "build": "Close the sed hole at Stop. Write src/lock.ts with lockChecks(dir): when it is created it records a sha256 hash of every file under dir, and it returns a Stop hook that blocks, listing the changed files, when any hash is different. Like proofBeforeDone, it lets a second stop through. Test it in test/lock.test.ts with a temporary folder: write a test file, create the hook, check that a stop passes, rewrite the file (as sed would), and check that the next stop is blocked.",
+  "checks": [
+   "node --test shows the four hook tests passing without any API key.",
+   "The extra test proves that a Bash sed command gets an empty answer from guardWalls: the PreToolUse wall cannot see it.",
+   "Your lock test passes: a stop before the change returns {}, a stop after it returns decision \"block\".",
+   "With your key, test/cart.test.ts still expects 'No projects yet' after the session ends."
+  ],
+  "solution": {
+   "lang": "typescript",
+   "file": "~/sdk-lab/src/lock.ts and test/lock.test.ts",
+   "text": "import { createHash } from \"node:crypto\";\nimport { readdirSync, readFileSync } from \"node:fs\";\nimport { join } from \"node:path\";\nimport type { HookCallback, StopHookInput } from \"@anthropic-ai/claude-agent-sdk\";\n\nconst hashAll = (dir: string): Record<string, string> =>\n  Object.fromEntries(\n    readdirSync(dir, { recursive: true, withFileTypes: true })\n      .filter((entry) => entry.isFile())\n      .map((entry) => join(entry.parentPath, entry.name))\n      .map((path) => [path, createHash(\"sha256\").update(readFileSync(path)).digest(\"hex\")]),\n  );\n\nexport const lockChecks = (dir: string): HookCallback => {\n  const before = hashAll(dir);\n  return async (input) => {\n    if ((input as StopHookInput).stop_hook_active) return {};\n    const now = hashAll(dir);\n    const changed = Object.keys(before).filter((path) => now[path] !== before[path]);\n    if (changed.length === 0) return {};\n    return { decision: \"block\", reason: `These locked checks changed: ${changed.join(\", \")}. Restore them and fix the code instead.` };\n  };\n};\n\n// test/lock.test.ts\nimport assert from \"node:assert/strict\";\nimport { mkdtemp, writeFile } from \"node:fs/promises\";\nimport { tmpdir } from \"node:os\";\nimport { join } from \"node:path\";\nimport { test } from \"node:test\";\nimport type { StopHookInput } from \"@anthropic-ai/claude-agent-sdk\";\nimport { lockChecks } from \"../src/lock.js\";\n\nconst stop: StopHookInput = { session_id: \"s1\", transcript_path: \"/tmp/t.jsonl\", cwd: \"/tmp\", hook_event_name: \"Stop\", stop_hook_active: false };\nconst signal = new AbortController().signal;\n\ntest(\"a test file rewritten by any tool blocks the stop\", async () => {\n  const dir = await mkdtemp(join(tmpdir(), \"checks-\"));\n  await writeFile(join(dir, \"cart.test.ts\"), \"expect(screen.getByText('No projects yet'))\");\n  const hook = lockChecks(dir);\n  assert.deepEqual(await hook(stop, undefined, { signal }), {});\n  await writeFile(join(dir, \"cart.test.ts\"), \"expect(screen.getByText('Loading'))\");\n  assert.equal(((await hook(stop, undefined, { signal })) as { decision?: string }).decision, \"block\");\n});"
+  },
+  "fix": "A teammate wrote a PreToolUse hook with matcher \"test/.*\" so it would only run for edits to test files, and it never fires. Then they changed the reason to \"DENIED\", and in the transcript the model tried the same edit through Write, then Bash, then NotebookEdit. Find what a matcher actually matches, move the path check to the right place, and rewrite the reason so the model has somewhere better to go.",
+  "explain": [
+   "Why can a hook refuse a call that bypassPermissions and an allow rule would both approve?",
+   "What does stop_hook_active protect against, and what should a Stop hook do when it is true?",
+   "Why does a PreToolUse hook on file_path not stop a test file from changing, and what catches it instead?"
+  ],
+  "done": "Your hooks have tests that run without a model, and you can show both the hole in the PreToolUse wall and the Stop hook that closes it."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Write is in allowedTools. Can a PreToolUse hook still stop a write to protected/?",
+   "q": "You want the agent to never edit files under test/. Why a PreToolUse hook rather than only a deny rule?",
    "options": [
     {
-     "text": "No, allowedTools wins over hooks",
+     "text": "Deny rules cannot match paths",
      "correct": false,
-     "why": "PreToolUse runs even when permissions would auto-allow; a deny from the hook stops the call."
+     "why": "They can: Edit(/test/**) is a valid scoped deny rule. The difference is elsewhere."
     },
     {
-     "text": "Yes, and the model gets the reason the hook returns",
+     "text": "A hook can give a reason with an alternative and record the refusal, and it runs first, even in bypass mode",
      "correct": true,
-     "why": "The hook sees the path, denies with permissionDecision 'deny', and the reason reaches the model."
+     "why": "Both can refuse, but the hook is your code: it explains, it can log to a ledger, and it decides before anything else."
     },
     {
-     "text": "Only if permissionMode is default",
+     "text": "Hooks are cheaper because they use a smaller model",
      "correct": false,
-     "why": "Hooks run in every mode, including dontAsk."
+     "why": "Hooks are your own functions. No model runs them at all."
     }
    ]
   },
   {
-   "q": "What is stop_hook_active for?",
+   "q": "A Stop hook returns { decision: \"block\", reason: \"Run the tests first\" }. What happens next?",
    "options": [
     {
-     "text": "It tells you the session is about to be killed",
+     "text": "The session ends with an error result",
      "correct": false,
-     "why": "It says this stop was already blocked once by a hook, nothing about killing."
+     "why": "Blocking a stop does not end anything. It keeps the model working."
     },
     {
-     "text": "It turns the Stop hook on",
+     "text": "The hook runs the tests itself",
      "correct": false,
-     "why": "Registering the hook turns it on; the flag is input, not configuration."
+     "why": "The hook only answers. The model gets the reason and decides how to run the tests."
     },
     {
-     "text": "It lets you avoid blocking forever: block once, then let the stop through and flag it",
+     "text": "The model continues, with your reason as its next instruction",
      "correct": true,
-     "why": "The harness uses it to flag checks as unproven instead of looping on a flaky test."
+     "why": "That is how a Stop hook demands proof: the model goes back to work and is told what is missing."
     }
    ]
   },
   {
-   "q": "Why does the harness read protected paths from protected-paths.yaml instead of listing them in the prompt?",
+   "q": "The model runs sed -i on a locked test file through Bash. Which hook catches it reliably?",
    "options": [
     {
-     "text": "Because YAML loads faster than text in a prompt",
-     "correct": false,
-     "why": "Speed is not the issue; a prompt is guidance and a wall must not depend on the model's attention."
-    },
-    {
-     "text": "So the agent and the locked-checks CI check read the same list. The rule holds even if the model ignores the prompt",
+     "text": "A Stop hook that compares the protected files with their hashes from the start",
      "correct": true,
-     "why": "One shared file, enforced by the hook and by G0-18's required check."
+     "why": "It checks the result, not the route. Whatever tool changed the file, the hash is different."
     },
     {
-     "text": "Because prompts cannot contain file paths",
+     "text": "A PreToolUse hook on Edit|Write",
      "correct": false,
-     "why": "They can; the point is enforcement, not syntax."
+     "why": "Bash is not Edit or Write, and the command text has no file_path to check."
+    },
+    {
+     "text": "A PostToolUse hook on Edit|Write",
+     "correct": false,
+     "why": "It runs after edits made with those tools only, so a Bash call never reaches it."
     }
    ]
   }
  ],
- "recall": [
-  "In p8-2, where on the result message are refused tool calls listed, and does a hook deny appear there?",
-  "From p3-3: What are the three sizes of sandbox VM, and what decides which one a run gets?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "The harness gives every agent session three kinds of hooks. A PreToolUse wall refuses edits to protected paths (CI workflows, lint and type settings, eval sets, and the QA checks approved in the plan) and the commands agents never run: terraform or tofu apply and destroy, argocd app sync, gh workflow run and dispatches. The list of protected paths lives in one shared file that the locked-checks check in CI reads too, so the agent and CI agree. Every refusal goes to a ledger that the PR lists under \"Refused actions\".",
+   "A PostToolUse hook runs the fast linter for the edited file (biome under frontend/, black, isort and flake8 for the backend) and hands back failures as context. The Stop hook asks for a passing run of every QA check recorded after the last edit, and lets a second stop through with the checks marked unproven when the failure is not Nova's, such as a flaky test or a main branch that was already red."
+  ],
+  "tickets": [
+   {
+    "key": "G3-21",
+    "why": "hooks.ts: the wall, the lint hook and the proof-before-done Stop hook, with the refusal ledger."
+   },
+   {
+    "key": "G0-18",
+    "why": "The locked-checks check in CI reads the same protected-paths file as the hook."
+   },
+   {
+    "key": "G3-31",
+    "why": "The refusal ledger becomes the \"Refused actions\" part of the PR."
+   }
+  ]
+ },
  "words": [
   {
    "term": "hook",
-   "plain": "A function of yours the SDK calls at a fixed event and waits for before going on."
-  },
-  {
-   "term": "HookCallback",
-   "plain": "The SDK type of a hook: (input, toolUseID, { signal }) => Promise<result object>."
-  },
-  {
-   "term": "matcher",
-   "plain": "A regex on the tool name that picks which tools a hook list runs for."
+   "plain": "Your function that the SDK calls at a fixed event in the loop, and waits for before going on."
   },
   {
    "term": "PreToolUse",
-   "plain": "The event before a tool runs; a hook can deny it with permissionDecision 'deny' and a reason."
+   "plain": "The event just before a tool runs. Its hook can deny the call with a reason."
   },
   {
    "term": "PostToolUse",
-   "plain": "The event after a tool finished; a hook can add additionalContext the model reads next."
+   "plain": "The event just after a tool ran. Its hook can add context the model reads next."
   },
   {
    "term": "Stop hook",
-   "plain": "The event when the model wants to end the turn; { decision: 'block', reason } sends it back to work."
+   "plain": "Runs when the model wants to finish. decision \"block\" with a reason sends it back to work."
   },
   {
-   "term": "refusal ledger",
-   "plain": "/run/nova/refusals.jsonl: one line per hook deny, uploaded with the artifacts and listed in the PR."
+   "term": "stop_hook_active",
+   "plain": "True when this stop follows one a hook already blocked. Use it to avoid an endless loop."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-21",
-   "why": "hooks.ts is exactly the three hooks built here: blockWalls, the lint hook and requireEvidence, plus the ledger."
+   "q": "Write the object a PreToolUse hook returns to refuse a call.",
+   "a": "{ hookSpecificOutput: { hookEventName: \"PreToolUse\", permissionDecision: \"deny\", permissionDecisionReason: \"a calm reason with an alternative\" } }."
   },
   {
-   "key": "G4-01",
-   "why": "The spike's PostToolUse hook on Workflow prints the runId; it is the lab's lint hook with a different matcher."
+   "q": "Two hooks match the same call; one returns {} and one returns deny. What happens?",
+   "a": "The call is blocked. Matching hooks run in parallel and the strictest permission decision wins."
   },
   {
-   "key": "G3-19",
-   "why": "session.ts takes the hooks as a parameter and passes them in the options; now you know what it receives."
+   "q": "Name the hole in a file_path wall and the hook that closes it.",
+   "a": "Bash commands such as sed -i change files without a file_path. A Stop hook that compares protected files with their starting hashes catches any route."
   }
  ],
- "remember": "PreToolUse denies by content with a reason, and PostToolUse hands back context. Stop blocks until there is proof: one retry, then flag, never loop."
+ "remember": "A hook is your code at a fixed moment of the loop; it runs first, a deny always wins, and a Stop hook can demand proof before done."
 }

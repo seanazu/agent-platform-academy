@@ -1,457 +1,347 @@
 {
+ "v": 2,
  "id": "p7-2",
  "title": "Writing a workflow",
  "minutes": 45,
  "youNeed": [
   "p7-1"
  ],
- "bridge": "An activity call in a workflow is like an API call inside a React component. Except: Temporal retries it for you, so the activity must be safe to run twice. And its result is recorded, so a replay never calls it again.",
- "intro": "This lesson writes workflow code the way the platform does: deterministic, with every outside call behind proxyActivities. You set the two timeouts Nova uses and learn why 7 days is never a work limit. Then you watch a heartbeat bring a killed activity back.",
- "picture": {
-  "caption": "The activity heartbeats while it follows the VM. If its worker dies, Temporal retries, and the new attempt re-attaches to the same VM.",
-  "nodes": [
-   {
-    "id": "wf",
-    "label": "ticketToPr (workflow code)",
-    "kind": "service"
-   },
-   {
-    "id": "server",
-    "label": "Temporal Service",
-    "kind": "service"
-   },
-   {
-    "id": "w1",
-    "label": "worker A: workInSandbox attempt 1",
-    "kind": "machine"
-   },
-   {
-    "id": "w2",
-    "label": "worker B: workInSandbox attempt 2",
-    "kind": "machine"
-   },
-   {
-    "id": "vm",
-    "label": "VM: nova-worker (harness)",
-    "kind": "machine"
-   }
+ "map": "temporal",
+ "hook": {
+  "story": [
+   "Thursday, 11:00. You approved Nova's plan, and Nova is building the \"No projects yet\" card on a VM. In the orchestrator, one activity called workInSandbox started Nova's harness, the program that runs Nova on the VM, and now it follows the build until it is done, which takes about 70 minutes.",
+   "At 11:20 someone deploys the orchestrator, and the worker process that was running workInSandbox is stopped. Nova keeps working on the VM, but nothing is following it any more, so Temporal has to notice that and start a new attempt. If the only timeout on the activity is 7 days, Temporal waits 7 days before it notices. If the timeout is 5 minutes, like a call to Jira, Temporal cuts off every build after 5 minutes."
   ],
-  "steps": [
-   {
-    "from": "wf",
-    "to": "server",
-    "text": "schedules workInSandbox with LONG: 7-day start-to-close, 2-minute heartbeat"
-   },
-   {
-    "from": "w1",
-    "to": "vm",
-    "text": "starts the harness once, then reads its heartbeat every 30 s"
-   },
-   {
-    "from": "w1",
-    "to": "server",
-    "text": "heartbeat(): this attempt is alive"
-   },
-   {
-    "from": "server",
-    "to": "w2",
-    "text": "worker A dies; no heartbeat for 2 minutes, so the service schedules attempt 2"
-   },
-   {
-    "from": "w2",
-    "to": "vm",
-    "text": "finds the harness still running and follows it; no work is lost"
-   }
-  ]
+  "question": "How does Temporal notice within two minutes that the worker of a long activity died, without putting a time limit on Nova's work?"
  },
- "sections": [
+ "read": [
   {
-   "h": "The rules of workflow code",
+   "h": "Every activity call has options",
    "p": [
-    "A workflow must make the same calls in the same order every time it is replayed. So workflow code has no I/O: no fetch, no files, no Node modules. The worker enforces part of this, because it bundles workflows without Node's built-in modules.",
-    "Time and randomness are handled for you. Inside a workflow, Date.now() returns the time of the current step, not the real clock, and Math.random() is seeded. They give the same answer on replay. Still, the tickets say no Date.now() for logic: use sleep() and condition() timeouts for anything about time. condition() waits until something becomes true, with an optional timeout (p7-3).",
-    "Use workflowInfo() for facts about the run, such as runId and historyLength. Everything else comes in as arguments or as activity results."
+    "A workflow never calls an activity directly. It calls a stand-in from proxyActivities, and the options you give proxyActivities decide what Temporal does when the activity is slow or fails. Each time the activity's code runs is one attempt. When an attempt fails or runs out of time, Temporal waits a little and starts a new attempt. By default it tries forever, waiting 1 second, then 2, then 4 and so on, up to 100 seconds between attempts. That rule is the activity's retry policy.",
+    "The SDK insists on a timeout, and the usual one is startToCloseTimeout: the longest a single attempt may run before Temporal ends it and retries. For a call to Jira, 5 minutes is plenty. If Jira has not answered by then, something is wrong, and a fresh attempt is the right answer. Our platform keeps these options in one file with two presets, so every workflow treats the same kind of call the same way."
    ],
-   "see": "Error: Your Workflow code (or a library used by your Workflow code) is importing the following disallowed modules:\n  - 'fs'   (output trimmed)",
-   "ifInstead": "If instead you imported \"node:fs\", webpack fails earlier with UnhandledSchemeError: Reading from \"node:fs\" is not handled by plugins. Same cause: move that code into an activity."
-  },
-  {
-   "h": "proxyActivities and the two timeouts",
-   "p": [
-    "proxyActivities gives the workflow stand-ins for your activities, with options. The SDK requires a timeout. startToCloseTimeout is the longest one attempt may run. heartbeatTimeout is the longest gap allowed between two heartbeats of a running attempt.",
-    "G3-29 keeps the options in one file, policies.ts, with two presets. SHORT is 5 minutes, for calls to Jira, Slack and AWS. LONG is 7 days with 2-minute heartbeats, for anything that follows a VM."
-   ],
-   "because": "We keep timeouts in one presets file because every workflow should treat a slow call the same way.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/policies.ts (part 1)",
-    "text": "// ai-agents/orchestrator/src/policies.ts (part 1): timeouts are safety nets, not work limits.\nimport { proxyActivities, type ActivityOptions, type RetryPolicy } from \"@temporalio/workflow\";\nimport type * as activities from \"./activities/index.js\";\n\nexport const SHORT: ActivityOptions = { startToCloseTimeout: \"5 minutes\" };\n// startToCloseTimeout is required by the SDK and is NOT a work limit: when 7 days pass, the retry\n// re-attaches to the harness still running on the VM. The 2-minute heartbeat catches a dead worker.\nexport const LONG: ActivityOptions = { startToCloseTimeout: \"7 days\", heartbeatTimeout: \"2 minutes\" };",
+    "file": "orchestrator/src/policies.ts",
+    "text": "import { proxyActivities, type ActivityOptions } from \"@temporalio/workflow\";\nimport type * as activities from \"./activities\";\n\n// Calls to Jira, Slack, GitHub and AWS: one attempt may take up to 5 minutes.\nexport const SHORT: ActivityOptions = { startToCloseTimeout: \"5 minutes\" };\n\n// Anything that follows a VM: a far safety net, plus a heartbeat that notices a dead worker.\nexport const LONG: ActivityOptions = { startToCloseTimeout: \"7 days\", heartbeatTimeout: \"2 minutes\" };\n\nexport const act = proxyActivities<typeof activities>(LONG);\nexport const peopleApis = proxyActivities<typeof activities>(SHORT);",
     "notes": [
      {
-      "line": 2,
-      "text": "Workflow-side imports only. ActivityOptions and RetryPolicy are the option types."
-     },
-     {
-      "line": 3,
-      "text": "Type-only import of every activity, so the stand-ins are typed and the activity code stays out of the bundle."
-     },
-     {
       "line": 5,
-      "text": "SHORT: one attempt may take 5 minutes. A Jira call that hangs longer is cut and retried."
-     },
-     {
-      "line": 6,
-      "text": "The comment from the ticket. Read it twice: this timeout never limits the agent's work."
+      "text": "SHORT: an attempt that has not finished after 5 minutes is cut off and retried."
      },
      {
       "line": 8,
-      "text": "LONG: a far safety net plus a 2-minute heartbeat. The heartbeat, not the 7 days, catches a dead worker."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Retry policies: how often, and when to stop",
-   "p": [
-    "When an attempt fails, Temporal waits and tries again. A RetryPolicy says how: the first wait, how fast the wait grows, the longest wait, and how many attempts. A wait that grows after each failure is called back-off. maximumAttempts 0, or no value, means no limit.",
-    "Some errors must never be retried. An activity marks one with ApplicationFailure.create({ type, nonRetryable: true }), or the policy lists the type in nonRetryableErrorTypes. A person who pressed Stop is StoppedByPerson: retrying it would ignore that person."
-   ],
-   "because": "We pick a policy per kind of call because AWS throttling, a Jira outage and a refused scope need different answers.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/policies.ts (part 2)",
-    "text": "// ai-agents/orchestrator/src/policies.ts (part 2): one RetryPolicy per kind of call\nconst NEVER_RETRY = [\"ScopeDenied\", \"PlanRejected\", \"NeedsPerson\", \"StoppedByPerson\"];\nexport const AWS: RetryPolicy = { initialInterval: \"1s\", backoffCoefficient: 2, maximumInterval: \"1 minute\",\n  maximumAttempts: 10, nonRetryableErrorTypes: NEVER_RETRY };\nexport const PEOPLE_APIS: RetryPolicy = { initialInterval: \"5s\", backoffCoefficient: 2, maximumInterval: \"5 minutes\",\n  nonRetryableErrorTypes: NEVER_RETRY }; // no attempt limit: G3-39 pauses the ticket on long outages\nexport const HARNESS_STEP: RetryPolicy = { maximumAttempts: 1 }; // recovery (G3-27) decides, not blind retries\n\n/** One place for timeouts and retries, so every workflow behaves the same. */\nexport const act = proxyActivities<typeof activities>({ ...LONG, retry: AWS });\nexport const peopleApis = proxyActivities<typeof activities>({ ...SHORT, retry: PEOPLE_APIS });",
-    "notes": [
-     {
-      "line": 2,
-      "text": "Errors that are decisions, not glitches. Retrying them would undo a person's choice or a wall."
-     },
-     {
-      "line": 3,
-      "text": "AWS: 1 s, 2 s, 4 s ... up to 1 minute between tries."
-     },
-     {
-      "line": 4,
-      "text": "At most 10 tries for AWS; then the error reaches the workflow."
-     },
-     {
-      "line": 6,
-      "text": "Jira, Slack and GitHub: no attempt limit. A long outage pauses the ticket instead (G3-39)."
-     },
-     {
-      "line": 7,
-      "text": "Check with G3-29's owner where this is used: a workInSandbox with one attempt could not re-attach (next sections)."
+      "text": "LONG: the 7 days is never a limit on Nova's work, and the 2-minute heartbeat is what notices a dead worker. The next two sections explain both."
      },
      {
       "line": 10,
-      "text": "act: the default proxy, LONG with AWS retries. Workflows call act.acquireSandbox, act.workInSandbox and so on."
-     },
-     {
-      "line": 11,
-      "text": "peopleApis: short calls to people's tools, retried with back-off and no limit."
+      "text": "Workflows call act.workInSandbox(...) or peopleApis.postToSlack(...), and the options come with the stand-in."
      }
     ]
+   },
+   "deeper": {
+    "h": "Go deeper: a retry policy per kind of call",
+    "p": [
+     "The default retry policy fits most calls, but not all. AWS may throttle us for a few seconds, so its calls start retrying after 1 second and stop after 10 attempts. Jira, Slack and GitHub can be down for an hour, so their calls wait longer between attempts and never stop trying; a separate rule pauses the ticket during a long outage. A wait that grows after each failure like this is called back-off.",
+     "Some errors must never be retried, because they are decisions, not accidents. If a person pressed Stop, a retry would ignore that person. An activity marks such an error with a type, for example StoppedByPerson, and the retry policy lists those types as non-retryable, so the error goes straight back to the workflow."
+    ],
+    "code": {
+     "lang": "typescript",
+     "file": "orchestrator/src/policies.ts",
+     "text": "const NEVER_RETRY = [\"ScopeDenied\", \"PlanRejected\", \"NeedsPerson\", \"StoppedByPerson\"];\n\nexport const AWS: RetryPolicy = { initialInterval: \"1s\", backoffCoefficient: 2, maximumInterval: \"1 minute\",\n  maximumAttempts: 10, nonRetryableErrorTypes: NEVER_RETRY };\nexport const PEOPLE_APIS: RetryPolicy = { initialInterval: \"5s\", backoffCoefficient: 2, maximumInterval: \"5 minutes\",\n  nonRetryableErrorTypes: NEVER_RETRY }; // no attempt limit\n\nexport const act = proxyActivities<typeof activities>({ ...LONG, retry: AWS });\nexport const peopleApis = proxyActivities<typeof activities>({ ...SHORT, retry: PEOPLE_APIS });"
+    }
    }
   },
   {
-   "h": "Heartbeats: proof of life",
+   "h": "A heartbeat says: I am still here",
    "p": [
-    "A long activity calls heartbeat() from @temporalio/activity now and then. Each call tells the service: this attempt is alive. You can pass details, such as how far you got.",
-    "If the heartbeats stop for longer than heartbeatTimeout, the service ends the attempt and schedules a new one. The new attempt can read the last details with activityInfo().heartbeatDetails and continue from there. That is the code you run in the lab."
+    "A 70-minute build cannot work with a 5-minute timeout, and a 7-day timeout alone would mean that nobody notices a dead worker for a week. The answer is a heartbeat: a small message the activity sends to Temporal again and again while it works, which means \"this attempt is alive\". You also set heartbeatTimeout, the longest gap allowed between two heartbeats. If the gap grows longer, for example because the worker was killed during a deploy, Temporal ends that attempt and starts a new one on any worker that listens on the queue.",
+    "A heartbeat can carry details, such as how far the work got. The next attempt reads them from activityInfo().heartbeatDetails and continues from there instead of starting over. Here is the activity from the lab: a build of 20 steps of one second each.",
+    "Look closely at the output below. The worker died right after step 9, but attempt 2 continued after step 8. To save network traffic, the SDK sends a heartbeat at most once every 80% of heartbeatTimeout and drops the ones in between, so the last details that reached Temporal said 8. A retry can therefore repeat a little work, and that is why every step must be safe to do twice."
    ],
-   "because": "We heartbeat so a dead worker shows up in 2 minutes, not after 7 days.",
    "code": {
     "lang": "typescript",
-    "file": "~/temporal-lab/src/activities.ts (add)",
-    "text": "import { activityInfo, heartbeat } from \"@temporalio/activity\";\n\nexport async function slowWork(steps: number): Promise<string> {\n  const done = (activityInfo().heartbeatDetails as number | undefined) ?? 0; // what a dead attempt reported\n  if (done > 0) console.log(`attempt ${activityInfo().attempt}: resuming after step ${done}`);\n  for (let i = done + 1; i <= steps; i++) {\n    await new Promise((r) => setTimeout(r, 1000)); // one second of \"work\"\n    heartbeat(i); // proof of life, and how far we got\n  }\n  return `did ${steps} steps`;\n}",
+    "file": "activities.ts",
+    "text": "import { activityInfo, heartbeat } from \"@temporalio/activity\";\n\nexport async function build(ticket: string): Promise<string> {\n  const { attempt, heartbeatDetails } = activityInfo();\n  const done: number = heartbeatDetails ?? 0;\n  console.log(`attempt ${attempt}: building ${ticket}, starting after step ${done}`);\n  for (let step = done + 1; step <= 20; step++) {\n    await new Promise((resolve) => setTimeout(resolve, 1000)); // one second of work\n    console.log(`  step ${step} done`);\n    heartbeat(step);\n  }\n  return `built ${ticket} in 20 steps`;\n}",
     "notes": [
      {
-      "line": 1,
-      "text": "Activity-side helpers. heartbeat and activityInfo work only inside a running activity."
-     },
-     {
       "line": 4,
-      "text": "On attempt 1 there are no details, so done is 0. On a retry it is the last step a dead attempt reported."
+      "text": "attempt counts from 1. heartbeatDetails holds what the previous attempt last reported, or nothing on attempt 1."
      },
      {
       "line": 5,
-      "text": "attempt counts from 1. You will see this line after you kill the worker."
+      "text": "On attempt 1 there are no details, so the build starts at step 1."
      },
      {
-      "line": 8,
-      "text": "Heartbeats are throttled by the SDK, so calling it often is fine; it sends at most one every few seconds."
+      "line": 10,
+      "text": "Proof of life and progress in one call. Calling it often is fine, because the SDK sends only some of the calls."
      }
     ]
-   }
+   },
+   "see": "attempt 1: building RH-1234, starting after step 0\n  step 1 done\n  …\n  step 9 done          ← the worker is killed here\nattempt 2: building RH-1234, starting after step 8\n  step 9 done\n  …\n  step 20 done"
   },
   {
-   "h": "7 days is a safety net, not a work limit",
+   "h": "Seven days is a safety net, not a work limit",
    "p": [
-    "Nova's agent may work for hours. No time, turn or budget limit may cut it off; that is a wall of the platform. So why does workInSandbox have a 7-day timeout at all? Because the SDK requires one.",
-    "The trick is that workInSandbox only follows the agent; the agent runs on the VM under systemd. If an attempt ends, from a dead worker or the 7 days, Temporal retries. The new attempt sees the harness already running and follows it again. The agent never notices.",
-    "A dead VM is different. The harness heartbeat stops, and after 5 minutes workInSandbox throws SandboxDead, marked non-retryable. The workflow catches it and recovery takes a fresh VM from the last checkpoint (G3-27). A checkpoint is the harness saving its work: it pushes the branch and saves the session."
+    "Now the real activity. workInSandbox does not do Nova's work itself. It starts the harness on the VM, and from then on it only follows it. Nova runs on the VM as a system service, so killing the orchestrator's worker does not touch Nova at all.",
+    "That makes a retry harmless. When the worker dies at 11:20, its heartbeats stop, and two minutes later Temporal starts attempt 2 on a worker from the new deploy. Attempt 2 first checks whether the harness is already running on the VM. It is, so it does not start a second Nova; it re-attaches, which means it simply follows the same harness again. Nova never notices the deploy.",
+    "The 7 days still has to be there, because the SDK requires a timeout. If it ever passed, the same thing would happen: a new attempt, which re-attaches. So no timeout in Temporal limits how long Nova may work. The timeouts only notice workers that died."
    ],
-   "because": "We start the harness only when it is not running; that check makes a retry re-attach instead of starting a second agent.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/activities/sandbox.ts (sketch)",
-    "text": "// ai-agents/orchestrator/src/activities/sandbox.ts (sketch of G3-20): start the harness once, then follow it\nimport { heartbeat } from \"@temporalio/activity\";\nimport { ApplicationFailure } from \"@temporalio/common\";\n\nexport async function workInSandbox(vm: Vm, task: Task): Promise<RunResult> {\n  if (!(await harnessRunning(vm))) await startHarness(vm, task); // systemd-run over SSM; a retry finds it running\n  for (;;) {\n    const beat = await broker.lastHeartbeat(task.runId); // the harness beats every 30 s from its own timer\n    if (beat.state !== \"running\") return beat.result; // done, needs_answer, preempted or failed\n    if (beat.ageMs > 5 * 60_000) throw ApplicationFailure.create({ type: \"SandboxDead\", nonRetryable: true });\n    heartbeat({ step: beat.step, checkpoint: beat.checkpoint }); // tells Temporal this worker is alive\n    await new Promise((r) => setTimeout(r, 30_000));\n  }\n}",
+    "file": "orchestrator/src/activities/run.ts",
+    "text": "import { ApplicationFailure, heartbeat } from \"@temporalio/activity\";\nimport { setTimeout as sleep } from \"node:timers/promises\";\n\nexport const workInSandbox = async (vm: Sandbox, task: Task): Promise<RunOutcome> => {\n  await ensureHarnessRunning(vm, task); // starts Nova only if it is not running yet\n  for (;;) {\n    const beat = await brokerInternal.get<Heartbeat>(`/internal/runs/${task.runId}/heartbeat`);\n    heartbeat({ step: beat.step, progress: beat.progress }); // to Temporal: this attempt is alive\n    if ([\"done\", \"needs_answer\", \"preempted\", \"failed\"].includes(beat.state)) return toOutcome(beat);\n    if (beat.age_s > 300) throw ApplicationFailure.create({ type: \"SandboxDead\", nonRetryable: true });\n    await sleep(30_000);\n  }\n};",
     "notes": [
      {
-      "line": 6,
-      "text": "Idempotent start: attempt 2 finds the systemd unit from attempt 1 and does not start another agent."
+      "line": 5,
+      "text": "The key line for retries: attempt 2 finds the harness from attempt 1 and does not start it again."
+     },
+     {
+      "line": 7,
+      "text": "The harness reports every 30 seconds to the broker, our service that holds the GitHub, Jira and Slack keys and makes those calls for runs. This line reads the last report."
      },
      {
       "line": 8,
-      "text": "The harness heartbeat comes from a timer in nova-worker, not the model loop, so slow thinking never looks dead."
+      "text": "The activity's own heartbeat to Temporal. If this worker dies, these stop, and after 2 minutes Temporal retries."
      },
      {
       "line": 9,
-      "text": "The activity returns when the agent stops for a reason: done, a question, a Spot warning or a failure."
+      "text": "The activity returns when Nova stops for a reason: the work is done, it has a question, the VM is being taken back, or it failed."
      },
      {
       "line": 10,
-      "text": "No harness heartbeat for 5 minutes: the VM is gone. Not retried here; the workflow's recovery decides."
-     },
-     {
-      "line": 11,
-      "text": "The activity's own heartbeat to Temporal. The checkpoint sha rides along, so the workflow knows the latest one."
-     },
-     {
-      "line": 12,
-      "text": "A plain timer is fine here: this is activity code, not workflow code."
+      "text": "A different problem: the VM itself went silent. Retrying cannot help, so the workflow gets the error and replaces the VM."
      }
     ]
    },
-   "callout": {
-    "kind": "wall",
-    "text": "No maxTurns, no maxBudgetUsd, no taskBudget, no time limit on an agent. Timeouts in Temporal only detect dead machines."
-   }
-  },
-  {
-   "h": "Always give the VM back",
-   "p": [
-    "Every VM a run claims must be released, whatever happens: success, failure, or a person pressing Stop. A try/finally does that. One detail: Stop cancels the workflow, and a cancelled workflow cannot start new activities.",
-    "CancellationScope.nonCancellable runs its function even while the run is being cancelled. So releaseSandbox still runs. The activities are idempotent: release accepts a VM that is already gone."
-   ],
-   "because": "We release in finally inside nonCancellable because a cancelled run must still free its VM.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (part)",
-    "text": "// ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (part of G3-24): workflow code\nconst inSandbox = async (task: Task, size: Size): Promise<RunResult> => {\n  const vm = await act.acquireSandbox({ runId: workflowInfo().runId, size, agent: \"nova\", jiraKey: t.key });\n  try {\n    await act.freshenSandbox(vm, base);\n    return await act.workInSandbox(vm, task); // heartbeats; no work-time limit\n  } finally {\n    await CancellationScope.nonCancellable(() => act.releaseSandbox(vm)); // always: no VM is left behind\n  }\n};",
-    "notes": [
-     {
-      "line": 3,
-      "text": "runId from workflowInfo(): deterministic, and unique for this run."
-     },
-     {
-      "line": 6,
-      "text": "The long call with LONG options. It returns when the agent is done or needs an answer."
-     },
-     {
-      "line": 7,
-      "text": "finally runs on success, on an error and on cancellation."
-     },
-     {
-      "line": 8,
-      "text": "nonCancellable: the release runs even when Stop cancelled the run."
-     }
+   "deeper": {
+    "h": "Go deeper: two heartbeats, and always giving the VM back",
+    "p": [
+     "There are two heartbeats in this picture, and they answer different questions. The harness sends one to the broker every 30 seconds, which answers \"is the VM alive?\". After 5 minutes of silence the activity throws SandboxDead, and the workflow takes a fresh VM from the last checkpoint; a later lesson covers that recovery. The activity sends the other to Temporal, which answers \"is the worker that follows the VM alive?\". After 2 minutes of silence Temporal retries the activity.",
+     "The workflow also makes sure every VM it claimed is released, whatever happens. It calls releaseSandbox in a finally block, inside CancellationScope.nonCancellable, because a run that a person stops is cancelled, and a cancelled workflow could not otherwise start a new activity. releaseSandbox accepts a VM that is already gone, so calling it twice is harmless."
     ]
-   }
-  },
-  {
-   "h": "Errors that come back to the workflow",
-   "p": [
-    "When an activity gives up, the workflow's await throws an ActivityFailure. Its cause holds the real error. For our own errors that is an ApplicationFailure with a type, such as SandboxDead or LabNotReady.",
-    "Recovery (G3-27) checks err instanceof ActivityFailure && err.cause instanceof ApplicationFailure and reads err.cause.type. Every other error is thrown again and fails the run. Match on the type string, never on the message text."
-   ],
-   "callout": {
-    "kind": "tip",
-    "text": "An activity is idempotent when running it twice has the same effect as once. claim finds its own VM by tag, release accepts a VM that is already gone. Write every activity this way."
    }
   }
  ],
  "lab": {
-  "title": "Kill an activity and watch it come back",
-  "youNeed": [
-   "~/temporal-lab from p7-1",
-   "The dev server running (temporal server start-dev --namespace ai-agents)"
+  "id": "p7-2",
+  "title": "Kill the worker in the middle of a long activity",
+  "minutes": 25,
+  "mode": "guided",
+  "needs": [
+   "Node 22+",
+   "The temporal CLI (brew install temporal)",
+   "The p7-1 lab folder, for worker.mjs and start.mjs",
+   "Three terminal tabs"
   ],
-  "worked": [
+  "goal": "Give a long activity a heartbeat, kill its worker in the middle, and see Temporal start a new attempt that continues from the last reported step.",
+  "guess": {
+   "q": "The build activity has startToCloseTimeout '7 days' and heartbeatTimeout '5 seconds'. You kill the worker at step 9 and start it again right away. What happens next?",
+   "options": [
+    {
+     "text": "Nothing for 7 days, because the attempt is still inside its timeout.",
+     "correct": false,
+     "why": "The heartbeat timeout fires first. 5 seconds without a heartbeat is enough for Temporal to end the attempt."
+    },
+    {
+     "text": "About 5 seconds after the last heartbeat, attempt 2 starts on the new worker and continues near step 9.",
+     "correct": true,
+     "why": "The heartbeats stop, Temporal ends the attempt after the heartbeat timeout, and attempt 2 reads the last reported step from the heartbeat details."
+    },
+    {
+     "text": "The new worker starts the build again at once, from step 1.",
+     "correct": false,
+     "why": "The service still thinks attempt 1 is running until the heartbeat timeout passes. And attempt 2 continues from the details, not from step 1."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "Add slowWork (the block above) to src/activities.ts. Put its two imports at the top of the file.",
-    "see": "(no output)"
+    "say": "Keep the dev server from the last lab running, or start it again in the first tab.",
+    "do": "temporal server start-dev",
+    "see": "Temporal Server:      localhost:7233\nTemporal UI:          http://localhost:8233"
    },
    {
-    "do": "Add to src/workflows.ts:\nconst { slowWork } = proxyActivities<typeof activities>({ startToCloseTimeout: \"7 days\", heartbeatTimeout: \"5 seconds\" });\nexport async function longJob(steps: number): Promise<string> { return slowWork(steps); }",
-    "see": "(no output; 5 seconds instead of 2 minutes so the lab is quick)"
+    "say": "In a second tab, make the lab folder. Install the packages again, this time with the activity package too, and borrow the worker and the client from p7-1.",
+    "do": "mkdir -p ~/academy-labs/p7-2 && cd ~/academy-labs/p7-2\nnpm init -y > /dev/null && npm pkg set type=module\nnpm install @temporalio/client@1.24.0 @temporalio/worker@1.24.0 @temporalio/workflow@1.24.0 @temporalio/activity@1.24.0\ncp ../p7-1/worker.mjs ../p7-1/start.mjs .",
+    "see": "added 150 packages, and audited 151 packages in 9s"
    },
    {
-    "do": "Tab 2: start the worker again: npx tsx src/worker.ts",
-    "see": "[INFO] Worker state changed { ... state: 'RUNNING' }"
+    "say": "Write the build activity. It does 20 steps of one second, prints each one and sends a heartbeat with the step number.",
+    "do": "cat > activities.mjs <<'EOF'\n// The build activity: 20 small steps of one second each, like Nova's build on the VM.\nimport { activityInfo, heartbeat } from '@temporalio/activity';\n\nexport const build = async (ticket) => {\n  const { attempt, heartbeatDetails } = activityInfo();\n  const done = heartbeatDetails ?? 0; // the last step a crashed attempt reported\n  console.log(`attempt ${attempt}: building ${ticket}, starting after step ${done}`);\n  for (let step = done + 1; step <= 20; step++) {\n    await new Promise((resolve) => setTimeout(resolve, 1000)); // one second of work\n    console.log(`  step ${step} done`);\n    heartbeat(step); // \"still alive, and this is how far I got\"\n  }\n  return `built ${ticket} in 20 steps`;\n};\nEOF"
    },
    {
-    "do": "Tab 3: temporal workflow start --namespace ai-agents --task-queue ai-agents-lab --type longJob --workflow-id lab:long --input 20",
-    "see": "Running execution:\n  WorkflowId  lab:long\n  Type        longJob   (output trimmed)"
+    "say": "Write the workflow. The 7 days is the safety net; the 5-second heartbeat timeout is the part that notices a dead worker.",
+    "do": "cat > workflows.mjs <<'EOF'\nimport { proxyActivities } from '@temporalio/workflow';\n\nconst { build } = proxyActivities({\n  startToCloseTimeout: '7 days', // a safety net, never a work limit\n  heartbeatTimeout: '5 seconds', // 2 minutes in our platform; short here so the lab is quick\n});\n\nexport async function ticketToPr(ticket) {\n  return build(ticket);\n}\nEOF"
    },
    {
-    "do": "About 8 seconds later, kill the worker hard: pkill -9 -f src/worker.ts",
-    "see": "(no output; tab 2 returns to the prompt)"
+    "say": "Start the worker in the second tab, then start a run in a third tab and watch the steps arrive.",
+    "do": "node worker.mjs\n\n# third tab\ncd ~/academy-labs/p7-2 && node start.mjs",
+    "see": "Worker is running. Ctrl+C stops it.\nattempt 1: building RH-1234, starting after step 0\n  step 1 done\n  step 2 done\n…"
    },
    {
-    "do": "Wait 10 seconds, then: temporal workflow describe --namespace ai-agents --workflow-id lab:long",
-    "see": "  State                 Scheduled\n  Attempt               2\n  LastFailure           {\"message\":\"activity Heartbeat timeout\", ...}\n  LastHeartbeatDetails  [8]   (output trimmed)"
+    "say": "Around step 8, kill the worker hard from the third tab. Do not use Ctrl+C: it lets the worker shut down politely, and a crash or a deploy does not.",
+    "do": "pkill -9 -f \"node worker.mjs\"",
+    "see": "(no output; in the worker tab the process is gone)"
    },
    {
-    "do": "Tab 2: npx tsx src/worker.ts",
-    "see": "attempt 2: resuming after step 8"
+    "say": "Ask Temporal about the run. Do it twice, a few seconds apart, and compare the pending activity: attempt 1 is ended after 5 seconds of silence, and attempt 2 waits for a worker.",
+    "do": "temporal workflow describe -w nova:RH-1234",
+    "see": "  Type                  build\n  State                 Scheduled\n  Attempt               2\n  LastHeartbeatTime     9 seconds ago\n  LastFailure           {\"message\":\"activity Heartbeat timeout\", …}\n  LastHeartbeatDetails  [8]"
    },
    {
-    "do": "Tab 3: temporal workflow result --namespace ai-agents --workflow-id lab:long",
-    "see": "Results:\n  Status          COMPLETED\n  Result          \"did 20 steps\""
+    "say": "Start the worker again in the second tab. Attempt 2 reads the details and continues near where attempt 1 stopped.",
+    "do": "node worker.mjs",
+    "see": "Worker is running. Ctrl+C stops it.\nattempt 2: building RH-1234, starting after step 8\n  step 9 done\n…\n  step 20 done"
    },
    {
-    "do": "Break a rule on purpose. Add import { readFileSync } from \"fs\"; to src/workflows.ts, use it in any exported function, and start the worker.",
-    "see": "Error: Your Workflow code (or a library used by your Workflow code) is importing the following disallowed modules: ... 'fs'"
-   },
-   {
-    "do": "Remove that import and function again",
-    "see": "The worker starts normally"
+    "say": "Get the result. Only one attempt shows in the history, the one that finished; the failed attempt is in LastFailure while it is pending.",
+    "do": "temporal workflow result -w nova:RH-1234",
+    "see": "Results:\n  Status          COMPLETED\n  Result          \"built RH-1234 in 20 steps\"\n  ResultEncoding  json/plain"
    }
   ],
-  "faded": "Give slowWork's proxy retry: { maximumAttempts: 1 } and repeat the kill with workflow ID lab:long-2. Left to you: predict the run's status before you look, then check it with temporal workflow describe.",
-  "alone": "Write an idempotent activity claimSlot(runId) that creates ~/temporal-lab/claims/<runId>.txt only if it does not exist, and returns 'claimed' or 'already mine'. Call it twice in a new workflow claimTwice and return both answers. Run it and check that the second call says 'already mine' and no error happened.",
-  "done": "A killed attempt came back as attempt 2 from its last heartbeat. The worker refused to bundle a workflow that imports fs."
+  "build": "Write a second long activity, runChecks(ticket), that runs the 10 checks of the QA plan, one per second. It prints \"check <n> passed\", sends a heartbeat with the number of the last passed check, and on a retry continues after the last reported check. Call it in the workflow after build and return both results. Restart the worker, start a run for RH-1235, kill the worker while the checks run, and start it again.",
+  "checks": [
+   "After the hard kill, temporal workflow describe shows Attempt 2 and a LastFailure that says activity Heartbeat timeout.",
+   "The restarted worker prints \"attempt 2: building RH-1234, starting after step N\", where N is a few steps or less below where the worker died.",
+   "temporal workflow result -w nova:RH-1234 shows Status COMPLETED and \"built RH-1234 in 20 steps\".",
+   "For your build: the worker prints \"attempt 2: checking RH-1235, starting after check N\" with N above 0, and the result ends with \"10 of 10 checks passed\"."
+  ],
+  "solution": {
+   "lang": "javascript",
+   "file": "activities.mjs and workflows.mjs",
+   "text": "// activities.mjs: a second long activity that heartbeats its progress\nexport const runChecks = async (ticket) => {\n  const { attempt, heartbeatDetails } = activityInfo();\n  const passed = heartbeatDetails ?? 0;\n  console.log(`attempt ${attempt}: checking ${ticket}, starting after check ${passed}`);\n  for (let check = passed + 1; check <= 10; check++) {\n    await new Promise((resolve) => setTimeout(resolve, 1000));\n    console.log(`  check ${check} passed`);\n    heartbeat(check);\n  }\n  return `${ticket}: 10 of 10 checks passed`;\n};\n\n// workflows.mjs\nconst { build, runChecks } = proxyActivities({ startToCloseTimeout: '7 days', heartbeatTimeout: '5 seconds' });\n\nexport async function ticketToPr(ticket) {\n  const built = await build(ticket);\n  const checked = await runChecks(ticket);\n  return `${built}; ${checked}`;\n}"
+  },
+  "fix": "A teammate found the 7-day timeout scary and wrote \"a build should be quick\", so they changed the workflow's options to startToCloseTimeout: '10 seconds' and removed heartbeatTimeout. Make that change, restart the worker and start a run for RH-1300. The 20-second build never finishes in one attempt: the worker prints attempt 2, attempt 3, attempt 4, and temporal workflow describe -w nova:RH-1300 shows a LastFailure of activity StartToClose timeout. That is a time limit on the work, the thing our platform never allows. Put the safety net and the heartbeat back, then stop the old run with temporal workflow terminate -w nova:RH-1300.",
+  "explain": [
+   "Why does a 7-day startToCloseTimeout never cut off Nova's work, even when a build runs for 8 days?",
+   "After the hard kill, why did attempt 2 not start the moment you started the worker again?",
+   "Attempt 2 repeated a step that attempt 1 had already done. Why, and what does it mean for how you write each step?"
+  ],
+  "done": "A run survived a hard kill of its worker in the middle of a long activity, the new attempt continued near the last reported step, and you stopped the worker and the dev server."
  },
- "quiz": [
+ "check": [
   {
-   "q": "workInSandbox reaches its 7-day startToCloseTimeout while the agent is still working. What happens?",
+   "q": "workInSandbox follows a 70-minute build. Which options fit it?",
    "options": [
     {
-     "text": "The agent on the VM is stopped and the work is lost",
+     "text": "startToCloseTimeout: '5 minutes', like every other call",
      "correct": false,
-     "why": "Temporal never touches the VM; only the attempt that follows the agent ends."
+     "why": "Every attempt would be cut off after 5 minutes and retried, so the build could never finish in one attempt. That is a time limit on the work."
     },
     {
-     "text": "The workflow fails with a timeout error",
-     "correct": false,
-     "why": "With retries allowed, a timed-out attempt is retried, not reported as a failure."
-    },
-    {
-     "text": "The attempt ends, Temporal retries, and the new attempt finds the harness running and follows it",
+     "text": "startToCloseTimeout: '7 days' and heartbeatTimeout: '2 minutes'",
      "correct": true,
-     "why": "That is re-attach: the timeout is a safety net, never a work limit."
+     "why": "The heartbeat notices a dead worker within 2 minutes, and the 7 days is only the timeout the SDK requires. A retry re-attaches either way."
+    },
+    {
+     "text": "startToCloseTimeout: '7 days' and nothing else",
+     "correct": false,
+     "why": "A worker that dies at minute 20 would not be noticed for almost 7 days, and the run would look busy the whole time."
     }
    ]
   },
   {
-   "q": "Which error type belongs in nonRetryableErrorTypes?",
+   "q": "The orchestrator is deployed while Nova builds, and attempt 2 of workInSandbox starts on a new worker. Why doesn't a second Nova start on the VM?",
    "options": [
     {
-     "text": "StoppedByPerson",
+     "text": "Temporal kills the harness when the first attempt ends",
+     "correct": false,
+     "why": "Temporal knows nothing about the VM. It only ends the attempt in its own records."
+    },
+    {
+     "text": "Temporal sends attempt 2 to the same worker process",
+     "correct": false,
+     "why": "That worker is gone. Attempt 2 runs on any worker that listens on the queue."
+    },
+    {
+     "text": "workInSandbox first checks whether the harness is already running, and only follows it if it is",
      "correct": true,
-     "why": "A person's decision must not be retried; it is in NEVER_RETRY."
-    },
-    {
-     "text": "ThrottlingException from AWS",
-     "correct": false,
-     "why": "Throttling is a glitch; back-off retries are exactly the answer."
-    },
-    {
-     "text": "ECONNRESET from a Jira call",
-     "correct": false,
-     "why": "A dropped connection should be retried with back-off by PEOPLE_APIS."
+     "why": "That check makes the activity safe to run twice. A retry re-attaches to the running harness instead of starting another agent."
     }
    ]
   },
   {
-   "q": "Why is releaseSandbox called inside CancellationScope.nonCancellable in finally?",
+   "q": "The build heartbeats after every step. The worker dies just after step 9, and attempt 2 says \"starting after step 8\". What happened?",
    "options": [
     {
-     "text": "To make the release faster",
-     "correct": false,
-     "why": "It changes when the call may run, not how fast it is."
-    },
-    {
-     "text": "So a run that a person stopped still frees its VM",
+     "text": "The SDK sends only some heartbeats, so the last details Temporal received were from step 8",
      "correct": true,
-     "why": "Stop cancels the workflow; without nonCancellable the release activity would not start."
+     "why": "Heartbeats are sent at most every 80% of the heartbeat timeout. A retry may repeat a little work, so each step must be safe to do twice."
     },
     {
-     "text": "So the release is retried forever",
+     "text": "Temporal always goes back one step, to be safe",
      "correct": false,
-     "why": "Retries come from the retry policy, not from the scope."
+     "why": "Temporal gives attempt 2 exactly the last details it received. It does not adjust them."
+    },
+    {
+     "text": "Step 9 failed, so Temporal removed it from the details",
+     "correct": false,
+     "why": "Nothing failed inside the step. The worker was killed before the heartbeat for step 9 was sent."
     }
    ]
   }
  ],
- "recall": [
-  "In p7-1, what does a worker do when it gets a task for a run it has never seen?",
-  "In p1-2, why do we run git with execFile and an argv instead of a shell string?"
- ],
- "videos": [
-  {
-   "title": "Temporal for React Developers",
-   "url": "https://www.youtube.com/watch?v=Cxaf8E00GMM",
-   "channel": "Temporal",
-   "minutes": 27,
-   "why": "TypeScript SDK introduced at a React conference, for frontend developers."
-  },
-  {
-   "title": "Temporal Live Coding Demo: Handling Failures & Human Interaction",
-   "url": "https://www.youtube.com/watch?v=dNVmRfWsNkM",
-   "channel": "Temporal",
-   "minutes": 14,
-   "why": "Live-codes retries, worker crashes, signals and a timer race."
-  }
- ],
+ "platform": {
+  "p": [
+   "Every activity in the orchestrator gets its options from one file, policies.ts. SHORT, 5 minutes, is for calls to Jira, Slack, GitHub and AWS. LONG is 7 days with a 2-minute heartbeat, for workInSandbox and anything else that follows a VM. Each kind of call also has its own retry policy, and errors that are decisions, such as StoppedByPerson or ScopeDenied, are never retried.",
+   "workInSandbox starts the harness as a systemd unit over SSM, not as a long SSM command, because SSM commands end after 48 hours at most and runs have no time limit. On a retry it re-attaches to that unit. The orchestrator can therefore be deployed at any time, even while several agents are in the middle of their builds."
+  ],
+  "tickets": [
+   {
+    "key": "G3-29",
+    "why": "The SHORT and LONG presets, the retry policy per kind of call and the never-retry error types."
+   },
+   {
+    "key": "G3-20",
+    "why": "workInSandbox: start the harness once, follow it with heartbeats, re-attach on a retry."
+   },
+   {
+    "key": "G3-24",
+    "why": "ticketToPr calls the sandbox activities with LONG and always releases the VM in finally."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "deterministic",
-   "plain": "Makes the same calls in the same order on every replay; no I/O, real clock or randomness."
-  },
-  {
-   "term": "proxyActivities",
-   "plain": "Gives workflow code typed stand-ins for activities, with timeouts and a retry policy."
-  },
-  {
-   "term": "startToCloseTimeout",
-   "plain": "The longest one attempt of an activity may run; required, and for us only a safety net."
-  },
-  {
-   "term": "heartbeat",
-   "plain": "A call from a running activity that says it is alive, optionally with progress details."
-  },
-  {
-   "term": "heartbeatTimeout",
-   "plain": "The longest gap allowed between heartbeats before the attempt is ended and retried."
+   "term": "attempt",
+   "plain": "One run of an activity's code. A retry is a new attempt of the same activity."
   },
   {
    "term": "retry policy",
-   "plain": "How Temporal retries a failed attempt: waits, growth, maximum and errors never to retry."
+   "plain": "The rule for retries: how long to wait between attempts, and when to stop."
   },
   {
-   "term": "idempotent",
-   "plain": "Safe to run twice: the second run has the same effect as the first."
+   "term": "startToCloseTimeout",
+   "plain": "The longest one attempt may run before Temporal ends it and retries."
+  },
+  {
+   "term": "heartbeat",
+   "plain": "A small message a running activity sends to say it is alive, often with its progress."
+  },
+  {
+   "term": "heartbeatTimeout",
+   "plain": "The longest gap allowed between two heartbeats before Temporal ends the attempt."
+  },
+  {
+   "term": "re-attach",
+   "plain": "A new attempt following work that is already running, instead of starting it again."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-29",
-   "why": "policies.ts is the presets and retry policies from this lesson, in one file every workflow imports."
+   "q": "Write the two presets from policies.ts from memory, and say what each is for.",
+   "a": "SHORT: startToCloseTimeout 5 minutes, for calls to Jira, Slack, GitHub and AWS. LONG: startToCloseTimeout 7 days and heartbeatTimeout 2 minutes, for activities that follow a VM."
   },
   {
-   "key": "G3-20",
-   "why": "workInSandbox starts the harness once and follows its heartbeat, which makes a retry re-attach."
+   "q": "A teammate asks for a 2-hour startToCloseTimeout on workInSandbox \"so runaway agents stop\". What do you answer?",
+   "a": "That is a time limit on the work, which the platform never uses; the timeout would only cause a retry that re-attaches anyway. Dead workers are caught by the heartbeat, and runaway agents by the progress watcher and the cost backstop."
   },
   {
-   "key": "G3-24",
-   "why": "ticketToPr's inSandbox uses try/finally with nonCancellable so every VM is released."
-  },
-  {
-   "key": "G3-27",
-   "why": "Recovery catches ActivityFailure whose cause is an ApplicationFailure of type SandboxDead."
+   "q": "Why must a long activity be safe to run twice?",
+   "a": "Retries happen after crashes and deploys, and heartbeat details can be a little behind, so a new attempt may repeat work. workInSandbox checks for a running harness before it starts one."
   }
  ],
- "remember": "Workflow code only decides. Activities do the work, heartbeat, and are safe to retry, so a timeout re-attaches instead of cutting work off."
+ "remember": "A long activity sends heartbeats so a dead worker is noticed in minutes; its long timeout is only a safety net, and a retry re-attaches to the work."
 }

@@ -1,414 +1,335 @@
 {
+ "v": 2,
  "id": "p4-6",
  "title": "Checks that keep infra safe",
- "minutes": 45,
+ "minutes": 50,
  "youNeed": [
+  "p4-1",
   "p4-3",
   "p2-3"
  ],
- "bridge": "Infra checks are like ESLint and a type check for HCL: they run on every push and need no running system. Except the last step, a plan, needs read access to the real cloud. So CI gets a role that can read configuration and nothing else, and applying stays a person's job.",
- "intro": "Agents will soon propose infrastructure changes, and today infra CI only checks formatting. This lesson adds the checks that need no keys: tofu validate, tflint and trivy. Then it adds read-only plans on PRs with a role that cannot change or read data. Last come the walls that keep agents from ever applying.",
- "picture": {
-  "caption": "Cheap keyless checks run on every push; a read-only plan is posted on the PR; a person applies.",
-  "nodes": [
-   {
-    "id": "pr",
-    "label": "infra PR (a person's or an agent's)",
-    "kind": "file"
-   },
-   {
-    "id": "lint",
-    "label": "fmt, validate, tflint (no keys)",
-    "kind": "check"
-   },
-   {
-    "id": "trivy",
-    "label": "trivy config (HIGH, CRITICAL)",
-    "kind": "check"
-   },
-   {
-    "id": "plan",
-    "label": "terragrunt plan as TerraformPlanRole",
-    "kind": "check"
-   },
-   {
-    "id": "comment",
-    "label": "one plan comment per unit",
-    "kind": "file"
-   },
-   {
-    "id": "person",
-    "label": "DevOps reviewer applies",
-    "kind": "person"
-   }
+ "map": "github",
+ "hook": {
+  "story": [
+   "An agent opens a pull request in the infrastructure repo. It changes the module for the runs bucket, the S3 bucket where every run keeps its transcript, and the diff is short. CI is green, because CI in that repo only checks formatting. Hidden in the change are three small things: a security group rule that opens port 22 to the whole internet \"for debugging\", a bucket with no block on public access, and a new retention_days variable that nothing uses, so transcripts would be kept forever instead of 30 days.",
+   "A tired reviewer approves, and the next apply makes all three real. A revert can change the code back later, but it cannot change back what happened in between."
   ],
-  "steps": [
-   {
-    "from": "pr",
-    "to": "lint",
-    "text": "every push: format, types and references, provider rules"
-   },
-   {
-    "from": "pr",
-    "to": "trivy",
-    "text": "every push: insecure settings such as public buckets or open ports"
-   },
-   {
-    "from": "pr",
-    "to": "plan",
-    "text": "pull_request: plan the changed units with a read-only role"
-   },
-   {
-    "from": "plan",
-    "to": "comment",
-    "text": "posts 'Plan: X to add, Y to change, Z to destroy' and the addresses"
-   },
-   {
-    "from": "comment",
-    "to": "person",
-    "text": "a person reads it and applies; agents never apply"
-   }
-  ]
+  "question": "What can check an infrastructure change before anyone applies it, and why must the one who applies it always be a person?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Start: what infra CI checks today",
+   "h": "Four checks that need no keys",
    "p": [
-    "Today the infrastructure repo's CI is terrugrunt-lint.yml (the file name has that typo). It runs tofu fmt -check and terragrunt hcl format --check. Nothing checks types, insecure settings or the effect of a change. Plans are run by hand over VPN and pasted into PRs.",
-    "That was fine while only DevOps wrote infra. G7-17 adds checks that need no cloud keys, so they can run on every push, even on an agent's branch."
+    "Most mistakes in HCL can be found by reading the files, without any cloud account, which means the checks can run on every push, even on an agent's branch. They come in four layers, and each one catches what the one before it cannot see.",
+    "tofu fmt -check only looks at layout. tofu validate checks meaning: types, references to things that exist, required arguments. It is tsc for HCL, and with init -backend=false it needs no state and no credentials. But validate only knows the provider's schema, not your intentions. tflint adds rules on top: an input variable that is declared but never used, a missing version constraint, and with its AWS ruleset an instance type that does not exist, such as m8i.2xlage. In the story, tflint is the check that would have asked why retention_days is never used.",
+    "The fourth layer looks for risky settings. trivy config, and checkov, which does the same job with its own rules, know what an open security group or a public bucket looks like and report each one with an ID and a severity, such as AWS-0107 (HIGH): Security group rule allows unrestricted ingress from any IP address. Our CI runs trivy and fails on HIGH and CRITICAL findings. One scanner is enough, and running two mostly doubles the noise."
    ],
-   "because": "We run the keyless checks first because they are cheap, safe on any branch, and catch most mistakes.",
    "code": {
     "lang": "bash",
-    "file": "what terrugrunt-lint.yml runs today",
-    "text": "# formatting only; exit code 3 and a file list when something is off\ntofu fmt -check -recursive\nterragrunt hcl format --check",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Formatting is checked, not meaning: a wrong type or an open port passes."
-     },
-     {
-      "line": 2,
-      "text": "The same tofu fmt you ran in p4-1, for every .tf file."
-     },
-     {
-      "line": 3,
-      "text": "The same for terragrunt.hcl files."
-     }
-    ]
-   }
-  },
-  {
-   "h": "tofu validate on every module",
-   "p": [
-    "tofu validate checks types, references and required arguments, like tsc for HCL. With tofu init -backend=false it needs no state and no credentials, only the providers.",
-    "G7-17's new workflow, terraform-checks.yml, loops over modules/*/ and validates each one. It reports every failing module, not only the first. Terragrunt units are covered later by plans."
-   ],
-   "because": "We validate every module in a loop because one broken module should not hide another.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/terraform-checks.yml, the validate job (G7-17)",
-    "text": "jobs:\n  validate:\n    name: Validate modules\n    runs-on: infrastructure-runner-set\n    steps:\n      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0\n      - name: Install Tofu\n        env:\n          TENV_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n        run: tenv tofu install\n      - name: tofu validate every module (no backend, no cloud keys)\n        run: |\n          status=0\n          for dir in modules/*/; do\n            (cd \"$dir\" && tofu init -backend=false -input=false -no-color >/dev/null && tofu validate -no-color) \\\n              || { echo \"::error file=${dir}::tofu validate failed\"; status=1; }\n          done\n          exit $status",
-    "notes": [
-     {
-      "line": 4,
-      "text": "The repo's own runners, like its other workflows. Actions are pinned by SHA (p2-2)."
-     },
-     {
-      "line": 10,
-      "text": "tenv is a version manager for OpenTofu and Terraform, like nvm for Node. It installs the OpenTofu version the repo pins."
-     },
-     {
-      "line": 15,
-      "text": "One subshell per module, so a cd never leaks into the next one."
-     },
-     {
-      "line": 16,
-      "text": "::error file=...:: makes GitHub show the failure on the file in the PR."
-     },
-     {
-      "line": 18,
-      "text": "Fail at the end if any module failed."
-     }
-    ]
-   }
-  },
-  {
-   "h": "tflint: what validate cannot see",
-   "p": [
-    "validate knows the provider's schema, not AWS's rules. tflint adds rulesets that do: the aws ruleset knows the real instance types, so a typo such as m8i.2xlage fails. The terraform ruleset flags unused variables and deprecated syntax.",
-    "G7-17 adds .tflint.hcl at the repo root with the aws and google rulesets, then runs tflint --init and tflint --recursive. GITHUB_TOKEN is passed so plugin downloads are not rate-limited."
-   ],
-   "because": "We lint with the provider rulesets because a wrong instance type passes validate and only fails at apply.",
-   "code": {
-    "lang": "hcl",
-    "file": ".tflint.hcl (repo root, sketch for G7-17)",
-    "text": "config {\n  call_module_type = \"local\"   # also lint the local modules a unit or module calls\n}\n\nplugin \"terraform\" {\n  enabled = true\n  preset  = \"recommended\"\n}\n\nplugin \"aws\" {\n  enabled = true\n  version = \"<pin>\"\n  source  = \"github.com/terraform-linters/tflint-ruleset-aws\"\n}\n\nplugin \"google\" {\n  enabled = true\n  version = \"<pin>\"\n  source  = \"github.com/terraform-linters/tflint-ruleset-google\"\n}",
+    "file": "what infrastructure CI runs on every push",
+    "text": "# 1. Layout: the same formatting everywhere (exit 3 and a file list if not)\ntofu fmt -check -recursive\nterragrunt hcl format --check\n\n# 2. Meaning: types, references, required arguments (like tsc for HCL)\ntofu init -backend=false && tofu validate\n\n# 3. Rules the language does not know: unused variables, bad instance types\ntflint --recursive\n\n# 4. Risky settings: open security groups, public or unencrypted buckets\ntrivy config --severity HIGH,CRITICAL modules/ terraform/ multi_tenant/",
     "notes": [
      {
       "line": 2,
-      "text": "Follow module calls inside the repo. Check the option's values in the tflint docs."
+      "text": "This and the next line are all the repo's CI checked before these checks were added."
      },
      {
-      "line": 7,
-      "text": "The recommended set: unused declarations, deprecated syntax, missing version pins."
+      "line": 6,
+      "text": "-backend=false: no state and no cloud keys. Only the provider is downloaded."
+     },
+     {
+      "line": 9,
+      "text": "tflint reads .tflint.hcl at the repo root to know which rulesets to load."
      },
      {
       "line": 12,
-      "text": "Pin the ruleset version, like any dependency."
-     }
-    ]
-   }
-  },
-  {
-   "h": "trivy config: insecure settings",
-   "p": [
-    "trivy config scans Terraform for misconfigurations. Examples are a bucket without a public access block, a security group open to the world, or encryption without our own key. Each finding has an ID, such as AWS-0107, and a severity.",
-    "G7-17 runs it over modules/, terraform/ and multi_tenant/ with --severity HIGH,CRITICAL. For two weeks it is advisory (exit code 0) while Security goes through the findings. Then new HIGH and CRITICAL findings fail the job. checkov is another scanner with the same purpose; the ticket picks trivy, and one is enough."
-   ],
-   "because": "We scan in CI because insecure settings look normal in a diff and a reviewer will miss one sooner or later.",
-   "code": {
-    "lang": "hcl",
-    "file": "~/academy/checks/modules/runs-bucket/main.tf (a bad module, on purpose)",
-    "text": "terraform {\n  required_providers {\n    aws = { source = \"hashicorp/aws\", version = \"6.64.0\" }\n  }\n}\n\nvariable \"name\" { type = string }\n\nresource \"aws_s3_bucket\" \"runs\" {\n  bucket = var.name\n}\n\nresource \"aws_security_group\" \"sandbox\" {\n  name        = \"sandbox\"\n  description = \"lab: far too open\"\n  ingress {\n    from_port   = 22\n    to_port     = 22\n    protocol    = \"tcp\"\n    cidr_blocks = [\"0.0.0.0/0\"]\n  }\n}",
-    "notes": [
-     {
-      "line": 9,
-      "text": "No public access block and no KMS key: four public-access findings and one encryption finding."
-     },
-     {
-      "line": 16,
-      "text": "SSH open to the internet: the opposite of a sandbox security group (p3-2)."
-     },
-     {
-      "line": 20,
-      "text": "0.0.0.0/0 is the whole internet."
+      "text": "Scans the HCL files only. Nothing is planned and no AWS call is made."
      }
     ]
    },
-   "see": "Failures: 6 (HIGH: 6, CRITICAL: 0)\nAWS-0086 (HIGH): No public access block so not blocking public acls\nAWS-0087 (HIGH): No public access block so not blocking public policies\nAWS-0091 (HIGH): No public access block so not blocking public acls\nAWS-0093 (HIGH): No public access block so not restricting public buckets\nAWS-0107 (HIGH): Security group rule allows unrestricted ingress from any IP address.\nAWS-0132 (HIGH): Bucket does not encrypt data with a customer managed key."
+   "see": "$ trivy config --severity HIGH,CRITICAL --quiet modules/   (the module from the story)\nFailures: 6 (HIGH: 6, CRITICAL: 0)\nAWS-0086 (HIGH): No public access block so not blocking public acls\nAWS-0087 (HIGH): No public access block so not blocking public policies\nAWS-0091 (HIGH): No public access block so not blocking public acls\nAWS-0093 (HIGH): No public access block so not restricting public buckets\nAWS-0107 (HIGH): Security group rule allows unrestricted ingress from any IP address.\nAWS-0132 (HIGH): Bucket does not encrypt data with a customer managed key.",
+   "deeper": {
+    "h": "Go deeper: what validate catches",
+    "p": [
+     "validate is the check you will meet most often, because it runs in a second. Rename a variable in one place and forget the other, and it stops with Reference to undeclared input variable, the line, and the name it could not find. It does not know whether the value is sensible: a warm pool of 50 or an instance type with a typo passes validate. That is what validation blocks in the module (lesson p4-3) and tflint are for."
+    ]
+   }
   },
   {
-   "h": ".trivyignore: every exception has an owner",
+   "h": "Every exception has an owner",
    "p": [
-    "Some findings are accepted for a while. trivy reads .trivyignore from the working folder: one finding ID per line, with an optional expiry date. G7-17 asks for an owner and a reason on every line, and every ignored rule listed in the PR description.",
-    "An expiry turns 'accepted' into 'accepted until': on that date the finding fails again and someone must decide anew."
+    "Some findings are accepted for a while. The runs bucket, for example, might wait one more PR for its own encryption key. trivy reads a .trivyignore file with one finding ID per line, and we add two rules to it: a comment above each line that names an owner and a reason, and an expiry date, after which the finding fails again and someone must decide again. An ignore without an owner is how a temporary exception becomes permanent.",
+    "The checks' own files are a target too. If an agent could add AWS-0107 to .trivyignore, it could make its own open security group pass. So the check workflows, .tflint.hcl and .trivyignore are protected paths: an agent's change to them is refused, and a person who did not ask for the work must approve any PR at all. Agents never change the checks they are judged by."
    ],
-   "because": "We give every ignore an owner and a date because unowned exceptions become permanent holes.",
    "code": {
     "lang": "text",
-    "file": "~/academy/checks/.trivyignore",
-    "text": "# owner=devops reason=G3-04 adds the bucket's own KMS key in the next PR\nAWS-0132 exp:2026-12-31\n# every entry: who owns it, why it is acceptable, and until when (G7-17)",
+    "file": ".trivyignore",
+    "text": "# Every line: who owns it, why it is acceptable, and until when.\n# owner=devops reason=the runs bucket gets its own KMS key in the next PR\nAWS-0132 exp:2026-12-31",
     "notes": [
      {
-      "line": 1,
-      "text": "A comment line: who owns this exception and why it is acceptable now."
-     },
-     {
       "line": 2,
-      "text": "The finding ID, and the date after which trivy reports it again."
+      "text": "Who decided, and why, written where the next reader will look."
      },
      {
       "line": 3,
-      "text": "Security reviews this file; agents may not change it (section 7)."
+      "text": "After this date the finding fails CI again."
      }
     ]
    }
   },
   {
-   "h": "Read-only plans on PRs",
+   "h": "A plan that can only read",
    "p": [
-    "A plan needs to read the real account. G7-30 adds TerraformPlanRole to each account: ReadOnlyAccess plus an explicit Deny on data reads (s3:GetObject, secrets, parameters, kms:Decrypt). An OIDC role in inf, GitHubActionsTerraformPlan, may assume it; it trusts only repo:RhinoHealth/infrastructure:pull_request.",
-    "G7-32's workflow plans the units a PR changes, as that role. account.hcl reads the role name from TG_ROLE_NAME. The role can write nothing, so plans run with -lock=false. Plans never use -out, because a plan file holds secret values in plain text. One sticky comment per PR shows each unit's summary line."
+    "Static checks cannot tell you what a change will do to the real account: whether a VPC gets replaced or a bucket is renamed. Only a plan can, and a plan needs to read the account. So the pull request workflow plans each changed unit with its own role, TerraformPlanRole, in every account. It has AWS's ReadOnlyAccess with an explicit deny on reading data: objects in buckets, secrets, parameters and decryption keys. It can describe the account but change nothing and read nothing secret.",
+    "Only pull_request runs of the infrastructure repo can get that role, through OIDC, the way a GitHub Actions run gets short-lived AWS credentials without any stored key (lesson p2-3). Because the role can write nothing, the plan runs with -lock=false, since even a state lock is a write. And it never saves a plan file with -out, because a plan file holds every value in plain text, secrets included. The result is one comment on the PR with each unit's Plan: line and the addresses that change, so the reviewer reads the effect next to the diff."
    ],
-   "because": "We plan with a role that cannot write because then a malicious PR can at worst read configuration, never change the cloud.",
    "code": {
     "lang": "yaml",
-    "file": ".github/workflows/terragrunt-plan.yml (G7-32, trimmed)",
-    "text": "on:\n  pull_request:\n    paths: ['terraform/**', 'modules/**', 'multi_tenant/**', 'single_tenant/**']\n\npermissions: { id-token: write, contents: read, pull-requests: write }\n\njobs:\n  plan:\n    runs-on: infrastructure-runner-set\n    env:\n      TG_ROLE_NAME: TerraformPlanRole  # read by account.hcl (G7-30); never TerraformDeploymentRole here\n    steps:\n      - uses: aws-actions/configure-aws-credentials@<sha> # pin by SHA\n        with: { aws-region: us-east-1, role-to-assume: \"arn:aws:iam::123456789012:role/GitHubActionsTerraformPlan\" }\n      - name: Plan the changed units (read-only, no lock, no plan files)\n        run: |\n          git diff --name-only origin/main...HEAD | grep 'terragrunt.hcl$' | xargs -r -n1 dirname | sort -u > units.txt\n          while read -r unit; do\n            (cd \"$unit\" && terragrunt plan -lock=false -input=false -no-color) > \"plan-${unit//\\//_}.txt\" 2>&1 || true\n          done < units.txt\n      - name: One comment with the summary per unit\n        env: { GH_TOKEN: \"${{ github.token }}\" }\n        run: .github/scripts/post_plan_comment.sh units.txt",
+    "file": ".github/workflows/terragrunt-plan.yml (trimmed)",
+    "text": "on:\n  pull_request:\n    paths: [\"terraform/**\", \"modules/**\", \"multi_tenant/**\"]\n\npermissions: { id-token: write, contents: read, pull-requests: write }\n\njobs:\n  plan:\n    runs-on: infrastructure-runner-set\n    env:\n      TG_ROLE_NAME: TerraformPlanRole # read by account.hcl; never the deployment role here\n    steps:\n      - uses: aws-actions/configure-aws-credentials@<sha> # pinned by SHA\n        with:\n          role-to-assume: arn:aws:iam::<inf-account>:role/GitHubActionsTerraformPlan\n          aws-region: us-east-1\n      - name: Plan each changed unit (read-only, no lock, no plan files)\n        run: |\n          while read -r unit; do\n            (cd \"$unit\" && terragrunt plan -lock=false -input=false -no-color) > \"plan-${unit//\\//_}.txt\" 2>&1 || true\n          done < changed-units.txt\n      - name: One comment with each unit's Plan line\n        run: .github/scripts/post_plan_comment.sh changed-units.txt",
     "notes": [
      {
-      "line": 5,
-      "text": "id-token: write lets the job get an OIDC token (p2-3). No stored AWS keys."
+      "line": 2,
+      "text": "Pull requests only. There is no workflow_dispatch and no apply job anywhere in this file."
      },
      {
       "line": 11,
-      "text": "account.hcl builds the role ARN from this, so every unit assumes the plan role."
+      "text": "account.hcl reads this variable to pick the role to assume, so plans can never use the role that applies."
      },
      {
-      "line": 14,
-      "text": "The OIDC role in inf; it trusts pull_request runs of this repo only (G7-30)."
+      "line": 15,
+      "text": "The OIDC role trusts only pull_request runs of RhinoHealth/infrastructure."
      },
      {
-      "line": 17,
-      "text": "Units are folders with a changed terragrunt.hcl. Module-only changes need Terragrunt's 'units reading' option."
-     },
-     {
-      "line": 19,
-      "text": "-lock=false because the role cannot write a lock; no -out because plan files hold secrets."
+      "line": 20,
+      "text": "-lock=false because the role cannot write a lock; no -out because a plan file holds secrets."
      }
     ]
    }
   },
   {
-   "h": "Walls for agents",
+   "h": "Why the last step is a person",
    "p": [
-    "An agent may write HCL, run fmt, validate, tflint and trivy, and read the plan comment. It never runs apply, destroy, sync or workflow_dispatch. Nothing in these workflows can apply, and agents hold no role that could.",
-    "Agents also never change the checks they are judged by. G7-17 asks for terraform-checks.yml, .tflint.hcl and .trivyignore to be on the protected paths agents may not edit (G0, G3). G0 must first narrow Vault's gha-runners role and add a read-only Vault role. Until then, PR plans skip the units that need Vault or EKS, our Kubernetes clusters."
+    "Every check above can be wrong or incomplete, and an apply changes the real world at once. A git revert restores the code, but it does not un-delete a database, and it does not undo what someone did through an open port in the meantime. So the rule for infrastructure is the same as for merging: agents may write HCL, run every check and read the plan comment, but they never apply, destroy, sync or dispatch a workflow. A person reads the plan, starting with the destroys and replacements, and applies.",
+    "This rule does not depend on an agent's instructions, because nothing an agent holds can apply. No agent has a role that can write to any account, the PR workflow can only plan, and the GitHub App that agents use has no permission to change or dispatch workflows. An agent that is fooled into trying simply has no button to press."
    ],
-   "callout": {
-    "kind": "wall",
-    "text": "Agents never merge, apply, destroy, sync or dispatch, and never edit the checks that judge them. A plan in a comment is information; applying it is a person's decision."
+   "deeper": {
+    "h": "Go deeper: why plans skip some units at first",
+    "p": [
+     "Some units call more than AWS. Units for tools on the internal cluster also read secrets from Vault and talk to the Kubernetes API. A read-only plan of those needs a read-only Vault role and a view-only Kubernetes access entry. Until those exist, the PR workflow skips such units and says so, and the author still runs those plans by hand and pastes them into the PR."
+    ]
    }
   }
  ],
  "lab": {
-  "title": "Catch a bad module before CI does",
-  "youNeed": [
-   "trivy (brew install trivy)",
-   "OpenTofu; the aws provider download from p4-3 again (a few hundred MB)",
-   "tflint (brew install tflint) for the faded rung"
+  "id": "p4-6",
+  "title": "Catch a bad infra PR before a person applies it",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "OpenTofu (for tofu fmt; nothing is planned or applied, and the aws provider is never downloaded).",
+   "trivy (trivy --version). Without it, use the aquasec/trivy Docker image with the same arguments.",
+   "Docker, for tflint (ghcr.io/terraform-linters/tflint) and, optionally, checkov (bridgecrew/checkov)."
   ],
-  "worked": [
+  "goal": "Run the four key-free checks on the bad runs-bucket module from the story, fix what they find, and keep one exception with an owner and an expiry.",
+  "guess": {
+   "q": "The module from the story has a public-by-default bucket, port 22 open to the world and an unused retention_days variable. Which check finds the unused variable?",
+   "options": [
+    {
+     "text": "tofu fmt -check, because it reads every line.",
+     "correct": false,
+     "why": "fmt only cares about layout: spaces, alignment, indentation. An unused variable is perfectly formatted."
+    },
+    {
+     "text": "trivy config, because it scans the whole module.",
+     "correct": false,
+     "why": "trivy looks for risky settings. An unused variable is not risky by itself; it is a sign that something was forgotten."
+    },
+    {
+     "text": "tflint, with its terraform_unused_declarations rule.",
+     "correct": true,
+     "why": "tflint knows rules the language does not enforce, such as \"declared but never used\". Here it points straight at the missing lifecycle rule."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "mkdir -p ~/academy/checks/modules/runs-bucket && cd ~/academy/checks. Save the bad module (section 4) as modules/runs-bucket/main.tf",
-    "see": "(one file)"
+    "say": "Make the lab folder and paste this block, because it writes the module from the story exactly as the agent's PR had it. Nothing here is ever planned or applied.",
+    "do": "mkdir -p ~/academy-labs/p4-6 && cd ~/academy-labs/p4-6\nmkdir -p modules/runs-bucket\ncat > modules/runs-bucket/main.tf <<'EOF'\nterraform {\n  required_providers {\n    aws = {\n      source  = \"hashicorp/aws\"\n      version = \"6.64.0\"\n    }\n  }\n}\n\nvariable \"bucket_name\" {\n  type = string\n}\n\nvariable \"retention_days\" {\n  type = number\n}\n\nresource \"aws_s3_bucket\" \"runs\" {\n  bucket = var.bucket_name\n}\n\nresource \"aws_security_group\" \"sandbox\" {\n  name = \"ai-agents-sandbox\"\n  description = \"Sandbox VMs: no ingress\"\n\n  ingress {\n    description = \"temporary: ssh for debugging\"\n    from_port   = 22\n    to_port     = 22\n    protocol    = \"tcp\"\n    cidr_blocks = [\"0.0.0.0/0\"]\n  }\n}\nEOF",
+    "see": "(no output)"
    },
    {
-    "do": "trivy config --severity HIGH,CRITICAL --quiet modules/ | grep -E '^AWS-|Failures'",
-    "see": "Failures: 6 (HIGH: 6, CRITICAL: 0)\nAWS-0086 (HIGH): No public access block so not blocking public acls\n...\nAWS-0107 (HIGH): Security group rule allows unrestricted ingress from any IP address.\nAWS-0132 (HIGH): Bucket does not encrypt data with a customer managed key."
+    "say": "Start with layout, because it is the cheapest check and CI already runs it. Then let fmt fix it.",
+    "do": "tofu fmt -check -recursive; echo \"exit $?\"\ntofu fmt -recursive",
+    "see": "modules/runs-bucket/main.tf\nexit 3\nmodules/runs-bucket/main.tf"
    },
    {
-    "do": "Add resource \"aws_s3_bucket_public_access_block\" \"runs\" with bucket = aws_s3_bucket.runs.id and the four block_/ignore_/restrict_ flags = true (p3-6). Run the trivy command again",
-    "see": "Failures: 2 (HIGH: 2, CRITICAL: 0)\nAWS-0107 (HIGH): Security group rule allows unrestricted ingress from any IP address.\nAWS-0132 (HIGH): Bucket does not encrypt data with a customer managed key."
+    "say": "Run tflint, because it knows rules that the language and fmt do not.",
+    "do": "docker run --rm -v \"$PWD\":/data -w /data ghcr.io/terraform-linters/tflint:v0.64.0 --recursive",
+    "see": "2 issue(s) found:\n\nWarning: terraform \"required_version\" attribute is required (terraform_required_version)\n  on modules/runs-bucket/main.tf line 1:\n\nWarning: [Fixable] variable \"retention_days\" is declared but not used (terraform_unused_declarations)\n  on modules/runs-bucket/main.tf line 14:"
    },
    {
-    "do": "Delete the ingress block from the security group. Run the trivy command again",
-    "see": "Failures: 1 (HIGH: 1, CRITICAL: 0)\nAWS-0132 (HIGH): Bucket does not encrypt data with a customer managed key."
+    "say": "Scan for risky settings the way CI does, HIGH and CRITICAL only.",
+    "do": "trivy config --severity HIGH,CRITICAL --quiet modules/ | grep -E '^AWS-|^Failures'",
+    "see": "Failures: 6 (HIGH: 6, CRITICAL: 0)\nAWS-0086 (HIGH): No public access block so not blocking public acls\nAWS-0087 (HIGH): No public access block so not blocking public policies\nAWS-0091 (HIGH): No public access block so not blocking public acls\nAWS-0093 (HIGH): No public access block so not restricting public buckets\nAWS-0107 (HIGH): Security group rule allows unrestricted ingress from any IP address.\nAWS-0132 (HIGH): Bucket does not encrypt data with a customer managed key."
    },
    {
-    "do": "Save .trivyignore (section 5). trivy config --severity HIGH,CRITICAL --quiet --exit-code 1 modules/ > out.txt; echo \"exit $?\"",
-    "see": "exit 0\n(the one remaining finding is ignored, with an owner, a reason and an expiry)"
+    "say": "Optional: run checkov on the same module, because comparing two scanners shows why we pick one. It finds the same open port and public bucket, plus opinions such as cross-region replication that we do not want.",
+    "do": "docker run --rm -v \"$PWD\":/w -w /w bridgecrew/checkov:3.3.28 -d modules --framework terraform --compact --quiet | grep -E 'Passed|Check:'",
+    "see": "Passed checks: 9, Failed checks: 9, Skipped checks: 0\nCheck: CKV_AWS_24: \"Ensure no security groups allow ingress from 0.0.0.0:0 to port 22\"\nCheck: CKV_AWS_21: \"Ensure all data stored in the S3 bucket have versioning enabled\"\nCheck: CKV2_AWS_6: \"Ensure that S3 bucket has a Public Access block\"\n…\nCheck: CKV_AWS_144: \"Ensure that S3 bucket has cross-region replication enabled\""
    },
    {
-    "do": "cd modules/runs-bucket && tofu init -backend=false -input=false >/dev/null && tofu validate",
-    "see": "Success! The configuration is valid.\n(from the docs; needs the aws provider download)"
+    "say": "Ask the question CI asks: does this fail the build? --exit-code 1 turns findings into a failing exit code.",
+    "do": "trivy config --severity HIGH,CRITICAL --quiet --exit-code 1 modules/ > /dev/null; echo \"exit $?\"",
+    "see": "exit 1"
    }
   ],
-  "faded": "Add .tflint.hcl from section 3 at ~/academy/checks. Pin the aws plugin to the current release from the ruleset's releases page. Add an aws_instance with ami = \"ami-12345678\" and instance_type = \"m8i.2xlage\" to the module. Run tflint --init, then tflint --recursive. Left to you: name the rule that caught it, fix the typo, and run tflint until it is clean.",
-  "alone": "In your actions-lab repo from p2-1, add .github/workflows/infra-checks.yml with the modules folder from this lab. One job runs aquasecurity/trivy-action pinned by SHA with scan-type config, severity HIGH,CRITICAL and exit-code '0' (advisory). A second job runs the validate loop from section 2. Push, and check that the run passes while the trivy step's log shows the findings.",
-  "done": "trivy goes from 6 findings to 0 reported, and every ignore has an owner and an expiry. validate passes with no backend and no keys."
+  "build": "Make the module pass. Add required_version = \">= 1.10\" to the terraform block. Add an aws_s3_bucket_public_access_block for the bucket with all four flags set to true, and an aws_s3_bucket_lifecycle_configuration with one enabled rule whose expiration uses var.retention_days. Remove the ingress block from the security group (the sandboxes need no ingress at all). One finding stays: the bucket's own KMS key comes in the next PR. Accept it in .trivyignore with an owner, a reason and an expiry date. Then run fmt, tflint and trivy with --exit-code 1 again.",
+  "checks": [
+   "tofu fmt -check -recursive exits 0.",
+   "tflint prints nothing and exits 0: retention_days is now used.",
+   "trivy config --severity HIGH,CRITICAL --quiet modules/ without the ignore file shows exactly one finding, AWS-0132.",
+   "With your .trivyignore, trivy --exit-code 1 exits 0, and the ignore line has an owner, a reason and an exp: date.",
+   "The security group has no ingress block at all."
+  ],
+  "solution": {
+   "lang": "hcl",
+   "file": "modules/runs-bucket/main.tf, plus .trivyignore from the Understand step",
+   "text": "terraform {\n  required_version = \">= 1.10\"\n  required_providers {\n    aws = {\n      source  = \"hashicorp/aws\"\n      version = \"6.64.0\"\n    }\n  }\n}\n\nvariable \"bucket_name\" {\n  type = string\n}\n\nvariable \"retention_days\" {\n  type = number\n}\n\nresource \"aws_s3_bucket\" \"runs\" {\n  bucket = var.bucket_name\n}\n\nresource \"aws_s3_bucket_public_access_block\" \"runs\" {\n  bucket                  = aws_s3_bucket.runs.id\n  block_public_acls       = true\n  block_public_policy     = true\n  ignore_public_acls      = true\n  restrict_public_buckets = true\n}\n\nresource \"aws_s3_bucket_lifecycle_configuration\" \"runs\" {\n  bucket = aws_s3_bucket.runs.id\n  rule {\n    id     = \"expire-runs\"\n    status = \"Enabled\"\n    filter {}\n    expiration {\n      days = var.retention_days\n    }\n  }\n}\n\nresource \"aws_security_group\" \"sandbox\" {\n  name        = \"ai-agents-sandbox\"\n  description = \"Sandbox VMs: no ingress\"\n}"
+  },
+  "fix": "A second agent PR \"fixes CI\" for a module like this one. trivy is green, yet checkov still reports CKV_AWS_24 for port 22. Recreate it: put the ingress block for port 22 from 0.0.0.0/0 back into the security group, and add a bare line AWS-0107 to the end of .trivyignore. trivy --exit-code 1 now exits 0. Find why, and fix it properly: remove the ingress block and the ignore line, and explain which wall should have refused this PR before any person saw it.",
+  "explain": [
+   "Which of the four checks would have caught each of the three problems in the story, and why can none of them run apply?",
+   "Why does the PR plan run with a read-only role, -lock=false and no -out plan file?",
+   "An agent is fooled into trying to apply a change. What stops it, and why does that not depend on the agent's instructions?"
+  ],
+  "done": "fmt, tflint and trivy (--exit-code 1) all pass on your fixed module, the one remaining exception has an owner, a reason and an expiry, and you can say which wall refuses an agent's edit to .trivyignore."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Why can tofu validate run on every push, even on an agent's branch?",
+   "q": "tofu validate passes on a module whose security group allows port 22 from 0.0.0.0/0. Why didn't it complain?",
    "options": [
     {
-     "text": "It runs with -backend=false: no state, no credentials, only the providers",
+     "text": "validate checks that the HCL is correct (types, references, required arguments), not whether a setting is safe.",
      "correct": true,
-     "why": "Nothing secret is needed, so nothing secret can leak."
+     "why": "That is the job of a misconfiguration scanner such as trivy config. The layers catch different things, so you need all of them."
     },
     {
-     "text": "Because GitHub hides the AWS keys from forks",
+     "text": "validate only runs on Terragrunt units, not on modules.",
      "correct": false,
-     "why": "validate uses no AWS keys at all."
+     "why": "CI runs validate on every module. It simply has no rules about safety."
     },
     {
-     "text": "Because it only checks formatting",
+     "text": "Because 0.0.0.0/0 is a valid CIDR, so it is safe.",
      "correct": false,
-     "why": "fmt checks formatting; validate checks types, references and required arguments."
+     "why": "Valid is not the same as safe. 0.0.0.0/0 means the whole internet."
     }
    ]
   },
   {
-   "q": "Why do PR plans run with -lock=false and never with -out?",
+   "q": "Why does the PR plan workflow never use tofu plan -out=plan.tfplan?",
    "options": [
     {
-     "text": "To make plans faster",
+     "text": "Because plan files are too large to upload.",
      "correct": false,
-     "why": "Speed is not the reason."
+     "why": "Size is not the reason."
     },
     {
-     "text": "Locks and plan files are not supported by Terragrunt",
-     "correct": false,
-     "why": "Both are supported; we choose not to use them."
-    },
-    {
-     "text": "The plan role cannot write a lock, and a plan file holds secret values in plain text",
+     "text": "Because a plan file holds every value in plain text, secrets included, and a PR workflow should leave nothing like that behind.",
      "correct": true,
-     "why": "A read-only role cannot write, and an artifact with secrets must not exist."
+     "why": "The comment carries the summary and the full text stays in the job log of a private repo. A saved plan file would be one more place for secrets to leak."
+    },
+    {
+     "text": "Because -out makes the plan apply automatically.",
+     "correct": false,
+     "why": "-out only saves the plan. Applying it is a separate command, which this workflow never runs."
     }
    ]
   },
   {
-   "q": "An agent's PR adds a line to .trivyignore so its change passes. What should happen?",
+   "q": "An agent opens an infrastructure PR, every check is green, and the plan comment says 0 to destroy. Who applies it, and why?",
    "options": [
     {
-     "text": "Nothing; .trivyignore is a normal file",
+     "text": "The agent, because every check passed.",
      "correct": false,
-     "why": "It is one of the checks the agent is judged by."
+     "why": "Checks can be wrong or incomplete, and apply changes the real world at once. Agents never apply; nothing they hold can."
     },
     {
-     "text": "The change is blocked: .trivyignore is a protected path agents may not edit",
+     "text": "Nobody needs to: the plan workflow applies green PRs.",
+     "correct": false,
+     "why": "The plan workflow can only plan. There is no apply step and no dispatch in it."
+    },
+    {
+     "text": "A person, after reading the plan, because an apply cannot be taken back with a revert and the walls give agents no way to apply.",
      "correct": true,
-     "why": "Agents never change the checks they are judged by."
-    },
-    {
-     "text": "trivy ignores entries written by bots",
-     "correct": false,
-     "why": "trivy cannot tell who wrote a line; the protection is on the path."
+     "why": "Agents write HCL and read plans; a person who did not ask for the work approves the PR, and a person applies."
     }
    ]
   }
  ],
- "recall": [
-  "From p4-3: what does a moved block do, and when is a resource replaced anyway?",
-  "From p2-3: what does the sub claim of a GitHub OIDC token contain for a pull_request run?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "Today the infrastructure repo's CI, terrugrunt-lint.yml, runs only tofu fmt -check and terragrunt hcl format --check, and plans are pasted into PRs by hand. A new terraform-checks.yml adds validate on every modules/* folder, tflint with the aws and google rulesets from a root .tflint.hcl, and trivy config over modules/, terraform/ and multi_tenant/: advisory for two weeks while Security goes through the findings, then failing on new HIGH and CRITICAL ones, with an owner and a reason on every .trivyignore line.",
+   "Each account gets a TerraformPlanRole (ReadOnlyAccess plus an explicit deny on data reads), assumed through an OIDC role in the inf account that trusts only pull_request runs of RhinoHealth/infrastructure. terragrunt-plan.yml posts one comment per PR with each changed unit's plan. The check workflows, .tflint.hcl and .trivyignore go on the paths agents may not change."
+  ],
+  "tickets": [
+   {
+    "key": "G7-17",
+    "why": "validate, tflint and trivy config in infrastructure CI, with no cloud keys and owned exceptions."
+   },
+   {
+    "key": "G7-30",
+    "why": "The read-only TerraformPlanRole per account and the OIDC role only PR runs may assume."
+   },
+   {
+    "key": "G7-32",
+    "why": "Read-only Terragrunt plans posted on infrastructure PRs; nothing in it can apply."
+   },
+   {
+    "key": "G0-18",
+    "why": "Locked checks: agent PRs that edit CI, lint or check files are blocked."
+   },
+   {
+    "key": "G5-32",
+    "why": "The infra upgrade fixer opens exactly the kind of PR these checks must judge."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "tofu validate",
-   "plain": "Checks types, references and required arguments with no state or credentials."
-  },
-  {
    "term": "tflint",
-   "plain": "A linter for HCL with provider rulesets that know real values such as instance types."
+   "plain": "A linter for HCL with rulesets: unused variables, missing version constraints, and with the AWS ruleset, instance types that do not exist."
   },
   {
    "term": "trivy config",
-   "plain": "A scanner for insecure settings in Terraform, with finding IDs and severities."
+   "plain": "A scanner that reads Terraform files and reports risky settings, such as open security groups, with an ID and a severity. checkov does the same job."
   },
   {
    "term": ".trivyignore",
-   "plain": "The list of accepted findings, one ID per line, each with an owner, a reason and an expiry."
+   "plain": "The list of accepted findings; ours needs an owner, a reason and an expiry date on every line."
   },
   {
-   "term": "TerraformPlanRole",
-   "plain": "A per-account role with read access to configuration and a Deny on data reads."
+   "term": "read-only plan role",
+   "plain": "TerraformPlanRole: can describe an account but change nothing and read no data, so PR plans are safe to run."
   },
   {
-   "term": "sticky comment",
-   "plain": "One PR comment that the workflow updates on each push instead of adding new ones."
-  },
-  {
-   "term": "protected path",
-   "plain": "A file agents may not change, such as the checks that judge them."
+   "term": "protected paths",
+   "plain": "Files such as check workflows and ignore lists that an agent's PR may not change."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G7-17",
-   "why": "Adds tofu validate, tflint and trivy config to infrastructure CI, with no cloud keys."
+   "q": "Name the four key-free checks in order and one thing each catches that the previous one does not.",
+   "a": "fmt (layout), validate (types and references), tflint (rules such as unused variables or bad instance types), trivy config (risky settings such as an open security group or a public bucket)."
   },
   {
-   "key": "G7-30",
-   "why": "The read-only TerraformPlanRole per account and the OIDC role that only PR runs may assume."
+   "q": "Write a correct .trivyignore entry for a finding you accept until the end of the year.",
+   "a": "A comment with owner and reason, then the ID with an expiry, for example: # owner=devops reason=KMS key comes in the next PR, then AWS-0132 exp:2026-12-31."
   },
   {
-   "key": "G7-32",
-   "why": "Posts read-only Terragrunt plans on infrastructure PRs; nothing in it can apply."
+   "q": "List what an agent may and may not do in the infrastructure repo.",
+   "a": "May: write HCL, run fmt, validate, tflint and trivy, read the plan comment. May not: apply, destroy, sync, dispatch workflows, or edit the check workflows, .tflint.hcl or .trivyignore."
   }
  ],
- "remember": "Keyless checks on every push, a read-only plan on every PR, and a person applies. Agents never touch the checks or the apply."
+ "remember": "Let key-free checks and a read-only plan judge every infrastructure change, keep every exception owned and dated, and leave apply to a person."
 }

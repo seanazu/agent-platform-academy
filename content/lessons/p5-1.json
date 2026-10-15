@@ -1,429 +1,347 @@
 {
+ "v": 2,
  "id": "p5-1",
  "title": "Containers, pods, deployments",
- "minutes": 45,
+ "minutes": 55,
  "youNeed": [
   "p1-8"
  ],
- "bridge": "A Kubernetes Deployment is like `npm start` on many machines at once. Except the machines are disposable. A pod can die at any moment, and a new one starts with a new name and IP. You never ssh in to restart anything.",
- "intro": "Our agent services do not run on a VM you log in to. The LLM gateway, the broker, the orchestrator worker, the Slack app and Temporal run as pods on inf-rhinohealth. That is a Kubernetes cluster DevOps already operates. This lesson gives you the five words you need to read and write what goes there.",
- "picture": {
-  "caption": "You describe what you want; the control plane keeps it true, even when a pod dies.",
-  "nodes": [
-   {
-    "id": "you",
-    "label": "you, with kubectl",
-    "kind": "person"
-   },
-   {
-    "id": "api",
-    "label": "control plane (inf-rhinohealth)",
-    "kind": "service"
-   },
-   {
-    "id": "dep",
-    "label": "Deployment broker, replicas 2",
-    "kind": "service"
-   },
-   {
-    "id": "pod1",
-    "label": "Pod broker-…-k2xq9",
-    "kind": "machine"
-   },
-   {
-    "id": "pod2",
-    "label": "Pod broker-…-v7mtp",
-    "kind": "machine"
-   },
-   {
-    "id": "svc",
-    "label": "Service broker",
-    "kind": "service"
-   },
-   {
-    "id": "orch",
-    "label": "orchestrator pod",
-    "kind": "machine"
-   }
+ "map": "temporal",
+ "hook": {
+  "story": [
+   "It is 3 in the morning. The broker, the service that holds our GitHub credentials and pushes Nova's commits, runs as two copies on two machines in our internal cluster. AWS needs one of those machines back, so the machine disappears, and one copy of the broker disappears with it. Nobody is awake.",
+   "At 3:01 Nova, our ticket-to-PR agent, finishes a step on RH-1234 and pushes a checkpoint commit through the broker. The push works. In the morning there is no alert, no ticket and nothing in Slack, and the broker is running as two copies again, one of them on a machine that did not exist last night. On your laptop, a container that dies stays dead until you type docker run again, so somebody must have done that here."
   ],
-  "steps": [
-   {
-    "from": "you",
-    "to": "api",
-    "text": "kubectl apply sends the Deployment YAML"
-   },
-   {
-    "from": "api",
-    "to": "dep",
-    "text": "records: I want 2 pods of this image"
-   },
-   {
-    "from": "dep",
-    "to": "pod1",
-    "text": "starts pod 1 from the image digest"
-   },
-   {
-    "from": "dep",
-    "to": "pod2",
-    "text": "starts pod 2 on another node"
-   },
-   {
-    "from": "pod1",
-    "to": "dep",
-    "text": "pod 1 dies; the Deployment starts a fresh one (new name, new IP)"
-   },
-   {
-    "from": "orch",
-    "to": "svc",
-    "text": "calls broker.ai-agents:443"
-   },
-   {
-    "from": "svc",
-    "to": "pod2",
-    "text": "the Service sends the call to a live pod"
-   }
-  ]
+  "question": "Who brought the broker back at 3 in the morning, and how did Nova still find it?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Start from one container on your laptop",
+   "h": "You write down what should be true",
    "p": [
-    "In p1-8 you built a Docker image for a Node service and ran it with `docker run`. A running image is a container: one process tree with its own filesystem and network.",
-    "Kubernetes runs the same images, but it never runs a bare container. It runs a pod: one or more containers that share one IP address and can talk over localhost. Almost all of our pods hold exactly one container.",
-    "The rest of this lesson is about what sits around the pod. Who starts it, who restarts it, and how other pods find it."
-   ],
-   "because": "We pull the image first to see the two ways to name it. A tag can move; a digest cannot.",
-   "code": {
-    "lang": "bash",
-    "file": "your laptop",
-    "text": "docker pull nginx:1.27\ndocker image inspect nginx:1.27 --format '{{index .RepoDigests 0}}'\n# nginx@sha256:3f1c…   <- the digest: the exact bytes, forever\n\ndocker run --rm -d --name web -p 8080:80 nginx:1.27\ncurl -s -o /dev/null -w '%{http_code}\\n' localhost:8080\ndocker rm -f web",
-    "notes": [
-     {
-      "line": 1,
-      "text": "A tag like 1.27 is a label. Whoever owns the image can point it at new bytes tomorrow."
-     },
-     {
-      "line": 2,
-      "text": "A digest is the sha256 of the image content. Our Terraform units pin images by digest for this reason."
-     },
-     {
-      "line": 5,
-      "text": "This is one container on one machine. A pod is the same thing with a Kubernetes wrapper around it."
-     },
-     {
-      "line": 7,
-      "text": "On your laptop you clean up by hand. In Kubernetes, something else restarts what you remove."
-     }
-    ]
-   },
-   "see": "nginx@sha256:…\n200"
-  },
-  {
-   "h": "The cluster: inf-rhinohealth",
-   "p": [
-    "A cluster is a set of machines (nodes) plus a control plane. The control plane is the API that stores what you asked for and makes the nodes match it. You talk to it with the `kubectl` command.",
-    "inf-rhinohealth is our internal cluster: Amazon EKS 1.36 in the infrastructure account (123456789012), region us-east-1. Karpenter adds and removes Spot nodes as pods come and go, so a node is as disposable as a pod.",
-    "The internal tools already live there: Vault, n8n, Nexus, Teleport, VictoriaMetrics and the GitHub Actions runner sets. Our agent services join them. They are the LLM gateway (G0-15), the broker, the orchestrator worker and the Slack app (G3-17). Then the agents' Temporal (G3-06) and the brain bot (G6-22).",
-    "Two things to remember about inf. It is not a product cluster, so nothing there is deployed by Argo CD. Everything is a Terraform `helm_release` unit in the infrastructure repo (next lesson). And KEDA is off, so replica counts are fixed numbers."
-   ],
-   "callout": {
-    "kind": "gotcha",
-    "text": "The sandbox VMs where agents work are NOT on this cluster. They are EC2 machines in the separate ai-agents account. Only the services that hold credentials run on inf."
-   }
-  },
-  {
-   "h": "Pods die; a Deployment keeps the count",
-   "p": [
-    "A pod is never repaired. When its node goes away or its process crashes, the pod is gone. What you create is a Deployment: it says which image to run and how many copies (replicas) you want.",
-    "The Deployment watches the count. Two pods wanted, one alive: it starts another one, with a new random name and a new IP. This is why you never write a pod's name or IP anywhere.",
-    "Below is the shape of the Deployment that our shared chart (modules/ai-agents-service, from G0-15) renders for the broker. Read it once with the notes; you will see it again rendered by `helm template`."
-   ],
-   "because": "We write the Deployment, not the pod, so the cluster can replace pods for us without anyone being paged.",
-   "code": {
-    "lang": "yaml",
-    "file": "what modules/ai-agents-service renders for the broker (shortened)",
-    "text": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: broker\n  namespace: ai-agents\nspec:\n  replicas: 2                 # fixed: KEDA is off on inf\n  selector:\n    matchLabels: { app: broker }\n  template:\n    metadata:\n      labels: { app: broker }\n    spec:\n      containers:\n        - name: broker\n          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/ai-agents-broker@sha256:…\n          ports: [{ containerPort: 8080 }]\n          readinessProbe: { httpGet: { path: /health, port: 8080 } }\n          securityContext:\n            runAsUser: 10001\n            readOnlyRootFilesystem: true\n            allowPrivilegeEscalation: false\n            capabilities: { drop: [ALL] }",
-    "notes": [
-     {
-      "line": 7,
-      "text": "Two copies. If one dies the Deployment starts another; if a node is drained, both move."
-     },
-     {
-      "line": 9,
-      "text": "The selector says which pods belong to this Deployment: the ones with the label app=broker."
-     },
-     {
-      "line": 10,
-      "text": "Everything under template is the pod recipe. Each new pod is stamped from it."
-     },
-     {
-      "line": 16,
-      "text": "The image from inf ECR, pinned by digest, as G3-17 asks. A tag could change under us; a digest cannot."
-     },
-     {
-      "line": 18,
-      "text": "The readiness probe calls GET /health. A pod gets traffic only after this returns 200."
-     },
-     {
-      "line": 19,
-      "text": "Non-root user, read-only root filesystem, no capabilities: the same flags Byte uses for its broker container."
-     }
-    ]
-   }
-  },
-  {
-   "h": "A Service is the stable name in front",
-   "p": [
-    "Pods come and go, so other pods need a name that stays. A Service is that name. It picks the pods by label and spreads calls over the live ones.",
-    "Inside the cluster the name is DNS: `broker.ai-agents.svc.cluster.local`, or `broker.ai-agents` for short. Type ClusterIP means the name works only inside the cluster. That is what we want for the broker's internal port: nothing outside inf should reach it."
-   ],
-   "because": "The orchestrator must call the broker by a name that survives every pod restart.",
-   "code": {
-    "lang": "yaml",
-    "file": "the Service next to the Deployment",
-    "text": "apiVersion: v1\nkind: Service\nmetadata:\n  name: broker\n  namespace: ai-agents\nspec:\n  type: ClusterIP\n  selector: { app: broker }\n  ports:\n    - name: http\n      port: 8080\n      targetPort: 8080",
-    "notes": [
-     {
-      "line": 4,
-      "text": "The DNS name other pods use: broker.ai-agents."
-     },
-     {
-      "line": 7,
-      "text": "ClusterIP: reachable inside the cluster only. Our UIs get an HTTPRoute on envoy-internal instead; that is a separate object."
-     },
-     {
-      "line": 8,
-      "text": "The same label as the Deployment's pods. That is the whole link between them."
-     },
-     {
-      "line": 11,
-      "text": "The port callers use. targetPort is the port the container listens on; here they match."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Namespaces keep teams apart",
-   "p": [
-    "A namespace is a folder for objects. Names must be unique inside it, and most access rules are written per namespace. Our agent services share one namespace, `ai-agents`; the OTel collector has `otel-collector`; the runner sets have their own.",
-    "The namespace is also the unit that network policy (lesson p5-4) reasons about. 'Only pods in ai-agents may reach Temporal on port 7233' is a sentence about a namespace.",
-    "Do not confuse the Kubernetes namespace `ai-agents` with the Temporal namespace `ai-agents` (G3-06). Same word, two systems: one groups pods, the other groups workflows."
+    "In p1-8 you built an image for a Node service and ran it with docker run. A running image is a container: one process with its own files and its own network. On your laptop you are the one who starts it, and you are the one who starts it again when it stops. That works for one laptop, but not for a service that must answer at 3 in the morning on machines that come and go.",
+    "Kubernetes changes the question you answer. You do not say \"start this container on that machine\". You write down what should be true, for example \"two copies of the broker image should be running\", and you hand that to the cluster. A cluster is a group of machines, called nodes, plus a control plane, which is the part that stores what you asked for and keeps comparing it with what is really running. When the two differ, the control plane acts until they match again. People call what you wrote the desired state, and the endless compare-and-fix the control loop. Nobody restarted the broker last night: the control loop saw one copy where you asked for two, and started another.",
+    "Our cluster for internal tools is called inf-rhinohealth, or inf for short. It is Amazon EKS, which is Kubernetes run by AWS, and it already runs tools like Vault, n8n, Nexus and VictoriaMetrics. The agent platform's services live there too: the LLM gateway, the broker, the orchestrator worker, the Slack app and our own Temporal. They run on inf because they hold credentials, and credentials never go to the sandbox VMs where the agents work. Those VMs are not in this cluster at all; they are EC2 machines in a separate AWS account. The nodes of inf are cheap Spot machines that AWS can take back, which is exactly what happened at 3 in the morning."
    ]
   },
   {
-   "h": "The kubectl you will use every week",
+   "h": "A pod is replaced, never repaired",
    "p": [
-    "You will mostly read, not write: the YAML comes from Terraform and Helm. These are the commands that answer 'is it running and why not'.",
-    "Every command takes `-n <namespace>`. Without it you are looking at the `default` namespace, which is empty, and you will think your pods are gone."
+    "Kubernetes never runs a bare container. It runs a pod, which is one or more containers that share one IP address. Almost all of our pods hold exactly one container, so for now you can read \"pod\" as \"one running copy of the service\". A pod is never repaired. When its node disappears or its process crashes for good, that pod is gone, and a new pod with a new random name and a new IP address takes its place.",
+    "So you do not create pods yourself. You create a Deployment, which says which image to run and how many copies, called replicas, to keep. The Deployment carries a template, a recipe that every new pod is stamped from, and a selector, which says which pods count as its own. Below is the shape of the broker's Deployment, shortened. You will rarely type this file, because our Terraform and Helm code produces it, but you need to read it."
    ],
-   "because": "Reading pod state is how you check that a deploy worked and how you find a crash.",
    "code": {
-    "lang": "bash",
-    "file": "your laptop, against any cluster",
-    "text": "kubectl config current-context          # ALWAYS first. prod-rhinohealth? stop.\nkubectl get pods -n ai-agents             # names, READY, STATUS, RESTARTS\nkubectl describe pod -n ai-agents broker-7d9c6f8b5c-k2xq9   # events: why it is Pending or crashing\nkubectl logs -n ai-agents deploy/broker --tail=50            # stdout of the broker's pods\nkubectl get svc,deploy -n ai-agents       # Services and Deployments in one list\nkubectl rollout status -n ai-agents deploy/broker           # waits until new pods are ready",
+    "lang": "yaml",
+    "file": "the broker's Deployment on inf (shortened)",
+    "text": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: broker\n  namespace: ai-agents\nspec:\n  replicas: 2\n  selector:\n    matchLabels:\n      app: broker\n  template:\n    metadata:\n      labels:\n        app: broker\n    spec:\n      containers:\n        - name: broker\n          image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/ai-agents-broker@sha256:4b1e…\n          ports:\n            - containerPort: 8080\n          readinessProbe:\n            httpGet: { path: /health, port: 8080 }\n          securityContext:\n            runAsUser: 10001\n            readOnlyRootFilesystem: true",
     "notes": [
      {
-      "line": 1,
-      "text": "Your laptop's kubectl context may point at prod-rhinohealth. Check before every command; add --context kind-academy in the lab."
+      "line": 5,
+      "text": "The namespace, a folder for objects in the cluster. All our agent services share the one called ai-agents."
      },
      {
-      "line": 2,
-      "text": "STATUS Running and READY 1/1 is good. CrashLoopBackOff means the process exits; ImagePullBackOff means the digest or ECR access is wrong."
+      "line": 7,
+      "text": "The desired state: two copies. Lose one and the control loop starts another; there is no autoscaling on inf, so the number stays fixed."
      },
      {
-      "line": 3,
-      "text": "The Events section at the bottom is where Kubernetes explains itself."
+      "line": 10,
+      "text": "The selector: every pod with the label app=broker belongs to this Deployment and counts towards the two."
      },
      {
-      "line": 4,
-      "text": "deploy/broker means 'any pod of that Deployment'. You do not need the random pod name."
+      "line": 12,
+      "text": "Everything under template is the pod recipe. A replacement pod gets exactly this, and nothing you changed by hand on the old one."
+     },
+     {
+      "line": 19,
+      "text": "The image is pinned by digest, the hash of its content, as you saw in p1-8. A tag could later point at different bytes; a digest cannot."
+     },
+     {
+      "line": 22,
+      "text": "A pod receives calls only after GET /health answers. Until then it exists but is not \"ready\"."
      }
     ]
    },
-   "callout": {
-    "kind": "wall",
-    "text": "On your laptop, run kubectl only against the kind cluster you create in the lab. Never against prod-rhinohealth or inf-rhinohealth from a lesson. Changes to inf go through a Terraform PR that a person applies."
+   "deeper": {
+    "h": "Go deeper: what happens when you change the image",
+    "p": [
+     "When the recipe changes, for example a new image digest, the Deployment does a rolling update: it starts one new pod, waits until it is ready, and only then removes an old one, and so on until every pod runs the new recipe. So a bad image does not take the service down. In the lab cluster, a Deployment pointed at an image tag that does not exist got one new pod stuck in ErrImagePull, while the three old pods stayed Running and kept answering.",
+     "kubectl rollout undo deployment/broker then goes back to the previous recipe. On inf you would not run that by hand, because the Terraform unit would put the bad digest back on the next apply; you revert the digest in the unit instead, and the next lesson shows that path."
+    ]
+   }
+  },
+  {
+   "h": "A Service is the name that stays",
+   "p": [
+    "Now the second half of the story. The orchestrator calls the broker hundreds of times a day. If its config held a pod's IP address, last night's replacement would have broken every call, because the new pod got a new address. So nobody writes down a pod's name or IP. Instead there is a Service: a stable name in front of whichever pods match a label at this moment. When a call arrives, the Service sends it to one of the ready pods.",
+    "Inside the cluster that name is a DNS name, broker.ai-agents, which is short for broker.ai-agents.svc.cluster.local: the Service name, then the namespace. That is the address in the orchestrator's config, and that is why Nova's 3:01 push still worked. The sandbox VMs reach the broker another way, through a private network path you will meet in p5-4."
+   ],
+   "code": {
+    "lang": "yaml",
+    "file": "the Service next to the broker's Deployment",
+    "text": "apiVersion: v1\nkind: Service\nmetadata:\n  name: broker\n  namespace: ai-agents\nspec:\n  type: ClusterIP\n  selector:\n    app: broker\n  ports:\n    - port: 8080\n      targetPort: 8080",
+    "notes": [
+     {
+      "line": 4,
+      "text": "With the namespace on line 5, this gives the DNS name broker.ai-agents."
+     },
+     {
+      "line": 7,
+      "text": "ClusterIP means reachable from inside the cluster only. Nothing on the internet can call it."
+     },
+     {
+      "line": 8,
+      "text": "The same label as the Deployment's pods. This label is the whole link between the Service and the pods: get it wrong and the Service points at nothing."
+     },
+     {
+      "line": 11,
+      "text": "The port the container listens on. Callers use port, the Service forwards to targetPort."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Reading the cluster safely",
+   "p": [
+    "Most of the time you will read the cluster, not change it, because every change to inf arrives as a Terraform pull request that a person applies. Five commands answer almost every question. Each one takes -n and a namespace; if you forget it, kubectl looks in the namespace called default, finds nothing, and you will think your pods are gone.",
+    "The first command matters most. kubectl talks to whichever cluster its current context points at, and on a work laptop that can be a real product cluster. So always check the context first. In the lab you will go one step further and give kubectl a separate key file that only knows your laptop cluster, so a mistake there can never reach anything real."
+   ],
+   "code": {
+    "lang": "bash",
+    "file": "your terminal",
+    "text": "kubectl config current-context\nkubectl -n ai-agents get pods\nkubectl -n ai-agents describe pod broker-6f9c4d79c8-qkjbl\nkubectl -n ai-agents logs deploy/broker --tail=50\nkubectl -n ai-agents get deploy,svc",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Which cluster am I talking to? Run it before anything else."
+     },
+     {
+      "line": 2,
+      "text": "READY 1/1 and STATUS Running are good. CrashLoopBackOff means the process keeps exiting; ImagePullBackOff means the image or digest is wrong."
+     },
+     {
+      "line": 3,
+      "text": "The Events list at the bottom is where Kubernetes explains why a pod is waiting or crashing."
+     },
+     {
+      "line": 4,
+      "text": "deploy/broker means \"any pod of this Deployment\", so you never need the random pod name."
+     }
+    ]
    }
   }
  ],
  "lab": {
-  "title": "A Deployment that heals itself, on your laptop",
-  "youNeed": [
-   "Docker Desktop running (docker info works)",
-   "kind (brew install kind)",
+  "id": "p5-1",
+  "title": "A Deployment that heals itself",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "Docker Desktop running, with about 1 GB of memory free",
    "kubectl (brew install kubectl)"
   ],
-  "worked": [
+  "goal": "Run a small Kubernetes cluster in Docker, give it a Deployment and a Service, delete a pod, and watch the cluster bring it back while the name keeps working.",
+  "guess": {
+   "q": "The Deployment broker asks for 2 replicas, and both pods are running. You delete one of them by name. What does kubectl get pods show a few seconds later?",
+   "options": [
+    {
+     "text": "One pod, because you deleted the other one.",
+     "correct": false,
+     "why": "That is what docker rm would do. Here the control loop sees one pod where the Deployment asks for two, and starts another."
+    },
+    {
+     "text": "Two pods with the same names as before, because Kubernetes restarted the deleted one.",
+     "correct": false,
+     "why": "A deleted pod is never brought back. A new pod is made from the template, with a new random name and a new IP."
+    },
+    {
+     "text": "Two pods: the one you did not touch, and a new one with a new name and an age of a few seconds.",
+     "correct": true,
+     "why": "The Deployment keeps the count, not the pods. The replacement is a fresh pod stamped from the same recipe."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "kind create cluster --name academy",
-    "see": "Creating cluster \"academy\" ...\n ✓ Ensuring node image (kindest/node:v1.33.1) 🖼\n ✓ Preparing nodes 📦\n ✓ Starting control-plane 🕹️\nSet kubectl context to \"kind-academy\""
+    "say": "Start a small Kubernetes cluster inside one Docker container. k3s is a light Kubernetes made for small machines, and this one command gives you a real control plane and one node called academy.",
+    "do": "docker run -d --name academy --hostname academy --privileged -p 6443:6443 rancher/k3s:v1.33.5-k3s1 server --disable=traefik --disable=metrics-server",
+    "see": "Unable to find image 'rancher/k3s:v1.33.5-k3s1' locally\nv1.33.5-k3s1: Pulling from rancher/k3s\n…\nStatus: Downloaded newer image for rancher/k3s:v1.33.5-k3s1\n7f507baea574b1673950eef750a394c3396ef7b1b14b08a77ccd970cab428b8c"
    },
    {
-    "do": "kubectl config current-context",
-    "see": "kind-academy"
+    "say": "Copy the cluster's key file out of the container and point kubectl at it for this terminal only. Your normal kubectl settings stay untouched, so nothing you do here can reach a real cluster. Wait about 20 seconds after the last step before you run this.",
+    "do": "docker cp academy:/etc/rancher/k3s/k3s.yaml ~/academy-k3s.yaml && export KUBECONFIG=~/academy-k3s.yaml && kubectl config current-context && kubectl get nodes",
+    "see": "default\nNAME      STATUS   ROLES                  AGE   VERSION\nacademy   Ready    control-plane,master   41s   v1.33.5+k3s1"
    },
    {
-    "do": "kubectl create namespace ai-agents",
-    "see": "namespace/ai-agents created"
+    "say": "Create the namespace and a Deployment with two replicas. nginx plays the part of the broker, because it is a small web server that answers on port 80.",
+    "do": "kubectl create namespace ai-agents && kubectl -n ai-agents create deployment broker --image=nginx:1.27 --replicas=2",
+    "see": "namespace/ai-agents created\ndeployment.apps/broker created"
    },
    {
-    "do": "kubectl -n ai-agents create deployment broker --image=nginx:1.27 --replicas=2",
-    "see": "deployment.apps/broker created"
-   },
-   {
+    "say": "Look at the two pods. Note their names and their IP addresses, because you are about to lose one.",
     "do": "kubectl -n ai-agents get pods -o wide",
-    "see": "NAME                      READY   STATUS    RESTARTS   AGE   IP           NODE\nbroker-7d9c6f8b5c-k2xq9   1/1     Running   0          30s   10.244.0.5   academy-control-plane\nbroker-7d9c6f8b5c-v7mtp   1/1     Running   0          30s   10.244.0.6   academy-control-plane"
+    "see": "NAME                      READY   STATUS    RESTARTS   AGE   IP          NODE\nbroker-6f9c4d79c8-mmqmq   1/1     Running   0          26s   10.42.0.4   academy\nbroker-6f9c4d79c8-qkjbl   1/1     Running   0          25s   10.42.0.5   academy"
    },
    {
-    "do": "kubectl -n ai-agents delete pod broker-7d9c6f8b5c-k2xq9   # use one of YOUR pod names",
-    "see": "pod \"broker-7d9c6f8b5c-k2xq9\" deleted"
+    "say": "Delete one pod, the way a disappearing node would, and look again straight away. Use one of your own pod names.",
+    "do": "kubectl -n ai-agents delete pod broker-6f9c4d79c8-mmqmq && kubectl -n ai-agents get pods -o wide",
+    "see": "pod \"broker-6f9c4d79c8-mmqmq\" deleted\nNAME                      READY   STATUS    RESTARTS   AGE   IP          NODE\nbroker-6f9c4d79c8-cpxzw   1/1     Running   0          1s    10.42.0.6   academy\nbroker-6f9c4d79c8-qkjbl   1/1     Running   0          31s   10.42.0.5   academy"
    },
    {
-    "do": "kubectl -n ai-agents get pods -o wide",
-    "see": "NAME                      READY   STATUS    RESTARTS   AGE   IP           NODE\nbroker-7d9c6f8b5c-v7mtp   1/1     Running   0          2m    10.244.0.6   academy-control-plane\nbroker-7d9c6f8b5c-zq8rd   1/1     Running   0          5s    10.244.0.7   academy-control-plane"
+    "say": "Put a Service in front of the pods, then call it by name from a throwaway pod inside the cluster, which is what the orchestrator does when it calls the broker.",
+    "do": "kubectl -n ai-agents expose deployment broker --port=80 && kubectl -n ai-agents run probe --rm -i --restart=Never --image=curlimages/curl:8.11.1 -- curl -s -o /dev/null -w '%{http_code}\\n' http://broker.ai-agents",
+    "see": "service/broker exposed\n200\npod \"probe\" deleted"
    },
    {
-    "do": "kubectl -n ai-agents expose deployment broker --port=80",
-    "see": "service/broker exposed"
-   },
-   {
-    "do": "kubectl -n ai-agents run probe --rm -it --restart=Never --image=curlimages/curl:8.10.1 -- curl -s -o /dev/null -w '%{http_code}\\n' http://broker.ai-agents",
-    "see": "200\npod \"probe\" deleted"
+    "say": "Ask the Service which pods it is sending calls to right now. These are the IPs of the two live pods, including the new one.",
+    "do": "kubectl -n ai-agents describe service broker | grep -E 'Selector|Endpoints'",
+    "see": "Selector:          app=broker\nEndpoints:         10.42.0.5:80,10.42.0.6:80"
    }
   ],
-  "faded": "Do the same for a second Deployment called orchestrator with 1 replica of the same image, in the same namespace. Then delete its only pod and watch it come back. The last step, exposing it as a Service and calling it from a probe pod, is yours: write the two commands yourself.",
-  "alone": "Create a namespace called otel-collector and a Deployment called collector with 3 replicas of nginx:1.27. Scale it down to 1 with `kubectl -n otel-collector scale deployment collector --replicas=1`. Before you run scale, write down which two pods you expect to disappear and which name survives. Then check. Keep the cluster: p5-2 to p5-4 reuse it. Delete it at the end with `kind delete cluster --name academy`.",
-  "done": "You deleted a pod by name and the Deployment replaced it with a new name and IP. A probe pod reached it through the Service name."
+  "build": "Add the orchestrator next to the broker, this time from a file, the way Terraform and Helm will give it to the cluster. Let kubectl write the starting YAML for you: kubectl -n ai-agents create deployment orchestrator --image=nginx:1.27 --replicas=1 --dry-run=client -o yaml > orchestrator.yaml. Open the file, change replicas to 2, and run kubectl apply -f orchestrator.yaml. Then prove three things on your own: both orchestrator pods are Running, deleting one of them brings a new one with a new name, and an orchestrator pod reaches the broker by its Service name: kubectl -n ai-agents exec deploy/orchestrator -- curl -s -o /dev/null -w '%{http_code}\\n' http://broker prints 200.",
+  "checks": [
+   "kubectl config current-context prints default, and kubectl get nodes shows one node called academy (your laptop cluster, not a real one)",
+   "After you delete a broker pod, kubectl -n ai-agents get pods still shows two broker pods, one with a new name and an age of a few seconds",
+   "The probe pod prints 200 for http://broker.ai-agents",
+   "kubectl -n ai-agents get deploy shows broker 2/2 and orchestrator 2/2",
+   "kubectl -n ai-agents exec deploy/orchestrator -- curl -s -o /dev/null -w '%{http_code}\\n' http://broker prints 200"
+  ],
+  "solution": {
+   "lang": "yaml",
+   "file": "orchestrator.yaml (after your edit)",
+   "text": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  labels:\n    app: orchestrator\n  name: orchestrator\n  namespace: ai-agents\nspec:\n  replicas: 2\n  selector:\n    matchLabels:\n      app: orchestrator\n  template:\n    metadata:\n      labels:\n        app: orchestrator\n    spec:\n      containers:\n      - image: nginx:1.27\n        name: nginx"
+  },
+  "fix": "A teammate renamed some labels and changed the broker Service's selector to match a new label name. Do the same with kubectl -n ai-agents set selector service broker app=brokr, then call it again with the probe pod: it now prints 000 instead of 200, although both broker pods are still Running. Find out why with kubectl -n ai-agents describe service broker (look at Selector and Endpoints) and kubectl -n ai-agents get pods --show-labels, then repair it with one command so the probe prints 200 again.",
+  "explain": [
+   "Nobody ran a restart command, yet a deleted pod came back. What compared what, and what did it do about the difference?",
+   "Why does the orchestrator's config hold broker.ai-agents and never a pod name or an IP address?",
+   "In the broken Service, the pods were healthy but every call failed. What is the only link between a Service and its pods?"
+  ],
+  "done": "You deleted a pod and the Deployment replaced it with a new name and IP, the Service name kept working, and when you are finished with p5 you remove the cluster with docker rm -f academy and delete ~/academy-k3s.yaml."
  },
- "quiz": [
+ "check": [
   {
-   "q": "The broker pod broker-7d9c6f8b5c-k2xq9 is crashing. What do you do?",
+   "q": "A broker pod keeps crashing because of a wrong setting in its environment. A teammate wants to log in to the pod, fix the file and restart the process. Why does that not work on Kubernetes?",
    "options": [
     {
-     "text": "ssh to the node, fix the config, and restart the process",
+     "text": "Because pods have no shell, so you cannot log in to them at all",
      "correct": false,
-     "why": "There is no ssh and no fixing in place. Pods are replaced, never repaired."
+     "why": "Many pods do have a shell, and kubectl exec can open it. The problem is what happens to your change afterwards."
     },
     {
-     "text": "Read `kubectl describe pod` and `kubectl logs`, fix the image or config in the Terraform unit, and let a person apply it",
+     "text": "Because the next replacement pod is stamped from the Deployment's template, so a change made inside one pod disappears with that pod",
      "correct": true,
-     "why": "The pod recipe lives in the Deployment, which Terraform owns. You change the recipe, not the pod."
+     "why": "Pods are replaced, never repaired. The fix belongs in the recipe, which on inf means the Terraform unit, so every future pod gets it."
     },
     {
-     "text": "Delete the pod so the Deployment starts a clean one",
+     "text": "Because Kubernetes forbids changes to running pods and rolls them back at once",
      "correct": false,
-     "why": "The new pod runs the same recipe and will crash the same way. Deleting only hides the problem for a minute."
+     "why": "Nothing watches the files inside a pod. The change would even work for a while, until the pod is replaced and the fix is lost."
     }
    ]
   },
   {
-   "q": "The orchestrator needs to call the broker. Which address goes in its config?",
+   "q": "Which address should the orchestrator use to call the broker?",
    "options": [
     {
-     "text": "The pod IP 10.244.0.6 from `kubectl get pods -o wide`",
+     "text": "The IP address of a broker pod, from kubectl get pods -o wide",
      "correct": false,
-     "why": "That IP belongs to one pod and dies with it. The next pod gets another IP."
+     "why": "That address belongs to one pod and is gone when the pod is replaced, as it was at 3 in the morning."
     },
     {
-     "text": "The pod name broker-7d9c6f8b5c-v7mtp",
-     "correct": false,
-     "why": "Pod names are random and change on every restart."
-    },
-    {
-     "text": "The Service name broker.ai-agents",
+     "text": "broker.ai-agents, the Service's name",
      "correct": true,
-     "why": "The Service is the stable DNS name and sends each call to a live pod."
+     "why": "The Service name stays the same while pods come and go, and it sends each call to a ready pod."
+    },
+    {
+     "text": "The node's IP address, because nodes live longer than pods",
+     "correct": false,
+     "why": "On inf the nodes are Spot machines that AWS can take back, so they come and go too, and a pod can move to any node."
     }
    ]
   },
   {
-   "q": "Why does the Deployment pin the broker image by digest and not by the tag 0.1.0?",
+   "q": "You asked for 2 replicas. A node disappears and takes one pod with it. What brings the count back to 2?",
    "options": [
     {
-     "text": "Tags are slower to pull than digests",
-     "correct": false,
-     "why": "Pull speed is the same. The difference is what the name means."
-    },
-    {
-     "text": "A tag can be moved to new bytes later; a digest names exactly one image forever",
+     "text": "The control loop, which compares the desired state with what is running and starts a pod from the template",
      "correct": true,
-     "why": "A digest is a hash of the content. G3-17 asks for digests so nobody can swap what runs under a known name."
+     "why": "That compare-and-fix is the core of Kubernetes. It works the same at 3 in the morning as at noon, with nobody awake."
     },
     {
-     "text": "ECR does not support tags",
+     "text": "An alert that wakes the on-call person, who runs kubectl to start a pod",
      "correct": false,
-     "why": "ECR supports both. Our ECR repos even set tags_immutability_enabled, but a digest is still the stronger pin."
+     "why": "No person is needed. An alert may still be useful, for example when pods keep crashing, but it is not what restores the count."
+    },
+    {
+     "text": "Docker on the node, which restarts containers that stop",
+     "correct": false,
+     "why": "The node itself is gone, so nothing on it can help. The new pod is started on a different node by the control plane."
     }
    ]
   }
  ],
- "recall": [
-  "From p1-8: which line in a Dockerfile makes the container run as a non-root user, and why do we add it?",
-  "From p4-2: in which repo and tree do the units for inf-rhinohealth live, and who runs apply?"
- ],
- "videos": [
-  {
-   "title": "Kubernetes Components explained! Pods, Services, Secrets, ConfigMap",
-   "url": "https://www.youtube.com/watch?v=Krpb44XR0bk",
-   "channel": "TechWorld with Nana",
-   "minutes": 18,
-   "why": "Pods, Deployments, Services and friends drawn out slowly and clearly."
-  },
-  {
-   "title": "Kubernetes Namespaces Explained in 15 mins",
-   "url": "https://www.youtube.com/watch?v=K3jNo4z5Jx8",
-   "channel": "TechWorld with Nana",
-   "minutes": 16,
-   "why": "Why namespaces exist and how to use them in practice."
-  }
- ],
+ "platform": {
+  "p": [
+   "Every agent service on inf is a Deployment plus a Service in the ai-agents namespace, produced by one shared Helm chart, modules/ai-agents-service, so the gateway, the broker, the orchestrator worker and the Slack app all look alike. Replica counts are fixed numbers, because KEDA, the tool that would scale them automatically, is off on inf: the gateway and the broker run 2, the orchestrator worker 2, the Slack app 1. Pods run as user 10001 with a read-only root filesystem and the image pinned by digest.",
+   "Two services break the pattern on purpose. The brain bot and the Slack app use Slack's Socket Mode, which means they dial out to Slack and nobody dials in, so the brain bot has no Service at all. And our Temporal is the upstream Temporal chart rather than our own, but it renders the same kinds of objects you met here."
+  ],
+  "tickets": [
+   {
+    "key": "G0-15",
+    "why": "The first agent service on inf, the LLM gateway, and the shared chart every later service reuses."
+   },
+   {
+    "key": "G3-17",
+    "why": "The broker, the orchestrator worker and the Slack app as Deployments with fixed replicas and digest-pinned images."
+   },
+   {
+    "key": "G3-06",
+    "why": "Our own Temporal on inf: the upstream chart's Deployments and a ClusterIP frontend Service."
+   },
+   {
+    "key": "G6-22",
+    "why": "The brain bot: one replica and no Service, because Socket Mode only dials out."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "container",
-   "plain": "A running image: one process tree with its own filesystem and network, like `docker run` gives you."
-  },
-  {
    "term": "pod",
-   "plain": "The smallest thing Kubernetes runs: one or more containers sharing one IP; it is replaced, never repaired."
+   "plain": "One running copy of a service: one or more containers sharing an IP. It is replaced, never repaired."
   },
   {
    "term": "Deployment",
-   "plain": "An object that says which image to run and how many pods to keep, and replaces pods that die."
+   "plain": "Says which image to run and how many pods to keep, and replaces pods that disappear."
   },
   {
    "term": "Service",
-   "plain": "A stable DNS name that sends calls to whichever pods currently match its label."
+   "plain": "A stable name in front of whichever pods carry a certain label right now."
   },
   {
    "term": "namespace",
-   "plain": "A folder for objects in the cluster; our agent services share the one called ai-agents."
+   "plain": "A folder for objects in a cluster. Our agent services share the one called ai-agents."
   },
   {
-   "term": "control plane",
-   "plain": "The cluster's API: it stores what you asked for and makes the nodes match it."
+   "term": "control loop",
+   "plain": "The control plane's endless compare-and-fix between what you asked for and what is running."
   },
   {
    "term": "inf-rhinohealth",
-   "plain": "Our internal EKS cluster in the infrastructure account where the tools and the agent services run."
+   "plain": "Our internal Kubernetes cluster (Amazon EKS), where internal tools and the agent services run."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G0-15",
-   "why": "The gateway is the first agent service deployed on inf; you now know what its Deployment, Service and probe mean."
+   "q": "Draw the broker on inf from memory: the Deployment, its pods, the Service and the orchestrator calling it. Mark the one label that ties them together.",
+   "a": "A Deployment broker with replicas 2 and a template labelled app=broker; two pods with that label; a Service broker selecting app=broker; the orchestrator calling broker.ai-agents."
   },
   {
-   "key": "G3-17",
-   "why": "Deploys the broker, orchestrator worker and Slack app as pods in the ai-agents namespace with fixed replicas and pinned digests."
+   "q": "A pod shows STATUS ImagePullBackOff after a deploy. What does it mean, and where do you fix it?",
+   "a": "The node could not download the image, usually a wrong digest or no access to the registry. Fix the image in the recipe (the Terraform unit), not in the pod."
   },
   {
-   "key": "G3-06",
-   "why": "Temporal's chart renders Deployments and Services like the ones here; its frontend stays ClusterIP."
-  },
-  {
-   "key": "G6-22",
-   "why": "The brain bot is a one-replica Deployment with no Service, because Socket Mode dials out."
+   "q": "Why do the sandbox VMs not run on inf, while the broker does?",
+   "a": "The broker holds credentials, so it runs in the cluster we control. The VMs run untrusted work and hold no keys, so they live in a separate AWS account and reach inf only through a narrow private path."
   }
  ],
- "remember": "You describe a Deployment and a Service; the cluster keeps the pods alive and the name stable. Never write down a pod's name or IP."
+ "remember": "You write down what should be true, a Deployment and a Service; the cluster replaces pods to keep it true, and callers only ever use the Service's name."
 }

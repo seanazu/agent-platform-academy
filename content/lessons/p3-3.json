@@ -1,402 +1,303 @@
 {
+ "v": 2,
  "id": "p3-3",
  "title": "Machines: EC2, AMIs and launch templates",
- "minutes": 45,
+ "minutes": 55,
  "youNeed": [
-  "p3-2"
+  "p3-1"
  ],
- "bridge": "An EC2 instance is like a CI runner you rent by the second. An AMI is like the Docker image it boots from. Except the image is a whole disk with no layers, and the machine can ask a local address for its role's credentials. That address is the first thing an attacker on the VM tries.",
- "intro": "Every run gets a fresh VM. This lesson picks its size, boots it from our image, and writes the launch template that sets its rules. Those rules are: no public IP, an encrypted disk, a near-empty role, and a metadata service the agent cannot reach.",
- "picture": {
-  "caption": "The launch template turns last night's image into a VM with fixed rules; the metadata door stays shut to the agent.",
-  "nodes": [
-   {
-    "id": "lt",
-    "label": "launch template ai-agents-sandbox-full",
-    "kind": "file"
-   },
-   {
-    "id": "param",
-    "label": "SSM parameter /ai-agents/sandbox/ami-id",
-    "kind": "file"
-   },
-   {
-    "id": "ami",
-    "label": "AMI ai-agent-sandbox (tested)",
-    "kind": "file"
-   },
-   {
-    "id": "vm",
-    "label": "VM m8i.2xlarge",
-    "kind": "machine"
-   },
-   {
-    "id": "imds",
-    "label": "metadata 169.254.169.254",
-    "kind": "service"
-   },
-   {
-    "id": "agent",
-    "label": "the agent (user agent, docker)",
-    "kind": "agent"
-   },
-   {
-    "id": "wall",
-    "label": "IMDSv2 + hop limit 1 + iptables",
-    "kind": "check"
-   }
+ "map": "vm-pool",
+ "hook": {
+  "story": [
+   "Nova is building RH-1234 on a full VM, and like every build it runs the product's tests inside Docker containers. One of those containers runs a test helper that fetches any URL it is given. A poisoned test fixture hands it the address http://169.254.169.254/latest/meta-data/iam/security-credentials/, a special address that exists on every EC2 machine. On a badly configured machine, the helper gets back a JSON document with an access key, a secret and a session token: the VM's role credentials, delivered to a container that should never have had them.",
+   "On our VMs the same request gets nothing back. Nobody had to remember to block it on this VM, for this run. The rule was written once, in the one file that every sandbox VM is started from."
   ],
-  "steps": [
-   {
-    "from": "lt",
-    "to": "param",
-    "text": "resolve:ssm: reads the promoted image ID at launch time"
-   },
-   {
-    "from": "param",
-    "to": "ami",
-    "text": "points at the image that passed last night's smoke test"
-   },
-   {
-    "from": "ami",
-    "to": "vm",
-    "text": "boots with the template's type, disk, role and security group"
-   },
-   {
-    "from": "vm",
-    "to": "imds",
-    "text": "root's SSM agent asks for the role's credentials, with a token"
-   },
-   {
-    "from": "agent",
-    "to": "wall",
-    "text": "the agent, or a container, tries the same address"
-   },
-   {
-    "from": "wall",
-    "to": "agent",
-    "text": "refused: wrong user, no token, or one network hop too far"
-   }
-  ]
+  "question": "What decides how every new VM is built, and how does it keep the machine's own credentials away from the code running on it?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Sizes are instance types",
+   "h": "A machine is a size and a disk",
    "p": [
-    "An instance type names a machine shape. m8i.2xlarge reads as: family m (general purpose), generation 8, i for Intel, size 2xlarge. Each size up doubles the CPUs and memory.",
-    "We use one image and three sizes (G3-11). lite is m8i.xlarge for plans and small routines. full is m8i.2xlarge for builds with FCP Lab. wide is m8i.4xlarge for the heaviest work. A full VM costs about $0.42 an hour while it runs (G3-20); a stopped one costs only its disk."
+    "An EC2 instance is a virtual machine that you rent by the second. Two choices define it. The instance type is its size: a name like m8i.2xlarge reads as family m (general purpose), generation 8, i for an Intel processor, and size 2xlarge, and each size step doubles the processors and the memory. The AMI, an Amazon Machine Image, is the saved disk the machine boots from, with the operating system and every tool already installed. You can think of it as a Docker image for a whole machine, with one difference: it is a complete disk, without layers.",
+    "The sandboxes use one AMI, ai-agent-sandbox, rebuilt every night with Docker, Node, Python, git and the product's test setup inside, and three sizes of machine: lite (m8i.xlarge) for plans and small routines, full (m8i.2xlarge) for builds that run the whole product, and wide (m8i.4xlarge) for the heaviest work."
    ],
-   "because": "We read the sizes from the API rather than a blog because the numbers decide what FCP Lab can run.",
    "code": {
     "lang": "bash",
-    "file": "~/academy/aws (moto running, source moto.env)",
+    "file": "your terminal, pointed at the practice AWS",
     "text": "aws ec2 describe-instance-types \\\n  --instance-types m8i.xlarge m8i.2xlarge m8i.4xlarge \\\n  --query 'InstanceTypes[].[InstanceType,VCpuInfo.DefaultVCpus,MemoryInfo.SizeInMiB]' \\\n  --output text",
     "notes": [
      {
-      "line": 2,
-      "text": "The three sandbox sizes: lite, full and wide."
-     },
-     {
       "line": 3,
-      "text": "vCPUs and memory in MiB. 16384 MiB is 16 GiB."
-     },
-     {
-      "line": 4,
-      "text": "Text output is quick to scan in a terminal. moto knows the real shapes."
+      "text": "Only three fields: the name, the number of virtual processors and the memory in MiB."
      }
     ]
    },
    "see": "m8i.2xlarge\t8\t32768\nm8i.4xlarge\t16\t65536\nm8i.xlarge\t4\t16384"
   },
   {
-   "h": "AMIs: the disk a VM starts from",
+   "h": "One recipe for every VM: the launch template",
    "p": [
-    "An AMI (Amazon Machine Image) is a saved disk plus a few settings. A VM boots from it. An AMI belongs to one account and one region; other accounts can use it only if it is shared with them.",
-    "Our images are built by Packer in the inf account (p4-4) and shared with ai-agents (infrastructure PR #1724). They are named rhino-ai-agent-sandbox-v<N>-<testing|release>-<time>. A launch template does not name an AMI ID. It names an SSM parameter, so promoting a new image is one parameter write (G3-16)."
+    "Starting a VM means answering many questions: which image, which size, which role, which disk, which tags, which metadata rules. A launch template is a saved set of those answers. The warm pools and the nightly image test start VMs only from the templates, one template per size, so a rule written in the template holds for every sandbox VM without anyone repeating it.",
+    "Here is the lite template, written as the JSON that the AWS CLI accepts. Two things are missing on purpose. There is no SSH key, because nobody logs in to a sandbox (a later lesson shows how we send it commands instead). And there is no public address: the VM is placed in the private subnets from the network lesson."
    ],
-   "because": "We store the image ID in a parameter because then three launch templates never need editing when the image changes.",
-   "code": {
-    "lang": "bash",
-    "file": "~/academy/aws (moto running)",
-    "text": "aws ssm put-parameter --name /ai-agents/sandbox/ami-id \\\n  --type String --data-type aws:ec2:image --value ami-03cf127a\naws ssm get-parameter --name /ai-agents/sandbox/ami-id \\\n  --query Parameter.Value --output text\n# a launch template then says: ImageId = resolve:ssm:/ai-agents/sandbox/ami-id",
-    "notes": [
-     {
-      "line": 2,
-      "text": "data-type aws:ec2:image makes AWS check that the value is a real AMI ID."
-     },
-     {
-      "line": 3,
-      "text": "Anyone may read it back; the value is not a secret."
-     },
-     {
-      "line": 5,
-      "text": "resolve:ssm: means 'read this parameter when you launch'. A new value applies to the next VM."
-     }
-    ]
-   },
-   "see": "{\n    \"Version\": 1,\n    \"Tier\": \"Standard\"\n}\nami-03cf127a"
-  },
-  {
-   "h": "A launch template: every setting in one place",
-   "p": [
-    "A launch template is a saved set of answers for 'start a VM'. Image, type, role, network, disk, metadata rules, tags. Auto Scaling groups (p3-4) and the smoke test both start VMs from it, so every VM gets the same rules.",
-    "Below is the lite template as JSON for the CLI. G3-11 writes the same in Terraform (p4-3), one per size."
-   ],
-   "because": "We put the rules in the template because a rule that every caller must remember gets forgotten.",
    "code": {
     "lang": "json",
-    "file": "~/academy/aws/lt.json",
-    "text": "{\n  \"ImageId\": \"resolve:ssm:/ai-agents/sandbox/ami-id\",\n  \"InstanceType\": \"m8i.xlarge\",\n  \"IamInstanceProfile\": { \"Name\": \"ai-agent-sandbox\" },\n  \"MetadataOptions\": {\n    \"HttpEndpoint\": \"enabled\",\n    \"HttpTokens\": \"required\",\n    \"HttpPutResponseHopLimit\": 1,\n    \"InstanceMetadataTags\": \"disabled\"\n  },\n  \"BlockDeviceMappings\": [{\n    \"DeviceName\": \"/dev/sda1\",\n    \"Ebs\": { \"VolumeType\": \"gp3\", \"VolumeSize\": 120, \"Encrypted\": true }\n  }],\n  \"TagSpecifications\": [{\n    \"ResourceType\": \"instance\",\n    \"Tags\": [{ \"Key\": \"ai-agents:managed\", \"Value\": \"true\" }, { \"Key\": \"ai-agents:size\", \"Value\": \"lite\" }]\n  }]\n}",
+    "file": "lt.json (the launch template for lite VMs)",
+    "text": "{\n  \"ImageId\": \"resolve:ssm:/ai-agents/sandbox/ami-id\",\n  \"InstanceType\": \"m8i.xlarge\",\n  \"IamInstanceProfile\": { \"Name\": \"ai-agent-sandbox\" },\n  \"MetadataOptions\": {\n    \"HttpTokens\": \"required\",\n    \"HttpPutResponseHopLimit\": 1,\n    \"HttpEndpoint\": \"enabled\",\n    \"InstanceMetadataTags\": \"disabled\"\n  },\n  \"BlockDeviceMappings\": [\n    {\n      \"DeviceName\": \"/dev/sda1\",\n      \"Ebs\": { \"VolumeType\": \"gp3\", \"VolumeSize\": 120, \"Encrypted\": true }\n    }\n  ],\n  \"TagSpecifications\": [\n    {\n      \"ResourceType\": \"instance\",\n      \"Tags\": [\n        { \"Key\": \"ai-agents:managed\", \"Value\": \"true\" },\n        { \"Key\": \"ai-agents:size\", \"Value\": \"lite\" }\n      ]\n    }\n  ]\n}",
     "notes": [
      {
       "line": 2,
-      "text": "The promoted image, read at launch."
+      "text": "Not an AMI ID but a pointer to an SSM parameter that holds it. Promoting a new nightly image is one write to that parameter."
      },
      {
       "line": 4,
-      "text": "The instance profile from p3-1: SSM core and one lifecycle action, nothing else."
-     },
-     {
-      "line": 7,
-      "text": "IMDSv2 only: every metadata request needs a token (next section)."
-     },
-     {
-      "line": 8,
-      "text": "Hop limit 1: the token cannot travel past the VM's own network stack."
-     },
-     {
-      "line": 13,
-      "text": "gp3 is the general SSD type. 120 GiB, encrypted. G3-11 also names the sandbox KMS key here."
-     },
-     {
-      "line": 17,
-      "text": "The sweeper (p3-7) finds VMs and disks only by these tags. G3-11 tags the volume too."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "tip",
-    "text": "There is no network setting with a public IP. The Auto Scaling group places VMs in the private subnets, and the template names the sandbox security group."
-   }
-  },
-  {
-   "h": "The metadata service: what a VM knows",
-   "p": [
-    "Every VM can reach 169.254.169.254, the instance metadata service (IMDS). It answers questions about the VM itself: its ID, its role, a Spot warning, its Auto Scaling state.",
-    "It also hands out the role's temporary credentials. Any program on the VM that can open a connection there gets them. That is the door an attacker tries first.",
-    "IMDSv2 adds a step: first PUT a request for a short token, then send the token with every GET. A plain GET, the IMDSv1 way, gets 401 Unauthorized when tokens are required."
-   ],
-   "because": "We show the token dance because spot-watch (p3-4) and the warm-up script both use it.",
-   "code": {
-    "lang": "bash",
-    "file": "on a real sandbox VM, as root",
-    "text": "TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token \\\n  -H \"X-aws-ec2-metadata-token-ttl-seconds: 300\")\ncurl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" \\\n  http://169.254.169.254/latest/meta-data/instance-id\ncurl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" \\\n  http://169.254.169.254/latest/meta-data/iam/security-credentials/\ncurl -s -o /dev/null -w '%{http_code}\\n' http://169.254.169.254/latest/meta-data/instance-id",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Step 1 of IMDSv2: a PUT that returns a token. Tricks that make a server fetch a URL for an attacker usually cannot send this PUT."
-     },
-     {
-      "line": 3,
-      "text": "Step 2: every read carries the token."
+      "text": "The instance profile from the IAM lesson: the near-empty role ai-agent-sandbox."
      },
      {
       "line": 6,
-      "text": "Lists the role name. Adding the name to the path returns the credentials."
+      "text": "IMDSv2 only: no credentials without a token. The next section explains it."
      },
      {
       "line": 7,
-      "text": "No token: refused with 401 because the template says HttpTokens required."
+      "text": "Hop limit 1: the token cannot reach a container on the VM."
+     },
+     {
+      "line": 14,
+      "text": "The disk is encrypted, and 120 GiB leaves room for the product's Docker images."
+     },
+     {
+      "line": 21,
+      "text": "The sweeper finds every sandbox VM by this tag and terminates the ones that were left behind."
      }
     ]
    },
-   "see": "i-0abc1234def567890\nai-agent-sandbox\n401\n(on a real VM; your IDs differ)"
-  },
-  {
-   "h": "Hop limit 1 and the host rules",
-   "p": [
-    "Each network hop lowers a packet's hop count. With a hop limit of 1, the token reply dies after one hop. A container on the Docker bridge is one hop further away, so it never gets a token.",
-    "The agent's own user is not in a container, so G3-08 adds host rules in the image. An iptables rule lets only root (user ID 0) reach 169.254.169.254. Root runs the SSM agent, which needs it. A rule in the DOCKER-USER chain, Docker's place for your own rules, drops it for containers."
-   ],
-   "because": "We check before we add each rule, because the image role runs on every build and must not stack copies.",
-   "code": {
-    "lang": "bash",
-    "file": "packer/ansible/roles/ai_agent_sandbox/tasks/main.yml (the shell part, G3-08)",
-    "text": "iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j REJECT 2>/dev/null ||\n  iptables -A OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j REJECT\niptables -C DOCKER-USER -d 169.254.169.254 -j DROP 2>/dev/null ||\n  iptables -I DOCKER-USER -d 169.254.169.254 -j DROP\nnetfilter-persistent save",
-    "notes": [
-     {
-      "line": 1,
-      "text": "-C checks whether the rule exists. The || runs line 2 only if it does not."
-     },
-     {
-      "line": 2,
-      "text": "-m owner matches the user that sent the packet. Everyone except uid 0 is rejected."
-     },
-     {
-      "line": 4,
-      "text": "-I inserts at the top of DOCKER-USER, so it runs before Docker's own rules."
-     },
-     {
-      "line": 5,
-      "text": "Saves the rules so they survive a reboot. Warm VMs are stopped and started (p3-4)."
-     }
+   "deeper": {
+    "h": "Go deeper: versions and the encryption key",
+    "p": [
+     "A launch template has numbered versions. Changing it creates a new version instead of editing the old one, and a group of machines uses either a fixed version or the latest one. That makes a bad change easy to see and easy to undo.",
+     "The disk is encrypted with a key from KMS, the AWS key service, that belongs to the sandboxes. The key's policy must allow the role that the Auto Scaling service uses to act for you; if it does not, every launch fails with a key error and the warm pool stays empty."
     ]
-   },
-   "callout": {
-    "kind": "wall",
-    "text": "These rules are speed bumps: root can delete them, and the docker group gives root. The wall is p3-1's near-empty role. A stolen credential can complete a lifecycle hook and talk to SSM, nothing more."
    }
   },
   {
-   "h": "Disk, key and tags",
+   "h": "The metadata door, and the token that locks it",
    "p": [
-    "The root disk is an EBS volume: network storage that outlives a stop. G3-11 makes it gp3, 120 GiB, encrypted with the sandbox key from KMS, AWS's key service. The key policy must allow the AutoScaling service-linked role, the role AWS's Auto Scaling uses to act for you. Otherwise the group cannot launch VMs with that key.",
-    "A volume made from an AMI is slow on its first read of each block. G3-11 sets volume_initialization_rate to 300 MiB/s to fill it faster; check that the pinned aws provider 6.64.0 supports it. Tags ai-agents:managed and ai-agents:size go on the VM and the volume, so the sweeper can find orphans."
+    "Every EC2 machine can reach a special address, 169.254.169.254, where the instance metadata service, IMDS, answers questions about the machine itself: its ID, its size, and, under iam/security-credentials, the temporary credentials of its role. That is how programs on the VM get the role's credentials without a key on disk. It is also the door from the story: any program that can make an HTTP request to that address can ask.",
+    "The first version, IMDSv1, answered any plain GET request, so a test helper tricked into fetching a URL was enough. IMDSv2 adds one step. A program must first send a PUT request to get a short-lived token, and then send that token in a header with every request. Setting HttpTokens to required turns off the old way completely; a plain GET gets 401 Unauthorized. A helper that only follows URLs cannot send a PUT with a special header, so the attack from the story ends there.",
+    "The hop limit closes the second gap, containers. Every time a network packet passes through a router, its hop count drops by one, and a packet whose count reaches zero is dropped. With HttpPutResponseHopLimit set to 1, the reply that carries the token survives exactly one hop: enough to reach a program on the VM itself, but not a container behind Docker's network bridge, which is one hop further. So code inside a container never receives a token, even if it knows how to ask for one."
    ],
-   "callout": {
-    "kind": "gotcha",
-    "text": "If the KMS key policy misses the AutoScaling service-linked role, launches fail with a key error. The warm pool then stays empty."
+   "code": {
+    "lang": "bash",
+    "file": "on a sandbox VM, as a program that is allowed to ask",
+    "text": "TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token \\\n  -H \"X-aws-ec2-metadata-token-ttl-seconds: 300\")\ncurl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" \\\n  http://169.254.169.254/latest/meta-data/iam/security-credentials/; echo\ncurl -s -o /dev/null -w '%{http_code}\\n' \\\n  http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Step one of IMDSv2: a PUT that asks for a token, valid here for 300 seconds."
+     },
+     {
+      "line": 3,
+      "text": "Step two: every request carries the token in this header. The answer is the role's name."
+     },
+     {
+      "line": 5,
+      "text": "The IMDSv1 way, a plain GET with no token, for comparison."
+     }
+    ]
+   },
+   "see": "ai-agent-sandbox\n401",
+   "deeper": {
+    "h": "Go deeper: the host rules in the image",
+    "p": [
+     "The image adds two firewall rules with iptables, the Linux tool for packet rules. The first lets only root, which runs the SSM agent, reach 169.254.169.254, so Nova's own user, which is not in a container, cannot ask either. The second, in the DOCKER-USER chain, the place Docker reserves for your own rules, drops that address for every container.",
+     "These rules are speed bumps rather than walls, because root can delete them and the docker group can become root. The wall behind them is the near-empty role: even if a fooled agent gets the credentials, they can only tell the warm pool that setup is done and talk to Systems Manager."
+    ]
    }
   }
  ],
  "lab": {
-  "title": "A launch template on a fake AWS, and a locked metadata door",
-  "youNeed": [
-   "moto and moto.env from p3-1 (with the ai-agent-sandbox instance profile, or create it again)",
-   "Docker Desktop running"
+  "id": "p3-3",
+  "title": "A launch template and a locked metadata door",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "Docker Desktop running",
+   "AWS CLI v2 and the LocalStack image from the p3-1 lab",
+   "jq"
   ],
-  "worked": [
+  "goal": "Write the sandbox launch template on a practice AWS, then use AWS's own metadata mock to see why IMDSv2 keeps the role's credentials from a program that only follows URLs.",
+  "guess": {
+   "q": "A launch template sets HttpTokens to required. A test helper on the VM is tricked into a plain GET of http://169.254.169.254/latest/meta-data/iam/security-credentials/ai-agent-sandbox. What does it get?",
+   "options": [
+    {
+     "text": "The credentials, because the request comes from the VM itself.",
+     "correct": false,
+     "why": "That was true with IMDSv1. With tokens required, coming from the VM is not enough: the request also needs a token from a PUT."
+    },
+    {
+     "text": "401 Unauthorized, because the request carries no token.",
+     "correct": true,
+     "why": "IMDSv2 only answers requests that send a token in a header, and a helper that only follows URLs cannot get one."
+    },
+    {
+     "text": "Nothing, because the metadata service is turned off.",
+     "correct": false,
+     "why": "HttpEndpoint is still enabled; programs that use the token flow, like the SSM agent, need it."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "cd ~/academy/aws && source moto.env. Save lt.json (section 3). aws ec2 create-launch-template --launch-template-name ai-agents-sandbox-lite --launch-template-data file://lt.json --query 'LaunchTemplate.[LaunchTemplateName,LatestVersionNumber]' --output text",
-    "see": "ai-agents-sandbox-lite\t1"
+    "say": "Start LocalStack if it is not running from an earlier lab, and point the AWS CLI at it in a new folder.",
+    "do": "docker run --rm -d --name localstack -p 4566:4566 localstack/localstack:4.9 && sleep 15\nmkdir -p ~/academy-labs/p3-3 && cd ~/academy-labs/p3-3 && export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:4566",
+    "see": "(a container ID, or a name conflict if LocalStack is already running, which is fine)"
    },
    {
-    "do": "aws ec2 describe-launch-template-versions --launch-template-name ai-agents-sandbox-lite --query 'LaunchTemplateVersions[0].LaunchTemplateData.MetadataOptions'",
-    "see": "{\n    \"HttpTokens\": \"required\",\n    \"HttpPutResponseHopLimit\": 1,\n    \"HttpEndpoint\": \"enabled\",\n    \"InstanceMetadataTags\": \"disabled\"\n}"
+    "say": "Compare the three sizes, because the size is the first answer every launch needs.",
+    "do": "aws ec2 describe-instance-types --instance-types m8i.xlarge m8i.2xlarge m8i.4xlarge --query 'InstanceTypes[].[InstanceType,VCpuInfo.DefaultVCpus,MemoryInfo.SizeInMiB]' --output text",
+    "see": "m8i.2xlarge\t8\t32768\nm8i.4xlarge\t16\t65536\nm8i.xlarge\t4\t16384"
    },
    {
-    "do": "aws ec2 run-instances --launch-template LaunchTemplateName=ai-agents-sandbox-lite --image-id ami-03cf127a --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1 --query 'Instances[0].[InstanceId,MetadataOptions.HttpTokens]' --output text",
-    "see": "i-8c031695486125c7b\trequired\n(moto does not resolve resolve:ssm or copy metadata options from a template, so we pass both here; AWS does it for you)"
+    "say": "Store the current image ID in an SSM parameter, because the template points at the parameter, not at the image.",
+    "do": "aws ssm put-parameter --name /ai-agents/sandbox/ami-id --type String --data-type aws:ec2:image --value ami-03cf127a",
+    "see": "{\n    \"Version\": 1\n}"
    },
    {
-    "do": "aws ec2 describe-instances --filters Name=tag:ai-agents:managed,Values=true --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text",
-    "see": "i-8c031695486125c7b\trunning"
+    "say": "Create the lite template from the JSON in Understand, and read back its metadata rules.",
+    "do": "Save the template from Understand as lt.json, then:\naws ec2 create-launch-template --launch-template-name ai-agents-sandbox-lite --launch-template-data file://lt.json --query 'LaunchTemplate.[LaunchTemplateName,LatestVersionNumber]' --output text\naws ec2 describe-launch-template-versions --launch-template-name ai-agents-sandbox-lite --query 'LaunchTemplateVersions[0].LaunchTemplateData.MetadataOptions'",
+    "see": "ai-agents-sandbox-lite\t1\n{\n    \"HttpTokens\": \"required\",\n    \"HttpPutResponseHopLimit\": 1,\n    \"HttpEndpoint\": \"enabled\",\n    \"InstanceMetadataTags\": \"disabled\"\n}"
    },
    {
-    "do": "docker run --rm -it --cap-add NET_ADMIN alpine:3.20 sh. Inside: apk add -q iptables curl python3 && adduser -D -u 1001 agent && ip addr add 169.254.169.254/32 dev lo",
-    "see": "(no output; you are root in a container that now owns the metadata address)"
+    "say": "LocalStack does not run a metadata service, so start AWS's own metadata mock, configured like a lite sandbox VM with tokens required. It listens on localhost:1338 instead of 169.254.169.254.",
+    "do": "cat > imds.json <<'EOF'\n{\n  \"imdsv2\": true,\n  \"metadata\": {\n    \"values\": {\n      \"instance-id\": \"i-0a1b2c3d4e5f60718\",\n      \"instance-type\": \"m8i.xlarge\",\n      \"iam-security-credentials-role\": \"ai-agent-sandbox\"\n    }\n  }\n}\nEOF\ndocker run -d --rm --name imds --platform linux/amd64 -p 1338:1338 -v \"$PWD/imds.json:/imds.json\" public.ecr.aws/aws-ec2/amazon-ec2-metadata-mock:v1.13.0 -c /imds.json",
+    "see": "(a container ID)"
    },
    {
-    "do": "Inside: mkdir -p /srv/latest/meta-data && echo ai-agent-sandbox > /srv/latest/meta-data/iam-role && cd /srv && (python3 -m http.server 80 --bind 169.254.169.254 >/dev/null 2>&1 &) && sleep 1 && su agent -s /bin/sh -c 'curl -s -m 3 http://169.254.169.254/latest/meta-data/iam-role; echo exit=$?'",
-    "see": "ai-agent-sandbox\nexit=0"
+    "say": "Be the tricked test helper: a plain GET for the role's credentials, with no token.",
+    "do": "curl -s -o /dev/null -w 'HTTP %{http_code}\\n' http://localhost:1338/latest/meta-data/iam/security-credentials/ai-agent-sandbox",
+    "see": "HTTP 401"
    },
    {
-    "do": "Inside: iptables -A OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j REJECT && iptables -S OUTPUT",
-    "see": "-P OUTPUT ACCEPT\n-A OUTPUT -d 169.254.169.254/32 -m owner ! --uid-owner 0 -j REJECT --reject-with icmp-port-unreachable"
-   },
-   {
-    "do": "Inside: su agent -s /bin/sh -c 'curl -s -m 3 http://169.254.169.254/latest/meta-data/iam-role; echo exit=$?' ; curl -s -m 3 http://169.254.169.254/latest/meta-data/iam-role; echo exit=$?",
-    "see": "exit=28\nai-agent-sandbox\nexit=0\n(28: curl gave up, the agent's packets never got out; root still reads it)"
+    "say": "Now be a program that is allowed to ask, like the SSM agent: get a token with a PUT, then send it with each request.",
+    "do": "TOKEN=$(curl -s -X PUT http://localhost:1338/latest/api/token -H \"X-aws-ec2-metadata-token-ttl-seconds: 300\")\nfor p in instance-id instance-type iam/security-credentials/; do echo \"$p: $(curl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" http://localhost:1338/latest/meta-data/$p)\"; done",
+    "see": "instance-id: i-0a1b2c3d4e5f60718\ninstance-type: m8i.xlarge\niam/security-credentials/: ai-agent-sandbox"
    }
   ],
-  "faded": "Still in the container, make the rule idempotent like G3-08. Write /fix.sh with the -C ... || -A ... form from section 5 (OUTPUT rule only) and run it twice. Left to you: predict how many 169.254 rules iptables -S OUTPUT shows after two runs, then count them with grep -c.",
-  "alone": "Write a second template, ai-agents-sandbox-wide, for m8i.4xlarge with the same metadata options and the tag ai-agents:size = wide. Create it in moto. Then write one describe-launch-template-versions call per template that prints the instance type and HttpTokens, and check both say required.",
-  "done": "The agent user times out on 169.254.169.254 while root still reads it. Both launch templates show HttpTokens required and hop limit 1."
+  "build": "Write lt-full.json for the full size: the same as lt.json, but with m8i.2xlarge and the tag ai-agents:size set to full. Create the template ai-agents-sandbox-full from it. Then write one describe-launch-template-versions command per template that prints the instance type, HttpTokens and the hop limit, and check that both say required and 1. Last, with the token you already have, read the full credentials document at iam/security-credentials/ai-agent-sandbox and find its Expiration field.",
+  "checks": [
+   "describe-launch-template-versions shows HttpTokens required and HttpPutResponseHopLimit 1 for ai-agents-sandbox-lite.",
+   "A plain GET to the mock's credentials path prints HTTP 401.",
+   "With a token, the mock answers instance-id, instance-type and the role name ai-agent-sandbox.",
+   "ai-agents-sandbox-full exists and prints m8i.2xlarge, required and 1.",
+   "You stopped the mock (docker stop imds) and LocalStack (docker stop localstack)."
+  ],
+  "solution": {
+   "lang": "bash",
+   "file": "~/academy-labs/p3-3",
+   "text": "jq '.InstanceType = \"m8i.2xlarge\" | .TagSpecifications[0].Tags[1].Value = \"full\"' lt.json > lt-full.json\naws ec2 create-launch-template --launch-template-name ai-agents-sandbox-full \\\n  --launch-template-data file://lt-full.json \\\n  --query 'LaunchTemplate.[LaunchTemplateName,LatestVersionNumber]' --output text\n\nfor size in lite full; do\n  aws ec2 describe-launch-template-versions --launch-template-name ai-agents-sandbox-$size \\\n    --query 'LaunchTemplateVersions[0].LaunchTemplateData.[InstanceType,MetadataOptions.HttpTokens,MetadataOptions.HttpPutResponseHopLimit]' \\\n    --output text\ndone\n# m8i.xlarge   required  1\n# m8i.2xlarge  required  1\n\ncurl -s -H \"X-aws-ec2-metadata-token: $TOKEN\" \\\n  http://localhost:1338/latest/meta-data/iam/security-credentials/ai-agent-sandbox | jq .Expiration"
+  },
+  "fix": "A teammate opened a pull request with a template for the wide size. Save it as lt-wide.json:\n{\n  \"ImageId\": \"resolve:ssm:/ai-agents/sandbox/ami-id\",\n  \"InstanceType\": \"m8i.4xlarge\",\n  \"IamInstanceProfile\": { \"Name\": \"ai-agent-sandbox\" },\n  \"NetworkInterfaces\": [{ \"DeviceIndex\": 0, \"AssociatePublicIpAddress\": true }],\n  \"MetadataOptions\": { \"HttpTokens\": \"optional\", \"HttpPutResponseHopLimit\": 2, \"HttpEndpoint\": \"enabled\" },\n  \"BlockDeviceMappings\": [{ \"DeviceName\": \"/dev/sda1\", \"Ebs\": { \"VolumeType\": \"gp3\", \"VolumeSize\": 120, \"Encrypted\": true } }],\n  \"TagSpecifications\": [{ \"ResourceType\": \"instance\", \"Tags\": [{ \"Key\": \"ai-agents:managed\", \"Value\": \"true\" }, { \"Key\": \"ai-agents:size\", \"Value\": \"wide\" }] }]\n}\nThey say the test containers \"needed to read the region from the metadata service\", and that a public address \"makes debugging easier\". Find the three settings that break the rules from this lesson with jq '{meta: .MetadataOptions, net: .NetworkInterfaces}' lt-wide.json. To see what the first one costs, edit imds.json to \"imdsv2\": false, restart the mock (docker rm -f imds, then the docker run from step 5), and run the plain GET from step 6 without -o /dev/null: the mock now hands the credentials to anyone who asks. Then repair lt-wide.json, put imds.json back to true, and create ai-agents-sandbox-wide.",
+  "explain": [
+   "Why do we write the metadata rules in the launch template instead of configuring each VM after it starts?",
+   "A test helper that only follows URLs gets 401 from the metadata service. What does a program need to do that the helper cannot?",
+   "Hop limit 1 stops containers on the VM from getting a token. Why is that not enough on its own, and what is the real wall behind it?"
+  ],
+  "done": "Both templates require tokens with hop limit 1, the plain GET gets 401 while the token flow works, and the mock and LocalStack are stopped."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Why does the launch template set a hop limit of 1?",
+   "q": "Why does every sandbox VM start from a launch template instead of a long run-instances command?",
    "options": [
     {
-     "text": "So the token reply dies at the Docker bridge and containers cannot get a token",
+     "text": "Because AWS cannot start a VM without one",
+     "correct": false,
+     "why": "You can start a VM with only command-line options. The template is about sameness, not about what AWS requires."
+    },
+    {
+     "text": "Because a launch template starts VMs faster",
+     "correct": false,
+     "why": "Speed comes from the warm pool. The template only stores the answers to the launch questions."
+    },
+    {
+     "text": "Because the rules written there, like IMDSv2 and the near-empty role, then hold for every VM without anyone repeating them",
      "correct": true,
-     "why": "The reply needs a second hop to reach a container; with a limit of 1 it is dropped."
-    },
-    {
-     "text": "So the VM has only one network card",
-     "correct": false,
-     "why": "Hop limit is about how far a packet travels, not how many cards a VM has."
-    },
-    {
-     "text": "So IMDS answers one request per second",
-     "correct": false,
-     "why": "It is not a rate limit."
+     "why": "The warm pools and the image test launch only from the templates, so one file sets the rules for all sandbox VMs."
     }
    ]
   },
   {
-   "q": "A new image passed the smoke test. What makes the next VMs use it?",
+   "q": "With HttpTokens set to required, what must a program on the VM do to read the role's credentials?",
    "options": [
     {
-     "text": "Editing the three launch templates and applying Terraform",
-     "correct": false,
-     "why": "That is the work resolve:ssm saves us."
-    },
-    {
-     "text": "Restarting every warm VM by hand",
-     "correct": false,
-     "why": "Warm VMs are replaced over time by the sweeper (p3-7); no hand restarts."
-    },
-    {
-     "text": "Writing its ID into /ai-agents/sandbox/ami-id; templates read it at launch",
+     "text": "Send a PUT to get a token, then send the token in a header with each GET",
      "correct": true,
-     "why": "One parameter write promotes it, and the previous ID is kept for rollback (p4-4)."
+     "why": "That is the IMDSv2 flow. A program that can only follow a URL cannot do the PUT with its special header."
+    },
+    {
+     "text": "Run as the agent user",
+     "correct": false,
+     "why": "The user does not matter to IMDS itself; on our image a firewall rule even blocks the agent user. The token is what IMDS checks."
+    },
+    {
+     "text": "Use an SSH key from the launch template",
+     "correct": false,
+     "why": "The sandbox templates have no SSH key, and IMDS never asks for one."
     }
    ]
   },
   {
-   "q": "The docker group makes the agent root-equivalent. What is the real wall around the role's credentials?",
+   "q": "A teammate sets the hop limit to 2 so a test container can read the region from the metadata service. What else does that change?",
    "options": [
     {
-     "text": "The iptables owner rule",
+     "text": "Nothing else, the region is harmless",
      "correct": false,
-     "why": "Root can delete iptables rules."
+     "why": "The hop limit does not care what the container asks for. Once the token reaches it, every path is open, the credentials included."
     },
     {
-     "text": "The instance role holds almost nothing worth stealing",
+     "text": "Any container on the VM can now get a token and read the role's credentials",
      "correct": true,
-     "why": "Assume the credentials leak. They can only finish a lifecycle hook and talk to SSM."
+     "why": "A container is one hop further than the VM. Hop limit 1 is what keeps the token from reaching it."
     },
     {
-     "text": "IMDSv2 tokens",
+     "text": "The VM can now be reached from the internet",
      "correct": false,
-     "why": "Root on the VM can request a token like the SSM agent does."
+     "why": "The hop limit only affects the metadata service's replies. Reachability comes from routes and security groups."
     }
    ]
   }
  ],
- "recall": [
-  "From p3-2: which egress rules does the sandbox security group have, and why no ingress?",
-  "From p3-1: which line of AmazonSSMManagedInstanceCore makes Parameter Store a bad place for secrets?"
- ],
- "videos": [
-  {
-   "title": "Learn AWS IAM in less than 10 minutes",
-   "url": "https://www.youtube.com/watch?v=9Pk2J_5qnlk",
-   "channel": "AWS Developers",
-   "minutes": 9,
-   "why": "Official, recent AWS explainer of users, roles and policies."
-  },
-  {
-   "title": "AWS VPC & Subnets For Beginners",
-   "url": "https://www.youtube.com/watch?v=TUTqYEZZUdc",
-   "channel": "Sam Meech-Ward",
-   "minutes": 17,
-   "why": "Visual explanation of VPC, public/private subnets, NAT and EC2 placement."
-  }
- ],
+ "platform": {
+  "p": [
+   "The infrastructure repo holds one launch template per size, lite, full and wide, all in one module next to the warm pools. Each boots the image found in the SSM parameter /ai-agents/sandbox/ami-id, requires IMDSv2 with hop limit 1, gets an encrypted gp3 disk, no public address, the sandbox security group and the near-empty instance role, and tags the VM and its disk with ai-agents:managed=true and its size.",
+   "The image itself, ai-agent-sandbox, is built with Packer and Ansible, and its host rules keep the metadata address for root only. A nightly workflow builds it, boots it from the full template, runs a smoke test, and only then writes the new image ID into the parameter; the previous ID stays in a second parameter for a one-command rollback."
+  ],
+  "tickets": [
+   {
+    "key": "G3-11",
+    "why": "The three launch templates with IMDSv2, hop limit 1, the encrypted disk, no public address and the near-empty role."
+   },
+   {
+    "key": "G3-08",
+    "why": "The ai-agent-sandbox image and its host rules that keep the metadata address away from the agent and from containers."
+   },
+   {
+    "key": "G3-16",
+    "why": "The nightly build, smoke test and promotion through the SSM parameter."
+   }
+  ]
+ },
  "words": [
   {
    "term": "instance type",
-   "plain": "A machine shape such as m8i.2xlarge: family, generation, processor and size."
+   "plain": "The size of an EC2 machine, like m8i.2xlarge: family, generation, processor and size."
   },
   {
    "term": "AMI",
-   "plain": "Amazon Machine Image: a saved disk a VM boots from, owned by one account in one region."
+   "plain": "Amazon Machine Image: the saved disk a VM boots from, with the system and tools installed."
   },
   {
    "term": "launch template",
-   "plain": "A saved set of settings for starting a VM: image, type, role, disk, metadata rules, tags."
+   "plain": "A saved set of answers for starting a VM: image, size, role, disk, metadata rules and tags."
   },
   {
    "term": "IMDS",
@@ -404,26 +305,26 @@
   },
   {
    "term": "IMDSv2",
-   "plain": "The metadata mode where every read needs a token from a PUT first."
+   "plain": "The version of IMDS that answers only requests carrying a token from a PUT request."
   },
   {
    "term": "hop limit",
-   "plain": "How many network hops the token reply may travel; 1 keeps it away from containers."
-  },
-  {
-   "term": "EBS volume",
-   "plain": "A network disk attached to a VM that survives a stop; ours is gp3, 120 GiB, encrypted."
+   "plain": "How many network hops the token reply may travel; 1 keeps it on the VM and away from containers."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-11",
-   "why": "One launch template per size with IMDSv2, hop limit 1, an encrypted gp3 disk, no public IP and the near-empty role."
+   "q": "Write the MetadataOptions block of a sandbox launch template from memory, and say what each of the two important lines prevents.",
+   "a": "HttpTokens required (a plain GET, such as one from a tricked URL fetcher, gets 401) and HttpPutResponseHopLimit 1 (the token never reaches a container); HttpEndpoint enabled, InstanceMetadataTags disabled."
   },
   {
-   "key": "G3-08",
-   "why": "The image's host rules: only root reaches the metadata address, containers never, saved across reboots."
+   "q": "Why does the launch template name an SSM parameter instead of an AMI ID?",
+   "a": "So promoting a new nightly image, or rolling back to the previous one, is one write to the parameter, and no template has to change."
+  },
+  {
+   "q": "Name the three sandbox sizes and what each one is for.",
+   "a": "lite (m8i.xlarge) for plans and small routines, full (m8i.2xlarge) for builds with the whole product, wide (m8i.4xlarge) for the heaviest work."
   }
  ],
- "remember": "The launch template fixes every VM's rules. The metadata door is shut to the agent, and the role behind it holds nothing worth stealing."
+ "remember": "Every sandbox VM is born from a launch template, so its rules hold for all of them, and the most important rule is IMDSv2 with hop limit 1: no token, no credentials."
 }

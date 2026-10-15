@@ -1,429 +1,319 @@
 {
+ "v": 2,
  "id": "p5-4",
  "title": "Network policy and PrivateLink",
  "minutes": 55,
  "youNeed": [
   "p5-1",
-  "p3-2",
   "p4-5"
  ],
- "bridge": "A NetworkPolicy is like a security group (p3-2) attached to a label instead of a machine. Except the default is the opposite of AWS: with no policy at all, every pod can reach every pod. The first policy that selects a pod flips that pod to deny-all for that direction.",
- "intro": "Our services share one cluster with Vault, n8n and the runners, and the sandbox VMs live in another AWS account. Two tools draw the lines. NetworkPolicy limits which pods may talk inside inf. PrivateLink lets a sandbox reach exactly three ports on inf without joining the networks. This lesson shows both, from a kind cluster to G3-17's Terraform.",
- "picture": {
-  "caption": "A sandbox reaches three ports through PrivateLink; inside inf, policies decide who reaches the rest.",
-  "nodes": [
-   {
-    "id": "vm",
-    "label": "sandbox VM (ai-agents VPC)",
-    "kind": "machine"
-   },
-   {
-    "id": "ep",
-    "label": "VPC endpoint: broker.ai-agents.example.com",
-    "kind": "cloud"
-   },
-   {
-    "id": "nlb",
-    "label": "NLB ai-agents-sandbox-facing (inf)",
-    "kind": "cloud"
-   },
-   {
-    "id": "broker",
-    "label": "broker pod: sandbox port + internal port",
-    "kind": "service"
-   },
-   {
-    "id": "orch",
-    "label": "orchestrator-worker pod",
-    "kind": "service"
-   },
-   {
-    "id": "temporal",
-    "label": "temporal-frontend :7233",
-    "kind": "service"
-   },
-   {
-    "id": "policy",
-    "label": "NetworkPolicies in ns ai-agents",
-    "kind": "check"
-   }
+ "map": "egress",
+ "hook": {
+  "story": [
+   "The broker has two doors. One faces the sandbox VMs: that is where Nova's harness asks it to push a branch or post in Slack, always inside the scope of its run. The other door is internal, and only the orchestrator should ever use it. Through that door, a request opens a new run's scope and gets back a fresh capability, the pass that lets a VM act for that run.",
+   "Now think about the n8n pod that shares the cluster with us, or a test service some other team deploys next month. Inside a Kubernetes cluster, every pod can open a connection to every other pod, unless someone says otherwise. So any of them can knock on the broker's internal door. The broker checks what it receives, but a door that strangers can reach is a door they can keep trying."
   ],
-  "steps": [
-   {
-    "from": "vm",
-    "to": "ep",
-    "text": "resolves the name to a private IP inside its own VPC"
-   },
-   {
-    "from": "ep",
-    "to": "nlb",
-    "text": "PrivateLink carries the TCP connection to inf; no VPC peering"
-   },
-   {
-    "from": "nlb",
-    "to": "broker",
-    "text": "listener 443 forwards to the broker's sandbox port only"
-   },
-   {
-    "from": "orch",
-    "to": "broker",
-    "text": "calls the internal port; the policy allows this one pod"
-   },
-   {
-    "from": "policy",
-    "to": "temporal",
-    "text": "only pods in ns ai-agents may reach 7233"
-   },
-   {
-    "from": "vm",
-    "to": "temporal",
-    "text": "no listener on the NLB, no route: never reachable from a sandbox"
-   }
-  ]
+  "question": "How do we make sure that only the orchestrator can even open a connection to the broker's internal port?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Start: inside a cluster, everything talks",
+   "h": "Inside a cluster, everyone can talk",
    "p": [
-    "Run a probe pod in the default namespace of your kind cluster and curl the broker Service in ai-agents from p5-1. It answers. Kubernetes has no firewall between pods until you write one.",
-    "On inf that means a pod in the n8n namespace could connect to the agents' Temporal on port 7233. It could also reach the broker's internal port. Nothing would stop it. The services check credentials, but a reachable port is a door to test. NetworkPolicy closes the doors that nobody should knock on."
+    "Kubernetes gives every pod an IP address and lets every pod reach every other pod, in any namespace, on any port. That makes the first deploy easy, and it is the opposite of what you know from AWS, where a security group refuses everything you did not allow. On inf it means the broker's internal port, the Temporal frontend and the gateway are all reachable from pods that have nothing to do with the agent platform.",
+    "A NetworkPolicy changes that for the pods it selects. It is an allow-list attached to pods by label. It has three parts: podSelector says which pods it protects, policyTypes says which direction it covers, Ingress for traffic coming into those pods and Egress for traffic going out of them, and the rules list who is allowed. The moment one policy selects a pod for a direction, everything in that direction that no rule allows is refused. Pods that no policy selects stay fully open."
    ],
-   "callout": {
-    "kind": "gotcha",
-    "text": "kind's default network (kindnet) ignores NetworkPolicy completely: you can apply a policy and nothing changes. The lab creates a second cluster with Calico, a network plugin that enforces policies. inf uses a plugin that enforces them; ask DevOps which one."
-   }
-  },
-  {
-   "h": "A policy: who may reach Temporal",
-   "p": [
-    "A NetworkPolicy has three parts. podSelector says which pods it protects. policyTypes says which direction it covers: Ingress (into those pods), Egress (out of them), or both. The rules list who is allowed; everything else in that direction is refused.",
-    "G3-06 says: the Temporal frontend stays ClusterIP, and a NetworkPolicy lets only pods in the ai-agents namespace reach port 7233. Here it is."
-   ],
-   "because": "We write an allow-list for Temporal so a pod elsewhere on inf cannot even open the port, whatever credentials it holds.",
    "code": {
     "lang": "yaml",
-    "file": "rendered by modules/ai-agents-temporal (G3-06)",
-    "text": "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: temporal-frontend-from-ai-agents\n  namespace: ai-agents\nspec:\n  podSelector:\n    matchLabels: { app.kubernetes.io/component: frontend }\n  policyTypes: [Ingress]\n  ingress:\n    - from:\n        - podSelector: {}          # any pod ...\n      ports:\n        - port: 7233\n          protocol: TCP",
-    "notes": [
-     {
-      "line": 5,
-      "text": "A policy lives in a namespace and can only protect pods in it."
-     },
-     {
-      "line": 8,
-      "text": "The pods this protects: the ones with Temporal's frontend label. Check the label with `kubectl get pods --show-labels`."
-     },
-     {
-      "line": 9,
-      "text": "Only Ingress is covered. The frontend's outgoing calls (to history, matching, the database) stay open."
-     },
-     {
-      "line": 12,
-      "text": "An empty podSelector inside `from` means every pod in the same namespace, and no pod from another one."
-     },
-     {
-      "line": 14,
-      "text": "Only this port. The frontend's metrics port is closed by this policy too; add it if the scraper lives in another namespace."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "tip",
-    "text": "To allow a pod from another namespace, add a namespaceSelector next to the podSelector inside the same `from` item. Two selectors in one item mean AND; two items in the list mean OR. People get this wrong often; test with a probe pod."
-   }
-  },
-  {
-   "h": "The broker's two ports",
-   "p": [
-    "The broker (G3-07) listens on two ports. The sandbox-facing port serves the harness in the VM: /v1/scope, /v1/gh, the git proxy. The internal port serves the orchestrator only: POST /internal/runs opens a run and returns the capability, DELETE revokes it. A sandbox that could reach the internal port could mint itself a scope.",
-    "G3-17 says: 'only orchestrator-worker reaches the broker's internal port and Temporal'. In policy terms, the broker's internal port gets an ingress rule whose only `from` is the orchestrator-worker pods."
-   ],
-   "because": "Naming the one allowed caller by label makes the rule survive pod restarts and scaling, which an IP list would not.",
-   "code": {
-    "lang": "yaml",
-    "file": "rendered by modules/ai-agents-service for the broker (G3-17)",
-    "text": "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: broker-internal-from-orchestrator\n  namespace: ai-agents\nspec:\n  podSelector:\n    matchLabels: { app: broker }\n  policyTypes: [Ingress]\n  ingress:\n    - from:\n        - podSelector:\n            matchLabels: { app: orchestrator-worker }\n      ports:\n        - port: internal            # the named container port; its number is set in the broker's config\n    - ports:\n        - port: sandbox             # the NLB's targets reach this one; no `from`, so any source",
+    "file": "the broker's policy on inf",
+    "text": "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: broker\n  namespace: ai-agents\nspec:\n  podSelector:\n    matchLabels:\n      app: broker\n  policyTypes: [Ingress]\n  ingress:\n    - from:\n        - podSelector:\n            matchLabels:\n              app: orchestrator-worker\n      ports:\n        - port: internal\n    - ports:\n        - port: sandbox",
     "notes": [
      {
       "line": 8,
-      "text": "Protects the broker pods. From now on, anything not listed below is refused."
+      "text": "The pods this policy protects: the broker's. From now on, any incoming connection that no rule below allows is refused."
+     },
+     {
+      "line": 11,
+      "text": "Only incoming traffic is covered. The broker's own outgoing calls, to GitHub and its database, are not touched by this policy."
      },
      {
       "line": 13,
-      "text": "Only orchestrator-worker pods, and only on the internal port. The Slack app and the gateway cannot mint scopes."
+      "text": "Rule one: only pods labelled app=orchestrator-worker in this namespace may connect…"
      },
      {
-      "line": 15,
-      "text": "Ports can be named. The Deployment names its container ports, so the policy need not repeat numbers."
-     },
-     {
-      "line": 16,
-      "text": "A second rule with no `from`: the sandbox port must accept the NLB's health checks and the VMs behind it."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Egress: what a pod may call out to",
-   "p": [
-    "Egress policies are the other direction. The brain bot (G6-22) may call only Slack, GitHub, the Jira site and the LLM gateway Service. Plain NetworkPolicy can name pods and IP ranges, not domain names. So 'Slack' has to become an ipBlock, or the cluster's network plugin must support domain rules. Check with DevOps which plugin inf runs and whether it does; write the decision in the ticket.",
-    "One rule every egress policy needs: DNS. The moment you add `policyTypes: [Egress]`, the pod loses port 53 to kube-dns unless you allow it. Every call then fails with a name-resolution error that looks like a network outage."
-   ],
-   "because": "An egress allow-list turns 'this pod was tricked into posting data somewhere' into a connection that never opens.",
-   "code": {
-    "lang": "yaml",
-    "file": "the shape of the brain bot's egress policy (G6-22)",
-    "text": "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: brain-bot-egress\n  namespace: ai-agents\nspec:\n  podSelector:\n    matchLabels: { app: brain-bot }\n  policyTypes: [Egress]\n  egress:\n    - to:\n        - namespaceSelector:\n            matchLabels: { kubernetes.io/metadata.name: kube-system }\n      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]\n    - to:\n        - podSelector:\n            matchLabels: { app: llm-gateway }\n      ports: [{ port: 8080 }]\n    - to:\n        - ipBlock: { cidr: 0.0.0.0/0 }   # Slack, GitHub, Jira: narrow this to their ranges, or use the plugin's domain rules\n      ports: [{ port: 443 }]",
-    "notes": [
-     {
-      "line": 9,
-      "text": "Egress only. Incoming is already closed: the bot has no Service, nothing dials in."
-     },
-     {
-      "line": 13,
-      "text": "DNS first. The label kubernetes.io/metadata.name is set on every namespace automatically, so you can select kube-system by name."
-     },
-     {
-      "line": 17,
-      "text": "The gateway Service's pods, by label, on its port 8080. The bot never needs the Anthropic key; the gateway adds it."
-     },
-     {
-      "line": 20,
-      "text": "The honest placeholder: port 443 anywhere until the domain rule exists. Say so in the PR; a reviewer should see the gap."
-     }
-    ]
-   }
-  },
-  {
-   "h": "PrivateLink: three ports, nothing else",
-   "p": [
-    "The sandbox VMs run in the ai-agents AWS account, in a VPC with no NAT and no route to inf. They still need the broker, the LLM gateway and the OTel collector. Peering the two VPCs would open every inf address to every sandbox. PrivateLink does the opposite. It publishes one load balancer as a service, and the other account gets a private IP for it in its own VPC.",
-    "G3-17 builds it in the unit ai-agents/sandbox-privatelink/. On the inf side there is an internal Network Load Balancer with one listener per port. An endpoint service in front of it allows only the ai-agents account. On the other side: an interface endpoint plus private DNS names. Read the provider side."
-   ],
-   "because": "With a listener per port, the list of what a sandbox can reach is a Terraform map. A reviewer reads it in five seconds.",
-   "code": {
-    "lang": "hcl",
-    "file": "infrastructure/multi_tenant/accounts/infrastructure/ai-agents/sandbox-privatelink/main.tf (part 1)",
-    "text": "# Sandboxes reach exactly three things on inf: the broker's sandbox port, the LLM gateway and the\n# OTel collector. Not envoy-internal (that would expose every internal tool) and not Temporal.\nlocals {\n  sandbox_ports = { broker = 443, gateway = 8443, otel = 4318 }\n}\n\nresource \"aws_lb\" \"sandbox_facing\" {\n  name               = \"ai-agents-sandbox-facing\"\n  internal           = true\n  load_balancer_type = \"network\"\n  subnets            = var.inf_private_subnets\n  tags               = var.tags\n}\n\nresource \"aws_lb_listener\" \"this\" {\n  for_each          = local.sandbox_ports\n  load_balancer_arn = aws_lb.sandbox_facing.arn\n  port              = each.value\n  protocol          = \"TLS\"\n  certificate_arn   = var.acm_certificate_arn # *.ai-agents.example.com\n  default_action {\n    type             = \"forward\"\n    target_group_arn = aws_lb_target_group.this[each.key].arn # pods bound with TargetGroupBinding\n  }\n}",
-    "notes": [
-     {
-      "line": 4,
-      "text": "The whole allow-list. Adding a fourth entry is a visible diff on a reviewed PR."
-     },
-     {
-      "line": 9,
-      "text": "internal: no public IP. It is reachable through the endpoint service and from inside inf, nowhere else."
-     },
-     {
-      "line": 16,
-      "text": "for_each makes one listener per map entry; each.key is broker, gateway or otel."
+      "line": 18,
+      "text": "…and only to the internal port. Ports can be named in the Deployment, so the policy does not repeat numbers."
      },
      {
       "line": 19,
-      "text": "TLS ends at the NLB with an ACM certificate, so the harness talks https to real names."
-     },
-     {
-      "line": 23,
-      "text": "A target group per port, bound to the pods with TargetGroupBinding (the AWS load balancer controller watches the Service)."
+      "text": "Rule two has no from, so any source may use the sandbox port. The VMs arrive there through the load balancer described below."
      }
     ]
    }
   },
   {
-   "h": "The endpoint service and the consumer side",
+   "h": "A policy is a request; the network plugin enforces it",
    "p": [
-    "The endpoint service is the published side. Its allowed principals list is a wall: only the ai-agents account may create an endpoint to it. No acceptance step is needed, because the list is the acceptance.",
-    "The consumer side lives in the new tree, under terraform/accounts/ai-agents/aws/us-east-1/core-services/inf-services-endpoint/. It holds an aws_vpc_endpoint in the sandbox VPC and a private hosted zone with records broker., gateway. and otel.ai-agents.example.com pointing at it. The harness is configured with those names, so it never knows an inf IP."
+    "Kubernetes itself stores your NetworkPolicy but does not enforce it. The network plugin does, the software that gives pods their network, and some plugins ignore policies completely. A policy on such a cluster applies without any error and changes nothing, which is the worst kind of wall: one that only looks like a wall. So a policy is not finished when kubectl apply succeeds. It is finished when a probe from a pod that should be refused is refused, and a probe from the pod that should pass still passes. The k3s cluster in your lab enforces policies, so you can see both.",
+    "Selectors have one trap that people fall into again and again. Inside one from or to item, a namespaceSelector and a podSelector together mean both must match: pods with this label in that namespace. Written as two separate items in the list, they mean either one is enough, which can open the door to a whole namespace. The dash at the start of a line is the difference, so read every list slowly.",
+    "The policy below shows both shapes. It is an Egress policy, which limits where a pod may connect to, and it starts the way every egress policy must, by allowing DNS. Every call begins with a question to the cluster's DNS server, kube-dns, on port 53, and without this rule every request fails with \"Resolving timed out\", which looks like a network outage. You will meet exactly that error in the lab."
    ],
-   "because": "Allowing one account by ARN means a mistake in another account's Terraform cannot connect to our services.",
    "code": {
-    "lang": "hcl",
-    "file": "infrastructure/multi_tenant/accounts/infrastructure/ai-agents/sandbox-privatelink/main.tf (part 2)",
-    "text": "resource \"aws_vpc_endpoint_service\" \"sandbox_facing\" {\n  acceptance_required        = false\n  network_load_balancer_arns = [aws_lb.sandbox_facing.arn]\n  allowed_principals         = [\"arn:aws:iam::${var.ai_agents_account_id}:root\"] # nobody else\n  tags                       = var.tags\n}\n\n# The consumer side (aws_vpc_endpoint + private-zone records broker., gateway., otel.) lives in\n# terraform/accounts/ai-agents/aws/us-east-1/core-services/inf-services-endpoint/.",
+    "lang": "yaml",
+    "file": "the start of every egress policy",
+    "text": "  policyTypes: [Egress]\n  egress:\n    - to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: kube-dns\n      ports:\n        - { port: 53, protocol: UDP }\n        - { port: 53, protocol: TCP }\n    - to:\n        - podSelector:\n            matchLabels:\n              app: broker",
     "notes": [
      {
-      "line": 2,
-      "text": "No manual accept click, because line 4 already says who may connect."
+      "line": 5,
+      "text": "Every namespace gets the label kubernetes.io/metadata.name automatically, so you can select kube-system by name."
      },
      {
-      "line": 3,
-      "text": "The NLB from part 1 is the only thing published. Not envoy-internal, not Temporal."
+      "line": 6,
+      "text": "No dash before podSelector: it is in the same item as the namespaceSelector, so both must match. That means the DNS pods in kube-system, nothing else."
      },
      {
-      "line": 4,
-      "text": "One account, by ARN. The sandbox VPC's endpoint is created by that account's Terraform."
+      "line": 11,
+      "text": "DNS uses UDP, and TCP for large answers. Allow both."
      },
      {
-      "line": 8,
-      "text": "Two accounts, two trees, two PRs. Each side plans and applies in its own account."
+      "line": 13,
+      "text": "A new dash, so a new item: a second allowed destination, the broker pods in our own namespace."
      }
     ]
    },
-   "callout": {
-    "kind": "wall",
-    "text": "The sandbox egress list (p4-5) has no github.com and no api.github.com: git and the GitHub API go through the broker. PrivateLink carries only the broker, the gateway and the collector. Together they mean a VM can push code only through a service that checks the branch first."
+   "deeper": {
+    "h": "Go deeper: names on the internet",
+    "p": [
+     "Plain NetworkPolicy can name pods, namespaces and IP ranges, but not domain names such as slack.com. Our brain bot, for example, should talk only to Slack, GitHub, Jira and the LLM gateway. The gateway is a pod, so a podSelector works; the other three are on the internet, so allowing them needs their IP ranges, or a network plugin with its own domain rules. When a policy has to allow port 443 to anywhere for a while, say so in the pull request, so a reviewer sees the gap."
+    ]
+   }
+  },
+  {
+   "h": "Between two accounts: PrivateLink",
+   "p": [
+    "A NetworkPolicy works inside one cluster. The sandbox VMs are not in the cluster, though; they live in a separate AWS account, in a network with no route to inf. They still need three things on inf: the broker's sandbox door, the LLM gateway and the telemetry collector. Joining the two networks, which AWS calls peering, would make every address on inf reachable from every VM, including the broker's internal door and every internal tool.",
+    "PrivateLink is the same allow-list idea between accounts, and you met it in p4-5. We put one internal load balancer on inf with exactly three listeners, publish it as an endpoint service, and allow exactly one account, the sandboxes' account, to connect to it. In that account it appears as a private address with DNS names like broker.ai-agents.rhinohealth.com. The broker's internal port is not in the list, so from a VM it does not exist at all. Inside the cluster the NetworkPolicy guards the internal door; between the accounts PrivateLink decides which doors exist."
+   ],
+   "code": {
+    "lang": "hcl",
+    "file": "the published side of the PrivateLink unit (shortened)",
+    "text": "locals {\n  sandbox_ports = { broker = 443, gateway = 8443, otel = 4318 }\n}\n\nresource \"aws_vpc_endpoint_service\" \"sandbox_facing\" {\n  acceptance_required        = false\n  network_load_balancer_arns = [aws_lb.sandbox_facing.arn]\n  allowed_principals         = [\"arn:aws:iam::${var.ai_agents_account_id}:root\"]\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The whole list of what a VM can reach on inf. A fourth entry would be a visible line in a reviewed plan."
+     },
+     {
+      "line": 6,
+      "text": "No manual approval step, because the next lines already say who may connect."
+     },
+     {
+      "line": 8,
+      "text": "One account, by its ID. A mistake in any other account's Terraform cannot connect to our services."
+     }
+    ]
    }
   }
  ],
  "lab": {
-  "title": "Close a door with a NetworkPolicy, and validate the PrivateLink unit",
-  "youNeed": [
-   "Docker Desktop, kind, kubectl",
-   "OpenTofu",
-   "about 2 GB of free RAM for a second kind cluster"
+  "id": "p5-4",
+  "title": "Close the broker's internal door",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "The laptop cluster from p5-1, running (docker start academy)",
+   "kubectl"
   ],
-  "worked": [
+  "goal": "Show that every pod can reach the broker, then write a NetworkPolicy so only the orchestrator worker can, and prove it from three different pods.",
+  "guess": {
+   "q": "You apply a NetworkPolicy that selects the broker pods and allows ingress only from pods labelled app=orchestrator-worker. The Slack app's pod, in the same namespace, calls the broker. What happens?",
+   "options": [
+    {
+     "text": "It works, because pods in the same namespace always trust each other.",
+     "correct": false,
+     "why": "Namespaces are not walls by themselves. Once a policy selects the broker, only what a rule allows gets in, and the Slack app's label is not in the rule."
+    },
+    {
+     "text": "It is refused, because the Slack app's pod does not carry the label the rule allows.",
+     "correct": true,
+     "why": "The policy is an allow-list by label. Same namespace or not, only app=orchestrator-worker gets through."
+    },
+    {
+     "text": "Kubernetes refuses to start the Slack app's pod until a rule allows it.",
+     "correct": false,
+     "why": "Policies never stop pods from running. They only decide which connections are allowed."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "printf 'kind: Cluster\\napiVersion: kind.x-k8s.io/v1alpha4\\nnetworking:\\n  disableDefaultCNI: true\\n  podSubnet: 192.168.0.0/16\\n' > kind-np.yaml && kind create cluster --name academy-np --config kind-np.yaml",
-    "see": "Creating cluster \"academy-np\" ...\nSet kubectl context to \"kind-academy-np\""
+    "say": "Start from clean namespaces: ai-agents for our services and n8n for a neighbour that shares the cluster.",
+    "do": "export KUBECONFIG=~/academy-k3s.yaml && kubectl delete namespace ai-agents n8n --ignore-not-found && kubectl create namespace ai-agents && kubectl create namespace n8n",
+    "see": "namespace \"ai-agents\" deleted\nnamespace/ai-agents created\nnamespace/n8n created"
    },
    {
-    "do": "kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml && kubectl -n kube-system rollout status daemonset/calico-node --timeout=180s",
-    "see": "daemon set \"calico-node\" successfully rolled out"
+    "say": "Start the broker with a Service, and three callers that only sleep, so you can run curl inside them: the orchestrator worker and the Slack app in ai-agents, and n8n in its own namespace.",
+    "do": "kubectl -n ai-agents create deployment broker --image=nginx:1.27 && kubectl -n ai-agents expose deployment broker --port=80 && kubectl -n ai-agents create deployment orchestrator-worker --image=curlimages/curl:8.11.1 -- sleep 86400 && kubectl -n ai-agents create deployment slack-app --image=curlimages/curl:8.11.1 -- sleep 86400 && kubectl -n n8n create deployment n8n --image=curlimages/curl:8.11.1 -- sleep 86400",
+    "see": "deployment.apps/broker created\nservice/broker exposed\ndeployment.apps/orchestrator-worker created\ndeployment.apps/slack-app created\ndeployment.apps/n8n created"
    },
    {
-    "do": "kubectl create namespace ai-agents && kubectl -n ai-agents create deployment temporal-frontend --image=nginx:1.27 && kubectl -n ai-agents expose deployment temporal-frontend --port=7233 --target-port=80",
-    "see": "namespace/ai-agents created\ndeployment.apps/temporal-frontend created\nservice/temporal-frontend exposed"
+    "say": "Wait until all of them run, then call the broker from each caller. With no policy at all, expect everyone to get in.",
+    "do": "kubectl -n ai-agents wait deploy --all --for=condition=Available --timeout=120s && kubectl -n n8n wait deploy --all --for=condition=Available --timeout=120s && for t in n8n/n8n ai-agents/slack-app ai-agents/orchestrator-worker; do printf '%-30s' \"$t\"; kubectl -n ${t%/*} exec deploy/${t#*/} -- curl -s --max-time 3 -o /dev/null -w '%{http_code}\\n' http://broker.ai-agents 2>/dev/null; done",
+    "see": "deployment.apps/broker condition met\n…\nn8n/n8n                       200\nai-agents/slack-app           200\nai-agents/orchestrator-worker 200"
    },
    {
-    "do": "kubectl run probe --rm -it --restart=Never --image=curlimages/curl:8.10.1 -- curl -s --max-time 5 -o /dev/null -w '%{http_code}\\n' http://temporal-frontend.ai-agents:7233",
-    "see": "200\npod \"probe\" deleted"
+    "say": "Write the policy: it protects the broker pods and lets in only the orchestrator worker, on the broker's port.",
+    "do": "cat > broker-policy.yaml <<'EOF'\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: broker-internal-from-orchestrator\n  namespace: ai-agents\nspec:\n  podSelector:\n    matchLabels:\n      app: broker\n  policyTypes: [Ingress]\n  ingress:\n    - from:\n        - podSelector:\n            matchLabels:\n              app: orchestrator-worker\n      ports:\n        - port: 80\nEOF\nkubectl apply -f broker-policy.yaml",
+    "see": "networkpolicy.networking.k8s.io/broker-internal-from-orchestrator created"
    },
    {
-    "do": "Write policy.yaml: the NetworkPolicy from section 2, with podSelector matchLabels { app: temporal-frontend } (the label kubectl gave the pods). Apply it: kubectl apply -f policy.yaml",
-    "see": "networkpolicy.networking.k8s.io/temporal-frontend-from-ai-agents created"
+    "say": "Run exactly the same calls again. 000 means curl got no HTTP answer at all: the connection was refused before it reached nginx.",
+    "do": "for t in n8n/n8n ai-agents/slack-app ai-agents/orchestrator-worker; do printf '%-30s' \"$t\"; kubectl -n ${t%/*} exec deploy/${t#*/} -- curl -s --max-time 3 -o /dev/null -w '%{http_code}\\n' http://broker.ai-agents 2>/dev/null; done",
+    "see": "n8n/n8n                       000\nai-agents/slack-app           000\nai-agents/orchestrator-worker 200"
    },
    {
-    "do": "kubectl run probe --rm -it --restart=Never --image=curlimages/curl:8.10.1 -- curl -s --max-time 5 -o /dev/null -w '%{http_code}\\n' http://temporal-frontend.ai-agents:7233; echo \"exit $?\"",
-    "see": "000\npod \"probe\" deleted\nexit 28"
-   },
-   {
-    "do": "kubectl -n ai-agents run probe --rm -it --restart=Never --image=curlimages/curl:8.10.1 -- curl -s --max-time 5 -o /dev/null -w '%{http_code}\\n' http://temporal-frontend.ai-agents:7233",
-    "see": "200\npod \"probe\" deleted"
-   },
-   {
-    "do": "mkdir -p ~/academy/privatelink && cd ~/academy/privatelink. Save part 1 and part 2 from sections 5 and 6 as main.tf. Add a variables.tf that declares inf_private_subnets (list(string)), tags (map(string)), vpc_id, acm_certificate_arn and ai_agents_account_id (string). Add an aws_lb_target_group \"this\" with for_each over local.sandbox_ports (port each.value, protocol TLS, vpc_id var.vpc_id, target_type ip). Then: tofu init -input=false >/dev/null && tofu validate",
-    "see": "Success! The configuration is valid."
+    "say": "Read the policy back the way Kubernetes understood it, because that is how you check a policy you did not write.",
+    "do": "kubectl -n ai-agents describe networkpolicy broker-internal-from-orchestrator | sed -n '/Spec:/,$p'",
+    "see": "Spec:\n  PodSelector:     app=broker\n  Allowing ingress traffic:\n    To Port: 80/TCP\n    From:\n      PodSelector: app=orchestrator-worker\n  Not affecting egress traffic\n  Policy Types: Ingress"
    }
   ],
-  "faded": "Add a second Deployment called orchestrator-worker in ai-agents. Add a Deployment called broker whose container port 80 is named internal, and apply the policy from section 3. Prove that a probe pod in ai-agents without the orchestrator-worker label is refused on port 80. The last step is yours: run the probe with `--labels=app=orchestrator-worker` and show it gets 200.",
-  "alone": "Write an egress policy for a pod called brain-bot in ai-agents that allows DNS and port 443 anywhere, and nothing else. Start a brain-bot pod from curlimages/curl that sleeps, and apply the policy. From inside it, show that https://github.com answers but http://temporal-frontend.ai-agents:7233 times out. Then remove the DNS rule, retry github.com, and explain the error you get. Delete the academy-np cluster when done.",
-  "done": "The same curl got 200 before the policy, exit 28 from the default namespace after it, and 200 from inside ai-agents. tofu validate accepted the PrivateLink unit."
+  "build": "Our Temporal's frontend should be reachable from pods in ai-agents only. Run a stand-in: kubectl -n ai-agents create deployment temporal-frontend --image=nginx:1.27 and kubectl -n ai-agents expose deployment temporal-frontend --port=7233 --target-port=80. Write a NetworkPolicy temporal-frontend-from-ai-agents that protects the pods labelled app=temporal-frontend and allows ingress from every pod in the same namespace (an empty podSelector, {}). Prove it with the same loop, calling http://temporal-frontend.ai-agents:7233: n8n must get 000, the Slack app and the orchestrator worker 200. If everyone gets 000, look closely at which port your rule names: the Service listens on 7233, but the pod listens on 80.",
+  "checks": [
+   "Before any policy, all three callers print 200 for the broker",
+   "After broker-policy.yaml, n8n and the Slack app print 000 and the orchestrator worker prints 200",
+   "kubectl -n ai-agents describe networkpolicy shows PodSelector app=broker and From PodSelector app=orchestrator-worker",
+   "For temporal-frontend, n8n prints 000 while the Slack app and the orchestrator worker print 200",
+   "After the fix, the orchestrator worker reaches the broker again with its egress policy still in place"
+  ],
+  "solution": {
+   "lang": "yaml",
+   "file": "the build: commands and temporal-policy.yaml",
+   "text": "kubectl -n ai-agents create deployment temporal-frontend --image=nginx:1.27\nkubectl -n ai-agents expose deployment temporal-frontend --port=7233 --target-port=80\n\n# temporal-policy.yaml\napiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: temporal-frontend-from-ai-agents\n  namespace: ai-agents\nspec:\n  podSelector:\n    matchLabels:\n      app: temporal-frontend\n  policyTypes: [Ingress]\n  ingress:\n    - from:\n        - podSelector: {}     # every pod in ai-agents, and only there\n      ports:\n        - port: 80            # the pod's port, not the Service's 7233"
+  },
+  "fix": "A teammate wanted the orchestrator worker to talk to the broker and nothing else, so they gave it an Egress policy that allows only the broker pods on port 80. Apply that yourself (podSelector app: orchestrator-worker, policyTypes [Egress], one to item with podSelector app: broker and port 80), then call the broker from the orchestrator worker with curl -sS so errors show. It now fails with curl: (28) Resolving timed out, although the broker allows it in. Find what the worker can no longer reach, and add the rule that brings the answer back to 200 without opening anything else.",
+  "explain": [
+   "Before any policy, why could n8n, a pod in a different namespace, reach the broker at all?",
+   "The Slack app is in the same namespace as the broker. Why was it refused, and what would have to change for it to get in?",
+   "Inside the cluster a NetworkPolicy guards the internal port. What decides that a sandbox VM in the other AWS account cannot reach that port either?"
+  ],
+  "done": "The same curl printed 200 for everyone before the policy and 200 only for the orchestrator worker after it, and you can explain why the VMs cannot see the internal port at all."
  },
- "quiz": [
+ "check": [
   {
-   "q": "You add `policyTypes: [Ingress, Egress]` to a policy for the broker, with one ingress rule and no egress rules. What happens?",
+   "q": "You add policyTypes: [Ingress, Egress] to the broker's policy, with ingress rules but no egress rules at all. What happens to the broker?",
    "options": [
     {
-     "text": "Nothing changes for egress because there are no egress rules",
+     "text": "Nothing changes for outgoing traffic, because there are no egress rules",
      "correct": false,
-     "why": "The opposite: listing Egress with no rules means deny all outgoing. The broker can no longer reach GitHub or Postgres."
+     "why": "The opposite. Listing Egress with no rules means no outgoing connection is allowed: the broker can no longer reach GitHub, its database, or even DNS."
     },
     {
-     "text": "The broker can receive from the listed source and cannot send anything, not even DNS",
+     "text": "Kubernetes rejects the policy as incomplete",
+     "correct": false,
+     "why": "It is a valid object and applies without a warning. That is what makes this mistake so common."
+    },
+    {
+     "text": "The allowed callers still get in, but the broker cannot open any connection itself, not even to DNS",
      "correct": true,
-     "why": "An empty rule list for a listed type is deny-all. This is the most common self-inflicted outage with policies."
-    },
-    {
-     "text": "Kubernetes refuses the policy as invalid",
-     "correct": false,
-     "why": "It is valid YAML and a valid object. It will apply and break the pod quietly."
+     "why": "Each direction listed in policyTypes becomes an allow-list. An empty allow-list allows nothing."
     }
    ]
   },
   {
-   "q": "Why does G3-17 use PrivateLink instead of peering the sandbox VPC with inf?",
+   "q": "You applied a policy that should block n8n from the broker, and kubectl said created. What proves the wall is real?",
    "options": [
     {
-     "text": "Peering is more expensive than PrivateLink",
-     "correct": false,
-     "why": "Cost is not the reason given. Peering would be cheaper for a few connections."
-    },
-    {
-     "text": "Peering would route every inf address to every sandbox; PrivateLink publishes one NLB with three ports and allows one account",
+     "text": "A curl from an n8n pod is refused, while a curl from the orchestrator worker still gets an answer",
      "correct": true,
-     "why": "The sketch's comment says it: not envoy-internal, not Temporal. The allow-list is the point."
+     "why": "The network plugin enforces policies, and some plugins ignore them. Only a probe from both sides shows that this cluster really does."
     },
     {
-     "text": "Peering does not work across accounts",
+     "text": "kubectl get networkpolicy lists it",
      "correct": false,
-     "why": "It does. It is too wide, not impossible."
+     "why": "That only shows the policy is stored. On a plugin that ignores policies, it is listed and does nothing."
+    },
+    {
+     "text": "kubectl describe shows the right selectors",
+     "correct": false,
+     "why": "It shows the policy says the right thing. Whether anything enforces it is a separate question."
     }
    ]
   },
   {
-   "q": "You apply a NetworkPolicy to your plain kind cluster from p5-1 and the probe still gets 200. Most likely cause?",
+   "q": "Why do the sandbox VMs reach inf through PrivateLink instead of peering the two networks?",
    "options": [
     {
-     "text": "The policy selector has a typo",
+     "text": "Peering does not work between two AWS accounts",
      "correct": false,
-     "why": "Possible, but check the cluster first: a plain kind cluster cannot enforce any policy at all."
+     "why": "It does. The problem is that it opens too much, not that it is impossible."
     },
     {
-     "text": "kind's default network plugin does not enforce NetworkPolicy",
+     "text": "Peering would make every address on inf reachable from the VMs; PrivateLink publishes only three ports, to one account",
      "correct": true,
-     "why": "kindnet ignores policies. You need a plugin like Calico, which is why the lab creates academy-np."
+     "why": "It is the same allow-list idea as a NetworkPolicy: the broker's internal port, Temporal and the internal tools simply do not exist from a VM."
     },
     {
-     "text": "NetworkPolicy only works for Egress",
+     "text": "PrivateLink is faster than peering",
      "correct": false,
-     "why": "It works for both directions on a plugin that enforces it."
+     "why": "Speed is not the reason. The reason is what becomes reachable."
     }
    ]
   }
  ],
- "recall": [
-  "From p5-3: which object decides what an ExternalSecret may read from Vault, and what is wrong with it on inf today?",
-  "From p4-5: name two domains that are NOT on the sandbox egress allow-list and say where that traffic goes instead."
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "The agent services' NetworkPolicies come with their units. The broker's policy lets only orchestrator-worker reach its internal port, where runs are opened and capabilities minted, and leaves its sandbox port to the load balancer. Our Temporal's frontend stays a ClusterIP Service, and a policy lets only pods in the ai-agents namespace reach port 7233. The brain bot gets an egress-only policy to Slack, GitHub, the Jira site and the LLM gateway.",
+   "The PrivateLink unit, ai-agents/sandbox-privatelink/, builds the internal Network Load Balancer on inf with three TLS listeners, the broker's sandbox port, the gateway and the OTel collector, binds them to the pods, and publishes the endpoint service to the ai-agents account only. The account's own tree holds the interface endpoint and the private DNS names broker., gateway. and otel.ai-agents.rhinohealth.com. Never on that list: the broker's internal port, Temporal and envoy-internal, the entry point for internal tools. The threat model checks these walls with drills."
+  ],
+  "tickets": [
+   {
+    "key": "G3-17",
+    "why": "The broker's policy, orchestrator-worker only on the internal port, and the PrivateLink unit with its three ports."
+   },
+   {
+    "key": "G3-06",
+    "why": "The policy that lets only ai-agents pods reach Temporal's frontend on 7233."
+   },
+   {
+    "key": "G6-22",
+    "why": "The brain bot's egress policy: Slack, GitHub, Jira and the gateway only."
+   },
+   {
+    "key": "G3-12",
+    "why": "The threat model that lists what a sandbox can and can never reach, and drills it."
+   }
+  ]
+ },
  "words": [
   {
    "term": "NetworkPolicy",
-   "plain": "A per-namespace allow-list of which pods or IPs may talk to selected pods on which ports. The first policy on a pod turns the rest off."
+   "plain": "An allow-list attached to pods by label, saying who may connect to them or where they may connect."
   },
   {
-   "term": "ingress / egress",
-   "plain": "Into a pod / out of a pod; a policy covers only the directions it lists in policyTypes."
+   "term": "ingress and egress",
+   "plain": "Traffic coming into a pod, and traffic going out of it. A policy covers only the directions it lists."
   },
   {
-   "term": "network plugin (CNI)",
-   "plain": "The software that gives pods their network; only some plugins, like Calico, enforce NetworkPolicy."
+   "term": "network plugin",
+   "plain": "The software that gives pods their network. It enforces NetworkPolicies, and some plugins ignore them."
   },
   {
    "term": "PrivateLink",
-   "plain": "An AWS feature that publishes one load balancer to other accounts as a private IP in their VPC, with no peering."
-  },
-  {
-   "term": "endpoint service",
-   "plain": "The published side of PrivateLink: an NLB plus a list of accounts allowed to connect."
-  },
-  {
-   "term": "interface endpoint",
-   "plain": "The consuming side: a network interface in your VPC with a private IP that leads to the endpoint service."
-  },
-  {
-   "term": "NLB",
-   "plain": "A Network Load Balancer: forwards TCP or TLS connections per port to targets, here our pods."
+   "plain": "An AWS feature that publishes one load balancer to another account as a private address, instead of joining the networks."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-17",
-   "why": "Builds the PrivateLink unit (NLB, listeners, endpoint service) and the policy that lets only orchestrator-worker reach the broker's internal port."
+   "q": "Write the broker's policy from memory: which pods it protects, which direction, and the two rules.",
+   "a": "podSelector app=broker, policyTypes Ingress; rule one from podSelector app=orchestrator-worker to the internal port; rule two the sandbox port with no from."
   },
   {
-   "key": "G3-06",
-   "why": "Adds the policy that lets only ai-agents pods reach Temporal on 7233."
+   "q": "A new egress policy makes every call from a pod fail with a name-resolution timeout. What is missing?",
+   "a": "A rule that allows DNS: to the kube-dns pods in kube-system on port 53, UDP and TCP."
   },
   {
-   "key": "G6-22",
-   "why": "Gives the brain bot an egress policy to Slack, GitHub, Jira and the gateway only."
-  },
-  {
-   "key": "G3-12",
-   "why": "The threat model checks these walls: PrivateLink ports, the egress list, and what a sandbox can never reach."
+   "q": "Name the three things a sandbox VM can reach on inf, and two things it can never reach.",
+   "a": "The broker's sandbox port, the LLM gateway and the OTel collector. Never the broker's internal port, Temporal or envoy-internal and the internal tools behind it."
   }
  ],
- "remember": "No policy means every pod talks to every pod, and a policy is an allow-list. PrivateLink is the same idea between two AWS accounts: three ports, one allowed account."
+ "remember": "Inside a cluster everyone can talk until a NetworkPolicy says otherwise, so we allow-list by label and prove it with a probe; between accounts, PrivateLink publishes only the doors we name."
 }

@@ -1,467 +1,350 @@
 {
+ "v": 2,
  "id": "p4-2",
  "title": "Terragrunt and our infrastructure repo",
  "minutes": 50,
  "youNeed": [
   "p4-1"
  ],
- "bridge": "Terragrunt is like npm workspaces for Terraform. It has one shared root config, one folder per piece, and a command that runs them all in order. Except Terragrunt only writes files and calls tofu. The resources, plans and state are still OpenTofu's.",
- "intro": "The infrastructure repo holds hundreds of small OpenTofu runs, one per folder. Terragrunt glues them together: it writes the backend settings, passes shared tags, and runs folders in dependency order. This lesson maps the repo and builds a small copy of the ai-agents tree on your laptop.",
- "picture": {
-  "caption": "A unit includes the root, reads its account's facts, points at a module, and gets its own state; dependencies set the order.",
-  "nodes": [
-   {
-    "id": "unit",
-    "label": "core-services/vpc/terragrunt.hcl",
-    "kind": "file"
-   },
-   {
-    "id": "root",
-    "label": "terraform/root.hcl",
-    "kind": "file"
-   },
-   {
-    "id": "account",
-    "label": "accounts/ai-agents/account.hcl",
-    "kind": "file"
-   },
-   {
-    "id": "module",
-    "label": "modules/aws-vpc-private/",
-    "kind": "file"
-   },
-   {
-    "id": "dep",
-    "label": "sandboxes/terragrunt.hcl",
-    "kind": "file"
-   },
-   {
-    "id": "tg",
-    "label": "terragrunt",
-    "kind": "service"
-   },
-   {
-    "id": "state",
-    "label": "S3 rhinohealth-terraform-state/<path>",
-    "kind": "cloud"
-   }
+ "map": "vm-pool",
+ "hook": {
+  "story": [
+   "You want to keep three lite VMs warm instead of two: one number in one file. But imagine the whole ai-agents account lives in one big OpenTofu folder with one state. Your plan refreshes every network rule, bucket, DNS record and role in the account, takes minutes, and shows a teammate's half-finished bucket change next to yours. While DevOps applies a network change, the state is locked and you cannot even plan. And the most worrying part: your small change and the network that every VM depends on sit in the same plan, so one wrong destroy line there takes every VM offline.",
+   "So the team splits the account into small folders, one per piece, each with its own state. That fixes the speed and the risk, but it creates new problems. Every folder now needs the same state settings and the same tags, copied twenty times. And the sandboxes folder needs the subnet IDs that only the network folder knows."
   ],
-  "steps": [
-   {
-    "from": "unit",
-    "to": "root",
-    "text": "include: pulls in the backend, providers and common inputs"
-   },
-   {
-    "from": "root",
-    "to": "account",
-    "text": "reads the account name, the role to assume and the tags"
-   },
-   {
-    "from": "unit",
-    "to": "module",
-    "text": "terraform.source names the module to run"
-   },
-   {
-    "from": "tg",
-    "to": "state",
-    "text": "copies the module, writes backend.tf, runs tofu; state key = the unit's path"
-   },
-   {
-    "from": "dep",
-    "to": "unit",
-    "text": "dependency \"vpc\": reads the VPC unit's outputs, so it runs after it"
-   }
-  ]
+  "question": "How do we split infrastructure into small pieces without copying the same settings into each one, and still let one piece use what another piece created?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Two trees in one repo",
+   "h": "One folder, one state",
    "p": [
-    "The infrastructure repo has an old tree and a new one. The old tree starts at root.hcl in the repo root and lives under multi_tenant/accounts/<account>/<component>/. The inf cluster's tools, such as n8n and Vault, live there, in multi_tenant/accounts/infrastructure/.",
-    "The new tree starts at terraform/root.hcl and lives under terraform/accounts/<account>/<cloud>/<region or global>/<component>/. New accounts go here. G3-02 adds terraform/accounts/ai-agents/, copied from the solutions account."
+    "Terragrunt is a thin tool that sits in front of OpenTofu. It does not create anything itself: in each folder it prepares the files, then runs tofu there. Our infrastructure repo uses it to split every account into many small folders called units. A unit is a folder with one terragrunt.hcl file in it, which says which module to run and with which inputs. Each unit has its own state, so a plan in the sandboxes unit can only change the sandboxes. It cannot even see the network, so it cannot destroy it by mistake.",
+    "The folders are arranged by account, then cloud, then region, then piece. That path is not only tidy. It is also the name of each unit's state file, so two units can never share a state, even when they run the same module."
    ],
-   "because": "We learn the layout first because every infra ticket starts with 'which folder does this go in?'.",
    "code": {
     "lang": "text",
-    "file": "infrastructure/terraform/accounts/ai-agents/ (after G3-02 and G3-04)",
-    "text": "terraform/\n├── root.hcl                          backend, providers, common inputs\n├── common.hcl                        provider versions (aws 6.64.0, helm 3.1.1, ...)\n└── accounts/ai-agents/\n    ├── account.hcl                   account name, role to assume, tags\n    └── aws/\n        ├── cloud.hcl\n        ├── global/\n        │   ├── region.hcl\n        │   └── iam/github-actions/terragrunt.hcl     the CI role (p3-1)\n        └── us-east-1/\n            ├── region.hcl\n            ├── core-services/vpc/terragrunt.hcl      the sandbox VPC (G3-04)\n            ├── core-services/runs-bucket/terragrunt.hcl\n            ├── core-services/dns-firewall/terragrunt.hcl\n            └── sandboxes/terragrunt.hcl              launch templates and pools (G3-11)",
+    "file": "the lab's tree, which has the same shape as the real repo",
+    "text": "terraform/\n├── root.hcl                   shared by every unit: where state goes, common inputs\n└── accounts/ai-agents/\n    ├── account.hcl            facts about this account: name prefix, tags\n    └── aws/us-east-1/\n        ├── core-services/\n        │   ├── vpc/terragrunt.hcl          unit: the private network\n        │   └── runs-bucket/terragrunt.hcl  unit: the bucket for run transcripts\n        └── sandboxes/terragrunt.hcl        unit: launch templates and warm pools\nmodules/\n├── vpc/       plain OpenTofu modules: the code each unit runs\n├── pool/\n└── bucket/",
     "notes": [
      {
       "line": 2,
-      "text": "Every unit below includes this file."
-     },
-     {
-      "line": 5,
-      "text": "One per account. Units find it by walking up the folders."
-     },
-     {
-      "line": 10,
-      "text": "global/ is for things with no region, such as IAM."
-     },
-     {
-      "line": 13,
-      "text": "One folder per component. Each is a unit with its own state."
-     }
-    ]
-   }
-  },
-  {
-   "h": "A unit is one folder and one state",
-   "p": [
-    "A unit is a folder with a terragrunt.hcl. It names one module and its inputs, and gets its own state. Running plan in a unit plans only that unit.",
-    "Here is G3-04's VPC unit. Notice the // in the source. Terragrunt copies everything before // into its cache, so the module can still reach its neighbours with ../. Everything after // is the folder to run."
-   ],
-   "because": "We keep one component per unit because a small state means a small plan, and a mistake touches one thing.",
-   "code": {
-    "lang": "hcl",
-    "file": "terraform/accounts/ai-agents/aws/us-east-1/core-services/vpc/terragrunt.hcl (G3-04)",
-    "text": "include \"root\" {\n  path   = find_in_parent_folders(\"root.hcl\")\n  expose = true\n}\n\nterraform {\n  source = \"${get_parent_terragrunt_dir(\"root\")}/..//modules/aws-vpc-private/\"\n}\n\nlocals {\n  account = read_terragrunt_config(find_in_parent_folders(\"account.hcl\"))\n}\n\ninputs = {\n  vpc_cidr           = \"10.60.0.0/16\"\n  s3_allowed_buckets = [\"rhino-ai-agents-runs\", \"prod-${include.root.locals.aws_region}-starport-layer-bucket\"]\n  interface_endpoints = [\"ssm\", \"ssmmessages\", \"ec2messages\", \"ecr.api\", \"ecr.dkr\", \"logs\", \"autoscaling\"]\n  tags               = local.account.locals.tags\n}",
-    "notes": [
-     {
-      "line": 2,
-      "text": "Walks up the folders until it finds root.hcl, and merges it in."
-     },
-     {
-      "line": 3,
-      "text": "expose = true lets this file read the root's locals, as include.root.locals."
-     },
-     {
-      "line": 7,
-      "text": "The folder of root.hcl, up one level, then modules/. The // marks where the copy stops."
-     },
-     {
-      "line": 11,
-      "text": "Reads account.hcl as data, so its locals can be used here."
-     },
-     {
-      "line": 15,
-      "text": "Inputs become the module's variables, like props."
-     },
-     {
-      "line": 18,
-      "text": "The account's tags, so every resource is labelled the same way."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The root: backend and shared inputs",
-   "p": [
-    "root.hcl is included by every unit. Its remote_state block says where state lives. In our repo that is the S3 bucket rhinohealth-terraform-state, with the key ${path_relative_to_include()}/terraform.tfstate and use_lockfile = true. Each unit's state key is its path, so no two units share a state.",
-    "Terragrunt writes the backend block into a generated backend.tf before it runs tofu. The root also passes common inputs and generates provider blocks that assume the account's TerraformDeploymentRole. Below is the lab copy, with a local file instead of S3."
-   ],
-   "because": "We use a local backend in the lab because the real bucket needs company credentials, and the shape is the same.",
-   "code": {
-    "lang": "hcl",
-    "file": "~/academy/tg-lab/terraform/root.hcl (lab copy)",
-    "text": "# Lab copy of terraform/root.hcl. The real one uses S3 (rhinohealth-terraform-state); we use a local file.\nlocals {\n  account = read_terragrunt_config(find_in_parent_folders(\"account.hcl\"))\n}\n\nremote_state {\n  backend = \"local\"\n  config = {\n    path = \"${get_parent_terragrunt_dir()}/.state/${path_relative_to_include()}/terraform.tfstate\"\n  }\n  generate = { path = \"backend.tf\", if_exists = \"overwrite_terragrunt\" }\n}\n\ninputs = {\n  tags = local.account.locals.tags\n}",
-    "notes": [
-     {
-      "line": 3,
-      "text": "Evaluated for each unit, so it finds that unit's own account.hcl."
-     },
-     {
-      "line": 7,
-      "text": "Real repo: backend = \"s3\" with bucket, key, region and use_lockfile = true."
-     },
-     {
-      "line": 9,
-      "text": "path_relative_to_include() is the unit's path below this file, so every unit gets its own state."
-     },
-     {
-      "line": 11,
-      "text": "Writes backend.tf into the unit's working copy, replacing any older one."
-     },
-     {
-      "line": 15,
-      "text": "Every unit gets tags without repeating them."
-     }
-    ]
-   }
-  },
-  {
-   "h": "account.hcl: one account's facts",
-   "p": [
-    "account.hcl holds what is true for every unit in one account. That is its name, the role Terragrunt assumes, a name prefix and the tags. Vanta, our compliance tool, reads the Vanta tags.",
-    "G3-02 writes this file for ai-agents. The name prefix is ai-agents, never agents: in this repo 'rhino-agent' already means a Rhino Client VM."
-   ],
-   "because": "We put account facts in one file because tags and role ARNs copied into units drift apart.",
-   "code": {
-    "lang": "hcl",
-    "file": "terraform/accounts/ai-agents/account.hcl (G3-02)",
-    "text": "locals {\n  account_name = \"ai-agents\"\n  project      = \"rhinofcp\"\n\n  # Created in Control Tower; TerraformDeploymentRole was bootstrapped by hand (see README).\n  assume_role_arn = \"arn:aws:iam::<AI_AGENTS_ACCOUNT_ID>:role/TerraformDeploymentRole\"\n\n  # Prefix for sandbox resources. Not \"agents\": in this repo that word means Rhino Client VMs.\n  name_prefix = \"ai-agents\"\n\n  tags = {\n    account_name          = \"ai-agents\"\n    VantaNonProd          = \"true\"\n    VantaContainsUserData = \"false\" # fake seed data only, never PHI\n    VantaOwner            = \"tal@example.com\"\n    created_by            = \"terraform\"\n    project               = \"rhinofcp\"\n  }\n}",
-    "notes": [
-     {
-      "line": 3,
-      "text": "New accounts use project rhinofcp."
-     },
-     {
-      "line": 6,
-      "text": "The role every plan and apply in this account assumes. G7-30 makes the role name switchable for read-only plans."
-     },
-     {
-      "line": 9,
-      "text": "Used in resource names: ai-agents-sandbox-lite and so on."
-     },
-     {
-      "line": 14,
-      "text": "A promise to Vanta: no user data here. Keeping PHI out of sandboxes makes it true."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Dependencies and mock outputs",
-   "p": [
-    "A dependency block lets one unit read another unit's outputs. The sandboxes unit needs the VPC's subnet IDs, so it depends on the vpc unit. That also sets the order: vpc runs first.",
-    "On the very first plan, the vpc unit has no state yet, so it has no outputs. mock_outputs gives placeholder values for plan and validate only. Apply never uses them."
-   ],
-   "because": "We allow mocks only for plan and validate because a mock subnet ID must never reach a real apply.",
-   "code": {
-    "lang": "hcl",
-    "file": "~/academy/tg-lab/terraform/accounts/ai-agents/aws/us-east-1/sandboxes/terragrunt.hcl",
-    "text": "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n\nterraform {\n  source = \"${get_parent_terragrunt_dir(\"root\")}/..//modules/fake-pool/\"\n}\n\ndependency \"vpc\" {\n  config_path  = \"../core-services/vpc\"\n  mock_outputs = { private_subnets = [\"10.0.0.0/18\"] } # used only while vpc has no state yet\n  mock_outputs_allowed_terraform_commands = [\"plan\", \"validate\"]\n}\n\ninputs = {\n  subnet_ids = dependency.vpc.outputs.private_subnets\n  sizes      = { lite = \"m8i.xlarge\", full = \"m8i.2xlarge\", wide = \"m8i.4xlarge\" }\n}",
-    "notes": [
-     {
-      "line": 10,
-      "text": "A relative path to the unit we read from."
-     },
-     {
-      "line": 11,
-      "text": "Placeholder outputs. The fake value 10.0.0.0/18 makes it obvious in a plan."
-     },
-     {
-      "line": 12,
-      "text": "Mocks are refused for apply, so a real apply always reads real outputs."
-     },
-     {
-      "line": 16,
-      "text": "The dependency's outputs, used like any value."
-     }
-    ]
-   }
-  },
-  {
-   "h": "run --all: many units in order",
-   "p": [
-    "terragrunt run --all -- plan runs plan in every unit below the current folder, in dependency order. Older docs call it run-all. terragrunt list --dag prints the units in that order without running anything.",
-    "In our repo, CI only checks formatting today. The author runs plan locally over VPN, pastes it into the PR, and a DevOps reviewer applies (G3-02, G3-04). G7-32 will post read-only plans on PRs. Nobody runs run --all apply from an agent, ever."
-   ],
-   "because": "We list the order before we plan because a wrong dependency shows up here, before any tofu run.",
-   "code": {
-    "lang": "bash",
-    "file": "~/academy/tg-lab/terraform/accounts/ai-agents/aws/us-east-1",
-    "text": "terragrunt list --dag\nterragrunt run --all --non-interactive -- plan\n(cd core-services/vpc && terragrunt apply -auto-approve)   # lab only\n(cd sandboxes && terragrunt plan 2>&1 | grep -o '10\\.60\\.[0-9]*\\.0/18' | sort -u)",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Units in run order: vpc first, because sandboxes depends on it."
-     },
-     {
-      "line": 2,
-      "text": "Everything after -- goes to tofu. --non-interactive answers prompts for you."
-     },
-     {
-      "line": 3,
-      "text": "Gives vpc real state and outputs. In the repo, a person applies."
+      "text": "root.hcl is at the top, so every unit below it can include it."
      },
      {
       "line": 4,
-      "text": "The plan now shows the real subnets instead of the mock."
+      "text": "account.hcl holds what is true for every unit in one account."
+     },
+     {
+      "line": 7,
+      "text": "A unit: one folder, one terragrunt.hcl, one state."
+     },
+     {
+      "line": 10,
+      "text": "Modules are ordinary OpenTofu folders. A unit says which one to run; the module does not know about Terragrunt."
+     }
+    ]
+   }
+  },
+  {
+   "h": "Write the shared parts once: include",
+   "p": [
+    "Every unit starts with an include block that pulls in root.hcl. Whatever the root says, the unit gets, much like a tsconfig.json that extends a base config. find_in_parent_folders walks up the folders until it finds the file, so a unit does not need to know how deep it sits.",
+    "The root says two things. Its remote_state block says where state lives, and Terragrunt writes that into a backend.tf file before it runs tofu. The key part is path_relative_to_include(), which gives the unit's path from the root, so the vpc unit's state lands at accounts/ai-agents/aws/us-east-1/core-services/vpc/terraform.tfstate. Its inputs block passes values to every unit. Here those are the name prefix and the tags, read from the account.hcl of whichever account the unit lives in. In the lab the state is a local file; in the real repo the same block points at an S3 bucket with a lock."
+   ],
+   "code": {
+    "lang": "hcl",
+    "file": "terraform/root.hcl",
+    "text": "locals {\n  account = read_terragrunt_config(find_in_parent_folders(\"account.hcl\"))\n}\n\n# Every unit gets its own state file, named after its folder.\nremote_state {\n  backend = \"local\"\n  config = {\n    path = \"${get_parent_terragrunt_dir()}/.state/${path_relative_to_include()}/terraform.tfstate\"\n  }\n  generate = {\n    path      = \"backend.tf\"\n    if_exists = \"overwrite_terragrunt\"\n  }\n}\n\n# Inputs every unit receives.\ninputs = {\n  name_prefix = local.account.locals.name_prefix\n  tags        = local.account.locals.tags\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Find the nearest account.hcl above the unit and read its locals. A unit in another account would find that account's file."
+     },
+     {
+      "line": 9,
+      "text": "get_parent_terragrunt_dir() is the folder of root.hcl; path_relative_to_include() is the unit's path below it. Every unit gets a different path."
+     },
+     {
+      "line": 11,
+      "text": "Terragrunt writes the backend settings into backend.tf for each unit, so no unit repeats them."
+     },
+     {
+      "line": 18,
+      "text": "Shared inputs. A unit's own inputs are merged on top of these."
      }
     ]
    },
-   "see": "core-services/vpc  sandboxes\nINFO  The following units will be run, starting with dependencies and then their dependents:\n[core-services/vpc] tofu: Plan: 1 to add, 0 to change, 0 to destroy.\nWARN  [sandboxes] ... has no outputs, but mock outputs provided and returning those in dependency output.\n[sandboxes] tofu: Plan: 3 to add, 0 to change, 0 to destroy.\n(output trimmed)"
+   "see": "$ cd sandboxes && terragrunt render   (the inputs part)\ninputs = {\n  name_prefix = \"ai-agents\"\n  sizes = {\n    full = \"m8i.2xlarge\"\n    lite = \"m8i.xlarge\"\n  }\n  subnet_ids = [\"10.0.0.0/18\"]\n  tags = {\n    account_name = \"ai-agents\"\n    created_by   = \"terraform\"\n  }\n}",
+   "deeper": {
+    "h": "Go deeper: the // in the source",
+    "p": [
+     "A unit's source looks like \"<path>/..//modules/vpc\". Terragrunt copies everything before the double slash into a cache folder, .terragrunt-cache, and runs tofu in the part after it. Copying the whole folder means a module can still reach its neighbours with ../, for example a shared template.",
+     "Inputs reach OpenTofu as environment variables (TF_VAR_name_prefix and so on). A module simply ignores inputs it does not declare, so the root can pass name_prefix to every unit, even to a module that has no use for it."
+    ]
+   }
   },
   {
-   "h": "The n8n pattern for services on inf",
+   "h": "One unit reads another: dependency",
    "p": [
-    "Services that run on the inf cluster are not in the new tree. They are units in the old tree, under multi_tenant/accounts/infrastructure/<tool>/, one unit per piece. n8n is the model: iam, secrets, rds, sg, elasticache, s3 and repository units, plus an n8n.hcl with the shared facts.",
-    "The agents' Temporal (G3-06) and services (G3-17) copy that shape under multi_tenant/accounts/infrastructure/ai-agents/. The repository unit installs a Helm chart with a helm_release; p5-2 walks through it."
+    "The sandboxes need the subnet IDs, and only the vpc unit knows them, because they are its outputs. A dependency block connects the two. Terragrunt runs tofu output in the vpc unit, reads private_subnets, and passes it to the sandboxes as an input. The same block also sets the order: the vpc unit must exist before the sandboxes.",
+    "There is a problem on the very first plan, when the vpc unit has never been applied. It has no state, so it has no outputs to read. mock_outputs solves this with stand-in values, so that plan and validate can still run. The line under it allows the mocks for validate and plan only, so an apply can never build anything on fake subnets: it fails until the vpc unit really exists. You can see them in the plan below: the sandboxes plan shows 10.0.0.0/18, the mock, while the vpc plan shows the real 10.60.x subnets it is about to create.",
+    "terragrunt run --all runs one tofu command in every unit below the folder you are in, in dependency order. For plan that is safe and useful. For apply it asks one question, then applies every unit without showing you each plan, which is why in our repo a person applies after reading each unit's plan."
    ],
-   "callout": {
-    "kind": "tip",
-    "text": "Module references differ by tree. New tree: \"${get_parent_terragrunt_dir(\"root\")}/..//modules/<m>/\". Old tree: \"../../../../modules/<m>//\". Registry: \"tfr:///terraform-aws-modules/<m>/aws//.?version=x\". The repo uses no git:: sources."
+   "code": {
+    "lang": "hcl",
+    "file": "terraform/accounts/ai-agents/aws/us-east-1/sandboxes/terragrunt.hcl",
+    "text": "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n\nterraform {\n  source = \"${get_parent_terragrunt_dir(\"root\")}/..//modules/pool\"\n}\n\ndependency \"vpc\" {\n  config_path = \"../core-services/vpc\"\n  mock_outputs = {\n    private_subnets = [\"10.0.0.0/18\"]\n  }\n  mock_outputs_allowed_terraform_commands = [\"validate\", \"plan\"]\n}\n\ninputs = {\n  subnet_ids = dependency.vpc.outputs.private_subnets\n  sizes = {\n    lite = \"m8i.xlarge\"\n    full = \"m8i.2xlarge\"\n  }\n}",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The same include as every unit: state settings and shared inputs come from the root."
+     },
+     {
+      "line": 6,
+      "text": "Run the pool module from the modules/ folder next to terraform/."
+     },
+     {
+      "line": 10,
+      "text": "The unit this one depends on, as a relative path."
+     },
+     {
+      "line": 11,
+      "text": "Stand-in outputs, used only while the vpc unit has no state yet."
+     },
+     {
+      "line": 14,
+      "text": "Mocks are allowed for validate and plan only. An apply without real outputs fails instead of using fake subnets."
+     },
+     {
+      "line": 18,
+      "text": "dependency.<name>.outputs.<output>: the vpc unit's real output once it exists."
+     }
+    ]
+   },
+   "see": "$ terragrunt run --all plan\nThe following units will be run, starting with dependencies and then their dependents:\n╰── core-services/vpc\n    ╰── sandboxes\n[core-services/vpc] tofu: Plan: 1 to add, 0 to change, 0 to destroy.\nWARN [sandboxes] ... has no outputs, but mock outputs provided and returning those in dependency output.\n[sandboxes] tofu:               + \"10.0.0.0/18\",\n[sandboxes] tofu: Plan: 2 to add, 0 to change, 0 to destroy.",
+   "deeper": {
+    "h": "Go deeper: two trees and the n8n pattern",
+    "p": [
+     "Our repo has two trees. The new one starts at terraform/root.hcl and is arranged as accounts/<account>/<cloud>/<region or global>/<piece>, exactly like the lab. New AWS accounts, including the ai-agents account, go there.",
+     "The old tree starts at a root.hcl at the top of the repo, under multi_tenant/accounts/<account>/<piece>/. Tools that run on our internal Kubernetes cluster live there, in multi_tenant/accounts/infrastructure/. n8n, an older workflow tool, is the model to copy: one folder per tool, with one unit per piece (iam, secrets, rds, sg, s3 and repository, which installs the Helm chart), plus an n8n.hcl file with the facts they share. Lesson p5-2 walks through that pattern."
+    ]
    }
   }
  ],
  "lab": {
-  "title": "A small ai-agents tree with two units",
-  "youNeed": [
-   "OpenTofu and the tf1 lab from p4-1",
-   "Terragrunt (brew install terragrunt; terragrunt --version prints 1.1 or newer)"
+  "id": "p4-2",
+  "title": "A small ai-agents tree with Terragrunt",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "OpenTofu 1.10 or newer, from p4-1",
+   "Terragrunt 1.0 or newer (terragrunt --version). It uses tofu when Terraform is not installed.",
+   "No cloud account: every module only stores values, like the warm pool record in p4-1."
   ],
-  "worked": [
+  "goal": "Build a small copy of the ai-agents tree with a shared root, two units and a dependency, and see each unit get its own state and the shared inputs.",
+  "guess": {
+   "q": "Both units include the same root.hcl. The vpc unit is at accounts/ai-agents/aws/us-east-1/core-services/vpc and the sandboxes unit at accounts/ai-agents/aws/us-east-1/sandboxes. How many state files will exist after you apply both?",
+   "options": [
+    {
+     "text": "One, because both units include the same root.hcl, which has one remote_state block.",
+     "correct": false,
+     "why": "The block is shared, but the path inside it uses path_relative_to_include(), which is different for every unit."
+    },
+    {
+     "text": "Two, one per unit, each at a path named after the unit's folder.",
+     "correct": true,
+     "why": "The root writes one backend.tf per unit, and each one points at accounts/.../<unit>/terraform.tfstate. Shared settings, separate states."
+    },
+    {
+     "text": "Three: one for each unit and one for the root.",
+     "correct": false,
+     "why": "The root is not a unit. It never runs tofu itself; it only gives settings to the units that include it."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "mkdir -p ~/academy/tg-lab && cd ~/academy/tg-lab && mkdir -p modules/fake-vpc modules/fake-pool terraform/accounts/ai-agents/aws/us-east-1/core-services/vpc terraform/accounts/ai-agents/aws/us-east-1/sandboxes",
-    "see": "(no output)"
+    "say": "Make the lab folder and paste this block, because it writes three tiny modules for you: a VPC, a pool and a bucket that only store values. The Terragrunt files are the lesson, so you write those yourself next.",
+    "do": "mkdir -p ~/academy-labs/p4-2 && cd ~/academy-labs/p4-2\nmkdir -p modules/vpc modules/pool modules/bucket\ncat > modules/vpc/main.tf <<'EOF'\nvariable \"name_prefix\" { type = string }\nvariable \"vpc_cidr\" { type = string }\nvariable \"tags\" { type = map(string) }\n\nresource \"terraform_data\" \"vpc\" {\n  input = { name = \"${var.name_prefix}-vpc\", cidr = var.vpc_cidr, tags = var.tags }\n}\n\noutput \"private_subnets\" {\n  value = [for n in range(3) : cidrsubnet(var.vpc_cidr, 2, n)]\n}\nEOF\ncat > modules/pool/main.tf <<'EOF'\nvariable \"name_prefix\" { type = string }\nvariable \"subnet_ids\" { type = list(string) }\nvariable \"sizes\" { type = map(string) }\nvariable \"tags\" { type = map(string) }\n\nresource \"terraform_data\" \"group\" {\n  for_each = var.sizes\n  input    = { name = \"${var.name_prefix}-sandbox-${each.key}\", type = each.value, subnets = var.subnet_ids }\n}\nEOF\ncat > modules/bucket/main.tf <<'EOF'\nvariable \"bucket_name\" { type = string }\nvariable \"tags\" { type = map(string) }\n\nresource \"terraform_data\" \"bucket\" {\n  input = { name = var.bucket_name, tags = var.tags }\n}\nEOF\nfind modules -type f | sort",
+    "see": "modules/bucket/main.tf\nmodules/pool/main.tf\nmodules/vpc/main.tf"
    },
    {
-    "do": "Save terraform/root.hcl (section 3). Save terraform/accounts/ai-agents/account.hcl with locals { account_name = \"ai-agents\", tags = { account_name = \"ai-agents\", created_by = \"terraform\", project = \"rhinofcp\" } } (one attribute per line)",
-    "see": "(two files)"
+    "say": "Save the four Terragrunt files: root.hcl and the sandboxes unit from the Understand step, plus account.hcl and the vpc unit below. Put each one at the path in its first line, because Terragrunt finds them by folder.",
+    "do": "# terraform/accounts/ai-agents/account.hcl\nlocals {\n  name_prefix = \"ai-agents\"\n  tags = {\n    account_name = \"ai-agents\"\n    created_by   = \"terraform\"\n  }\n}\n\n# terraform/accounts/ai-agents/aws/us-east-1/core-services/vpc/terragrunt.hcl\ninclude \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n\nterraform {\n  source = \"${get_parent_terragrunt_dir(\"root\")}/..//modules/vpc\"\n}\n\ninputs = {\n  vpc_cidr = \"10.60.0.0/16\"\n}\n\n# then check:\nfind terraform -name '*.hcl' | sort",
+    "see": "terraform/accounts/ai-agents/account.hcl\nterraform/accounts/ai-agents/aws/us-east-1/core-services/vpc/terragrunt.hcl\nterraform/accounts/ai-agents/aws/us-east-1/sandboxes/terragrunt.hcl\nterraform/root.hcl"
    },
    {
-    "do": "modules/fake-vpc/main.tf: variables vpc_cidr (string) and tags (map(string)); resource \"terraform_data\" \"vpc\" { input = { cidr = var.vpc_cidr, tags = var.tags } }; output \"private_subnets\" { value = [for n in range(3) : cidrsubnet(var.vpc_cidr, 2, n)] }",
-    "see": "(terraform_data is built into OpenTofu: it stores values and needs no provider download)"
-   },
-   {
-    "do": "modules/fake-pool/main.tf: variables subnet_ids (list(string)), sizes (map(string)) and tags (map(string)); resource \"terraform_data\" \"asg\" { for_each = var.sizes, input = { name = \"ai-agents-sandbox-${each.key}\", type = each.value, subnets = var.subnet_ids } } (one argument per line)",
-    "see": "(no output)"
-   },
-   {
-    "do": "Save the vpc unit: section 2's file with source ...//modules/fake-vpc/ and only vpc_cidr = \"10.60.0.0/16\" in inputs (no locals; the root passes tags). Save the sandboxes unit from section 5.",
-    "see": "(two terragrunt.hcl files)"
-   },
-   {
-    "do": "cd terraform/accounts/ai-agents/aws/us-east-1 && terragrunt list --dag",
+    "say": "Ask Terragrunt in which order it would run the units, because the dependency block should put vpc first.",
+    "do": "cd terraform/accounts/ai-agents/aws/us-east-1\nterragrunt list --dag",
     "see": "core-services/vpc  sandboxes"
    },
    {
-    "do": "terragrunt run --all --non-interactive -- plan 2>&1 | grep -E 'Plan:|WARN|10\\.'",
-    "see": "[core-services/vpc] tofu:           + cidr = \"10.60.0.0/16\"\n[core-services/vpc] tofu: Plan: 1 to add, 0 to change, 0 to destroy.\nWARN  [sandboxes] ... mock outputs provided and returning those in dependency output.\n[sandboxes] tofu:               + \"10.0.0.0/18\",\n[sandboxes] tofu: Plan: 3 to add, 0 to change, 0 to destroy.\n(output trimmed)"
+    "say": "Look at the sandboxes unit the way OpenTofu will receive it, with the root's inputs merged in, because that is the include working.",
+    "do": "(cd sandboxes && terragrunt render) | sed -n '/^inputs/,$p'",
+    "see": "inputs = {\n  name_prefix = \"ai-agents\"\n  sizes = {\n    full = \"m8i.2xlarge\"\n    lite = \"m8i.xlarge\"\n  }\n  subnet_ids = [\"10.0.0.0/18\"]\n  (tags follow, from account.hcl)"
    },
    {
-    "do": "(cd core-services/vpc && terragrunt apply -auto-approve 2>&1 | grep 'Apply complete') && (cd sandboxes && terragrunt plan 2>&1 | grep -o '10\\.60\\.[0-9]*\\.0/18' | sort -u)",
-    "see": "STDOUT tofu: Apply complete! Resources: 1 added, 0 changed, 0 destroyed.\n10.60.0.0/18\n10.60.128.0/18\n10.60.64.0/18\n(the real subnets from the vpc unit's state, no more mock)"
+    "say": "Plan every unit at once. The vpc has never been applied, so watch the sandboxes plan use the mock subnet.",
+    "do": "terragrunt run --all plan 2>&1 | grep -E 'Plan:|mock outputs|\"10\\.'",
+    "see": "[core-services/vpc] tofu:           + cidr = \"10.60.0.0/16\"\n[core-services/vpc] tofu: Plan: 1 to add, 0 to change, 0 to destroy.\n[core-services/vpc] tofu:       + \"10.60.0.0/18\",\n…\nWARN   [sandboxes] Config …/core-services/vpc/terragrunt.hcl is a dependency of …/sandboxes/terragrunt.hcl that has no outputs, but mock outputs provided and returning those in dependency output.\n[sandboxes] tofu:               + \"10.0.0.0/18\",\n[sandboxes] tofu: Plan: 2 to add, 0 to change, 0 to destroy."
    },
    {
-    "do": "find ~/academy/tg-lab/terraform/.state -name terraform.tfstate",
-    "see": "/Users/you/academy/tg-lab/terraform/.state/accounts/ai-agents/aws/us-east-1/core-services/vpc/terraform.tfstate"
+    "say": "Apply both in order and answer y. This is a lab on your laptop; in the real repo nobody runs run --all apply on an account, because one y would apply every unit without showing each plan.",
+    "do": "terragrunt run --all apply 2>&1 | grep -E 'Are you sure|Apply complete|sandboxes.*\"10\\.'",
+    "see": "Are you sure you want to run 'terragrunt apply' in each unit of the run queue displayed above? (y/n) y\n[core-services/vpc] tofu: Apply complete! Resources: 1 added, 0 changed, 0 destroyed.\n[sandboxes] tofu:               + \"10.60.0.0/18\",\n[sandboxes] tofu:               + \"10.60.64.0/18\",\n[sandboxes] tofu:               + \"10.60.128.0/18\",\n[sandboxes] tofu: Apply complete! Resources: 2 added, 0 changed, 0 destroyed."
+   },
+   {
+    "say": "Find the state files, because the folder paths are the proof that every unit has a state of its own.",
+    "do": "find ~/academy-labs/p4-2/terraform/.state -name terraform.tfstate",
+    "see": "~/academy-labs/p4-2/terraform/.state/accounts/ai-agents/aws/us-east-1/sandboxes/terraform.tfstate\n~/academy-labs/p4-2/terraform/.state/accounts/ai-agents/aws/us-east-1/core-services/vpc/terraform.tfstate"
    }
   ],
-  "faded": "Add a third unit, core-services/runs-bucket. Its module fake-bucket has a terraform_data with input = { name = var.name } and an output name. Its input is name = \"rhino-ai-agents-runs\". Left to you: make sandboxes depend on it too, with a second dependency block and its own mock_outputs. Check with terragrunt list --dag that sandboxes now runs last.",
-  "alone": "Copy terraform/accounts/ai-agents to terraform/accounts/solutions-lab with its own account.hcl (account_name solutions-lab). From terraform/accounts, run terragrunt run --all --non-interactive -- plan. Their units have the same names. Use the state paths to explain why the two accounts still never share a state file.",
-  "done": "list --dag shows vpc before sandboxes, and the first plan uses the mock subnet. After you apply vpc, the sandboxes plan shows the three real /18s."
+  "build": "Add a third unit, core-services/runs-bucket, for the bucket where runs keep their transcripts. Its module is modules/bucket, which needs bucket_name and tags. Give it bucket_name = \"rhino-ai-agents-runs\" and let the tags come from the root. Before you apply, predict where its state file will appear. Then run terragrunt list --dag, terragrunt run --all plan and terragrunt run --all apply.",
+  "checks": [
+   "terragrunt list --dag shows three units: core-services/runs-bucket, core-services/vpc and sandboxes.",
+   "terragrunt render in the runs-bucket folder shows bucket_name = \"rhino-ai-agents-runs\" and the tags with account_name = \"ai-agents\", which you did not write in the unit.",
+   "run --all plan says Plan: 1 to add for runs-bucket and No changes for vpc and sandboxes.",
+   "A third state file exists at terraform/.state/accounts/ai-agents/aws/us-east-1/core-services/runs-bucket/terraform.tfstate.",
+   "Your new terragrunt.hcl has no remote_state block and no tags of its own: both come from the root."
+  ],
+  "solution": {
+   "lang": "hcl",
+   "file": "terraform/accounts/ai-agents/aws/us-east-1/core-services/runs-bucket/terragrunt.hcl",
+   "text": "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n\nterraform {\n  source = \"${get_parent_terragrunt_dir(\"root\")}/..//modules/bucket\"\n}\n\ninputs = {\n  bucket_name = \"rhino-ai-agents-runs\"\n}"
+  },
+  "fix": "A teammate wants Spot groups next to the normal ones, so they copy the sandboxes folder to sandboxes-spot. They delete the include block (\"every unit has the same lines anyway\"), and when the source path stops working they write it out by hand as \"../../../../../..//modules/pool\". Now terragrunt plan in sandboxes-spot stops and asks for var.name_prefix, then var.tags. Press Ctrl+C. Find what is missing and put it back, using the sandboxes unit as your model. Then explain one more problem the copy had that no error showed: where would its state have been written without the root's remote_state block? (Look inside .terragrunt-cache.)",
+  "explain": [
+   "Why does every unit get its own state file, even though they all include the same root.hcl?",
+   "What does the dependency block give the sandboxes unit, and why does the first plan need mock_outputs?",
+   "Why is terragrunt run --all plan a normal thing to run, but run --all apply on a real account is not?"
+  ],
+  "done": "Three units plan and apply in dependency order, each with its own state file under terraform/.state, and the runs-bucket unit gets its tags from the root."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Where does a unit's state live in our repo?",
+   "q": "The vpc unit and the sandboxes unit include the same root.hcl. You apply the sandboxes unit. Can that apply destroy the VPC?",
    "options": [
     {
-     "text": "In S3, bucket rhinohealth-terraform-state, at the unit's path below root.hcl plus /terraform.tfstate",
+     "text": "Yes, because both units share the root's state settings.",
+     "correct": false,
+     "why": "They share the settings, but path_relative_to_include() gives each unit its own state file. The sandboxes state does not contain the VPC."
+    },
+    {
+     "text": "No. The sandboxes apply only knows the resources in its own state and configuration, and the VPC is in neither.",
      "correct": true,
-     "why": "path_relative_to_include() makes the key, so every unit has its own state."
+     "why": "That is the point of small units: a plan or apply can only touch what its own state and configuration describe."
     },
     {
-     "text": "In the unit's folder, committed to git",
+     "text": "Only if the sandboxes unit has a dependency block on the vpc unit.",
      "correct": false,
-     "why": "State can hold secrets and must be locked; it never goes in git."
-    },
-    {
-     "text": "In one state file per account",
-     "correct": false,
-     "why": "One per unit. A small state means a small plan."
+     "why": "A dependency only reads the vpc unit's outputs. It does not put the VPC's resources into the sandboxes state."
     }
    ]
   },
   {
-   "q": "What are mock_outputs for?",
+   "q": "The vpc unit has never been applied, and the sandboxes unit reads dependency.vpc.outputs.private_subnets. What happens when you plan the sandboxes unit?",
    "options": [
     {
-     "text": "Faking a unit's outputs in production when it is broken",
+     "text": "Terragrunt applies the vpc unit first, so that the outputs exist.",
      "correct": false,
-     "why": "Mocks are refused for apply by mock_outputs_allowed_terraform_commands."
+     "why": "Plan never applies anything, not even a dependency. That would be a terrible surprise."
     },
     {
-     "text": "Unit tests for modules",
+     "text": "The plan fails, because there is no way to plan before the dependency exists.",
      "correct": false,
-     "why": "They exist so plan can run in order, not for tests."
+     "why": "That is what happens without mock_outputs. With them, plan can still run."
     },
     {
-     "text": "Letting plan and validate run before the unit they depend on has state",
+     "text": "The plan uses the mock_outputs values, and apply would refuse to use them.",
      "correct": true,
-     "why": "On the first plan of a new account, nothing has outputs yet."
+     "why": "Mock outputs exist so that plan and validate work on a fresh account. Once the vpc unit is applied, its real outputs replace them."
     }
    ]
   },
   {
-   "q": "Where does the new ai-agents AWS account's code go?",
+   "q": "A teammate copies a unit folder and deletes the include block because \"every unit has the same lines anyway\". What did the include give the unit?",
    "options": [
     {
-     "text": "multi_tenant/accounts/ai-agents/, next to the inf tools",
-     "correct": false,
-     "why": "That is the old tree. New accounts go in the new one."
-    },
-    {
-     "text": "terraform/accounts/ai-agents/, copied from terraform/accounts/solutions/",
+     "text": "Where its state lives (remote_state) and the shared inputs, such as the name prefix and the tags.",
      "correct": true,
-     "why": "G3-02 copies the solutions account and drops the GCP parts."
+     "why": "Without it, the module asks for name_prefix and tags, and even if you typed them, the state would land inside the cache folder instead of next to the other units' states."
     },
     {
-     "text": "A new repository only for agents",
+     "text": "Only the formatting rules for the file.",
      "correct": false,
-     "why": "All AWS accounts live in the infrastructure repo, owned by DevOps."
+     "why": "Formatting is checked by terragrunt hcl format. The include carries the state settings and shared inputs."
+    },
+    {
+     "text": "Nothing important, because the module path is enough to plan.",
+     "correct": false,
+     "why": "The module path says which code to run, not where its state lives or which shared inputs it receives."
     }
    ]
   }
  ],
- "recall": [
-  "From p4-1: what does tofu init write that you commit, and why?"
- ],
- "videos": [
-  {
-   "title": "How To Use Terragrunt to Manage Terraform At Scale",
-   "url": "https://www.youtube.com/watch?v=p7oB_OsWNAU",
-   "channel": "Josh Geissler",
-   "minutes": 17,
-   "why": "Recent explanation of why Terragrunt exists, units and run-all."
-  },
-  {
-   "title": "Getting started with Terragrunt",
-   "url": "https://www.youtube.com/watch?v=VuGmV9qXFKE",
-   "channel": "Cloud Advocate",
-   "minutes": 8,
-   "why": "Eight-minute first look at terragrunt.hcl and DRY backends."
-  }
- ],
+ "platform": {
+  "p": [
+   "RhinoHealth/infrastructure runs OpenTofu 1.12.6 with Terragrunt 1.1.4. The ai-agents account goes into the new tree at terraform/accounts/ai-agents/, copied from the solutions account, with units such as aws/us-east-1/core-services/vpc, core-services/runs-bucket, core-services/dns-firewall and sandboxes. The real root.hcl keeps state in the S3 bucket rhinohealth-terraform-state with the key ${path_relative_to_include()}/terraform.tfstate and use_lockfile = true, pins provider versions in common.hcl (for example aws 6.64.0), and makes every unit assume the account's TerraformDeploymentRole. Module sources in the new tree use \"${get_parent_terragrunt_dir(\"root\")}/..//modules/<name>/\", and registry modules use tfr:/// with a pinned version.",
+   "The agents' Temporal and services run on the internal cluster, so they follow the n8n pattern in the old tree, under multi_tenant/accounts/infrastructure/ai-agents/. The infrastructure repo's CI only checks formatting today; plans are run on a laptop over VPN, pasted into the PR, and a person applies."
+  ],
+  "tickets": [
+   {
+    "key": "G3-02",
+    "why": "Adds terraform/accounts/ai-agents/ with account.hcl and the region files, copied from the solutions account."
+   },
+   {
+    "key": "G3-04",
+    "why": "The core-services units of the sandbox network: vpc, runs-bucket, dns-firewall and private-zone."
+   },
+   {
+    "key": "G3-06",
+    "why": "Temporal on the internal cluster, built as units in the old tree on the n8n pattern."
+   },
+   {
+    "key": "G3-17",
+    "why": "The agent services as more units in that folder, plus the PrivateLink unit."
+   }
+  ]
+ },
  "words": [
   {
    "term": "Terragrunt",
-   "plain": "A tool that writes backend and provider files and runs tofu in many folders, in order."
+   "plain": "A thin tool in front of OpenTofu that prepares each folder's settings and runs tofu there, one folder at a time or all in order."
   },
   {
    "term": "unit",
-   "plain": "One folder with a terragrunt.hcl: one module, its inputs, and its own state."
-  },
-  {
-   "term": "root.hcl",
-   "plain": "The file every unit includes, with the backend, providers and common inputs."
+   "plain": "One folder with a terragrunt.hcl: one module, its inputs and its own state."
   },
   {
    "term": "include",
-   "plain": "A block that merges a parent file, usually root.hcl, into a unit."
+   "plain": "A block that pulls a parent file such as root.hcl into a unit, so shared settings are written once."
   },
   {
    "term": "dependency",
-   "plain": "A block that reads another unit's outputs and makes it run first."
+   "plain": "A block that reads another unit's outputs and makes that unit run first."
   },
   {
-   "term": "mock_outputs",
-   "plain": "Placeholder outputs for plan and validate while the other unit has no state yet."
+   "term": "mock outputs",
+   "plain": "Stand-in outputs a dependency gives during plan and validate, before the other unit has ever been applied."
   },
   {
    "term": "run --all",
-   "plain": "Run one tofu command in every unit below a folder, in dependency order (formerly run-all)."
+   "plain": "Runs one tofu command in every unit below the current folder, in dependency order."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-02",
-   "why": "Adds terraform/accounts/ai-agents/ with account.hcl and the region files, copied from solutions."
+   "q": "Without looking: what two things does our root.hcl give every unit, and which function makes the state paths different?",
+   "a": "The remote_state settings (where and how state is stored, written into backend.tf) and the shared inputs (name prefix, tags). path_relative_to_include() makes each unit's state key its own folder path."
   },
   {
-   "key": "G3-04",
-   "why": "The core-services units: vpc, runs-bucket, dns-firewall and private-zone, planned locally and applied by a person."
+   "q": "You add a dns-firewall unit that needs the VPC ID. What do you write, and what happens on the first plan in a new account?",
+   "a": "A dependency \"vpc\" block with config_path to the vpc unit and mock_outputs for vpc_id, then inputs = { vpc_id = dependency.vpc.outputs.vpc_id }. On the first plan the mock value is used; apply needs the real output, so the vpc unit is applied first."
   },
   {
-   "key": "G3-06",
-   "why": "Temporal on inf copies the n8n pattern: one folder of units in the old tree."
-  },
-  {
-   "key": "G3-17",
-   "why": "The agent services are more units in that folder, plus a PrivateLink unit."
+   "q": "Why would a team rather have twenty small units than one big folder for an account?",
+   "a": "Faster plans, separate locks so people do not block each other, and a smaller blast radius: a mistake in one unit cannot destroy what another unit manages."
   }
  ],
- "remember": "One folder is one unit and one state. root.hcl writes the plumbing, account.hcl holds the facts, and dependencies set the order."
+ "remember": "One folder is one unit with one state; the root is written once and included everywhere, and a dependency passes outputs and sets the order."
 }

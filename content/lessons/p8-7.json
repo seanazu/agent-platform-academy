@@ -1,458 +1,304 @@
 {
+ "v": 2,
  "id": "p8-7",
  "title": "Many agents on purpose",
  "minutes": 50,
  "youNeed": [
-  "p8-5",
-  "p8-2"
+  "p8-5"
  ],
- "bridge": "A workflow script is like a file that orchestrates a few Promise.all() calls. Except: each promise is a whole subagent, and the script holds the plan instead of the model. Date.now() and Math.random() throw inside it, so a run can be replayed from its saved results.",
- "intro": "Research is where extra agents help most: four cheap readers in parallel give the planner a wide view for little cost. Writing code is where they hurt: one writer per change. This lesson shows the Workflow tool and the script API (agent, parallel, pipeline, phase). It shows how to run a saved workflow from a session, and how to size a run on purpose.",
- "picture": {
-  "caption": "Nova calls the Workflow tool with a saved script. The runtime fans out helpers, then planners, then a judge, and returns one result.",
-  "nodes": [
-   {
-    "id": "nova",
-    "label": "Nova's session",
-    "kind": "agent"
-   },
-   {
-    "id": "tool",
-    "label": "Workflow tool (runtime)",
-    "kind": "service"
-   },
-   {
-    "id": "script",
-    "label": "nova-research.js",
-    "kind": "file"
-   },
-   {
-    "id": "helpers",
-    "label": "4 helpers (Haiku) in parallel",
-    "kind": "agent"
-   },
-   {
-    "id": "planners",
-    "label": "3 planners, three angles",
-    "kind": "agent"
-   },
-   {
-    "id": "judge",
-    "label": "judge",
-    "kind": "agent"
-   },
-   {
-    "id": "result",
-    "label": "{ notes, plan }",
-    "kind": "file"
-   }
+ "map": "vm",
+ "hook": {
+  "story": [
+   "Nova's diff for a bigger ticket touches 14 files. One reviewer misses things on a diff that size, so we want several: one looking for bugs, one for security, one for weak tests, and for every important finding a skeptic that tries to prove it wrong. That is easily ten agents.",
+   "If Nova starts them one by one through the Agent tool, every report lands in Nova's own context, and Nova spends its turns deciding what to start next. And someone on the team asks the natural question: if ten reviewers are good, why not ten agents writing the code in parallel too?"
   ],
-  "steps": [
-   {
-    "from": "nova",
-    "to": "tool",
-    "text": "calls Workflow with name 'nova-research' and args"
-   },
-   {
-    "from": "tool",
-    "to": "script",
-    "text": "loads the saved script and runs it in the background"
-   },
-   {
-    "from": "script",
-    "to": "helpers",
-    "text": "parallel(): four agent() calls with a pointer schema"
-   },
-   {
-    "from": "helpers",
-    "to": "planners",
-    "text": "fuzzy ticket: three agent() calls with the Plan schema"
-   },
-   {
-    "from": "planners",
-    "to": "judge",
-    "text": "one agent() picks a plan and grafts the best ideas"
-   },
-   {
-    "from": "judge",
-    "to": "result",
-    "text": "the script returns an object"
-   },
-   {
-    "from": "result",
-    "to": "nova",
-    "text": "only the result enters Nova's context, not the helpers' work"
-   }
-  ]
+  "question": "How do I run many agents in a planned shape, and how do I decide when more agents help and when they hurt?"
  },
- "sections": [
+ "read": [
   {
-   "h": "When many agents help, and when they do not",
+   "h": "Move the plan into a script",
    "p": [
-    "A workflow is a JavaScript script that starts many subagents and holds the plan itself: loops, fan-out, what to merge. Only the final return enters the calling session's context. That is the win: four readers can each read 100K tokens and the planner sees one list of pointers.",
-    "It helps for research: where is the code, which tests, similar PRs, the brain. It helps for independent plans with a judge on fuzzy tickets, and for review panels on big diffs. It does not help for writing code: parallel writers conflict. One writer per change stays the rule.",
-    "Nova decides when to use one, guided by one line in the plan-and-grill skill. The harness never forces it."
+    "A dynamic workflow is a JavaScript script that starts many subagents and holds the plan itself: the loops, the fan-out, what to keep and what to drop. A runtime inside Claude Code runs the script in the background, and the session that started it gets back only the script's final return value. Four lenses can each read a big diff, and the session sees one short list of findings.",
+    "This changes who decides. With subagents, the model decides turn by turn what to start next, and every result passes through its context. With a workflow, the script decides, and the intermediate results live in script variables. That makes the orchestration something you can read, save, rerun and test, like any other code.",
+    "More agents help with reading, searching, reviewing and comparing plans, because those jobs are independent and their results can be merged. They hurt with writing code: two agents editing the same repo at once produce conflicts. So the rule for our agents is many readers, one writer."
    ],
-   "callout": {
-    "kind": "wall",
-    "text": "One writer per change. A workflow may read, plan, judge and review in parallel; it never edits the same repo from several agents."
-   }
-  },
-  {
-   "h": "The shape of a script",
-   "p": [
-    "A script starts with export const meta: name, description, and the phase titles, as a plain object literal. Then a body in plain JavaScript with top-level await. agent(prompt, opts) starts one subagent and returns its text, or an object if opts.schema is given.",
-    "parallel(thunks) runs functions at once and waits for all. phase(title) groups the agents that follow in the progress view. log(text) shows a line. args is whatever the caller passed.",
-    "An agent() that is stopped or dies on an API error returns null, so results are filtered with .filter(Boolean). Scripts are not TypeScript: no type annotations. No imports, no file system: agents do the work."
-   ],
-   "because": "We write the lab script first because the API is small, and seeing one whole script makes the real ones readable.",
    "code": {
     "lang": "javascript",
-    "file": "~/sdk-lab/.claude/workflows/count-files.js",
-    "text": "export const meta = {\n  name: 'count-files',\n  description: 'Count files by extension in a folder, three readers in parallel',\n  phases: [{ title: 'Read' }, { title: 'Merge' }],\n}\n\nconst COUNT = { type: 'object', required: ['ext', 'count'], properties: { ext: { type: 'string' }, count: { type: 'integer' } } }\nconst EXTS = ['.ts', '.js', '.json']\n\nphase('Read')\nconst counts = await parallel(EXTS.map((ext) => () =>\n  agent(`Count the files ending in ${ext} under ${args.folder}. Use Glob. Return ext and count.`,\n    { schema: COUNT, model: 'haiku', effort: 'low', phase: 'Read' })))\n\nphase('Merge')\nconst total = counts.filter(Boolean).reduce((sum, c) => sum + c.count, 0)\nlog(`${total} files counted`)\nreturn { counts: counts.filter(Boolean), total }",
+    "file": "~/sdk-lab/.claude/workflows/review-panel.js",
+    "text": "export const meta = {\n  name: 'review-panel',\n  description: 'Review a diff through several lenses, then try to refute each important finding',\n  phases: [{ title: 'Lenses' }, { title: 'Skeptics' }],\n}\n\nconst FINDINGS = { type: 'object', required: ['findings'], properties: { findings: { type: 'array', items: {\n  type: 'object', required: ['path', 'line', 'severity', 'body'], properties: {\n    path: { type: 'string' }, line: { type: 'integer' }, severity: { enum: ['important', 'nit'] }, body: { type: 'string' } } } } } }\nconst VERDICT = { type: 'object', required: ['refuted'], properties: { refuted: { type: 'boolean' } } }\nconst LENSES = ['correctness', 'security', 'tests']\n\nphase('Lenses')\nconst found = await parallel(LENSES.map((lens) => () =>\n  agent(`Review the diff in ${args.diffPath} through the ${lens} lens.`, { schema: FINDINGS, label: lens })))\n\nconst important = found.filter(Boolean).flatMap((r) => r.findings).filter((f) => f.severity === 'important')\n\nphase('Skeptics')\nconst checked = await parallel(important.map((f) => () =>\n  agent(`Try to refute this finding. Read ${f.path}:${f.line}. If you cannot show the problem, refuted=true.\\n${f.body}`,\n    { schema: VERDICT, label: `${f.path}:${f.line}` })))\n\nconst kept = important.filter((f, i) => checked[i] && !checked[i].refuted)\nlog(`${kept.length} of ${important.length} important findings survived`)\nreturn { findings: kept }",
     "notes": [
      {
       "line": 1,
-      "text": "A pure literal: no variables, no spreads. The name is how a session calls it."
+      "text": "meta comes first and must be a plain object literal: no variables, no function calls."
      },
      {
       "line": 7,
-      "text": "A JSON Schema, by hand. Scripts cannot import zod; keep schemas small."
-     },
-     {
-      "line": 11,
-      "text": "parallel takes functions (thunks), not promises. Each thunk starts one agent."
+      "text": "A hand-written JSON Schema. Scripts cannot import zod or anything else."
      },
      {
       "line": 13,
-      "text": "schema makes agent() return an object. model and effort per call; phase pins it to a group."
-     },
-     {
-      "line": 16,
-      "text": "Plain JavaScript between agents: filter nulls, add up. No Date.now(), no Math.random()."
-     },
-     {
-      "line": 18,
-      "text": "The return value is the tool result Nova sees."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Run a saved workflow from a session",
-   "p": [
-    "Saved workflows live in .claude/workflows/ of the project or ~/.claude/workflows/ of the user. In the sandbox image Packer bakes Nova's scripts into ~/.claude/workflows/ of the VM user, not into fcp. settingSources must include the matching source for them to load.",
-    "Under dontAsk the Workflow tool itself must be in allowedTools, or the launch is refused like any other call. The settings option can turn workflows on and set the size guideline. A PostToolUse hook on Workflow prints the tool result, which carries the runId.",
-    "The settings option takes a Settings object or a string. A string is read as the path to a settings JSON file, like the --settings flag of the claude CLI. Some ticket sketches (G4-01, walkthrough g4-5) write JSON.stringify({...}) there. We pass the object, because TypeScript checks its keys."
-   ],
-   "because": "We allow the Workflow tool explicitly because in a headless session nobody can approve the launch prompt a person would see.",
-   "code": {
-    "lang": "typescript",
-    "file": "~/sdk-lab/src/lab7-workflow.ts",
-    "text": "import { query, type HookCallback } from \"@anthropic-ai/claude-agent-sdk\";\nconst logWorkflowRun: HookCallback = async (input) => {\n  if (input.hook_event_name === \"PostToolUse\") console.log(\"Workflow tool returned:\", JSON.stringify(input.tool_response));\n  return {};\n};\n\nfor await (const msg of query({\n  prompt: \"Run the saved workflow count-files with args { folder: 'src' } and report its result.\",\n  options: {\n    model: \"claude-opus-5-5\",\n    effort: \"medium\",\n    cwd: process.cwd(), // .claude/workflows/count-files.js lives here\n    settingSources: [\"project\"], // project settings, so saved workflows in .claude/ load\n    allowedTools: [\"Read\", \"Glob\", \"Grep\", \"Workflow\"], // Workflow must be allowed under dontAsk\n    permissionMode: \"dontAsk\",\n    settings: { enableWorkflows: true, workflowSizeGuideline: \"small\" }, // size is advice, not a cap\n    hooks: { PostToolUse: [{ matcher: \"Workflow\", hooks: [logWorkflowRun] }] },\n    env: { ...process.env, CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS: \"3\" }, // like a lite VM\n  },\n})) {\n  if (msg.type === \"result\") {\n    console.log(\"result\", msg.subtype, \"cost\", msg.total_cost_usd);\n    for (const [model, use] of Object.entries(msg.modelUsage)) console.log(model, use.inputTokens, \"in\", use.outputTokens, \"out\");\n  }\n}",
-    "notes": [
-     {
-      "line": 3,
-      "text": "Narrowing on hook_event_name instead of a cast: TypeScript then knows tool_response exists."
-     },
-     {
-      "line": 13,
-      "text": "'project' loads .claude/workflows/ next to cwd. The spike uses ['user', 'project'] for ~/.claude/workflows/."
+      "text": "phase() groups the agents that follow in the progress view."
      },
      {
       "line": 14,
-      "text": "The lab's agents only read, so Read, Glob and Grep are enough for them too."
-     },
-     {
-      "line": 16,
-      "text": "settings is the flag layer: highest priority among user-controlled settings. Here it is an object; a string would be a file path. Workflows are on for paid plans; Pro turns them on in /config."
-     },
-     {
-      "line": 18,
-      "text": "The runtime caps concurrent agents at this number; the VM's CPUs decide the value: 3 lite, 6 full, 12 wide."
-     },
-     {
-      "line": 23,
-      "text": "modelUsage lists haiku next to opus: workflow agents are counted in the session's cost."
-     }
-    ]
-   },
-   "see": "Workflow tool returned: {\"status\":\"async_launched\",\"taskId\":\"...\",\"workflowName\":\"count-files\",\"runId\":\"...\",\"scriptPath\":\"...\"}\nresult success cost 0.09\nclaude-opus-5-5 2100 in 300 out\nclaude-haiku-5-5 5400 in 180 out",
-   "ifInstead": "If instead the model says it cannot find a workflow named count-files, the file did not load. Check it is at .claude/workflows/count-files.js under cwd. Check that settingSources includes 'project', and that meta.name matches."
-  },
-  {
-   "h": "Size on purpose",
-   "p": [
-    "Three things bound a run. CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS caps how many agents run at the same moment.",
-    "The harness sets 3, 6 or 12 by VM size, because agents are processes and the VM has that many CPUs. workflowSizeGuideline (small: fewer than 5 agents) is advice to the model that writes a script, not a cap. The runtime also caps a run at 1,000 agents and a parallel() or pipeline() call at 4,096 items.",
-    "A workflow agent inherits the session's tools and permissions. It cannot start a new run: there is no orchestrator access in the VM, and workflow() nests one level only. Workflow agents' calls go to the gateway with the same run token, so they count toward the ticket's cost and the backstop."
-   ],
-   "callout": {
-    "kind": "tip",
-    "text": "Run a workflow on a small slice first (one folder, one question). The /workflows view in interactive Claude Code shows each agent's tokens as it runs."
-   }
-  },
-  {
-   "h": "nova-research.js (G4-09), part 1: four helpers",
-   "p": [
-    "Four questions, four Haiku helpers in parallel, each returning file:line pointers in a fixed schema. The prompts stay under 100K tokens each. The brain question says 'skipped' until the kb skill exists (G6). 'Similar past PRs' uses gh through the broker, read-only.",
-    "If the ticket is not fuzzy the script returns the notes and stops. Nova decides fuzzy from the readiness verdict (size: fuzzy)."
-   ],
-   "because": "We fan out research because reading is where extra agents add width for little cost. The planner needs width before it needs depth.",
-   "code": {
-    "lang": "javascript",
-    "file": "ai-agents/harness/workflows/nova-research.js (research phase)",
-    "text": "export const meta = {\n  name: 'nova-research',\n  description: 'Parallel research before planning; for fuzzy tickets, 3 plans and a judge',\n  phases: [{ title: 'Research' }, { title: 'Plans' }, { title: 'Judge' }],\n}\n\nconst POINTERS = { type: 'object', required: ['pointers'], properties: { pointers: { type: 'array', items: {\n  type: 'object', required: ['where', 'why'], properties: { where: { type: 'string' }, why: { type: 'string' } } } } } }\nconst QUESTIONS = [\n  'Where is the code this ticket is about? Return file:line pointers, most relevant first.',\n  'Find up to 5 merged fcp PRs that changed the same area (gh, read-only). Return the PR number and what it teaches.',\n  'Which existing tests cover this area, and how are they run? Return file:line pointers.',\n  'Search the brain with the kb skill for pages about this area; return path@sha and the key fact. If there is no kb skill, say \"skipped\".',\n]\n\nphase('Research')\nconst found = await parallel(QUESTIONS.map((q) => () =>\n  agent(`${q}\\n\\nTicket:\\n${args.ticket}`, { schema: POINTERS, model: 'haiku', effort: 'medium', phase: 'Research' })))\nconst notes = found.filter(Boolean).flatMap((r) => r.pointers)\nif (!args.fuzzy) return { notes }",
-    "notes": [
-     {
-      "line": 4,
-      "text": "Three phase titles, matched exactly by the phase() calls below."
-     },
-     {
-      "line": 7,
-      "text": "Every helper returns { pointers: [{ where, why }] }: a shape the planner can read without parsing prose."
-     },
-     {
-      "line": 13,
-      "text": "The helper reports 'skipped' when it cannot search the brain. No silent gaps."
+      "text": "parallel() takes functions and runs them at the same time; each starts one agent."
      },
      {
       "line": 17,
-      "text": "args.ticket is the ticket text Nova passed in. haiku at medium: the helper row of the routing table."
+      "text": "An agent that was stopped or failed returns null, so drop those before reading .findings."
      },
      {
-      "line": 19,
-      "text": "A bigger ticket that is not fuzzy stops here: notes only."
+      "line": 20,
+      "text": "One skeptic per important finding, all in parallel."
+     },
+     {
+      "line": 26,
+      "text": "Only this value goes back to the session that started the workflow."
      }
     ]
    }
   },
   {
-   "h": "nova-research.js, part 2: three plans and a judge",
+   "h": "The script's building blocks",
    "p": [
-    "For fuzzy tickets three planners write a plan each from a different angle: the smallest safe change, risk first, the user first. Each returns a Plan in the G4-07 schema, passed in as args.planSchema, so the shape is the same one the harness validates. A judge picks one and grafts the best ideas from the others.",
-    "The judge inherits the main loop's model, Opus 5.5, at medium. The planners inherit it too; only effort and schema are set."
+    "The body is plain JavaScript with top-level await, and a few globals. agent(prompt, options) starts one subagent and resolves to its text, or to an object when you pass a schema; it resolves to null when the agent was stopped or hit an error it could not recover from. parallel() runs a list of functions at once and waits for all of them. pipeline(items, stage1, stage2) sends each item through the stages on its own, with no waiting between items, so the security lens's skeptics can start while the tests lens is still reading. phase() and log() feed the progress view, and args is whatever input the caller passed.",
+    "A script cannot import modules or touch the file system; the agents do that work. Date.now(), Math.random() and new Date() without arguments throw inside a script. That is on purpose: a stopped run can be relaunched in the same session, and completed agents with an unchanged prompt return their saved result instead of running again, which only works if the script builds the same prompts every time.",
+    "Because the script is just JavaScript, you can test its logic without any model. The lab gives you a stand-in runtime with fake agents that answer from a JSON file, so you can see the order of agents, the null handling and the final result in a second."
    ],
-   "because": "We make independent plans and judge them. For fuzzy work, three angles with a judge beat one plan polished on its own.",
+   "see": "phase Lenses\n  agent  1  correctness            -> answered\n  agent  2  security               -> answered\n  agent  3  tests                  -> null\nphase Skeptics\n  agent  4  src/cart.ts:42         -> answered\n  agent  5  src/api.ts:12          -> answered\nlog   1 of 2 important findings survived"
+  },
+  {
+   "h": "Start it from a session, sized on purpose",
+   "p": [
+    "In the SDK, a workflow starts through the built-in Workflow tool. In a dontAsk session the tool must be approved like any other, with Workflow in allowedTools, or Workflow(<name>) for one saved workflow. Saved workflows live in .claude/workflows/ in the project or ~/.claude/workflows/ in your home folder, and run by the name in their meta.",
+    "The agents a workflow starts use the session's permission rules, so starting the panel from a read-only session keeps every lens and skeptic read-only. Three numbers bound a run. CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS sets how many agents run at the same moment; the default is 16, fewer on a machine with fewer CPUs. The runtime stops a run at 1,000 agents and refuses a parallel() or pipeline() list longer than 4,096 items. The workflowSizeGuideline setting (small means fewer than 5 agents) is advice to the model that writes a script, not a limit."
+   ],
    "code": {
-    "lang": "javascript",
-    "file": "ai-agents/harness/workflows/nova-research.js (plans and judge)",
-    "text": "phase('Plans')\nconst ANGLES = ['the smallest safe change', 'risk first: what could break', 'the user first: every screen state']\nconst plans = await parallel(ANGLES.map((angle) => () =>\n  agent(`Write a plan for this ticket, thinking ${angle}.\\nTicket:\\n${args.ticket}\\nNotes:\\n${JSON.stringify(notes)}`,\n    { schema: args.planSchema, phase: 'Plans' })))\n\nphase('Judge')\nconst plan = await agent(\n  `Pick the plan a reviewer and a tester would trust most; graft good ideas from the others. Return the final plan.\\n${JSON.stringify(plans.filter(Boolean))}`,\n  { schema: args.planSchema, effort: 'medium', phase: 'Judge' })\nreturn { notes, plan }",
+    "lang": "typescript",
+    "file": "~/sdk-lab/src/run-panel.ts",
+    "text": "import { query } from \"@anthropic-ai/claude-agent-sdk\";\n\nfor await (const msg of query({\n  prompt: \"Run the saved workflow review-panel with args { diffPath: 'diff.patch' } and report the findings that survived.\",\n  options: {\n    model: \"claude-opus-5-5\",\n    effort: \"medium\",\n    tools: [\"Read\", \"Grep\", \"Glob\", \"Workflow\"],\n    allowedTools: [\"Read\", \"Grep\", \"Glob\", \"Workflow\"],\n    permissionMode: \"dontAsk\",\n    settings: { workflowSizeGuideline: \"small\" },\n    env: { ...process.env, CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS: \"3\" },\n  },\n})) {\n  if (msg.type === \"result\") {\n    for (const [model, use] of Object.entries(msg.modelUsage)) console.log(model, \"$\" + use.costUSD.toFixed(4));\n    if (msg.subtype === \"success\") console.log(msg.result);\n  }\n}",
     "notes": [
      {
-      "line": 2,
-      "text": "Three angles, three independent contexts. They never see each other's plan."
-     },
-     {
-      "line": 5,
-      "text": "args.planSchema is z.toJSONSchema(Plan) computed by the harness: one schema everywhere."
+      "line": 8,
+      "text": "A read-only session plus the Workflow tool: the workflow's agents cannot edit anything."
      },
      {
       "line": 9,
-      "text": "The judge sees all surviving plans at once; this is the one place a barrier (parallel) is right."
+      "text": "Under dontAsk the Workflow tool must be approved, or the launch is refused."
      },
      {
       "line": 11,
-      "text": "Nova receives notes and one plan; the harness runs Plan.safeParse on it."
-     }
-    ]
-   }
-  },
-  {
-   "h": "nova-review-panel.js (G4-19): lenses, then skeptics",
-   "p": [
-    "On big diffs one reviewer misses things. The panel runs five lenses: correctness, security, conventions, plan coverage and tests. Then a skeptic per important finding tries to refute it. A skeptic must show the problem at file:line, or the finding is dropped.",
-    "pipeline(items, stage1, stage2) runs each item through the stages with no barrier between them. The security lens can be in the skeptic stage while conventions is still reviewing. The panel runs from the read-only reviewer session (Read, Grep, Glob, Workflow), so lenses and skeptics cannot edit anything.",
-    "When to use it: diffs over about 300 changed lines, 8 or more files, or a risky area. One reviewer otherwise."
-   ],
-   "because": "We add a skeptic per finding because a panel that only finds cries wolf. A panel that also refutes finds more and cries wolf less.",
-   "code": {
-    "lang": "javascript",
-    "file": "ai-agents/harness/workflows/nova-review-panel.js (body)",
-    "text": "const LENSES = [\n  { name: 'correctness', opts: {} },\n  { name: 'security', opts: {} },\n  { name: 'conventions (frontend/AGENTS.md and the Byte playbook)', opts: { model: 'sonnet', effort: 'low' } },\n  { name: 'plan coverage: is every plan item and QA check done?', opts: {} },\n  { name: 'tests: do they read what the user sees, and could they fail?', opts: {} },\n]\n\nconst reviewed = await pipeline(LENSES,\n  (lens) => agent(`Review the diff in /run/nova/review/diff.patch through the ${lens.name} lens.\\nTicket:\\n${args.ticket}`,\n    { schema: FINDINGS, phase: 'Lenses', ...lens.opts }),\n  (found) => parallel((found?.findings ?? []).filter((f) => f.severity === 'important').map((f) => () =>\n    agent(`Try to refute this finding. Read the code at ${f.path}:${f.line}. If you cannot show the problem, refuted=true.\\n${f.body}`,\n      { schema: VERDICT, phase: 'Skeptics' }).then((v) => (v && !v.refuted ? { ...f, evidence: v.evidence } : null)))))\n\nconst kept = reviewed.flat().filter(Boolean)\nlog(`${kept.length} important findings survived the skeptics`)\nreturn { findings: kept }",
-    "notes": [
-     {
-      "line": 4,
-      "text": "The conventions lens is cheap work: Sonnet at low. The others inherit Opus 5.5."
-     },
-     {
-      "line": 9,
-      "text": "pipeline: stage 1 per lens, stage 2 per lens's findings. No waiting for the slowest lens."
+      "text": "Advice for scripts the model writes. It does not cap a saved script."
      },
      {
       "line": 12,
-      "text": "Stage 2 fans out again: one skeptic per important finding, in parallel."
+      "text": "At most three agents at the same moment, as on a small machine. The others wait their turn."
      },
      {
-      "line": 14,
-      "text": "A refuted finding becomes null and is dropped; a surviving one carries the skeptic's evidence."
-     },
-     {
-      "line": 17,
-      "text": "log() tells the person what was dropped: no silent caps."
+      "line": 16,
+      "text": "modelUsage counts the workflow's agents too, so the cost of the whole panel is here."
      }
     ]
    },
-   "callout": {
-    "kind": "gotcha",
-    "text": "FINDINGS and VERDICT (defined above the body in the file) are hand-written JSON Schemas, like POINTERS. Scripts cannot import zod."
-   }
-  },
-  {
-   "h": "Resume a run (G4-01)",
-   "p": [
-    "The Workflow tool result carries a runId. If the session is killed mid-workflow, resume the session (p8-6) and call Workflow again with the same script and resumeFromRunId.",
-    "Completed agent() calls with an unchanged prompt return their saved result at once. Only the first changed call and everything after it run live. Same session only.",
-    "That is why Date.now() and Math.random() throw in a script: a replay must build the same prompts. The spike checks exactly this, and writes a go or no-go for G4-09 and G4-19 in ai-agents/docs/spikes/workflows-in-the-vm.md."
-   ],
-   "callout": {
-    "kind": "tip",
-    "text": "If a headless session exits before the workflow ends, the spike says to try CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 and note it."
+   "deeper": {
+    "h": "Go deeper: relaunching a stopped run",
+    "p": [
+     "The Workflow tool's result carries a runId. If a run is stopped, calling Workflow again with resumeFromRunId replays it in the same session: completed agents whose prompt and options are unchanged return their saved result, and the first changed or failed agent runs again, with every agent that started after it.",
+     "This works only inside the same session, which is one more reason to resume the session itself after a crash, as in the previous lesson."
+    ]
    }
   }
  ],
  "lab": {
-  "title": "Three readers in parallel from a session",
-  "youNeed": [
-   "The ~/sdk-lab project",
-   "A Claude Code login on a plan with dynamic workflows (paid plans; on Pro turn them on in /config)"
+  "id": "p8-7",
+  "title": "A review panel, tested without a model",
+  "minutes": 35,
+  "needs": [
+   "The ~/sdk-lab project from p8-1",
+   "For the last step only: your own Anthropic API key with access to dynamic workflows"
   ],
-  "worked": [
+  "goal": "Write a workflow script, run its logic with a stand-in runtime and fake agents, break and fix its null handling, then launch it from a read-only session.",
+  "mode": "guided",
+  "guess": {
+   "q": "A workflow starts three lens agents with parallel(). The tests lens is stopped halfway. What does parallel() give back for it?",
+   "options": [
+    {
+     "text": "The partial findings it had so far",
+     "correct": false,
+     "why": "A stopped agent returns nothing partial to the script."
+    },
+    {
+     "text": "null, in that agent's place in the list",
+     "correct": true,
+     "why": "agent() resolves to null for a stopped or failed agent, so scripts filter with .filter(Boolean)."
+    },
+    {
+     "text": "Nothing: parallel() throws and the whole run fails",
+     "correct": false,
+     "why": "Inside parallel() and pipeline() the run carries the null and goes on. Only an agent you await directly can end the run with its error."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "mkdir -p .claude/workflows and create .claude/workflows/count-files.js from above",
-    "see": "An 18-line plain JavaScript file starting with export const meta"
+    "say": "Save the panel from the Understand step as a project workflow.",
+    "do": "cd ~/sdk-lab && mkdir -p .claude/workflows\n# write .claude/workflows/review-panel.js from the Understand step",
+    "see": "(no output)"
    },
    {
-    "do": "Create src/lab7-workflow.ts from above",
-    "see": "A 26-line file; allowedTools includes Workflow"
+    "say": "Write the stand-in runtime. It gives the script fake versions of agent(), parallel(), pipeline(), phase() and log(); each fake agent answers from a JSON file by its label, and a missing answer behaves like a stopped agent.",
+    "do": "cat > src/dry-run.ts <<'EOF'\n// A stand-in runtime: it runs a workflow script's logic with fake agents, so you can test the\n// orchestration without a model. The real runtime is the Workflow tool inside Claude Code.\nimport { readFile } from \"node:fs/promises\";\n\nconst [file, answersFile, argsJson = \"{}\"] = process.argv.slice(2);\nconst answers: Record<string, unknown> = JSON.parse(await readFile(answersFile!, \"utf8\"));\nconst source = (await readFile(file!, \"utf8\")).replace(/^export const meta/m, \"const meta\");\nconst AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;\n\nlet agents = 0;\nconst agent = async (prompt: string, opts: { label?: string } = {}) => {\n  agents++;\n  const label = opts.label ?? prompt.slice(0, 30);\n  const answer = answers[label] ?? null; // a missing answer behaves like a stopped or failed agent\n  console.log(`  agent ${String(agents).padStart(2)}  ${label.padEnd(22)} -> ${answer === null ? \"null\" : \"answered\"}`);\n  return answer;\n};\nconst parallel = (thunks: (() => Promise<unknown>)[]) => Promise.all(thunks.map((t) => t()));\nconst pipeline = (items: unknown[], ...stages: ((x: any, item: unknown, i: number) => Promise<unknown>)[]) =>\n  Promise.all(items.map(async (item, i) => { let x: unknown = item; for (const s of stages) x = await s(x, item, i); return x; }));\nconst phase = (title: string) => console.log(`phase ${title}`);\nconst log = (text: string) => console.log(`log   ${text}`);\n\nconst run = new AsyncFunction(\"agent\", \"parallel\", \"pipeline\", \"phase\", \"log\", \"args\", source);\nconst result = await run(agent, parallel, pipeline, phase, log, JSON.parse(argsJson));\nconsole.log(`result ${JSON.stringify(result)}  (${agents} agents)`);\nEOF\nnpx tsc && echo clean",
+    "see": "clean"
    },
    {
-    "do": "npx tsx src/lab7-workflow.ts",
-    "see": "Workflow tool returned: {\"status\":\"async_launched\",...\"workflowName\":\"count-files\",\"runId\":\"...\"}\nresult success cost 0.09\nclaude-opus-5-5 ... in ... out\nclaude-haiku-5-5 ... in ... out"
+    "say": "Give the fake agents their answers: two lenses with findings, no answer for the tests lens, and a verdict from each skeptic.",
+    "do": "cat > answers.json <<'EOF'\n{\n  \"correctness\": { \"findings\": [\n    { \"path\": \"src/cart.ts\", \"line\": 42, \"severity\": \"important\", \"body\": \"total ignores the discount when the cart has one item\" },\n    { \"path\": \"src/cart.ts\", \"line\": 7, \"severity\": \"nit\", \"body\": \"rename t to total\" } ] },\n  \"security\": { \"findings\": [\n    { \"path\": \"src/api.ts\", \"line\": 12, \"severity\": \"important\", \"body\": \"user id is read from the query string\" } ] },\n  \"src/cart.ts:42\": { \"refuted\": false },\n  \"src/api.ts:12\": { \"refuted\": true }\n}\nEOF\nnpx tsx src/dry-run.ts .claude/workflows/review-panel.js answers.json '{\"diffPath\":\"/tmp/diff.patch\"}'",
+    "see": "phase Lenses\n  agent  1  correctness            -> answered\n  agent  2  security               -> answered\n  agent  3  tests                  -> null\nphase Skeptics\n  …\nlog   1 of 2 important findings survived\nresult {\"findings\":[{\"path\":\"src/cart.ts\",\"line\":42,…}]}  (5 agents)"
    },
    {
-    "do": "Read the model's final text in the transcript or add a console.log of msg.result",
-    "see": "A table like .ts 8, .js 0, .json 1, total 9 (your numbers depend on your folder)"
+    "say": "Break it on purpose: remove .filter(Boolean) from the line that reads the findings, and run the dry run again.",
+    "do": "sed 's/found.filter(Boolean).flatMap/found.flatMap/' .claude/workflows/review-panel.js > broken-panel.js\nnpx tsx src/dry-run.ts broken-panel.js answers.json '{\"diffPath\":\"/tmp/diff.patch\"}'",
+    "see": "  agent  3  tests                  -> null\n<anonymous_script>:19\nconst important = found.flatMap((r) => r.findings).filter((f) => f.severity === 'important')\n                                         ^\nTypeError: Cannot read properties of null (reading 'findings')"
    },
    {
-    "do": "Change CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS to \"1\" and run again",
-    "see": "The same result, slower: the three readers ran one after another."
+    "say": "Now the real runtime. Put any small diff into diff.patch, write src/run-panel.ts from the Understand step, and run it with your key.",
+    "do": "git diff --no-index /dev/null src/kb.ts > diff.patch\nexport ANTHROPIC_API_KEY=sk-ant-...   # your own key\nnpx tsx src/run-panel.ts",
+    "see": "(Needs your key and workflow access; numbers and findings differ.) One cost line per model in modelUsage, including the agents the workflow started, then the session's summary of the findings that survived."
    }
   ],
-  "faded": "Add a second stage with pipeline(): for each count, one agent that names the largest file of that extension. Left to you: the second stage's prompt and a schema with one string field; remember a stage function receives (previousResult, originalItem, index).",
-  "alone": "Write .claude/workflows/review-panel-mini.js: two lenses (correctness, tests) over a diff passed in args.diff. Then add one skeptic per important finding, with pipeline(), and return the survivors. Run it from a session on a small diff you paste into args, and print how many findings survived.",
-  "done": "The hook prints a Workflow result with a runId, modelUsage shows haiku next to opus, and the counts match ls."
+  "build": "Rewrite the panel with pipeline() instead of two parallel() rounds, so each lens's skeptics start as soon as that lens is done instead of waiting for all three lenses. pipeline(LENSES, stage1, stage2) passes each lens's result into stage 2, which starts one skeptic per important finding and returns the finding or null. Flatten the results at the end and drop the nulls. Your dry run must give the same result as before: one finding, src/cart.ts:42, from five agents.",
+  "checks": [
+   "The dry run of review-panel.js prints two phases, five agents and one surviving finding.",
+   "Without .filter(Boolean), the dry run stops with TypeError: Cannot read properties of null.",
+   "Your pipeline() version prints the same result line from five agents.",
+   "With your key, modelUsage lists more than one cost line, because the workflow's agents are counted."
+  ],
+  "solution": {
+   "lang": "javascript",
+   "file": "~/sdk-lab/.claude/workflows/review-panel-pipeline.js",
+   "text": "export const meta = {\n  name: 'review-panel',\n  description: 'Review a diff through several lenses, then try to refute each important finding',\n  phases: [{ title: 'Lenses' }, { title: 'Skeptics' }],\n}\n\nconst FINDINGS = { type: 'object', required: ['findings'], properties: { findings: { type: 'array', items: {\n  type: 'object', required: ['path', 'line', 'severity', 'body'], properties: {\n    path: { type: 'string' }, line: { type: 'integer' }, severity: { enum: ['important', 'nit'] }, body: { type: 'string' } } } } } }\nconst VERDICT = { type: 'object', required: ['refuted'], properties: { refuted: { type: 'boolean' } } }\nconst LENSES = ['correctness', 'security', 'tests']\n\nconst reviewed = await pipeline(LENSES,\n  (lens) => agent(`Review the diff in ${args.diffPath} through the ${lens} lens.`, { schema: FINDINGS, label: lens }),\n  (found) => parallel((found?.findings ?? []).filter((f) => f.severity === 'important').map((f) => () =>\n    agent(`Try to refute this finding. Read ${f.path}:${f.line}. If you cannot show the problem, refuted=true.\\n${f.body}`,\n      { schema: VERDICT, label: `${f.path}:${f.line}` }).then((v) => (v && !v.refuted ? f : null)))))\n\nconst kept = reviewed.flat().filter(Boolean)\nlog(`${kept.length} important findings survived`)\nreturn { findings: kept }"
+  },
+  "fix": "A teammate wants a big refactor done faster and writes a workflow that starts six agents with parallel(), each told to \"update the imports in your part of src/\". They run it from Nova's normal session, which has Edit and Write. Half the files now have broken imports, and two agents edited the same index.ts. Explain what went wrong with this shape, and rewrite it as many readers and one writer: agents that each return a list of needed changes, and a single agent (or Nova itself) that applies them.",
+  "explain": [
+   "What does a workflow script hold that a session with subagents keeps in the model's context instead?",
+   "Why do Date.now() and Math.random() throw inside a script?",
+   "Why are parallel reviewers safe and parallel writers not, and what makes the panel's agents read-only?"
+  ],
+  "done": "Your panel's logic is tested with fake agents, survives a stopped agent, and runs from a read-only session."
  },
- "quiz": [
+ "check": [
   {
-   "q": "What is the difference between parallel() and pipeline()?",
+   "q": "When does a workflow help more than one agent working alone?",
    "options": [
     {
-     "text": "parallel waits for all thunks (a barrier); pipeline runs each item through all stages with no barrier",
+     "text": "When many independent reads or reviews can run at once and be merged into one short answer",
      "correct": true,
-     "why": "Use pipeline by default; use parallel only when a later step needs all results together, like a judge."
+     "why": "Readers and reviewers do not interfere with each other, and only the merged result enters the session's context."
     },
     {
-     "text": "pipeline runs agents one at a time; parallel runs them at once",
+     "text": "When the code change is large, so several agents can write parts of it at once",
      "correct": false,
-     "why": "Both run agents concurrently; the difference is whether stages wait for each other."
+     "why": "Parallel writers edit the same repo and conflict. Our rule is many readers, one writer."
     },
     {
-     "text": "parallel is for Haiku, pipeline for Opus",
+     "text": "Whenever the ticket is urgent, because more agents always finish sooner",
      "correct": false,
-     "why": "Models are set per agent() call; neither function cares."
+     "why": "More agents cost more tokens and add merging work. They pay off only for independent work."
     }
    ]
   },
   {
-   "q": "Why do Date.now() and Math.random() throw inside a workflow script?",
+   "q": "Why does Math.random() throw inside a workflow script?",
    "options": [
     {
-     "text": "Scripts have no access to Node APIs at all",
+     "text": "Because scripts run in a browser sandbox without Math",
      "correct": false,
-     "why": "JSON, Math and Array work; these two are blocked on purpose."
+     "why": "Math exists; only the calls that make runs differ are blocked."
     },
     {
-     "text": "So a resumed run builds the same prompts and can reuse completed agents' saved results",
+     "text": "So that a relaunched run builds the same prompts and can reuse the saved results of finished agents",
      "correct": true,
-     "why": "resumeFromRunId caches by (prompt, opts); a changing prompt would rerun everything."
+     "why": "Replay matches agents by prompt and options. A random value or the current time would change them every run."
     },
     {
-     "text": "Because agents run on other machines with other clocks",
+     "text": "To save memory",
      "correct": false,
-     "why": "Agents run in the same VM; the reason is replay, not clocks."
+     "why": "It has nothing to do with memory. It is about replaying a run the same way."
     }
    ]
   },
   {
-   "q": "The plan says a change touches 12 files. Should Nova write the code with a workflow?",
+   "q": "A session with dontAsk has allowedTools: [\"Read\", \"Grep\", \"Glob\"] and is asked to run a saved workflow. What happens?",
    "options": [
     {
-     "text": "Yes, one agent per file is faster",
+     "text": "The workflow runs, because saved workflows are always trusted",
      "correct": false,
-     "why": "Parallel writers conflict and nobody holds the whole change; one writer per change is a wall."
+     "why": "In the SDK the launch goes through the normal permission checks like any tool call."
     },
     {
-     "text": "No; use a workflow for the research before and the review panel after, and one writer for the change",
+     "text": "The workflow runs, but its agents may not use any tools",
+     "correct": false,
+     "why": "The launch itself is the problem: it is never approved."
+    },
+    {
+     "text": "The Workflow call is refused, because the tool is not approved",
      "correct": true,
-     "why": "Workflows add width where reading helps; the edit stays with one context."
-    },
-    {
-     "text": "Only if CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS is 12",
-     "correct": false,
-     "why": "The cap bounds resources; it does not make parallel editing safe."
+     "why": "Add Workflow, or Workflow(<name>) for one saved workflow, to allowedTools."
     }
    ]
   }
  ],
- "recall": [
-  "In p8-5, what does agent() with a schema return, and what is the lesson's name for that pattern in a judge session?",
-  "In p8-2, what must be in allowedTools for the Workflow tool to launch under dontAsk?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "Nova uses two saved workflows, baked into the VM user's ~/.claude/workflows/. nova-research runs four helpers in parallel before planning (where the code is, similar past PRs, which tests cover the area, what the brain says) and, for a fuzzy ticket, three plans from different angles plus a judge that picks one. nova-review-panel runs five lenses on a bigger diff and a skeptic per important finding, and it is started from the read-only reviewer session, so none of its agents can edit.",
+   "Nova decides when a workflow is worth it, guided by one line in its planning skill; the harness never forces one. The harness sets CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS by VM size (3, 6 or 12), and Workflow is in Nova's allowedTools so the launch passes under dontAsk. A spike first checks that workflows run headless in a VM behind the gateway."
+  ],
+  "tickets": [
+   {
+    "key": "G4-01",
+    "why": "The spike: run a saved workflow headless in a VM, check concurrency, cost counting and resume."
+   },
+   {
+    "key": "G4-09",
+    "why": "nova-research.js: parallel research helpers, three plans and a judge for fuzzy tickets."
+   },
+   {
+    "key": "G4-19",
+    "why": "nova-review-panel.js: lenses, then skeptics, from the read-only reviewer session."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "Workflow tool",
-   "plain": "The built-in tool that runs a workflow script in the background and returns its result and a runId."
-  },
-  {
-   "term": "workflow script",
-   "plain": "A plain JavaScript file with export const meta and a body that calls agent(), parallel(), pipeline(), phase()."
+   "term": "dynamic workflow",
+   "plain": "A JavaScript script, run by a runtime in Claude Code, that starts many subagents and holds the plan itself."
   },
   {
    "term": "agent()",
-   "plain": "Starts one subagent with a prompt; returns its text, or an object when a schema is given; null if it died."
+   "plain": "Starts one subagent from a script; resolves to its text, an object with a schema, or null."
   },
   {
    "term": "parallel()",
-   "plain": "Runs a list of functions at once and waits for all of them: a barrier."
+   "plain": "Runs a list of functions at the same time and waits for all of them."
   },
   {
    "term": "pipeline()",
-   "plain": "Runs each item through stages independently; an item can be in stage 2 while another is in stage 1."
+   "plain": "Sends each item through a chain of stages on its own, with no waiting between items."
   },
   {
-   "term": "phase()",
-   "plain": "Names the group the following agents appear under in the progress view."
-  },
-  {
-   "term": "runId",
-   "plain": "The id of one workflow run; pass it as resumeFromRunId to replay with cached results."
+   "term": "Workflow tool",
+   "plain": "The built-in tool that starts a workflow from a session; under dontAsk it must be approved."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G4-01",
-   "why": "The spike runs a workflow headless in a lite VM behind the gateway; this lesson's lab is the laptop version of it."
+   "q": "Name the globals a workflow script can use and one thing it cannot do.",
+   "a": "agent, parallel, pipeline, phase, log and args. It cannot import modules or use the file system, and Date.now(), Math.random() and new Date() throw."
   },
   {
-   "key": "G4-09",
-   "why": "nova-research.js is explained line by line here: helpers in parallel, three plans, a judge."
-  },
-  {
-   "key": "G4-19",
-   "why": "nova-review-panel.js is the pipeline example: lenses, then a skeptic per finding."
+   "q": "What makes the review panel's agents unable to edit files?",
+   "a": "It is started from a read-only session, and a workflow's agents use that session's permission rules."
   }
  ],
- "remember": "Fan out to read, plan and review; never to write. The script holds the plan, agent() returns data, and only the return value enters Nova's context."
+ "remember": "A workflow moves the plan into a script: many readers in parallel, one writer, and only the final answer comes back."
 }

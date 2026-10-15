@@ -13,7 +13,7 @@ export const scrub = (text) => REPLACEMENTS.reduce((t, [re, to]) => t.replace(re
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
   let changed = 0;
-  for (const dir of ['content/lessons', 'src/sample']) {
+  for (const dir of ['content/lessons', 'content/clips', 'content/cards', 'content', 'src/sample']) {
     for (const f of readdirSync(join(root, dir)).filter((n) => n.endsWith('.json'))) {
       const p = join(root, dir, f);
       const before = readFileSync(p, 'utf8');

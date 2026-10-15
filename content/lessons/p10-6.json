@@ -1,459 +1,360 @@
 {
+ "v": 2,
  "id": "p10-6",
  "title": "Developer tools and the eval bench",
- "minutes": 55,
+ "minutes": 65,
  "youNeed": [
-  "p10-2",
-  "p10-4"
+  "p10-1",
+  "p10-2"
  ],
- "bridge": "A poe task is like an npm script with named arguments and help text. A Harbor task is like a Playwright spec folder for an agent. It holds an instruction, an environment and a test script that decides pass or fail. Except: poe can run a Python function, not only a shell string. And the Harbor test judges a whole agent run inside a container and writes a number, the reward, to a file.",
- "intro": "Two kinds of tooling make agents useful in fcp. Developer tools give one command that means the same thing in the editor, in the sandbox and in CI. They are poe verify, poe doctor and a one-page failure report. The eval bench runs the real Nova harness on real past tickets and scores it. This lesson covers both, because both live in Python and both are things you will add to.",
- "picture": {
-  "caption": "One TICKET-BENCH trial. Harbor builds the task container, the Python adapter starts the real TypeScript harness, and the hidden tests write a reward.",
-  "nodes": [
-   {
-    "id": "task",
-    "label": "task folder (instruction.md, task.toml, tests/)",
-    "kind": "file"
-   },
-   {
-    "id": "harbor",
-    "label": "harbor run",
-    "kind": "service"
-   },
-   {
-    "id": "container",
-    "label": "task container: fcp at base_sha + Node 24",
-    "kind": "machine"
-   },
-   {
-    "id": "adapter",
-    "label": "nova_agent.py (Python adapter)",
-    "kind": "service"
-   },
-   {
-    "id": "nova",
-    "label": "nova-worker run (the real harness)",
-    "kind": "agent"
-   },
-   {
-    "id": "verify",
-    "label": "tests/test.sh with the hidden tests",
-    "kind": "check"
-   },
-   {
-    "id": "score",
-    "label": "score.py (pass@1, pass^3, cost, minutes)",
-    "kind": "file"
-   }
+ "map": "evals",
+ "hook": {
+  "story": [
+   "Nova, our ticket-to-PR agent, finishes a backend ticket and writes \"Done, all tests pass\". It ran the three tests it wrote. It did not run the linter, and it did not run the older tests next to its change, one of which it broke. Nothing told it to, because \"done\" was only its own opinion.",
+   "The same week, a teammate adds one sentence to Nova's instructions: \"before you finish, run the full test suite\". Nova seems slower, and the next few pull requests look a little better. Or do they? Nobody can say, because \"better\" is also only an opinion."
   ],
-  "steps": [
-   {
-    "from": "harbor",
-    "to": "task",
-    "text": "reads instruction.md and task.toml"
-   },
-   {
-    "from": "harbor",
-    "to": "container",
-    "text": "builds the environment and resets the checkout to base_sha"
-   },
-   {
-    "from": "adapter",
-    "to": "nova",
-    "text": "starts nova-worker run with the instruction; plan auto-approved, no Jira, Slack or PR"
-   },
-   {
-    "from": "nova",
-    "to": "container",
-    "text": "works until it is done; the result is the working tree (no turn or time limit)"
-   },
-   {
-    "from": "verify",
-    "to": "container",
-    "text": "copies the hidden tests in and runs them; writes /logs/verifier/reward.txt"
-   },
-   {
-    "from": "score",
-    "to": "verify",
-    "text": "collects every trial's reward, cost and minutes, by kind of change"
-   }
-  ]
+  "question": "How do you turn \"is it done?\" and \"did Nova get better?\" into questions a machine can answer with yes or no?"
  },
- "sections": [
+ "read": [
   {
-   "h": "poe tasks in pyproject.toml",
+   "h": "poe: named commands in pyproject.toml",
    "p": [
-    "poethepoet (poe) is npm scripts for a uv project. Tasks live in the [tool.poe.tasks] table of pyproject.toml. fcp's root pyproject already has cloud-up, cloud-migrate, backend-integration-tests, frontend-test and health, and .claude/settings.json allows Bash(poe *) for agents.",
-    "A cmd task is a shell command string with an optional cwd and help. A script task names a Python function by import path, with typed arguments that become flags.",
-    "uv run poe <task> runs it inside .venv. uvx --from poethepoet poe <task> runs it without installing anything, which is what CI and the sandbox image use. Extra arguments after the task name go to the command."
+    "The first answer is a command, and in a Python project commands live in pyproject.toml. poethepoet, called poe, is the Python version of npm scripts: you name a task in a [tool.poe.tasks] table and run it with uv run poe <name>, and uv run poe on its own lists every task with its help text. fcp's root pyproject.toml already has poe tasks such as cloud-up for starting the backend in Docker.",
+    "A task can be a plain command (cmd), like an npm script, or a script task that calls a Python function by its import path. A script task can also declare arguments, which become flags such as --full or --json. That matters for checks, because a check written in Python can read git, decide what to run, print a short summary and choose its exit code, which a one-line shell command does badly."
    ],
-   "because": "Every G7 command an agent or a person runs is a poe task, so the table is the menu of the repo.",
    "code": {
     "lang": "toml",
-    "file": "pyproject.toml (root, [tool.poe.tasks], G7-13)",
-    "text": "api-test = { cmd = \"uv run --frozen --group api-tests pytest tests_api -n auto --randomly-seed=1009 --junitxml=reports/junit.xml -q --tb=short\", cwd = \"cloud/rhinoCloud\", help = \"Run the whole cloud API layer in parallel. Writes reports/failures.md and reports/junit.xml.\" }\n\n# Only the tests whose code paths changed (pytest-testmon). No -n: the set is small, and testmon + xdist must be\n# checked for the pinned version first. poe verify runs api-test instead when migrations or fixtures change.\napi-test-affected = { cmd = \"uv run --frozen --group api-tests pytest tests_api --testmon --randomly-seed=1009 -q --tb=short\", cwd = \"cloud/rhinoCloud\", help = \"Run only the API tests affected by your changes (pytest-testmon).\" }",
+    "file": "pyproject.toml",
+    "text": "[tool.poe.tasks]\ntest = { cmd = \"pytest -q\", help = \"Run every test.\" }\nverify = { script = \"tools.verify:main(full=full)\", args = [{ name = \"full\", type = \"boolean\", help = \"Lint and test everything, not only what changed.\" }], help = \"Lint and test what changed since main.\" }\ndoctor = { script = \"tools.doctor:main(as_json=json)\", args = [{ name = \"json\", type = \"boolean\", help = \"One JSON object per line, for machines.\" }], help = \"Check that this machine can run the project.\" }",
     "notes": [
      {
-      "line": 1,
-      "text": "A cmd task. cwd runs it in the cloud project; help shows in uv run poe with no arguments. The fixed seed makes the order reproducible."
+      "line": 2,
+      "text": "A cmd task: a command with help text, like \"test\": \"pytest -q\" in package.json."
      },
      {
       "line": 3,
-      "text": "A comment in TOML starts with #. The ticket keeps the open question (testmon with -n) right next to the task."
-     },
-     {
-      "line": 5,
-      "text": "The affected variant: same layer, --testmon instead of -n auto. poe api-test-affected -k vocab passes -k through."
-     }
-    ]
-   },
-   "see": "$ uv run poe\nConfigured tasks:\n  test                  Run every test.\n  doctor                Check this machine.\n    --json\n  verify                Lint and test what changed.\n    --all"
-  },
-  {
-   "h": "poe verify: one command, three callers",
-   "p": [
-    "G7-14 adds a script task, verify, that lints the changed Python files and runs the affected tests for each area that changed. Three callers run the same command.",
-    "A Claude Code Stop hook in fcp's .claude/settings.json is one. Nova's harness is another (it loads the project settings, so the same hook runs). CI with --all is the third.",
-    "A Stop hook is a command Claude Code runs when the agent says it is done. Exit 2 with a message on stderr sends the agent back to work with that message; exit 0 lets it stop.",
-    "The hook script checks stop_hook_active in its input. When it is already inside a stop, it lets the session end, so it never loops. This is feedback, not a cage: verify tells the agent what is red, and the agent keeps working until it is green."
-   ],
-   "because": "When the editor, the agent and CI run the same command, green means the same thing everywhere. Agents stop guessing which checks to run.",
-   "code": {
-    "lang": "python",
-    "file": "scripts/poe_verify.py (G7-14, shortened)",
-    "text": "def main(all_files: bool = False) -> None:\n    base = _git(\"merge-base\", \"HEAD\", \"origin/main\")[0]\n    changed = _git(\"diff\", \"--name-only\", base) + _git(\"ls-files\", \"--others\", \"--exclude-standard\")\n    python_files = [f for f in changed if f.endswith(\".py\")]\n    steps: list[tuple[str, list[str]]] = []\n    if all_files or python_files:\n        steps.append((\"lint\", [\"pre-commit\", \"run\", *([\"--all-files\"] if all_files else [\"--files\", *python_files])]))\n    if all_files or any(f.startswith(FULL_RUN) for f in changed):\n        steps.append((\"cloud API tests: all\", [\"poe\", \"api-test\"]))\n    elif any(f.startswith(CLOUD) for f in changed):\n        steps.append((\"cloud API tests: affected\", [\"poe\", \"api-test-affected\"]))\n    if any(f.startswith(\"sdk/\") for f in changed):\n        steps.append((\"sdk\", [\"make\", \"-C\", \"sdk\", \"lint\", \"test\"]))\n    failed = {name for name, cmd in steps if subprocess.run(cmd).returncode != 0}\n    for name, _ in steps:\n        print(f\"{'FAIL' if name in failed else 'pass'}  {name}\")\n    if failed:\n        print(\"Details: cloud/rhinoCloud/reports/failures.md\", file=sys.stderr)\n    sys.exit(1 if failed else 0)",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The task is verify = { script = \"scripts.poe_verify:main(all_files=all)\", args = [{ name = \"all\", type = \"boolean\" }] }. The flag --all becomes this argument."
-     },
-     {
-      "line": 2,
-      "text": "The merge base again (p10-5): changed means changed since main, plus untracked files on the next line."
-     },
-     {
-      "line": 7,
-      "text": "Lint only the changed files, with the same pre-commit hooks CI runs (black, isort, flake8)."
-     },
-     {
-      "line": 8,
-      "text": "FULL_RUN is migrations/, fixtures/ and tests_api/conftest.py: the files testmon cannot see (p10-2), so the whole layer runs."
-     },
-     {
-      "line": 16,
-      "text": "One line per step at the end, so the summary fits in an agent's context."
-     },
-     {
-      "line": 18,
-      "text": "On failure, point at the one-page report instead of printing the log again."
-     }
-    ]
-   }
-  },
-  {
-   "h": "poe doctor: check a machine, fix only what is safe",
-   "p": [
-    "G7-22 adds doctor, a list of checks with a fix per check. It checks node and npm versions from frontend/package.json engines, Python 3.13 through uv, and uv sync --check for the cloud venv. It checks Docker memory of at least 16 GiB, the rhino-net Docker network and poe itself. It also checks the git hooks problem: husky sets core.hooksPath, so the Python pre-commit hooks never run on commit.",
-    "--fix runs only safe local commands (uv python install, make sync-deps, docker network create) and prints them. It never touches credentials, ~/.aws or Docker volumes.",
-    "--json prints one JSON object per check, one per line, for machines. G7-25 runs poe doctor --json inside the nightly sandbox image build and fails the build when a check fails. So a broken fresh setup never becomes the image Nova runs on."
-   ],
-   "because": "Setup problems cost about 86 hours per developer per year. An agent in a fresh VM hits the same problems with less patience.",
-   "code": {
-    "lang": "python",
-    "file": "scripts/poe_doctor.py (G7-22, the checks table and main)",
-    "text": "CHECKS = [  # (what, passes, fix, safe for --fix)\n    (\"node \" + ENGINES[\"node\"], lambda: _at_least(_run(\"node\", \"--version\"), ENGINES[\"node\"]), \"nvm install\", False),\n    (\"Python 3.13 (uv)\", lambda: _run(\"uv\", \"python\", \"find\", \"3.13\"), \"uv python install 3.13\", True),\n    (\"cloud venv = uv.lock\", lambda: _run(\"uv\", \"sync\", \"--check\", \"--directory\", \"cloud/rhinoCloud\"), \"make -C cloud/rhinoCloud sync-deps\", True),\n    (\"Docker >= 16 GiB (FCP Lab)\", lambda: int(_run(\"docker\", \"info\", \"-f\", \"{{.MemTotal}}\") or 0) >= 16 * 2**30, \"raise Docker's memory limit\", False),\n]\n\n\ndef main(fix: bool = False, as_json: bool = False) -> None:\n    results = [(what, bool(passes()), how, safe) for what, passes, how, safe in CHECKS]\n    for what, ok, how, safe in results:\n        if fix and safe and not ok:\n            subprocess.run(how, shell=True, cwd=ROOT)  # local commands only: never credentials, ~/.aws or volumes\n        print(json.dumps({\"check\": what, \"ok\": ok, \"fix\": how}) if as_json else f\"{'ok ' if ok else 'FIX'}  {what}  {'' if ok else '-> ' + how}\")\n    raise SystemExit(0 if all(ok for _, ok, _, _ in results) else 1)",
-    "notes": [
-     {
-      "line": 1,
-      "text": "A table of tuples. Adding a check is adding a row; the loop below does not change."
-     },
-     {
-      "line": 2,
-      "text": "lambda: a one-expression anonymous function, evaluated later by the loop. _run returns stdout or None when the command is missing or fails."
+      "text": "A script task: poe imports tools/verify.py and calls main, passing the --full flag as full."
      },
      {
       "line": 4,
-      "text": "uv sync --check exits non-zero when .venv does not match uv.lock; the fix is safe, so --fix may run it."
-     },
-     {
-      "line": 5,
-      "text": "Docker's memory from docker info, compared in bytes. Not safe to fix: a person changes Docker's settings."
-     },
-     {
-      "line": 12,
-      "text": "The guard: only a failing check whose fix is marked safe runs under --fix."
-     },
-     {
-      "line": 14,
-      "text": "JSON lines for machines (the image build), aligned text for people."
+      "text": "--json makes the output one JSON object per line, for a machine to read."
      }
     ]
    },
-   "see": "$ uv run poe doctor --json\n{\"check\": \"uv on PATH\", \"ok\": true, \"fix\": \"install uv: https://docs.astral.sh/uv/\"}\n{\"check\": \"Python 3.13 (uv)\", \"ok\": true, \"fix\": \"uv python install 3.13\"}\n{\"check\": \"docker daemon\", \"ok\": true, \"fix\": \"start Docker Desktop\"}"
+   "see": "$ uv run poe\nConfigured tasks:\n  test                  Run every test.\n  verify                Lint and test what changed since main.\n    --full              Lint and test everything, not only what changed.\n  doctor                Check that this machine can run the project.\n    --json              One JSON object per line, for machines."
   },
   {
-   "h": "Test output an agent can read",
+   "h": "verify: one answer for the editor, the agent and CI",
    "p": [
-    "A 3,000-line log fills an agent's context. G7-12 adds a pytest plugin that writes reports/failures.md after the run. For each failing test it gives the node id, file and line, and the first error line.",
-    "Then the last 40 lines of the traceback and an exact rerun command with the seed. It caps at 20 failures and points at reports/junit.xml for the rest. Under xdist only the controller writes it.",
-    "JUnit XML is the old, boring, universal test report format: one <testcase> per test with its status and message. CI tools, the nightly history in G7-24 and the flaky-test fixer all read it. --junitxml=reports/junit.xml makes pytest write it.",
-    "The seed comes from pytest-randomly. With --randomly-seed=1009 the tests run in the same shuffled order every time, and Faker and factory_boy are reseeded. So a failure reproduces."
+    "verify answers \"is my change done?\" It finds the Python files that changed since the merge base (the commit where your branch left main), lints them, runs the tests those changes touched (with testmon from the pytest lesson), prints one line per step and exits with 1 if anything failed. --full lints and tests everything, which is what CI runs. The important part is not the script but the contract: one command, a short report and an exit code, so the answer is the same in the editor, in the agent's machine and in CI.",
+    "That exit code is how Nova learns that it is not done. Claude Code can run hooks, commands it starts at fixed moments in a session, and a Stop hook runs each time the agent wants to finish. If the hook exits with 2, Claude Code does not stop the session: it shows the agent what the hook wrote to stderr, and the agent keeps working. The hook reads its input as JSON, and when stop_hook_active is true, the agent is already continuing because of this hook, so the hook lets it stop instead of looping forever. This is guidance, not a cage: the hook does not forbid anything, it tells the agent what is still red."
    ],
-   "because": "An agent fixes its own mistakes only when the failure is short, complete and comes with the command to reproduce it.",
-   "see": "# API tests: 1 failing (seed 1009)\n\n## test_project_permissions.py::test_project_collab_permission_endpoint\n- where: tests_api/test_project_permissions.py:21\n- error: AssertionError: assert ['RHINO_ADMIN'] == ['COLLABORATOR_MEMBER']\n```\n...last 40 lines of the traceback...\n```\n- rerun: `cd cloud/rhinoCloud && uv run --group api-tests pytest tests_api/test_project_permissions.py::test_project_collab_permission_endpoint --randomly-seed=1009`"
-  },
-  {
-   "h": "The eval bench: a Harbor task",
-   "p": [
-    "ai-agents/evals is a small uv project inside the TypeScript repo, because Harbor, the bench runner, is Python. CI runs it as its own job. First uv sync --frozen --project evals, then black, isort and flake8 at 120 columns, then uv run --project evals pytest. TICKET-BENCH (G4-02, G4-03, G4-25) and ROUTINE-BENCH (G5-10) live there.",
-    "A Harbor task is a folder. instruction.md is what the agent reads (the ticket text). task.toml holds the configuration and metadata. environment/ describes the container (a Dockerfile, or a prebuilt image named in task.toml).",
-    "solution/solve.sh applies the real fix; only Harbor's oracle agent uses it, to prove the task is solvable. tests/test.sh runs after the agent and must write a number to /logs/verifier/reward.txt: 1 for pass, 0 for fail. tests/hidden/ holds the PR's real test files at their real paths. They are copied in only at grading time, so the agent never sees them.",
-    "The task.toml field names depend on the Harbor version pinned in evals/pyproject.toml. The ticket sketch starts with version = \"1.0\"; the current Harbor docs show schema_version and a [task] table with a name. Check the docs for the pinned version before you copy the sketch."
-   ],
-   "because": "The bench has to test the same Nova that runs real tickets. The task format tells Harbor how to build that run.",
-   "code": {
-    "lang": "toml",
-    "file": "tasks/fe-bug-1234/task.toml (G4-03, in the restricted golden-set repo)",
-    "text": "version = \"1.0\"\n\n[metadata]\nkind = \"fe_bug\"                 # fe_bug | be_bug | add_tests | small_feature | dependency_bump\nmulti_file = false\nsource_repo = \"RhinoHealth/fcp\"\nsource_pr = 1234\njira = \"RH-1234\"\nbase_sha = \"<parent of the squash commit on main>\"\nhidden_tests = [\"frontend/test/unit/<file>.test.tsx\"]\nsmoke = false                   # true for the 15 tasks in the smoke set\ncurated_by = \"<BE or FE engineer>\"\n\n[agent]\n# A far-away eval backstop only, to free a stuck eval VM. Nova itself has no time limit:\n# minutes per task are measured and reported, and a timeout is reported as \"stuck\", not as a slow pass.\ntimeout_sec = 21600.0\n\n[verifier]\ntimeout_sec = 3600.0\n\n[environment]\ncpus = 8\nmemory_mb = 32768",
-    "notes": [
-     {
-      "line": 3,
-      "text": "metadata is free-form: anything the scorer needs later. kind splits the scores; multi_file flags the 5 big cases."
-     },
-     {
-      "line": 9,
-      "text": "The commit the container is reset to: the parent of the squash commit, so the fix is not there yet."
-     },
-     {
-      "line": 10,
-      "text": "The real tests from the merged PR, at their real paths. They come in at grading time; the agent never sees them."
-     },
-     {
-      "line": 17,
-      "text": "Six hours, to free a stuck eval VM, and a timeout counts as stuck in the report. It is not a limit on Nova: no maxTurns, no budget, nothing cuts a run."
-     },
-     {
-      "line": 20,
-      "text": "How long the hidden tests may take. One hour covers a frontend e2e set."
-     },
-     {
-      "line": 23,
-      "text": "A full-size container, like the full VM: FCP Lab and browsers fit."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "wall",
-    "text": "Candidates and tasks go to the restricted golden-set repo, never to ai-agents or rnd-kb, so the brain never indexes the answers. Ticket text comes from a read-only Jira token; attachments are never downloaded."
-   }
-  },
-  {
-   "h": "The adapter starts the real harness",
-   "p": [
-    "Harbor runs an agent through an adapter, a Python class that knows how to start the agent inside the task container. G4-03's nova_agent.py starts the TypeScript harness CLI, nova-worker run <task.json>, on the base commit with the instruction. The task image carries Node 24 and the harness tarball from release-harness.yml (one bundled file, nothing to install) next to fcp's toolchain. So the bench runs exactly the harness that runs real tickets.",
-    "Bench mode strips the people out. The plan is auto-approved, and a question gets \"no answer, use your judgement\". There is no Jira, Slack or PR; the result is the working tree.",
-    "Answer leaks are stopped on two sides. The checkout is reset to base_sha with git mirror refs dropped. And in bench mode the broker refuses to read the source PR and anything merged after base. So the similar-past-PRs helper cannot find the answer.",
-    "Trials need a VM each. G4-25 adds an evalRun workflow in the orchestrator on its own eval queue with fixed slots. So bench runs never take Nova's VMs, and only the orchestrator starts runs. Where do trials run: a fresh full VM per trial on the same AMI, or Harbor's docker environment inside one wide VM? That decision is written into evals/ticket_bench/README.md."
-   ]
-  },
-  {
-   "h": "Scoring: pass@1, pass^3, and numbers that are never limits",
-   "p": [
-    "Each task runs three times. pass@1 is the mean success rate over trials. pass^3 is the chance that all three trials of a task pass, which measures consistency.",
-    "A task that passes once in three has pass^3 of zero. Cost per task comes from the gateway's run tag (bench:<task>:<try>), minutes from Harbor's trial timings. The report splits by kind, with the 5 big cases on their own.",
-    "The 15-task smoke set runs on every ai-agents PR that touches the harness, prompts, skills or the image, one try per task. With 15 tasks, one task is about 6.7 points.",
-    "So a drop of one task means run again, and two or more fail the check. The full 40 run monthly on a Temporal schedule. Cost and minutes are measured to learn; they are never used as limits on a run."
-   ],
-   "because": "This is how we decide whether a harness change, a new skill or a cheaper model setting helps. So the arithmetic must be right.",
    "code": {
     "lang": "python",
-    "file": "ai-agents/evals/ticket_bench/score.py (G4-25, the per-task part)",
-    "text": "def pass_hat_k(successes: int, tries: int, k: int) -> float:\n    \"\"\"Chance that k tries picked from this task's runs all pass (tau-bench's pass^k).\"\"\"\n    return comb(successes, k) / comb(tries, k) if tries >= k else float(\"nan\")\n\n\nfor (kind, _), trials in by_task.items():\n    wins = sum(t[\"reward\"] == 1 for t in trials)\n    by_kind[kind].append({\"p1\": wins / len(trials), \"p3\": pass_hat_k(wins, len(trials), 3),\n                          \"cost\": mean(t[\"cost_usd\"] for t in trials), \"min\": median(t[\"minutes\"] for t in trials)})",
+    "file": "tools/verify.py (main)",
+    "text": "def main(full: bool = False) -> None:\n    files = python_files(full)\n    if not files:\n        print(\"nothing to verify\")\n        return\n    steps = [\n        (\"lint\", [\"flake8\", \"--select=F\", *files]),\n        (\"tests\", [\"pytest\", \"-q\"] if full else [\"pytest\", \"-q\", \"--testmon\"]),\n    ]\n    failed = [name for name, cmd in steps if subprocess.run(cmd).returncode != 0]\n    for name, _ in steps:\n        print(f\"{'FAIL' if name in failed else 'pass'}  {name}\")\n    sys.exit(1 if failed else 0)",
     "notes": [
      {
-      "line": 3,
-      "text": "comb(n, k) counts combinations. With 3 tries and 2 wins, comb(2,3) is 0, so pass^3 is 0; with 3 wins it is 1."
+      "line": 2,
+      "text": "Changed .py files since the merge base, or every tracked .py file with --full."
      },
      {
       "line": 7,
-      "text": "sum of booleans: True counts as 1. reward comes from reward.txt."
+      "text": "fcp's lint rule: flake8 limited to real errors such as unused imports."
      },
      {
       "line": 8,
-      "text": "Per task: pass@1 is wins over tries; pass^3 uses the function above. Cost is a mean, minutes a median, both reported, never enforced."
+      "text": "Only the affected tests, unless --full."
+     },
+     {
+      "line": 13,
+      "text": "The exit code is the answer. A Stop hook and CI only need this number."
      }
+    ]
+   },
+   "see": "$ uv run poe verify\nPoe => verify\nscore.py:1:1: F401 'os' imported but unused\n......                                                                   [100%]\nFAIL  lint\npass  tests\n$ echo '{\"stop_hook_active\": false}' | .claude/stop-verify.sh; echo \"exit $?\"\npoe verify failed. Fix this before you stop:\n…\nexit 2",
+   "deeper": {
+    "h": "Go deeper: doctor, the check for the machine itself",
+    "p": [
+     "A second command answers a different question: can this machine run the project at all? doctor is a list of checks, each with the fix to try: is uv installed, is Python 3.13 available, is Docker running, does .venv match uv.lock. It prints ok or FIX per check and exits with 1 if anything needs fixing. With --json it prints one JSON object per check, so a machine can read it.",
+     "That JSON form is useful far from any laptop. The image that every agent VM starts from is built every night, and running doctor --json inside the build means a broken setup fails the build instead of becoming the machine Nova works on the next morning. A fix flag can repair what is safe, such as installing a Python version, but never touches credentials or data."
+    ]
+   }
+  },
+  {
+   "h": "The eval bench gives Nova's work a test too",
+   "p": [
+    "The second question, \"did Nova get better?\", needs the same thing on a bigger scale: a test for the agent's whole attempt. An eval bench is a fixed set of tasks with known answers, and Harbor is a Python tool that runs an agent on each task inside a container and scores it. A Harbor task is a folder. instruction.md is what the agent reads. environment/ describes the machine it starts on, here a Dockerfile with the buggy script from the first lesson of this part. tests/test.sh runs after the agent has finished and writes a number, the reward, to /logs/verifier/reward.txt: 1 for pass, 0 for fail. The tests are copied in only for grading, so the agent never sees them.",
+    "Before a task can judge anyone, it has to prove that it can tell good work from bad. solution/solve.sh contains the known fix, and Harbor's oracle agent runs only that script, so it must score 1. Harbor's nop agent does nothing at all, so it must score 0. A task where doing nothing passes, or where the real fix fails, measures nothing and is fixed or dropped."
+   ],
+   "code": {
+    "lang": "text",
+    "file": "a Harbor task folder",
+    "text": "pass-rate/\n  instruction.md          what the agent reads: the task, in plain words\n  task.toml               name, timeouts and resources\n  environment/Dockerfile  the machine the agent starts on (with the bug)\n  solution/solve.sh       the known fix; only the oracle agent runs it\n  tests/test.sh           runs after the agent and writes the reward\n  tests/check_score.py    the hidden check; copied in only for grading",
+    "notes": [
+     {
+      "line": 3,
+      "text": "harbor init writes it. The current format starts with schema_version and a [task] table."
+     },
+     {
+      "line": 5,
+      "text": "Only the oracle agent uses it, to prove the task can be solved."
+     },
+     {
+      "line": 6,
+      "text": "Must write 1 or 0 to /logs/verifier/reward.txt."
+     }
+    ]
+   },
+   "see": "$ uvx harbor run -p pass-rate -a oracle\n┃ Trials ┃ Exceptions ┃  Mean ┃\n│      1 │          0 │ 1.000 │\n$ uvx harbor run -p pass-rate -a nop\n┃ Trials ┃ Exceptions ┃  Mean ┃\n│      1 │          0 │ 0.000 │"
+  },
+  {
+   "h": "Scores that mean something",
+   "p": [
+    "An agent does not give the same answer every time, so each task runs several times. pass@1 is the average success rate over all those tries: the chance that one try passes. pass^3 (read \"pass hat three\") is the chance that three tries of the same task all pass, which measures how consistent the agent is. A task that passes once in three tries adds a third to pass@1 but nothing to pass^3.",
+    "Small benches are noisy. With 15 tasks, one task is about 6.7 points, so a drop of one task can be bad luck, and the rule is to run again; a drop of two or more is a real signal. That is how the teammate's new sentence gets a fair answer: it ships only if the score goes up on the bench. Cost and minutes per task are measured as well, but only to learn from, never as a limit on a run."
+   ],
+   "deeper": {
+    "h": "Go deeper: keeping the answers secret",
+    "p": [
+     "A bench made from old tickets has a weakness: the real fix exists, in git history and in the merged pull request. If the agent can find it, the score measures searching, not solving. So the task checks out the commit before the fix and drops the newer history, the services the agent uses refuse to show the source pull request during a bench run, and the tasks themselves live in a restricted repository that agents and the search index can never read."
     ]
    }
   }
  ],
  "lab": {
-  "title": "poe tasks, a doctor, a verify command and a Harbor task",
-  "youNeed": [
+  "id": "p10-6",
+  "title": "verify, doctor and a Harbor task",
+  "minutes": 40,
+  "needs": [
+   "The p10-2 lab folder (~/academy-labs/p10-2)",
    "uv",
-   "Docker Desktop (for the doctor's docker check)",
-   "the pytest words from p10-2"
+   "Docker running",
+   "git",
+   "jq"
   ],
-  "worked": [
+  "goal": "Give the scoring project a verify and a doctor command, hook verify into a Stop hook, and write a Harbor task that scores 1 for the known fix and 0 for doing nothing.",
+  "guess": {
+   "q": "A Harbor task's tests/test.sh runs the hidden check, but then always writes 1 to reward.txt, whatever the check said. What do the oracle and nop agents score?",
+   "options": [
+    {
+     "text": "Oracle 1 and nop 0, because the hidden check still runs.",
+     "correct": false,
+     "why": "The check runs, but its result is thrown away. Only the number in reward.txt counts."
+    },
+    {
+     "text": "Both score 1, so the task cannot tell good work from no work.",
+     "correct": true,
+     "why": "The reward is whatever test.sh writes. That is why every task must show oracle 1 and nop 0 before it joins the bench."
+    },
+    {
+     "text": "Both score 0, because Harbor notices that the check failed.",
+     "correct": false,
+     "why": "Harbor does not read the check's output. It trusts the reward file."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "uv init --python 3.13 --bare lab6 && cd lab6 && uv add --dev pytest poethepoet pytest-testmon && mkdir scripts tests && touch scripts/__init__.py",
-    "see": " + poethepoet==0.x\n + pytest==9.1.1\n + pytest-testmon==2.2.0"
+    "say": "Start from the p10-2 project, which already has the scoring code and its tests, and add flake8 (fcp's lint) and poe.",
+    "do": "cp -r ~/academy-labs/p10-2 ~/academy-labs/p10-6 && cd ~/academy-labs/p10-6 && rm -rf .venv .testmondata tests/test_fix.py && uv add --dev flake8 poethepoet && mkdir -p tools && touch tools/__init__.py",
+    "see": " + flake8==7.4.1\n …\n + poethepoet==0.49.0"
    },
    {
-    "do": "Create tests/test_ok.py with one passing test. Create scripts/poe_doctor.py: a CHECKS list of (what, passes, fix) tuples for uv on PATH, Python 3.13 (uv python find 3.13) and the docker daemon (docker info -f {{.ServerVersion}}), and a main(as_json=False) that prints one line per check and exits 1 if any failed.",
-    "see": "Two files, about 30 lines of Python."
+    "say": "Write the two scripts: verify for the change, doctor for the machine.",
+    "do": "cat > tools/verify.py <<'EOF'\nimport subprocess\nimport sys\n\n\ndef git(*args: str) -> list[str]:\n    return subprocess.run([\"git\", *args], capture_output=True, text=True).stdout.split()\n\n\ndef python_files(full: bool) -> list[str]:\n    if full:\n        return git(\"ls-files\", \"*.py\")\n    base = git(\"merge-base\", \"HEAD\", \"main\")[0]\n    changed = git(\"diff\", \"--name-only\", base) + git(\"ls-files\", \"--others\", \"--exclude-standard\")\n    return [f for f in changed if f.endswith(\".py\")]\n\n\ndef main(full: bool = False) -> None:\n    files = python_files(full)\n    if not files:\n        print(\"nothing to verify\")\n        return\n    steps = [\n        (\"lint\", [\"flake8\", \"--select=F\", *files]),\n        (\"tests\", [\"pytest\", \"-q\"] if full else [\"pytest\", \"-q\", \"--testmon\"]),\n    ]\n    failed = [name for name, cmd in steps if subprocess.run(cmd).returncode != 0]\n    for name, _ in steps:\n        print(f\"{'FAIL' if name in failed else 'pass'}  {name}\")\n    sys.exit(1 if failed else 0)\nEOF\ncat > tools/doctor.py <<'EOF'\nimport json\nimport shutil\nimport subprocess\nimport sys\n\n\ndef ok(*cmd: str) -> bool:\n    return shutil.which(cmd[0]) is not None and subprocess.run(cmd, capture_output=True).returncode == 0\n\n\nCHECKS = [  # (what, passes, how to fix)\n    (\"uv on PATH\", lambda: ok(\"uv\", \"--version\"), \"install uv: https://docs.astral.sh/uv/\"),\n    (\"Python 3.13 (uv)\", lambda: ok(\"uv\", \"python\", \"find\", \"3.13\"), \"uv python install 3.13\"),\n    (\"docker daemon\", lambda: ok(\"docker\", \"info\"), \"start Docker Desktop\"),\n    (\".venv matches uv.lock\", lambda: ok(\"uv\", \"sync\", \"--locked\", \"--check\"), \"uv sync\"),\n]\n\n\ndef main(as_json: bool = False) -> None:\n    results = [(what, passes(), fix) for what, passes, fix in CHECKS]\n    for what, passed, fix in results:\n        if as_json:\n            print(json.dumps({\"check\": what, \"ok\": passed, \"fix\": fix}))\n        else:\n            print(f\"{'ok ' if passed else 'FIX'}  {what}\" + (\"\" if passed else f\"  -> {fix}\"))\n    sys.exit(0 if all(passed for _, passed, _ in results) else 1)\nEOF",
+    "see": "(no output: tools/verify.py and tools/doctor.py exist)"
    },
    {
-    "do": "Create scripts/poe_verify.py: main(all_files=False) runs pytest -q (with --testmon unless all_files), prints pass or FAIL per step and exits 1 on failure.",
-    "see": "A script of about 12 lines."
+    "say": "Register them as poe tasks and list them.",
+    "do": "cat >> pyproject.toml <<'EOF'\n\n[tool.poe.tasks]\ntest = { cmd = \"pytest -q\", help = \"Run every test.\" }\nverify = { script = \"tools.verify:main(full=full)\", args = [{ name = \"full\", type = \"boolean\", help = \"Lint and test everything, not only what changed.\" }], help = \"Lint and test what changed since main.\" }\ndoctor = { script = \"tools.doctor:main(as_json=json)\", args = [{ name = \"json\", type = \"boolean\", help = \"One JSON object per line, for machines.\" }], help = \"Check that this machine can run the project.\" }\nEOF\nuv run poe",
+    "see": "Poe the Poet (version 0.49.0)\nResult: No task specified.\n…\nConfigured tasks:\n  test                  Run every test.\n  verify                Lint and test what changed since main.\n    --full              Lint and test everything, not only what changed.\n  doctor                Check that this machine can run the project.\n    --json              One JSON object per line, for machines."
    },
    {
-    "do": "Append to pyproject.toml:\n[tool.poe.tasks]\ntest = { cmd = \"pytest -q\", help = \"Run every test.\" }\ndoctor = { script = \"scripts.poe_doctor:main(as_json=json)\", args = [{ name = \"json\", type = \"boolean\" }], help = \"Check this machine.\" }\nverify = { script = \"scripts.poe_verify:main(all_files=all)\", args = [{ name = \"all\", type = \"boolean\" }], help = \"Lint and test what changed.\" }",
-    "see": "uv run poe lists test, doctor (--json) and verify (--all)."
+    "say": "Ask the doctor about your laptop, first for people and then for machines.",
+    "do": "uv run poe doctor && uv run poe doctor --json",
+    "see": "Poe => doctor\nok   uv on PATH\nok   Python 3.13 (uv)\nok   docker daemon\nok   .venv matches uv.lock\nPoe => doctor --json\n{\"check\": \"uv on PATH\", \"ok\": true, \"fix\": \"install uv: https://docs.astral.sh/uv/\"}\n…"
    },
    {
-    "do": "uv run poe doctor",
-    "see": "Poe => doctor\nok   uv on PATH\nok   Python 3.13 (uv)\nok   docker daemon"
+    "say": "verify compares with main, so make this state main, then make a change on a branch with a mistake that tests do not catch: an unused import.",
+    "do": "printf '.venv/\\n.testmondata\\n__pycache__/\\n.pytest_cache/\\n' > .gitignore && git init -q -b main && git add -A && git commit -qm scoring && git switch -q -c tidy && sed -i '' '1s/^/import os\\n/' score.py && uv run poe verify; echo \"exit $?\"",
+    "see": "Poe => verify\nscore.py:1:1: F401 'os' imported but unused\n......                                                                   [100%]\n6 passed in 0.04s\nFAIL  lint\npass  tests\nexit 1"
    },
    {
-    "do": "uv run poe doctor --json",
-    "see": "{\"check\": \"uv on PATH\", \"ok\": true, \"fix\": \"install uv: https://docs.astral.sh/uv/\"}\n{\"check\": \"Python 3.13 (uv)\", \"ok\": true, \"fix\": \"uv python install 3.13\"}\n{\"check\": \"docker daemon\", \"ok\": true, \"fix\": \"start Docker Desktop\"}"
+    "say": "Write the Stop hook and feed it the JSON that Claude Code would send when the agent wants to finish.",
+    "do": "mkdir -p .claude && cat > .claude/stop-verify.sh <<'EOF'\n#!/bin/bash\n# Claude Code runs this when the agent wants to stop. Exit 2 sends the agent back to work.\nif [ \"$(jq -r '.stop_hook_active')\" = \"true\" ]; then\n  exit 0  # already continuing because of this hook: let it stop, never loop\nfi\nif ! output=$(uv run poe verify 2>&1); then\n  echo \"poe verify failed. Fix this before you stop:\" >&2\n  echo \"$output\" | tail -15 >&2\n  exit 2\nfi\nEOF\nchmod +x .claude/stop-verify.sh && echo '{\"stop_hook_active\": false}' | .claude/stop-verify.sh; echo \"exit $?\"",
+    "see": "poe verify failed. Fix this before you stop:\nPoe => verify\nscore.py:1:1: F401 'os' imported but unused\n…\nFAIL  lint\npass  tests\nexit 2"
    },
    {
-    "do": "uv run poe verify && uv run poe verify --all",
-    "see": ".                                                                        [100%]\n1 passed in 0.04s\npass  tests\n(and the same again for --all)"
+    "say": "Now the bench. Let Harbor write a task skeleton, then fill it with the 0% bug from p10-1: the buggy script in the environment, the known fix in solve.sh and a hidden check in tests/.",
+    "do": "uvx harbor init --task academy/pass-rate && cd pass-rate && rm -f tests/test_outputs.py README.md\ncat > instruction.md <<'EOF'\nThe script /app/score.py prints the pass rate of the attempts in /app/rewards.txt.\nThe file holds three passes (1) and two failures (0), but the script prints 0%.\nFix score.py so that it prints the right pass rate. Do not change rewards.txt.\nEOF\ncat > environment/Dockerfile <<'EOF'\nFROM python:3.13-slim\nWORKDIR /app\nCOPY score.py rewards.txt /app/\nEOF\ncat > environment/score.py <<'EOF'\nfrom pathlib import Path\n\n\ndef read_rewards(path: Path) -> list[str]:\n    return path.read_text().split()\n\n\ndef pass_rate(rewards: list[int]) -> float:\n    passed = [r for r in rewards if r == 1]\n    return len(passed) / len(rewards)\n\n\nif __name__ == \"__main__\":\n    rewards = read_rewards(Path(\"rewards.txt\"))\n    print(f\"pass rate: {pass_rate(rewards):.0%}\")\nEOF\nprintf '1\\n0\\n1\\n1\\n0\\n' > environment/rewards.txt\ncat > solution/solve.sh <<'EOF'\n#!/bin/bash\nsed -i 's/return path.read_text().split()/return [int(r) for r in path.read_text().split()]/' /app/score.py\nsed -i 's/-> list\\[str\\]:/-> list[int]:/' /app/score.py\nEOF\ncat > tests/test.sh <<'EOF'\n#!/bin/bash\ncd /app\nif python /tests/check_score.py; then\n  echo 1 > /logs/verifier/reward.txt\nelse\n  echo 0 > /logs/verifier/reward.txt\nfi\nEOF\ncat > tests/check_score.py <<'EOF'\nimport subprocess\nfrom pathlib import Path\n\nassert Path(\"/app/rewards.txt\").read_text() == \"1\\n0\\n1\\n1\\n0\\n\", \"rewards.txt was changed\"\nout = subprocess.run([\"python\", \"score.py\"], capture_output=True, text=True, cwd=\"/app\").stdout\nassert out.strip() == \"pass rate: 60%\", out\nprint(\"ok:\", out.strip())\nEOF\nchmod +x solution/solve.sh tests/test.sh && cd ..",
+    "see": "✓ Task initialized in pass-rate\n…\n(the task files are written)"
    },
    {
-    "do": "mkdir -p tasks/add-note/tests && write tasks/add-note/instruction.md (\"Add a function add(a, b) to app.py that returns a + b.\"), tasks/add-note/task.toml (schema_version, [task] name, [metadata] kind, [verifier] timeout_sec = 300.0, [environment] cpus and memory_mb) and tasks/add-note/tests/test.sh: it runs python3 -c \"from app import add; assert add(2, 3) == 5\" and writes 1 or 0 to ${REWARD_DIR:-/logs/verifier}/reward.txt.",
-    "see": "A task folder with three files."
+    "say": "Prove the task can be solved: the oracle agent runs only solve.sh.",
+    "do": "uvx harbor run -p pass-rate -a oracle",
+    "see": "  1/1 Mean: 1.000 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0:00:13 0:00:00\n┏━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━┓\n┃ Trials ┃ Exceptions ┃  Mean ┃\n┡━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━┩\n│      1 │          0 │ 1.000 │\n└────────┴────────────┴───────┘"
    },
    {
-    "do": "cd tasks/add-note && printf 'def add(a, b):\\n    return a + b\\n' > app.py && REWARD_DIR=./out bash tests/test.sh && cat out/reward.txt && rm app.py && REWARD_DIR=./out bash tests/test.sh; cat out/reward.txt",
-    "see": "1\n0"
-   },
-   {
-    "do": "Optional: uvx harbor --version",
-    "see": "0.24.0 (or whatever uvx installs today; the version to use in fcp is the one pinned in evals/pyproject.toml)"
+    "say": "Prove it cannot be passed by doing nothing: the nop agent changes nothing.",
+    "do": "uvx harbor run -p pass-rate -a nop",
+    "see": "┏━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━┓\n┃ Trials ┃ Exceptions ┃  Mean ┃\n┡━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━┩\n│      1 │          0 │ 0.000 │\n└────────┴────────────┴───────┘"
    }
   ],
-  "faded": "Add a fourth doctor check: git on PATH, with git --version. Run poe doctor --json and confirm four lines. Then stop the Docker daemon (or quit Docker Desktop) and run poe doctor again. The docker line should turn to FIX and the exit code to 1. Writing the lambda for the git check is the step left for you.",
-  "alone": "Make a second Harbor task, tasks/money-format, whose instruction asks for a format_money function like p10-1's. Its tests/test.sh copies a hidden pytest file from tests/hidden/ into the working folder at grading time. It runs uv run pytest -q on it and writes the reward from pytest's exit code. Prove it with and without a correct solution, as in the worked example.",
-  "done": "poe lists three tasks, and doctor exits 0 with Docker up and 1 with it down. verify runs only affected tests. Both Harbor tasks write 1 for a correct solution and 0 without one."
+  "build": "Write a second Harbor task, fix-tuesday, from the shared-default bug in p10-1's fix.py: failed_tasks(lines, seen: list[str] = []) still reports Monday's failure on Tuesday. Use uvx harbor init --task academy/fix-tuesday, put the buggy failed.py into environment/ with a Dockerfile, write the fix in solution/solve.sh, and a hidden check in tests/ that calls failed_tasks twice. Careful: python /tests/check_failed.py starts in /tests, so set PYTHONPATH=/app in test.sh or the import fails. Prove it: the oracle agent scores 1.000 and the nop agent 0.000.",
+  "checks": [
+   "uv run poe lists test, verify (with --full) and doctor (with --json).",
+   "poe verify on the branch printed FAIL lint for the unused import and exit 1.",
+   "The Stop hook printed the failure to stderr and exited with 2; with {\"stop_hook_active\": true} it exits with 0.",
+   "pass-rate scores Mean 1.000 with -a oracle and 0.000 with -a nop.",
+   "fix-tuesday also scores 1.000 with oracle and 0.000 with nop."
+  ],
+  "solution": {
+   "lang": "bash",
+   "file": "the fix-tuesday task, file by file",
+   "text": "# fix-tuesday/instruction.md\n/app/failed.py reports the tasks that failed. On Tuesday every task passed, but it still reports Monday's failure.\nFix failed_tasks so that each call only reports the failures in the lines it was given.\n\n# fix-tuesday/environment/Dockerfile\nFROM python:3.13-slim\nWORKDIR /app\nCOPY failed.py /app/\n\n# fix-tuesday/environment/failed.py (the bug from p10-1)\ndef failed_tasks(lines: list[str], seen: list[str] = []) -> list[str]:\n    for line in lines:\n        task, reward = line.split()\n        if reward == \"0\":\n            seen.append(task)\n    return seen\n\n# fix-tuesday/solution/solve.sh\n#!/bin/bash\nsed -i 's/seen: list\\[str\\] = \\[\\]) -> list\\[str\\]:/seen: list[str] | None = None) -> list[str]:\\n    seen = [] if seen is None else seen/' /app/failed.py\n\n# fix-tuesday/tests/test.sh\n#!/bin/bash\ncd /app\nif PYTHONPATH=/app python /tests/check_failed.py; then\n  echo 1 > /logs/verifier/reward.txt\nelse\n  echo 0 > /logs/verifier/reward.txt\nfi\n\n# fix-tuesday/tests/check_failed.py\nfrom failed import failed_tasks\n\nassert failed_tasks([\"fe-bug-1 0\", \"be-bug-7 1\"]) == [\"fe-bug-1\"]\nassert failed_tasks([\"be-bug-7 1\"]) == [], \"Tuesday still remembers Monday\"\nprint(\"ok\")"
+  },
+  "fix": "Someone \"simplified\" pass-rate/tests/test.sh to two lines: python /tests/check_score.py, then echo 1 > /logs/verifier/reward.txt. Make that change and run uvx harbor run -p pass-rate -a nop. Doing nothing now scores 1.000. Explain why the bench can no longer tell a good attempt from no attempt, and restore the if/else so the reward follows the check.",
+  "explain": [
+   "Why is the exit code of poe verify more important than its printed output?",
+   "What does the Stop hook do with exit code 2, and why does it check stop_hook_active?",
+   "Why must every bench task score 1 with the oracle agent and 0 with the nop agent before it can judge Nova?"
+  ],
+  "done": "poe verify and doctor work, the Stop hook exits 2 on a red verify, and both Harbor tasks score 1.000 for oracle and 0.000 for nop."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Nova's Stop hook runs poe verify, which fails. What happens next?",
+   "q": "Nova's Stop hook runs poe verify, which fails. The hook prints the failures to stderr and exits with 2. What happens next?",
    "options": [
     {
-     "text": "The run is cancelled and the ticket goes back to the requester.",
+     "text": "The session ends, and the failures go into the pull request description.",
      "correct": false,
-     "why": "Nothing cancels a run; the hook is feedback, not a cage."
+     "why": "Exit code 2 from a Stop hook blocks the stop. The session goes on."
     },
     {
-     "text": "The hook exits 2 with the summary and the failures.md path on stderr, and the agent keeps working on the red steps.",
+     "text": "Claude Code shows the agent the stderr text, and the agent keeps working on the failures.",
      "correct": true,
-     "why": "Exit 2 sends the agent back with the message; stop_hook_active prevents an endless loop."
+     "why": "That is the point of the hook: \"done\" becomes the command's answer, not the agent's opinion."
     },
     {
-     "text": "The failure is logged and the agent is allowed to stop.",
+     "text": "Claude Code retries poe verify by itself until it passes.",
      "correct": false,
-     "why": "That is what happens only when stop_hook_active is already true, to avoid a loop."
+     "why": "The hook only reports. The agent has to fix the code, and then the hook runs again at the next stop."
     }
    ]
   },
   {
-   "q": "Why is the [agent] timeout_sec in a TICKET-BENCH task.toml not a violation of the no-limits rule?",
+   "q": "A new bench task scores 1.000 with the oracle agent and also 1.000 with the nop agent. What does that tell you?",
    "options": [
     {
-     "text": "Because six hours is long enough for any ticket.",
+     "text": "The task is easy, which is fine for a smoke set.",
      "correct": false,
-     "why": "Length is not the argument; what the number is used for is."
+     "why": "Easy would mean a real agent passes it. Here doing nothing passes it, so it tests nothing."
     },
     {
-     "text": "It exists only to free a stuck eval VM. A timeout is reported as stuck, never counted as a result or used to stop a real Nova run.",
+     "text": "The agents share a cache, so run them in a different order.",
+     "correct": false,
+     "why": "Each trial starts a fresh container. The task itself is the problem."
+    },
+    {
+     "text": "The hidden check does not detect the bug, so the task cannot tell good work from no work and must be fixed or dropped.",
      "correct": true,
-     "why": "The ticket says so in the comment, and Nova's own harness has no maxTurns, budget or time limit."
-    },
-    {
-     "text": "Because Harbor requires a timeout.",
-     "correct": false,
-     "why": "Harbor's docs say the agent timeout defaults to no timeout."
+     "why": "A task must fail when nothing is done (nop 0) and pass with the known fix (oracle 1)."
     }
    ]
   },
   {
-   "q": "A task was run 3 times: pass, fail, pass. What are pass@1 and pass^3 for it?",
+   "q": "A harness change drops the smoke bench from 11 passing tasks of 15 to 10 of 15. What is the right reaction?",
    "options": [
     {
-     "text": "pass@1 = 0.67, pass^3 = 0.67",
-     "correct": false,
-     "why": "pass^3 asks whether all three pass; one failed, so it is 0."
-    },
-    {
-     "text": "pass@1 = 0.67, pass^3 = 0",
+     "text": "Run the bench again; one task is about 6.7 points, and one task of difference can be luck.",
      "correct": true,
-     "why": "2 wins out of 3 trials; comb(2, 3) is 0, so pass^3 is 0."
+     "why": "Agents are not deterministic, and small benches are noisy. Two or more tasks lower is a real signal."
     },
     {
-     "text": "pass@1 = 1, pass^3 = 0",
+     "text": "Revert the change at once, because the score went down.",
      "correct": false,
-     "why": "pass@1 is the mean success rate, 2/3, not whether any trial passed."
+     "why": "One task on 15 is within the noise. Reacting to it would reject good changes by chance."
+    },
+    {
+     "text": "Ignore the bench; it is too small to mean anything.",
+     "correct": false,
+     "why": "It is small but useful, as long as you apply the rule: rerun on one task, act on two or more."
     }
    ]
   }
  ],
- "recall": [
-  "From p10-2: name two kinds of files testmon cannot see, and what poe verify does when they change.",
-  "From p10-4: why does the bench adapter have to run the real nova-worker instead of a Python copy of its logic?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "In fcp, poe verify lints the changed Python files with the project's black, isort and flake8 setup and runs the affected API tests, and npm run verify does the same for the frontend. A Stop hook in fcp's tracked .claude/settings.json runs the right one for what changed, so people's Claude Code sessions and Nova (whose harness loads the project's settings) get the same answer, and CI runs poe verify --all. poe doctor checks a developer machine, and the nightly build of the sandbox image runs it with --json so that a broken setup never reaches the agents.",
+   "The eval bench lives in ai-agents/evals, a small uv project in the TypeScript repo because Harbor is Python. TICKET-BENCH holds 40 old fcp tickets with hidden tests, each proven with nop 0 and oracle 1, and a Python adapter that runs Nova's real harness inside the task. ROUTINE-BENCH does the same for routines, for example the flaky-test fixer, the routine that finds and fixes the cause of a backend test that passes only sometimes. A 15-task smoke set runs on every harness change, scored with pass@1 and pass^3."
+  ],
+  "tickets": [
+   {
+    "key": "G7-14",
+    "why": "poe verify, the Stop hook in fcp's settings, and CI running the same command."
+   },
+   {
+    "key": "G7-22",
+    "why": "poe doctor: one line per check with its fix, a safe --fix and --json for machines."
+   },
+   {
+    "key": "G7-25",
+    "why": "The nightly sandbox image build runs poe doctor --json and fails on any red check."
+   },
+   {
+    "key": "G4-03",
+    "why": "The Harbor task format for TICKET-BENCH and the adapter that runs Nova's harness."
+   },
+   {
+    "key": "G4-10",
+    "why": "Curates the 40 tasks and proves each one with the nop and oracle agents."
+   },
+   {
+    "key": "G4-25",
+    "why": "pass@1, pass^3, cost and minutes per kind, and the smoke gate on harness changes."
+   }
+  ]
+ },
  "words": [
   {
    "term": "poe task",
-   "plain": "An entry in [tool.poe.tasks] in pyproject.toml: a shell command or a Python function with named arguments and help text."
+   "plain": "A named command in pyproject.toml's [tool.poe.tasks], run with uv run poe <name>; Python's npm scripts."
   },
   {
    "term": "Stop hook",
-   "plain": "A command Claude Code runs when the agent wants to stop; exit 2 with a message sends the agent back to work."
-  },
-  {
-   "term": "doctor",
-   "plain": "A table of checks with a fix each. --fix runs only the safe local fixes, and --json prints one object per check for machines."
-  },
-  {
-   "term": "JUnit XML",
-   "plain": "The universal test report file, one testcase element per test; pytest writes it with --junitxml and many tools read it."
+   "plain": "A command Claude Code runs when the agent wants to finish; exit code 2 sends the agent back to work."
   },
   {
    "term": "Harbor task",
-   "plain": "A folder with instruction.md, task.toml, an environment, an optional solution and tests/test.sh that judges an agent run."
+   "plain": "A folder with an instruction, an environment, a known solution and tests that write a reward."
   },
   {
    "term": "reward",
-   "plain": "The number tests/test.sh writes to /logs/verifier/reward.txt: 1 for pass, 0 for fail."
+   "plain": "The number a task's tests/test.sh writes to /logs/verifier/reward.txt: 1 for pass, 0 for fail."
   },
   {
-   "term": "pass^k",
-   "plain": "The chance that k trials of a task all pass; with 3 trials it measures consistency, next to the mean pass@1."
+   "term": "oracle and nop agents",
+   "plain": "Harbor's two proof agents: oracle runs the known fix (must score 1), nop does nothing (must score 0)."
+  },
+  {
+   "term": "pass@1 and pass^3",
+   "plain": "The chance one try passes, and the chance three tries of the same task all pass."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G7-14",
-   "why": "poe verify is the script task, the Stop hook and the CI --all call explained here."
+   "q": "Write the poe line for a script task verify that calls tools.verify:main with a boolean --full flag.",
+   "a": "verify = { script = \"tools.verify:main(full=full)\", args = [{ name = \"full\", type = \"boolean\" }], help = \"...\" } under [tool.poe.tasks]."
   },
   {
-   "key": "G7-22",
-   "why": "poe doctor is the checks table with safe fixes and JSON output shown in this lesson and its lab."
+   "q": "List the files of a Harbor task and say who reads each one.",
+   "a": "instruction.md (the agent), task.toml (Harbor), environment/ (Harbor builds the agent's machine), solution/solve.sh (only the oracle agent), tests/test.sh and the hidden checks (the verifier, after the agent)."
   },
   {
-   "key": "G4-03",
-   "why": "The Harbor task folder, task.toml and the Python adapter that starts nova-worker run are this lesson's bench half."
-  },
-  {
-   "key": "G4-25",
-   "why": "score.py's pass@1 and pass^3, the smoke set on harness PRs and the one-task noise rule come from here."
+   "q": "A task passes in 1 of 3 tries. What does it add to pass@1 and to pass^3?",
+   "a": "A third (0.33) to the task's pass@1, and 0 to its pass^3, because the three tries did not all pass."
   }
  ],
- "remember": "One command that means the same thing everywhere (poe verify), and one report an agent can read (failures.md). A bench runs the real harness and writes a reward. Cost and minutes are measured, never limits."
+ "remember": "Make \"done\" and \"better\" into commands with a yes or no answer: verify's exit code for a change, and a reward that is 1 for the known fix and 0 for doing nothing for an agent."
 }

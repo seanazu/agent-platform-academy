@@ -1,400 +1,333 @@
 {
-  "id": "p7-7",
-  "title": "Testing workflows",
-  "minutes": 45,
-  "youNeed": [
-    "p7-6",
-    "p1-6"
+ "v": 2,
+ "id": "p7-7",
+ "title": "Testing workflows",
+ "minutes": 50,
+ "youNeed": [
+  "p7-3",
+  "p7-6"
+ ],
+ "map": "temporal",
+ "hook": {
+  "story": [
+   "You change how Nova waits for a plan decision: the reminder now goes to Slack and to Jira. Before you merge, you want proof that the rest still works. A plan nobody decides on must be reminded once after a day and parked after three days, and a quick approval must start the work with no reminder at all.",
+   "But the real test of \"parked after three days\" takes three days, and it would post to the real Slack and the real Jira. And there is a second worry from last week: a deploy broke twelve open runs, and nobody found out until a person pressed Approve."
   ],
-  "bridge": "TestWorkflowEnvironment is like fake timers in a unit test, for a whole Temporal server: days pass in milliseconds. Except: time only skips while every run is waiting. And activities are plain functions you pass in, so a mock is an object, not a library.",
-  "intro": "A workflow that waits three days cannot be tested by waiting three days. This lesson runs workflows against a time-skipping test server with mocked activities. Then it adds the replay test, which stops a non-deterministic change before it reaches a ticket.",
-  "picture": {
-    "caption": "A test starts a test server, a worker with mocks and a run, and time skips ahead. The replay test feeds saved histories to new code.",
-    "nodes": [
-      {
-        "id": "test",
-        "label": "node:test file",
-        "kind": "check"
-      },
-      {
-        "id": "env",
-        "label": "TestWorkflowEnvironment (time-skipping)",
-        "kind": "service"
-      },
-      {
-        "id": "worker",
-        "label": "Worker with mocked activities",
-        "kind": "machine"
-      },
-      {
-        "id": "run",
-        "label": "hello / ticketToPr run",
-        "kind": "service"
-      },
-      {
-        "id": "hist",
-        "label": "test/histories/*.json",
-        "kind": "file"
-      }
-    ],
-    "steps": [
-      {
-        "from": "test",
-        "to": "env",
-        "text": "createTimeSkipping() starts a local test server once per file"
-      },
-      {
-        "from": "test",
-        "to": "worker",
-        "text": "creates a worker whose activities are plain mock functions"
-      },
-      {
-        "from": "worker",
-        "to": "run",
-        "text": "runUntil(execute(...)): the run waits on a 1-day timer, and the server skips ahead"
-      },
-      {
-        "from": "run",
-        "to": "test",
-        "text": "the result comes back in about a second; the test asserts on it"
-      },
-      {
-        "from": "hist",
-        "to": "test",
-        "text": "the replay test runs every saved history through the new code and fails on a mismatch"
-      }
+  "question": "How do you test a workflow that waits for days and talks to Jira and Slack in a few seconds, and prove that a change will not break runs that are already open?"
+ },
+ "read": [
+  {
+   "h": "A test server that skips time",
+   "p": [
+    "The testing package of the SDK can start a small Temporal server just for your tests, with TestWorkflowEnvironment.createTimeSkipping(). It is a real Temporal server, with one difference: whenever every workflow in it is only waiting for a timer, it moves its clock straight to the next timer instead of waiting. A three-day wait with nothing to do in between therefore takes milliseconds. The first time it runs, it downloads the test server, so it needs the internet once.",
+    "The test itself looks like the code you already know. You start a worker on the test server's connection with Worker.create, run the workflow with execute, which starts it and waits for its result, and check the result. worker.runUntil runs the worker exactly as long as the promise you give it, and then shuts it down cleanly."
+   ],
+   "code": {
+    "lang": "typescript",
+    "file": "orchestrator/test/waiting.test.ts",
+    "text": "import { after, before, test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { fileURLToPath } from \"node:url\";\nimport { TestWorkflowEnvironment } from \"@temporalio/testing\";\nimport { Worker } from \"@temporalio/worker\";\nimport { ticketToPr } from \"../src/workflows/ticket-to-pr\";\n\nconst workflowsPath = fileURLToPath(new URL(\"../src/workflows/index.ts\", import.meta.url));\nlet env: TestWorkflowEnvironment;\nbefore(async () => { env = await TestWorkflowEnvironment.createTimeSkipping(); });\nafter(async () => { await env?.teardown(); });\n\ntest(\"a plan nobody decides on is reminded once, then parked\", async () => {\n  const posted: string[] = [];\n  const activities = {\n    notify: async (text: string) => void posted.push(text),\n    parkTicket: async (ticket: string) => void posted.push(`parked ${ticket}`),\n  };\n  const worker = await Worker.create({ connection: env.nativeConnection, taskQueue: \"test\", workflowsPath, activities });\n  const result = await worker.runUntil(\n    env.client.workflow.execute(ticketToPr, { taskQueue: \"test\", workflowId: \"nova:RH-1\", args: [\"RH-1\"] }),\n  );\n  assert.equal(result, \"parked\");\n  assert.equal(posted.length, 3); // ready, reminder, parked\n});",
+    "notes": [
+     {
+      "line": 10,
+      "text": "One test server for the whole file. Starting it takes a second or two, so do not start one per test."
+     },
+     {
+      "line": 15,
+      "text": "Fake activities: plain functions that write down what the real ones would post."
+     },
+     {
+      "line": 20,
+      "text": "runUntil: the worker runs until the workflow's result is ready, then stops."
+     },
+     {
+      "line": 24,
+      "text": "Three days passed in about a second: one day to the reminder, two more to parking."
+     }
     ]
+   },
+   "see": "$ node --test\nok 1 - a plan nobody decides on is reminded once, then parked\nok 2 - an approval on the first day starts the work, with no reminder\n# pass 2\n# fail 0\n# duration_ms 2020.951"
   },
-  "sections": [
-    {
-      "h": "What to test, and the two tools",
-      "p": [
-        "G3-24 lists the tests for ticketToPr: approve, change, reject, a question and its answer, and a worker crash between steps. Each one involves days of waiting and several outside services. We test the workflow's decisions, not Jira or AWS.",
-        "Two tools from @temporalio/testing and @temporalio/worker do this. The time-skipping environment runs real workflows fast, with activities replaced by mocks. The replay test checks that new code still fits old histories."
-      ]
-    },
-    {
-      "h": "A test server that skips time",
-      "p": [
-        "TestWorkflowEnvironment.createTimeSkipping() starts a small Temporal test server on your machine. The first run downloads it, so it needs the internet once. When every run is waiting on a timer, the server jumps to the next timer instead of waiting.",
-        "Start one environment per test file in before(), and tear it down in after(). Each test creates its own worker on the environment's connection."
-      ],
-      "because": "We start the server once per file because starting it takes a few seconds and every test can share it.",
-      "code": {
-        "lang": "typescript",
-        "file": "~/temporal-lab/test/hello.test.ts (part 1)",
-        "text": "// ~/temporal-lab/test/hello.test.ts (part 1): one time-skipping server for the file\nimport { after, before, test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { fileURLToPath } from \"node:url\";\nimport { TestWorkflowEnvironment } from \"@temporalio/testing\";\nimport { Worker } from \"@temporalio/worker\";\nimport { approve, hello } from \"../src/workflows.js\";\n\nlet env: TestWorkflowEnvironment;\nbefore(async () => { env = await TestWorkflowEnvironment.createTimeSkipping(); });\nafter(async () => { await env?.teardown(); });\n\nconst workflowsPath = fileURLToPath(new URL(\"../src/workflows.ts\", import.meta.url));\nconst greet = async (name: string) => `Hi ${name} (mock)`; // a mocked activity: a plain function",
-        "notes": [
-          {
-            "line": 10,
-            "text": "createTimeSkipping: a local test server whose clock jumps when everything waits."
-          },
-          {
-            "line": 11,
-            "text": "teardown stops the server; the ?. covers a failed start."
-          },
-          {
-            "line": 13,
-            "text": "The worker bundles the real workflow file, the same code you deploy."
-          },
-          {
-            "line": 14,
-            "text": "The mock: same name and signature as the real activity, a fixed answer, no network."
-          }
-        ]
-      }
-    },
-    {
-      "h": "Run a workflow with mocked activities",
-      "p": [
-        "worker.runUntil(promise) runs the worker until the promise settles, then shuts it down. Inside it, start the run with env.client and wait for the result. The run never knows its activities are mocks.",
-        "The first test waits on a 1-day condition() with no signal. The server skips the day, condition() returns false, and the run returns parked. The second test sends the signal through the handle, like the Slack app would."
-      ],
-      "because": "We pass mocks as the activities object because the worker gets activities only from there.",
-      "code": {
-        "lang": "typescript",
-        "file": "~/temporal-lab/test/hello.test.ts (part 2)",
-        "text": "// ~/temporal-lab/test/hello.test.ts (part 2)\ntest(\"parks after a day with no approval\", async () => {\n  const worker = await Worker.create({ connection: env.nativeConnection, taskQueue: \"t\", workflowsPath, activities: { greet } });\n  const result = await worker.runUntil(\n    env.client.workflow.execute(hello, { taskQueue: \"t\", workflowId: \"t-1\", args: [\"Sean\"] }));\n  assert.equal(result, \"parked\"); // a whole day passed in about a second\n});\n\ntest(\"approval runs the activity\", async () => {\n  const worker = await Worker.create({ connection: env.nativeConnection, taskQueue: \"t\", workflowsPath, activities: { greet } });\n  const result = await worker.runUntil(async () => {\n    const h = await env.client.workflow.start(hello, { taskQueue: \"t\", workflowId: \"t-2\", args: [\"Sean\"] });\n    await h.signal(approve, \"dana\");\n    return h.result();\n  });\n  assert.equal(result, \"Hi Sean (mock) (approved by dana)\");\n});",
-        "notes": [
-          {
-            "line": 3,
-            "text": "A fresh worker per test, on a task queue only this test uses."
-          },
-          {
-            "line": 4,
-            "text": "runUntil plus execute: start the run, wait for its result, stop the worker."
-          },
-          {
-            "line": 6,
-            "text": "The proof that time skipped: a day-long wait ended in about a second."
-          },
-          {
-            "line": 12,
-            "text": "start instead of execute, because we want the handle to signal it."
-          },
-          {
-            "line": 13,
-            "text": "The same signal call a client makes in production."
-          },
-          {
-            "line": 16,
-            "text": "The mock's answer shows up in the result: the real greet never ran."
-          }
-        ]
-      },
-      "see": "ok 1 - parks after a day with no approval\nok 2 - approval runs the activity\n# pass 2\n# fail 0",
-      "ifInstead": "If instead the first run hangs on 'downloading', the test server download is blocked. Check your network or proxy, then run again; later runs use the cached copy."
-    },
-    {
-      "h": "Skipping a chosen amount of time",
-      "p": [
-        "Sometimes you want to stop between timers: wait a day, then act. env.sleep(\"25 hours\") moves the test clock forward by that much. Then you signal and check what happened in between.",
-        "A mock can record its calls in an array. Assert on that array after the run, when every activity has finished."
-      ],
-      "because": "We assert on recorded mock calls because the reminder is an activity, and the array shows it ran exactly once.",
-      "code": {
-        "lang": "typescript",
-        "file": "ai-agents/orchestrator/test/ticket-to-pr.test.ts (sketch)",
-        "text": "// ai-agents/orchestrator/test/ticket-to-pr.test.ts (sketch): a plan waits a day, is reminded once, then approved\ntest(\"a plan not approved for a day gets one reminder\", async () => {\n  const notes: string[] = [];\n  const activities = { ...happyPath, notify: async (_t: Handoff, text: string) => { notes.push(text); } };\n  const worker = await Worker.create({ connection: env.nativeConnection, taskQueue: \"t\", workflowsPath, activities });\n  const result = await worker.runUntil(async () => {\n    const h = await env.client.workflow.start(ticketToPr, { taskQueue: \"t\", workflowId: \"nova:RH-1\", args: [handoff] });\n    await env.sleep(\"25 hours\"); // skips a day of waiting\n    await h.signal(decidePlan, { kind: \"approve\", by: \"dana@example.com\", version: \"v1\" });\n    return h.result();\n  });\n  assert.equal(result, \"https://github.com/RhinoHealth/fcp/pull/1\");\n  assert.equal(notes.length, 1); // reminded once, never parked\n});",
-        "notes": [
-          {
-            "line": 4,
-            "text": "happyPath: an object of mocks for every activity ticketToPr calls. Override only what this test watches."
-          },
-          {
-            "line": 8,
-            "text": "Skip a day plus an hour: past the reminder, before the park at 3 days."
-          },
-          {
-            "line": 9,
-            "text": "Approve after the reminder, as a slow requester would."
-          },
-          {
-            "line": 13,
-            "text": "Checked after the result, when every activity has finished: one reminder, no park."
-          }
-        ]
-      }
-    },
-    {
-      "h": "A worker crash and a lost VM",
-      "p": [
-        "For a worker crash between steps, run the first half with one worker, stop it, and finish with a new worker. The new worker has an empty cache, so it must replay. A lost VM needs its own test. The mock workInSandbox throws SandboxDead the first time, the way the real one does after 5 minutes without a heartbeat.",
-        "The assertion is about what the workflow did: it claimed a second VM and finished. G3-27 adds the opposite test too: two lost VMs end the run with NeedsPerson."
-      ],
-      "because": "We throw SandboxDead from a mock because recovery must be proven without killing a real VM.",
-      "code": {
-        "lang": "typescript",
-        "file": "ai-agents/orchestrator/test/recovery.test.ts (sketch)",
-        "text": "// ai-agents/orchestrator/test/recovery.test.ts (sketch): a VM dies once; recovery takes a fresh one\nimport { ApplicationFailure } from \"@temporalio/common\";\n\ntest(\"a lost VM is replaced and the run finishes\", async () => {\n  const acquired: string[] = [];\n  let attempts = 0;\n  const activities = {\n    ...happyPath, // mocks for freshenSandbox, notify, releaseSandbox ...\n    acquireSandbox: async () => { acquired.push(`vm-${acquired.length + 1}`); return { id: acquired.at(-1)! }; },\n    workInSandbox: async () => {\n      attempts += 1;\n      if (attempts === 1) throw ApplicationFailure.create({ type: \"SandboxDead\", nonRetryable: true });\n      return { needsAnswer: false, prUrl: \"https://github.com/RhinoHealth/fcp/pull/1\" };\n    },\n  };\n  const worker = await Worker.create({ connection: env.nativeConnection, taskQueue: \"t\", workflowsPath, activities });\n  await worker.runUntil(env.client.workflow.execute(ticketToPr, { taskQueue: \"t\", workflowId: \"nova:RH-2\", args: [handoff] }));\n  assert.deepEqual(acquired, [\"vm-1\", \"vm-2\"]); // the dead VM was not reused\n});",
-        "notes": [
-          {
-            "line": 9,
-            "text": "Each claim gets a new name, so we can see whether a dead VM was reused."
-          },
-          {
-            "line": 12,
-            "text": "The same failure the real activity throws: typed and non-retryable."
-          },
-          {
-            "line": 13,
-            "text": "The second attempt succeeds on the fresh VM."
-          },
-          {
-            "line": 17,
-            "text": "execute inside runUntil: wait for the whole run."
-          },
-          {
-            "line": 18,
-            "text": "Two claims: recovery released the dead VM and took a fresh one."
-          }
-        ]
-      }
-    },
-    {
-      "h": "Replay tests: old histories, new code",
-      "p": [
-        "Save the history of a real run as JSON with temporal workflow show --output json. The replay test feeds each saved file to Worker.runReplayHistory with the current workflow code. If the code would ask for different steps, it throws DeterminismViolationError and the test fails.",
-        "G3-29 runs this on every PR from orchestrator/test/replay.test.ts. Keep one history per important path, and add one whenever you add a path."
-      ],
-      "because": "We replay saved histories in CI so a missing patched() fails a PR, not a ticket three days into its run.",
-      "code": {
-        "lang": "typescript",
-        "file": "~/temporal-lab/test/replay.test.ts",
-        "text": "// ~/temporal-lab/test/replay.test.ts: the same shape as G3-29's orchestrator/test/replay.test.ts\nimport { test } from \"node:test\";\nimport { readdir, readFile } from \"node:fs/promises\";\nimport { fileURLToPath } from \"node:url\";\nimport { Worker } from \"@temporalio/worker\";\n\ntest(\"saved workflow histories still replay\", async () => {\n  const workflowsPath = fileURLToPath(new URL(\"../src/workflows.ts\", import.meta.url));\n  const dir = new URL(\"./histories/\", import.meta.url); // next to this file: npm test runs from the repo root\n  for (const file of (await readdir(dir)).filter((f) => f.endsWith(\".json\")).sort()) {\n    const history = JSON.parse(await readFile(new URL(file, dir), \"utf8\"));\n    await Worker.runReplayHistory({ workflowsPath }, history, file);\n  }\n});",
-        "notes": [
-          {
-            "line": 8,
-            "text": "Point at the workflow source, as the worker does."
-          },
-          {
-            "line": 9,
-            "text": "Resolve the folder from this file, so the test works from any working directory."
-          },
-          {
-            "line": 10,
-            "text": "Sorted, so failures always appear in the same order."
-          },
-          {
-            "line": 12,
-            "text": "Throws on a mismatch. The file name is used as the workflow ID in the error."
-          }
-        ]
-      },
-      "see": "not ok 1 - saved workflow histories still replay\n  error: 'Replay failed with a nondeterminism error. ... [TMPRL1100] Nondeterminism error ...'\n  name: 'DeterminismViolationError'   (output trimmed)",
-      "ifInstead": "If instead you see TypeError: type must be a Type, npm installed two copies of protobufjs. Run npm ls protobufjs, then npm i protobufjs@<the version under @temporalio/common> so one copy is shared."
+  {
+   "h": "Fake activities, real decisions",
+   "p": [
+    "The test does not check Slack or Jira. It checks the workflow's decisions: when to remind, when to park, what to do after an approval. That is possible because activities are only functions handed to the worker. In production the worker gets the real ones; in a test it gets fakes that record what they were asked to do, and the workflow cannot tell the difference. The usual name for these fakes is mocks.",
+    "A test can also be a person. The test below sends the decidePlan signal through the run's handle, exactly as the Slack app would, and then checks that only the first message was posted. When you need to stop between two timers, env.sleep moves the test clock forward by an amount you choose, for example 25 hours, so you can approve on the second day and check that exactly one reminder went out."
+   ],
+   "code": {
+    "lang": "typescript",
+    "file": "orchestrator/test/waiting.test.ts",
+    "text": "test(\"an approval on the first day starts the work, with no reminder\", async () => {\n  const { posted, activities } = fakeActivities();\n  const worker = await Worker.create({ connection: env.nativeConnection, taskQueue: \"test\", workflowsPath, activities });\n  const result = await worker.runUntil(async () => {\n    const handle = await env.client.workflow.start(ticketToPr, { taskQueue: \"test\", workflowId: \"nova:RH-2\", args: [\"RH-2\"] });\n    await handle.signal(decidePlan, { kind: \"approve\", by: \"sean\" });\n    return handle.result();\n  });\n  assert.equal(result, \"approve by sean\");\n  assert.deepEqual(posted, [\"The plan for RH-2 is ready. Approve, Change or Stop?\"]);\n});",
+    "notes": [
+     {
+      "line": 5,
+      "text": "start returns a handle at once, so the test can act while the run waits."
+     },
+     {
+      "line": 6,
+      "text": "The test plays the requester pressing Approve."
+     },
+     {
+      "line": 10,
+      "text": "The decision was quick, so the fake Slack got one message and no reminder."
+     }
+    ]
+   },
+   "deeper": {
+    "h": "Go deeper: testing a crash or a lost VM",
+    "p": [
+     "Failures are just as easy to fake. A fake workInSandbox can throw SandboxDead on its first call, the way the real one does after five minutes without a heartbeat from the VM, and return a PR on the second call. The test then checks what the workflow did about it: it claimed a second VM and finished. A second test makes it fail twice and checks that the run stops and asks for a person.",
+     "A worker crash between two steps is tested by running the first half with one worker, stopping it, and finishing with a new worker. The new worker has nothing in memory, so it must replay, and the test proves the replay works."
+    ],
+    "code": {
+     "lang": "typescript",
+     "file": "orchestrator/test/recovery.test.ts",
+     "text": "test(\"a lost VM is replaced and the run finishes\", async () => {\n  const acquired: string[] = [];\n  let attempts = 0;\n  const activities = {\n    ...happyPath, // fakes for freshenSandbox, notify, releaseSandbox and the rest\n    acquireSandbox: async () => { acquired.push(`vm-${acquired.length + 1}`); return { id: acquired.at(-1)! }; },\n    workInSandbox: async () => {\n      attempts += 1;\n      if (attempts === 1) throw ApplicationFailure.create({ type: \"SandboxDead\", nonRetryable: true });\n      return { needsAnswer: false, prUrl: \"https://github.com/RhinoHealth/fcp/pull/2512\" };\n    },\n  };\n  // ...run ticketToPr with an approval, as above, then:\n  assert.deepEqual(acquired, [\"vm-1\", \"vm-2\"]); // the dead VM was not used again\n});"
     }
-  ],
-  "lab": {
-    "title": "Test a day-long wait in a second",
-    "youNeed": [
-      "~/temporal-lab from p7-6",
-      "The dev server running (only for saving a history)"
-    ],
-    "worked": [
-      {
-        "do": "npm i @temporalio/testing@1.24.0 && mkdir -p test/histories",
-        "see": "added <n> packages"
-      },
-      {
-        "do": "Make sure hello is the p7-3 version that waits \"1 day\" for approve (remove the greet(\"first\") patch). Create test/hello.test.ts from parts 1 and 2.",
-        "see": "(no output)"
-      },
-      {
-        "do": "node --import tsx --test test/hello.test.ts",
-        "see": "ok 1 - parks after a day with no approval\nok 2 - approval runs the activity\n# pass 2\n# fail 0"
-      },
-      {
-        "do": "Save a finished run as a history: temporal workflow show --namespace ai-agents --workflow-id lab:sig-1 --output json > test/histories/lab-sig-1.json. The dev server keeps data in memory, so if lab:sig-1 is gone, run and approve it again first.",
-        "see": "(no output; the file starts with { \"events\": [ ... )"
-      },
-      {
-        "do": "Create test/replay.test.ts and run: node --import tsx --test test/replay.test.ts",
-        "see": "ok 1 - saved workflow histories still replay\n# pass 1"
-      },
-      {
-        "do": "Add await greet(\"first\"); as the first line of hello and run the replay test again",
-        "see": "not ok 1 - saved workflow histories still replay\n  name: 'DeterminismViolationError'"
-      },
-      {
-        "do": "Wrap it: if (patched(\"greet-first\")) await greet(\"first\"); and run both test files",
-        "see": "# pass 1 (replay)\n# pass 2 (hello)"
-      }
-    ],
-    "faded": "Add a third test to hello.test.ts: approve after two hours of test time. Left to you: where env.sleep(\"2 hours\") goes, and the assertion that the result names the approver.",
-    "alone": "Write test/long-job.test.ts for longJob from p7-2. Mock slowWork so it throws an ApplicationFailure of type Boom with nonRetryable: true. Assert that execute rejects, and that the error's cause type is Boom (WorkflowFailedError, then ActivityFailure, then ApplicationFailure).",
-    "done": "A day-long wait was tested in seconds. The replay test failed on an unpatched change and passed once it was patched."
+   }
   },
-  "quiz": [
-    {
-      "q": "How does a test give hello a fake greet activity?",
-      "options": [
-        {
-          "text": "Pass an object { greet } to Worker.create as activities",
-          "correct": true,
-          "why": "The worker only knows the activities you hand it; a plain function is the mock."
-        },
-        {
-          "text": "Use a mocking library to replace the import in workflows.ts",
-          "correct": false,
-          "why": "Workflow code imports only the type; there is nothing to replace there."
-        },
-        {
-          "text": "Set an environment variable that turns activities off",
-          "correct": false,
-          "why": "There is no such switch; mocks are the activities object."
-        }
-      ]
-    },
-    {
-      "q": "The 1-day test finishes in about a second. Why?",
-      "options": [
-        {
-          "text": "condition() timeouts are ignored in tests",
-          "correct": false,
-          "why": "The timeout fires; that is why the result is parked."
-        },
-        {
-          "text": "The test server jumps its clock to the next timer when every run is waiting",
-          "correct": true,
-          "why": "That is time skipping; it only happens while nothing else is running."
-        },
-        {
-          "text": "node:test runs timers with a fake clock",
-          "correct": false,
-          "why": "Workflow timers live on the Temporal test server, not in node:test."
-        }
-      ]
-    },
-    {
-      "q": "What makes the replay test fail?",
-      "options": [
-        {
-          "text": "An activity's code changed",
-          "correct": false,
-          "why": "Activity code is not replayed; only its recorded result is used."
-        },
-        {
-          "text": "A saved history was produced on another machine",
-          "correct": false,
-          "why": "Histories are portable JSON; any machine can replay them."
-        },
-        {
-          "text": "The workflow now asks for a step the saved history did not record",
-          "correct": true,
-          "why": "That mismatch is a DeterminismViolationError, exactly what CI should catch."
-        }
-      ]
-    }
+  {
+   "h": "Replay tests: old histories, new code",
+   "p": [
+    "The second worry was the deploy that broke twelve open runs. A replay test finds that kind of change before it is merged. You save the history of a real run as JSON with temporal workflow show --output json, and the test feeds each saved history to Worker.runReplayHistory together with the current workflow code. The worker replays the history, exactly as it would in production after a deploy, and if the code asks for different steps than the history recorded, the test fails with DeterminismViolationError.",
+    "Keep one saved history for each path that matters: a plan approved at once, a plan changed, a question answered, a VM lost, a ticket parked. Add one whenever you add a path. In the lab you make an unpatched change and watch this test fail, then wrap the change in patched and watch it pass."
+   ],
+   "code": {
+    "lang": "typescript",
+    "file": "orchestrator/test/replay.test.ts",
+    "text": "import { test } from \"node:test\";\nimport { readdir, readFile } from \"node:fs/promises\";\nimport { fileURLToPath } from \"node:url\";\nimport { Worker } from \"@temporalio/worker\";\n\ntest(\"saved workflow histories still replay\", async () => {\n  const workflowsPath = fileURLToPath(new URL(\"../src/workflows/index.ts\", import.meta.url));\n  const dir = new URL(\"./histories/\", import.meta.url);\n  for (const file of (await readdir(dir)).filter((f) => f.endsWith(\".json\")).sort()) {\n    const history = JSON.parse(await readFile(new URL(file, dir), \"utf8\"));\n    await Worker.runReplayHistory({ workflowsPath }, history, file);\n  }\n});",
+    "notes": [
+     {
+      "line": 8,
+      "text": "test/histories/*.json: one file per saved run, made with temporal workflow show --output json."
+     },
+     {
+      "line": 11,
+      "text": "Replays the whole history with today's code, with no server and no activities. A mismatch throws."
+     }
+    ]
+   },
+   "see": "not ok 1 - saved histories still replay with the current code\n  error: `Replay failed with a nondeterminism error. … [TMPRL1100] Nondeterminism error:\n    Activity type of scheduled event 'notify' does not match activity type of activity command 'checkReadiness'`\n  name: 'DeterminismViolationError'\n(trimmed)"
+  }
+ ],
+ "lab": {
+  "id": "p7-7",
+  "title": "Test three days in two seconds",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "Node 22+",
+   "The temporal CLI (brew install temporal)",
+   "The p7-1 lab folder, for worker.mjs and start.mjs",
+   "Internet once, to download the test server",
+   "Three terminal tabs"
   ],
-  "recall": [
-    "In p7-6, what does patched() return when it replays a history from before the change?",
-    "In p1-6, how do node:test and tsx run a TypeScript test file?"
-  ],
-  "videos": [],
-  "words": [
+  "goal": "Test a workflow's three-day wait in seconds with a time-skipping server and fake activities, and add a replay test that catches a change that would break open runs.",
+  "guess": {
+   "q": "The workflow waits up to 1 day, sends a reminder, and waits 2 more days before it parks. In the time-skipping test server, with fake activities and no signal, how long does the test take?",
+   "options": [
     {
-      "term": "TestWorkflowEnvironment",
-      "plain": "A local Temporal test server for tests, from @temporalio/testing."
+     "text": "About 3 days, because the timers are real Temporal timers.",
+     "correct": false,
+     "why": "They are real timers, but the test server moves its clock to the next timer whenever nothing else is happening."
     },
     {
-      "term": "time skipping",
-      "plain": "The test server jumps its clock to the next timer when every run is waiting."
+     "text": "A second or two, because the server jumps to each timer when every workflow is only waiting.",
+     "correct": true,
+     "why": "That is time skipping. Most of the time is spent starting the server and bundling the workflow."
     },
     {
-      "term": "mocked activity",
-      "plain": "A plain function passed to the test worker in place of the real activity."
-    },
-    {
-      "term": "runUntil",
-      "plain": "Runs a worker until a promise settles, then shuts it down."
-    },
-    {
-      "term": "replay test",
-      "plain": "Feeds saved histories to the current workflow code and fails on any mismatch."
-    },
-    {
-      "term": "DeterminismViolationError",
-      "plain": "The error a replay throws when code and history disagree."
+     "text": "It never ends, because nobody sends the decidePlan signal.",
+     "correct": false,
+     "why": "Both waits have a timeout. When the timers fire, condition returns false, and the run parks itself."
     }
+   ]
+  },
+  "follow": [
+   {
+    "say": "Make the lab folder and install the packages, this time with the testing package. The last one, protobufjs@8.8.1, makes all Temporal packages share one copy of that library; with two copies, reading a saved history fails with TypeError: type must be a Type.",
+    "do": "mkdir -p ~/academy-labs/p7-7 && cd ~/academy-labs/p7-7\nnpm init -y > /dev/null && npm pkg set type=module\nnpm install @temporalio/client@1.24.0 @temporalio/worker@1.24.0 @temporalio/workflow@1.24.0 @temporalio/testing@1.24.0 protobufjs@8.8.1",
+    "see": "added 149 packages, and audited 150 packages in 11s"
+   },
+   {
+    "say": "Write the workflow to test: the plan wait from the signals lab, but with the real times, one day and two days.",
+    "do": "cat > workflows.mjs <<'EOF'\n// The plan wait from the signals lesson, with the real times: remind after 1 day, park after 3.\nimport { condition, defineQuery, defineSignal, proxyActivities, setHandler } from '@temporalio/workflow';\n\nconst { notify, parkTicket } = proxyActivities({ startToCloseTimeout: '1 minute' });\n\nexport const decidePlan = defineSignal('decidePlan');\nexport const status = defineQuery('status');\n\nexport async function ticketToPr(ticket) {\n  let state = 'Awaiting approval';\n  let decision;\n  setHandler(decidePlan, (d) => {\n    decision = d;\n  });\n  setHandler(status, () => state);\n\n  await notify(`The plan for ${ticket} is ready. Approve, Change or Stop?`);\n  if (!(await condition(() => decision !== undefined, '1 day'))) {\n    await notify(`Reminder: the plan for ${ticket} is still waiting for you.`);\n    if (!(await condition(() => decision !== undefined, '2 days'))) {\n      state = 'Parked';\n      await parkTicket(ticket);\n      return 'parked';\n    }\n  }\n  state = 'Working';\n  return `${decision.kind} by ${decision.by}`;\n}\nEOF"
+   },
+   {
+    "say": "Write the tests: one time-skipping server for the file, fake activities that record what they would post, and two tests.",
+    "do": "cat > ticket-to-pr.test.mjs <<'EOF'\n// Three days of waiting, tested in a few seconds, with fake activities.\nimport { after, before, test } from 'node:test';\nimport assert from 'node:assert/strict';\nimport { fileURLToPath } from 'node:url';\nimport { TestWorkflowEnvironment } from '@temporalio/testing';\nimport { DefaultLogger, Runtime, Worker } from '@temporalio/worker';\n\nRuntime.install({ logger: new DefaultLogger('WARN') });\nconst workflowsPath = fileURLToPath(new URL('./workflows.mjs', import.meta.url));\nlet env;\nbefore(async () => {\n  env = await TestWorkflowEnvironment.createTimeSkipping();\n});\nafter(async () => {\n  await env?.teardown();\n});\n\n// Fake activities: plain functions that write down what the real ones would post.\nconst fakeActivities = () => {\n  const posted = [];\n  return {\n    posted,\n    activities: {\n      notify: async (text) => void posted.push(text),\n      parkTicket: async (ticket) => void posted.push(`parked ${ticket}`),\n    },\n  };\n};\n\ntest('a plan nobody decides on is reminded once, then parked', async () => {\n  const { posted, activities } = fakeActivities();\n  const worker = await Worker.create({ connection: env.nativeConnection, taskQueue: 'test', workflowsPath, activities });\n  const result = await worker.runUntil(\n    env.client.workflow.execute('ticketToPr', { taskQueue: 'test', workflowId: 'nova:RH-1', args: ['RH-1'] }),\n  );\n  assert.equal(result, 'parked');\n  assert.equal(posted.length, 3); // ready, reminder, parked\n});\n\ntest('an approval on the first day starts the work, with no reminder', async () => {\n  const { posted, activities } = fakeActivities();\n  const worker = await Worker.create({ connection: env.nativeConnection, taskQueue: 'test', workflowsPath, activities });\n  const result = await worker.runUntil(async () => {\n    const handle = await env.client.workflow.start('ticketToPr', { taskQueue: 'test', workflowId: 'nova:RH-2', args: ['RH-2'] });\n    await handle.signal('decidePlan', { kind: 'approve', by: 'sean' });\n    return handle.result();\n  });\n  assert.equal(result, 'approve by sean');\n  assert.deepEqual(posted, ['The plan for RH-2 is ready. Approve, Change or Stop?']);\n});\nEOF"
+   },
+   {
+    "say": "Run them. The first run downloads the test server, so it takes a little longer; after that, three days of waiting take about two seconds.",
+    "do": "node --test ticket-to-pr.test.mjs",
+    "see": "ok 1 - a plan nobody decides on is reminded once, then parked\nok 2 - an approval on the first day starts the work, with no reminder\n# pass 2\n# fail 0"
+   },
+   {
+    "say": "Now the replay test needs a real history. Start the dev server in a second tab, and in this tab write two activities that print, and borrow the worker and the client from p7-1.",
+    "do": "# second tab\ntemporal server start-dev\n\n# this tab\ncat > activities.mjs <<'EOF'\nexport const notify = async (text) => console.log(`[slack] ${text}`);\nexport const parkTicket = async (ticket) => console.log(`[jira] parked ${ticket}`);\nEOF\ncp ../p7-1/worker.mjs ../p7-1/start.mjs ."
+   },
+   {
+    "say": "Start the worker in a third tab, then run and approve one ticket, and save its history as JSON.",
+    "do": "# third tab\ncd ~/academy-labs/p7-7 && node worker.mjs\n\n# this tab\nnode start.mjs\ntemporal workflow signal -w nova:RH-1234 --name decidePlan --input '{\"kind\":\"approve\",\"by\":\"sean\"}'\nmkdir -p histories && temporal workflow show -w nova:RH-1234 --output json > histories/approved.json\nhead -c 120 histories/approved.json",
+    "see": "Started nova:RH-1234. The worker does the rest.\nSignal workflow succeeded\n{\n  \"events\": [\n    {\n      \"eventId\": \"1\",\n      \"eventTime\": \"2026-10-15T23:21:56.800926Z\","
+   },
+   {
+    "say": "Write the replay test and run it. The saved history matches today's code, so it passes.",
+    "do": "cat > replay.test.mjs <<'EOF'\n// Replays every saved history with the current workflow code. A change that would break an open run fails here.\nimport { test } from 'node:test';\nimport { readdir, readFile } from 'node:fs/promises';\nimport { fileURLToPath } from 'node:url';\nimport { Worker } from '@temporalio/worker';\n\nconst workflowsPath = fileURLToPath(new URL('./workflows.mjs', import.meta.url));\nconst dir = new URL('./histories/', import.meta.url);\n\ntest('saved histories still replay with the current code', async () => {\n  for (const file of (await readdir(dir)).filter((f) => f.endsWith('.json'))) {\n    const history = JSON.parse(await readFile(new URL(file, dir), 'utf8'));\n    await Worker.runReplayHistory({ workflowsPath }, history, file);\n  }\n});\nEOF\nnode --test replay.test.mjs",
+    "see": "ok 1 - saved histories still replay with the current code\n# pass 1"
+   },
+   {
+    "say": "Make a careless change: add an activity call, await checkReadiness(ticket), right before the first notify, and add checkReadiness to the proxyActivities list. Run the replay test again.",
+    "do": "node --test replay.test.mjs",
+    "see": "not ok 1 - saved histories still replay with the current code\n  error: `Replay failed with a nondeterminism error. … [TMPRL1100] Nondeterminism error:\n    Activity type of scheduled event 'notify' does not match activity type of activity command 'checkReadiness'`\n  name: 'DeterminismViolationError'\n(trimmed)"
+   },
+   {
+    "say": "Wrap the new call in if (patched('readiness-check')) { ... } and add patched to the import. The old history now replays on the old path.",
+    "do": "node --test replay.test.mjs",
+    "see": "ok 1 - saved histories still replay with the current code\n# pass 1"
+   }
+  ],
+  "build": "Write a third test, \"an approval on the second day comes after exactly one reminder\". Start the run, move the test clock forward by 25 hours with env.sleep, then send the approval and check that the result is \"approve by sean\" and that exactly two messages were posted: the plan and one reminder. The workflow now calls checkReadiness on new runs, so add a fake for it to fakeActivities too. Then run every test file at once with node --test.",
+  "checks": [
+   "node --test ticket-to-pr.test.mjs shows ok 1 and ok 2, and the whole file takes a few seconds, not three days.",
+   "histories/approved.json starts with { \"events\": [ and the replay test passed before your change.",
+   "The careless change made the replay test fail with DeterminismViolationError and the words Nondeterminism error.",
+   "With patched around the new call, the replay test passes again.",
+   "For your build: node --test runs every test file and shows # pass 4 and # fail 0."
+  ],
+  "solution": {
+   "lang": "javascript",
+   "file": "ticket-to-pr.test.mjs",
+   "text": "// in fakeActivities: the workflow now calls checkReadiness, so the fakes need it too\n      checkReadiness: async () => {},\n\n// a third test in ticket-to-pr.test.mjs\ntest('an approval on the second day comes after exactly one reminder', async () => {\n  const { posted, activities } = fakeActivities();\n  const worker = await Worker.create({ connection: env.nativeConnection, taskQueue: 'test', workflowsPath, activities });\n  const result = await worker.runUntil(async () => {\n    const handle = await env.client.workflow.start('ticketToPr', { taskQueue: 'test', workflowId: 'nova:RH-3', args: ['RH-3'] });\n    await env.sleep('25 hours'); // the test clock moves a day and an hour forward\n    await handle.signal('decidePlan', { kind: 'approve', by: 'sean' });\n    return handle.result();\n  });\n  assert.equal(result, 'approve by sean');\n  assert.equal(posted.length, 2); // ready, reminder\n});"
+  },
+  "fix": "A teammate added checkReadiness to the workflow, patched it correctly, and pushed. CI never finished: the test job ran until it was killed, and its log was thousands of lines of Activity function checkReadiness is not registered on this Worker, available activities: [\"notify\",\"parkTicket\"], with the attempt number going up and up. Remove checkReadiness from your fakeActivities and run node --test ticket-to-pr.test.mjs to see it (stop it with Ctrl+C). Why does the test hang instead of failing, and what is the one-line fix?",
+  "explain": [
+   "Why does a three-day wait take about a second in the test server, and when would it not skip?",
+   "Your tests use fake activities. What do they prove about the workflow, and what do they not prove?",
+   "What does the replay test catch that the time-skipping tests cannot?"
+  ],
+  "done": "Your time-skipping tests pass in seconds, the replay test failed on an unpatched change and passed once it was patched, and you stopped the worker and the dev server."
+ },
+ "check": [
+  {
+   "q": "A workflow waits for condition(..., \"3 days\") and nothing else happens. What does the time-skipping test server do?",
+   "options": [
+    {
+     "text": "It waits three real days, because a timer cannot be skipped",
+     "correct": false,
+     "why": "Skipping timers is exactly what this server is for."
+    },
+    {
+     "text": "It moves its clock to the moment the timer fires, so the test continues at once",
+     "correct": true,
+     "why": "When every workflow is only waiting for a timer, nothing can happen before it fires, so the server jumps there."
+    },
+    {
+     "text": "It fires the timer at once and also skips the activities after it",
+     "correct": false,
+     "why": "Only waiting is skipped. Activities after the timer run normally, on your fake functions."
+    }
+   ]
+  },
+  {
+   "q": "Why does the test pass fake activities to the worker instead of the real ones?",
+   "options": [
+    {
+     "text": "Real activities cannot run inside a test",
+     "correct": false,
+     "why": "They could, but they would post to the real Slack and Jira, and the test would depend on those services."
+    },
+    {
+     "text": "The test checks the workflow's decisions, and fakes let it record what would be posted without touching Jira or Slack",
+     "correct": true,
+     "why": "Activities are plain functions handed to the worker, so a test can hand it fakes that write down every call."
+    },
+    {
+     "text": "The time-skipping server refuses network calls",
+     "correct": false,
+     "why": "It does not. Fakes are a choice, to keep the test fast and focused on the workflow."
+    }
+   ]
+  },
+  {
+   "q": "Your change passes every time-skipping test but fails the replay test with DeterminismViolationError. What does that mean?",
+   "options": [
+    {
+     "text": "The test is flaky; run it again",
+     "correct": false,
+     "why": "Replay is exact. The same history and the same code fail the same way every time."
+    },
+    {
+     "text": "The saved history is out of date and should be replaced with a new one",
+     "correct": false,
+     "why": "That hides the problem. Open runs in production have exactly those old histories."
+    },
+    {
+     "text": "New runs work, but runs that started on the old code would break after the deploy, so the change needs patched",
+     "correct": true,
+     "why": "The time-skipping tests start fresh runs. The replay test checks old histories, which is what open runs are."
+    }
+   ]
+  }
+ ],
+ "platform": {
+  "p": [
+   "The orchestrator's tests use the time-skipping environment and fake activities for every path of ticketToPr: approve, change, reject, a question and its answer, a worker crash between steps, a lost VM and two lost VMs. The fan-out rules have their own: two starts for one ticket give one run, a fourth Nova ticket waits for a slot, and the kill switch stops a run between steps.",
+   "A replay test runs on every pull request: orchestrator/test/replay.test.ts replays every saved history in test/histories with the new code. Together with the patching rule, it is what makes it safe to deploy the orchestrator while runs are days into their life."
   ],
   "tickets": [
-    {
-      "key": "G3-24",
-      "why": "ticketToPr's tests (approve, change, reject, a question, a crash) use the time-skipping environment and mocks."
-    },
-    {
-      "key": "G3-27",
-      "why": "Recovery is tested with a mock workInSandbox that throws SandboxDead."
-    },
-    {
-      "key": "G3-29",
-      "why": "orchestrator/test/replay.test.ts replays saved histories on every PR."
-    },
-    {
-      "key": "G3-25",
-      "why": "Two starts give one run, a 4th Nova ticket waits for a slot, and the kill switch stops a run between steps."
-    }
-  ],
-  "remember": "Test decisions with a time-skipping server and mock functions; replay saved histories in CI so no change breaks an open run."
+   {
+    "key": "G3-24",
+    "why": "ticketToPr's tests with TestWorkflowEnvironment.createTimeSkipping() and fake activities."
+   },
+   {
+    "key": "G3-29",
+    "why": "The replay test in CI, run against saved histories on every PR."
+   },
+   {
+    "key": "G3-27",
+    "why": "The lost-VM tests: one lost VM is replaced, a second one stops the run."
+   },
+   {
+    "key": "G3-25",
+    "why": "Fan-out tests: one run per ticket, slots that make work wait, and the kill switch."
+   }
+  ]
+ },
+ "words": [
+  {
+   "term": "time-skipping environment",
+   "plain": "A test Temporal server that jumps its clock to the next timer when every workflow is only waiting."
+  },
+  {
+   "term": "fake activity (mock)",
+   "plain": "A plain function given to the test worker instead of the real activity, often recording how it was called."
+  },
+  {
+   "term": "env.sleep",
+   "plain": "Moves the test server's clock forward by a chosen amount, so a test can act between two timers."
+  },
+  {
+   "term": "replay test",
+   "plain": "A test that replays saved histories with the current workflow code, to catch changes that would break open runs."
+  },
+  {
+   "term": "DeterminismViolationError",
+   "plain": "The error a replay throws when the code asks for different steps than the history recorded."
+  }
+ ],
+ "review": [
+  {
+   "q": "Write the shape of a time-skipping test from memory: setup, worker, run, assertion.",
+   "a": "before: env = await TestWorkflowEnvironment.createTimeSkipping(); in the test: Worker.create with env.nativeConnection, a task queue, workflowsPath and fake activities; worker.runUntil(env.client.workflow.execute(...)); assert on the result and on what the fakes recorded; after: env.teardown()."
+  },
+  {
+   "q": "Which paths of ticketToPr deserve a saved history in test/histories, and when do you add one?",
+   "a": "Every path that matters: approved at once, changed, a question answered, a VM lost, parked. Add one whenever a change adds a new path."
+  },
+  {
+   "q": "A test hangs and logs \"Activity function ... is not registered on this Worker\". What happened?",
+   "a": "The workflow calls an activity that the test's fakes do not include. The activity fails and is retried forever, very fast in the time-skipping server. Add a fake for it."
+  }
+ ],
+ "remember": "Test the workflow's decisions in a time-skipping server with fake activities, and replay saved histories so a change cannot break the runs that are already open."
 }

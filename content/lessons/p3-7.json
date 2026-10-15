@@ -1,486 +1,286 @@
 {
-  "id": "p3-7",
-  "title": "Small jobs with Lambda",
-  "minutes": 50,
-  "youNeed": [
-    "p3-4",
-    "p3-1"
+ "v": 2,
+ "id": "p3-7",
+ "title": "Small jobs with Lambda",
+ "minutes": 50,
+ "youNeed": [
+  "p3-1",
+  "p3-4"
+ ],
+ "map": "vm-pool",
+ "hook": {
+  "story": [
+   "Late on a Thursday, a run hits a failure nobody planned for, and the code that should give its VM back never runs. The run is gone, but its full VM is still on: 42 cents an hour, all weekend, with nobody watching. Next month a different bug leaves three VMs behind, and the account slowly fills with machines that belong to no one.",
+   "Something must notice machines that nobody owns any more and destroy them. It must not depend on the orchestrator, because the orchestrator may be the thing that broke. And it must never touch a machine that is not a sandbox, such as the egress proxy that lives in the same account."
   ],
-  "bridge": "A Lambda function is like a serverless API route that a cron job calls. You upload a handler and AWS runs it on a schedule. Except nothing stays in memory between calls, and each call has only the permissions of its execution role. So the role is the whole security story.",
-  "intro": "Throw-away VMs must really be thrown away, even when the orchestrator is down or a run crashed. A small Python Lambda checks every 15 minutes and removes what no live run owns. It works only from tags, so it needs nothing from Temporal.",
-  "picture": {
-    "caption": "A schedule calls the sweeper; it reads tags, and its role lets it touch only what carries our tag.",
-    "nodes": [
-      {
-        "id": "eb",
-        "label": "EventBridge rule rate(15 minutes)",
-        "kind": "service"
-      },
-      {
-        "id": "fn",
-        "label": "Lambda: sandbox sweeper (Python)",
-        "kind": "service"
-      },
-      {
-        "id": "ec2",
-        "label": "VMs and disks tagged ai-agents:managed",
-        "kind": "cloud"
-      },
-      {
-        "id": "role",
-        "label": "execution role: tag-scoped",
-        "kind": "check"
-      },
-      {
-        "id": "logs",
-        "label": "one JSON line per action",
-        "kind": "file"
-      },
-      {
-        "id": "metric",
-        "label": "metrics AIAgents/Sweeper",
-        "kind": "file"
-      }
-    ],
-    "steps": [
-      {
-        "from": "eb",
-        "to": "fn",
-        "text": "calls the handler every 15 minutes"
-      },
-      {
-        "from": "fn",
-        "to": "ec2",
-        "text": "lists managed VMs and available disks, and reads their tags"
-      },
-      {
-        "from": "fn",
-        "to": "role",
-        "text": "every terminate or delete is checked against the role's tag condition"
-      },
-      {
-        "from": "role",
-        "to": "ec2",
-        "text": "allowed only for resources tagged ai-agents:managed=true"
-      },
-      {
-        "from": "fn",
-        "to": "logs",
-        "text": "prints what it did and why, dry_run true at first"
-      },
-      {
-        "from": "fn",
-        "to": "metric",
-        "text": "counts orphans and deleted volumes for the alerts"
-      }
+  "question": "How do you run a small piece of code every 15 minutes, without a server of your own, that cleans up abandoned VMs and cannot touch anything else?"
+ },
+ "read": [
+  {
+   "h": "A function, a trigger and a role",
+   "p": [
+    "AWS Lambda runs a function for you when an event arrives, and you never see the server it runs on. Three things are involved. The handler is the function AWS calls, here handler(event, context), with the event as a dictionary. The trigger is what produces events; for the sweeper it is an EventBridge schedule, a rule that fires every 15 minutes, written rate(15 minutes). And the execution role is the IAM role the function wears, so everything it can do is decided by that role's policies. You pay for the milliseconds the handler runs and nothing in between.",
+    "Nothing stays in memory from one event to the next, with one exception. The first call after AWS starts a fresh copy of the function is a cold start: Python loads, the code outside the handler runs, which is where the AWS client is created, and then the handler runs. If another event arrives soon, AWS may reuse that warm copy and call only the handler, which is much faster. So expensive setup goes outside the handler, and the handler must never rely on anything from an earlier call.",
+    "The sweeper is written in Python, although the rest of the platform is TypeScript, because the infrastructure repo builds all its Lambdas in Python and the DevOps team owns them. You can read it with TypeScript eyes: def is a function, indentation marks the blocks, a dict is an object, [x for x in xs] is a map, and boto3 is the AWS SDK for Python, so boto3.client(\"ec2\") is like new EC2Client({})."
+   ]
+  },
+  {
+   "h": "The sweeper's rule: no lease, no machine",
+   "p": [
+    "The sweeper needs a way to tell an abandoned VM from a busy one without asking the orchestrator. It uses a lease, a tag with an expiry time. When a run claims a VM, it tags it with ai-agents:run-id and ai-agents:lease-until, and while the run lives, the orchestrator moves the lease forward every 5 minutes. If the run dies, nobody moves the lease, and soon it lies in the past. That is the whole signal: a VM with a run ID and a lease in the past has no live owner.",
+    "So the handler lists the VMs tagged ai-agents:managed=true, reads their tags, and terminates every one whose lease has passed. The real sweeper has three more rules of the same kind: a VM stopped for over 72 hours, a disk attached to no VM, and a warm-pool VM older than 24 hours, which is replaced so the pool always holds the newest image. All of them work from tags and times only, which is why the sweeper still works on the day the orchestrator does not."
+   ],
+   "code": {
+    "lang": "python",
+    "file": "handler.py (a short version of the sweeper with its main rule)",
+    "text": "import datetime as dt\nimport json\nimport os\n\nimport boto3\n\nec2 = boto3.client(\"ec2\")  # created once per cold start, reused by later calls\nDRY_RUN = os.environ.get(\"DRY_RUN\", \"true\") == \"true\"\nMANAGED = {\"Name\": \"tag:ai-agents:managed\", \"Values\": [\"true\"]}\n\n\ndef handler(event, context):\n    now = dt.datetime.now(dt.UTC)\n    swept = 0\n    for vm in managed_vms():\n        tags = {t[\"Key\"]: t[\"Value\"] for t in vm.get(\"Tags\", [])}\n        lease = tags.get(\"ai-agents:lease-until\")\n        if \"ai-agents:run-id\" in tags and (not lease or dt.datetime.fromisoformat(lease) < now):\n            act(vm[\"InstanceId\"], \"lease expired: no live run owns this VM\")\n            swept += 1\n    return {\"swept\": swept, \"dry_run\": DRY_RUN}\n\n\ndef managed_vms():\n    pages = ec2.get_paginator(\"describe_instances\").paginate(\n        Filters=[MANAGED, {\"Name\": \"instance-state-name\", \"Values\": [\"running\", \"stopped\"]}])\n    return [vm for page in pages for r in page[\"Reservations\"] for vm in r[\"Instances\"]]\n\n\ndef act(instance_id, reason):\n    print(json.dumps({\"action\": \"terminate\", \"id\": instance_id, \"reason\": reason, \"dry_run\": DRY_RUN}))\n    if not DRY_RUN:\n        ec2.terminate_instances(InstanceIds=[instance_id])",
+    "notes": [
+     {
+      "line": 7,
+      "text": "Outside the handler: runs once per cold start, then the client is reused."
+     },
+     {
+      "line": 8,
+      "text": "Dry run unless told otherwise, so a new version only reports what it would do."
+     },
+     {
+      "line": 12,
+      "text": "The handler. event is the schedule's event; the sweeper does not need anything from it."
+     },
+     {
+      "line": 18,
+      "text": "A claimed VM whose lease is missing or in the past: no live run owns it."
+     },
+     {
+      "line": 26,
+      "text": "Only VMs with our tag are ever looked at, never the proxy or anything else in the account."
+     },
+     {
+      "line": 31,
+      "text": "One JSON line per decision. Lambda sends everything printed to CloudWatch Logs."
+     }
     ]
+   }
   },
-  "sections": [
-    {
-      "h": "Python, for this one lesson",
-      "p": [
-        "The platform is TypeScript, but this Lambda is Python. The infrastructure repo builds its Lambdas in Python with uv, and DevOps owns them. G3-22 copies the existing modules/aws-vm-autostop, which already stops dev VMs on a schedule.",
-        "You can read it with TypeScript eyes. def is a function, indentation is the block, and a dict is an object. A list comprehension [x for x in xs] is a map. boto3 is the AWS SDK for Python: boto3.client(\"ec2\") is like new EC2Client({}). p10-1 teaches Python properly later."
-      ],
-      "callout": {
-        "kind": "tip",
-        "text": "Read type hints like TypeScript types: def parse(value: str | None) -> dt.datetime means a function from string-or-None to a datetime. Python does not check them at run time."
-      }
-    },
-    {
-      "h": "The handler and its four rules",
-      "p": [
-        "A Lambda function is code that AWS runs when something calls it. The entry point is the handler: here handler(event, context). Code outside it, such as creating the boto3 clients, runs once per cold start. That is the first call after AWS starts a fresh copy; later calls reuse it.",
-        "The handler looks only at VMs tagged ai-agents:managed=true and applies four rules from G3-22.",
-        "A claimed VM whose lease has passed: terminate. A VM stopped for over 72 hours: terminate, since checkpoints already saved its work. A warm-pool VM older than 24 hours: recycle, so the pool refills from the newest image. A disk that belongs to no VM: delete."
-      ],
-      "because": "We decide from tags alone because the sweeper must work exactly when the orchestrator is broken.",
-      "code": {
-        "lang": "python",
-        "file": "infrastructure/modules/aws-sandbox-sweeper/lambda/handler.py (part 1)",
-        "text": "\"\"\"Sandbox sweeper: every 15 minutes, remove VMs and disks that no live run owns. Based on aws-vm-autostop.\"\"\"\nimport datetime as dt\nimport json\nimport os\nimport re\n\nimport boto3\n\nec2, autoscaling = boto3.client(\"ec2\"), boto3.client(\"autoscaling\")\nDRY_RUN = os.environ.get(\"DRY_RUN\", \"true\") == \"true\"  # start dry, like dev-vm-autostop\nMANAGED = {\"Name\": \"tag:ai-agents:managed\", \"Values\": [\"true\"]}\n\n\ndef handler(event, context):\n    now = dt.datetime.now(dt.UTC)\n    for inst in managed_instances(states=[\"running\", \"stopped\"]):  # tag ai-agents:managed=true only\n        tags = {t[\"Key\"]: t[\"Value\"] for t in inst.get(\"Tags\", [])}\n        if \"ai-agents:run-id\" in tags and parse(tags.get(\"ai-agents:lease-until\")) < now:\n            act(\"terminate\", inst[\"InstanceId\"], \"lease expired: no live run owns this VM\")\n        elif inst[\"State\"][\"Name\"] == \"stopped\" and stopped_since(inst) < now - dt.timedelta(hours=72):\n            act(\"terminate\", inst[\"InstanceId\"], \"stopped for over 72 h; its work is already saved\")\n        elif \"aws:autoscaling:groupName\" in tags and inst[\"LaunchTime\"] < now - dt.timedelta(hours=24):\n            act(\"recycle\", inst[\"InstanceId\"], \"warm VM older than 24 h; the pool refills from the newest image\")\n    for vol in managed_volumes(status=\"available\"):\n        act(\"delete-volume\", vol[\"VolumeId\"], \"orphaned disk\")",
-        "notes": [
-          {
-            "line": 9,
-            "text": "Two AWS clients, made once per cold start. The region comes from the Lambda environment."
-          },
-          {
-            "line": 10,
-            "text": "Dry run unless DRY_RUN is the string 'false'. Environment values are always strings."
-          },
-          {
-            "line": 14,
-            "text": "AWS calls this with the schedule's event. We do not need it or the context."
-          },
-          {
-            "line": 17,
-            "text": "Turns the tag list [{Key, Value}] into a dict, like Object.fromEntries."
-          },
-          {
-            "line": 18,
-            "text": "Rule 1: a claimed VM (it has a run-id) whose lease is in the past. No live run renews it."
-          },
-          {
-            "line": 22,
-            "text": "Rule 3: the ASG adds this tag to its own VMs. Older than 24 h means an old image."
-          },
-          {
-            "line": 24,
-            "text": "Rule 4: 'available' means attached to nothing."
-          }
-        ]
-      }
-    },
-    {
-      "h": "Reading tags and times",
-      "p": [
-        "The helpers keep the handler short. managed_instances and managed_volumes page through results, since one call returns at most a page. parse reads the lease tag; a missing tag counts as expired.",
-        "EC2 has no 'stopped at' field. The time hides in StateTransitionReason, a text like 'User initiated (2026-10-10 08:00:00 GMT)'. If the text has no time, we return now, so the VM looks freshly stopped and is never terminated on a guess."
-      ],
-      "because": "We fail safe on unknown times because terminating a parked VM by mistake loses a person's place in a conversation.",
-      "code": {
-        "lang": "python",
-        "file": "infrastructure/modules/aws-sandbox-sweeper/lambda/handler.py (part 2)",
-        "text": "def managed_instances(states: list[str]) -> list[dict]:\n    pages = ec2.get_paginator(\"describe_instances\").paginate(\n        Filters=[MANAGED, {\"Name\": \"instance-state-name\", \"Values\": states}])\n    return [i for page in pages for r in page[\"Reservations\"] for i in r[\"Instances\"]]\n\n\ndef managed_volumes(status: str) -> list[dict]:\n    pages = ec2.get_paginator(\"describe_volumes\").paginate(Filters=[MANAGED, {\"Name\": \"status\", \"Values\": [status]}])\n    return [v for page in pages for v in page[\"Volumes\"]]\n\n\ndef parse(value: str | None) -> dt.datetime:\n    if not value:  # no lease tag: treat as expired\n        return dt.datetime.min.replace(tzinfo=dt.UTC)\n    return dt.datetime.fromisoformat(value)\n\n\ndef stopped_since(inst: dict) -> dt.datetime:\n    # \"User initiated (2026-10-10 08:00:00 GMT)\": the only place EC2 records when a VM stopped\n    m = re.search(r\"\\((\\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d) GMT\\)\", inst.get(\"StateTransitionReason\", \"\"))\n    if not m:\n        return dt.datetime.now(dt.UTC)  # unknown: never terminate on a guess\n    return dt.datetime.strptime(m.group(1), \"%Y-%m-%d %H:%M:%S\").replace(tzinfo=dt.UTC)",
-        "notes": [
-          {
-            "line": 2,
-            "text": "A paginator follows NextToken for us, like an async iterator over pages."
-          },
-          {
-            "line": 3,
-            "text": "Two filters: our tag, and the states we care about."
-          },
-          {
-            "line": 4,
-            "text": "A nested list comprehension: every instance of every reservation of every page."
-          },
-          {
-            "line": 14,
-            "text": "No lease tag at all: treat it as expired, the oldest possible time."
-          },
-          {
-            "line": 20,
-            "text": "A regular expression pulls the date out of the reason text."
-          },
-          {
-            "line": 22,
-            "text": "Unknown: return now, so the 72-hour rule cannot fire."
-          }
-        ]
-      }
-    },
-    {
-      "h": "act(): log first, dry run at first",
-      "p": [
-        "act prints one JSON line for every decision, then acts unless DRY_RUN is on. Lambda sends stdout to CloudWatch Logs, so each line is searchable later. G3-22 starts with dry_run true, like dev-vm-autostop: read a few days of lines, then switch it off.",
-        "recycle uses the Auto Scaling call with ShouldDecrementDesiredCapacity=False. The group sees a VM gone and launches a new one from the current template, which reads the newest image ID (p3-3)."
-      ],
-      "because": "We log before we act because a cleanup job that deletes silently is impossible to trust or debug.",
-      "code": {
-        "lang": "python",
-        "file": "infrastructure/modules/aws-sandbox-sweeper/lambda/handler.py (part 3)",
-        "text": "def act(action: str, resource_id: str, reason: str) -> None:\n    print(json.dumps({\"action\": action, \"id\": resource_id, \"reason\": reason, \"dry_run\": DRY_RUN}))\n    if DRY_RUN:\n        return\n    if action == \"terminate\":\n        ec2.terminate_instances(InstanceIds=[resource_id])\n    elif action == \"recycle\":\n        autoscaling.terminate_instance_in_auto_scaling_group(InstanceId=resource_id, ShouldDecrementDesiredCapacity=False)\n    else:\n        ec2.delete_volume(VolumeId=resource_id)",
-        "notes": [
-          {
-            "line": 2,
-            "text": "One JSON line per action: what, which resource, why, and whether it was real."
-          },
-          {
-            "line": 3,
-            "text": "In dry run we stop here: decisions are visible, nothing changes."
-          },
-          {
-            "line": 8,
-            "text": "Terminate inside the group without lowering its count, so the pool refills."
-          },
-          {
-            "line": 10,
-            "text": "Only reached for 'delete-volume'."
-          }
-        ]
-      }
-    },
-    {
-      "h": "A role that can touch only our tags",
-      "p": [
-        "A Lambda runs as its execution role. G3-22 lets that role terminate VMs and delete volumes only when the resource carries ai-agents:managed=true, and recycle only in the sandbox groups. Describe calls cannot be limited by resource, so they take '*'.",
-        "If a bug made the code pick a VM without our tag, AWS would refuse the call. The role is the wall; the code is the guidance."
-      ],
-      "because": "We put the tag check in IAM as well as in code, because code has bugs and a deploy cannot change IAM.",
-      "code": {
-        "lang": "json",
-        "file": "the sweeper's execution role (G3-22, sketch)",
-        "text": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    { \"Effect\": \"Allow\", \"Action\": [\"ec2:DescribeInstances\", \"ec2:DescribeVolumes\"], \"Resource\": \"*\" },\n    { \"Effect\": \"Allow\", \"Action\": [\"ec2:TerminateInstances\", \"ec2:DeleteVolume\"],\n      \"Resource\": [\"arn:aws:ec2:us-east-1:<AI_AGENTS_ACCOUNT_ID>:instance/*\",\n                   \"arn:aws:ec2:us-east-1:<AI_AGENTS_ACCOUNT_ID>:volume/*\"],\n      \"Condition\": { \"StringEquals\": { \"aws:ResourceTag/ai-agents:managed\": \"true\" } } },\n    { \"Effect\": \"Allow\", \"Action\": \"autoscaling:TerminateInstanceInAutoScalingGroup\",\n      \"Resource\": \"arn:aws:autoscaling:us-east-1:<AI_AGENTS_ACCOUNT_ID>:autoScalingGroup:*:autoScalingGroupName/ai-agents-sandbox-*\" },\n    { \"Effect\": \"Allow\", \"Action\": [\"logs:CreateLogStream\", \"logs:PutLogEvents\", \"cloudwatch:PutMetricData\"], \"Resource\": \"*\" }\n  ]\n}",
-        "notes": [
-          {
-            "line": 4,
-            "text": "Reading is harmless and has no resource-level control."
-          },
-          {
-            "line": 5,
-            "text": "The two destructive actions..."
-          },
-          {
-            "line": 8,
-            "text": "...only on resources whose tag says they are ours."
-          },
-          {
-            "line": 9,
-            "text": "Recycling only inside the sandbox groups."
-          },
-          {
-            "line": 11,
-            "text": "Writing its log lines and the metrics. Narrow the log resource to its log group in the module."
-          }
-        ]
-      }
-    },
-    {
-      "h": "A schedule, leases, and metrics",
-      "p": [
-        "An EventBridge rule with the schedule rate(15 minutes) calls the function. The function is not attached to the VPC, so it needs no endpoints; it calls the EC2 API like any client.",
-        "A live run keeps its VM safe with the lease tag. workInSandbox renews ai-agents:lease-until every 5 minutes, two hours ahead (G3-20). A parked VM gets now + 73 hours. If the orchestrator dies, leases stop moving and the sweeper cleans up within 15 minutes of expiry.",
-        "G3-22 also publishes CloudWatch metrics in the namespace AIAgents/Sweeper: OrphansTerminated and VolumesDeleted. G3-34 alerts on them: a sudden rise in orphans means runs are dying without releasing their VMs."
-      ],
-      "because": "We wire the schedule with three CLI calls here so the Terraform in the module reads as the same three things.",
-      "code": {
-        "lang": "bash",
-        "file": "the schedule's shape (the module does this in Terraform)",
-        "text": "aws events put-rule --name ai-agents-sandbox-sweeper --schedule-expression \"rate(15 minutes)\"\naws lambda add-permission --function-name ai-agents-sandbox-sweeper --statement-id every-15-minutes \\\n  --action lambda:InvokeFunction --principal events.amazonaws.com --source-arn \"$RULE_ARN\"\naws events put-targets --rule ai-agents-sandbox-sweeper --targets \"Id=sweeper,Arn=$FUNCTION_ARN\"",
-        "notes": [
-          {
-            "line": 1,
-            "text": "The rule: a timer, no event pattern. 'rate(15 minutes)' is EventBridge's syntax."
-          },
-          {
-            "line": 2,
-            "text": "The function's own policy: EventBridge, from this rule only, may invoke it."
-          },
-          {
-            "line": 4,
-            "text": "The target: what the rule calls when it fires."
-          }
-        ]
-      }
-    },
-    {
-      "h": "Test it without AWS: the fixture",
-      "p": [
-        "moto also works inside Python, with no server. mock_aws() swaps every boto3 call for an in-memory AWS while the block runs. A pytest fixture is like a beforeEach that hands a value to the test.",
-        "One trap: handler.py creates its clients when it is imported. So the fixture imports and reloads it inside mock_aws, after setting the region and DRY_RUN."
-      ],
-      "because": "We test against moto because a cleanup job is exactly the code you cannot try out on the real account.",
-      "code": {
-        "lang": "python",
-        "file": "~/academy/sweeper/test_handler.py (part 1)",
-        "text": "import datetime as dt\nimport importlib\n\nimport boto3\nimport pytest\nfrom moto import mock_aws\n\nPAST = (dt.datetime.now(dt.UTC) - dt.timedelta(minutes=5)).isoformat()\nFUTURE = (dt.datetime.now(dt.UTC) + dt.timedelta(hours=2)).isoformat()\n\n\n@pytest.fixture\ndef aws(monkeypatch):\n    monkeypatch.setenv(\"AWS_DEFAULT_REGION\", \"us-east-1\")\n    monkeypatch.setenv(\"DRY_RUN\", \"false\")\n    with mock_aws():\n        import handler\n        importlib.reload(handler)  # build its boto3 clients inside the fake AWS\n        yield boto3.client(\"ec2\"), handler\n\n\ndef launch(ec2, tags: dict[str, str]) -> str:\n    spec = [{\"ResourceType\": \"instance\", \"Tags\": [{\"Key\": k, \"Value\": v} for k, v in tags.items()]}]\n    reply = ec2.run_instances(ImageId=\"ami-03cf127a\", MinCount=1, MaxCount=1, TagSpecifications=spec)\n    return reply[\"Instances\"][0][\"InstanceId\"]",
-        "notes": [
-          {
-            "line": 8,
-            "text": "A lease five minutes in the past, and one two hours ahead."
-          },
-          {
-            "line": 12,
-            "text": "A fixture: pytest calls it and passes what it yields to each test that names it."
-          },
-          {
-            "line": 15,
-            "text": "Dry run off, so we can see real terminations."
-          },
-          {
-            "line": 16,
-            "text": "Inside this block every boto3 call goes to moto's in-memory AWS."
-          },
-          {
-            "line": 18,
-            "text": "Reload, so the module-level clients are created inside the fake."
-          },
-          {
-            "line": 22,
-            "text": "Starts one VM with the given tags and returns its ID."
-          }
-        ]
-      }
-    },
-    {
-      "h": "Test it without AWS: the case",
-      "p": [
-        "The test starts three VMs. One is an orphan with an old lease, one a live run with a fresh lease, one a stranger without our tag. After one sweep, only the orphan is gone.",
-        "The stranger matters most. It proves the sweeper ignores anything that is not ours, even with an expired lease."
-      ],
-      "because": "We assert on what must survive too, because a sweeper's worst bug is deleting the wrong thing.",
-      "code": {
-        "lang": "python",
-        "file": "~/academy/sweeper/test_handler.py (part 2)",
-        "text": "def state(ec2, instance_id: str) -> str:\n    return ec2.describe_instances(InstanceIds=[instance_id])[\"Reservations\"][0][\"Instances\"][0][\"State\"][\"Name\"]\n\n\ndef test_expired_lease_is_terminated_and_live_run_is_kept(aws):\n    ec2, handler = aws\n    orphan = launch(ec2, {\"ai-agents:managed\": \"true\", \"ai-agents:run-id\": \"run-1\", \"ai-agents:lease-until\": PAST})\n    live = launch(ec2, {\"ai-agents:managed\": \"true\", \"ai-agents:run-id\": \"run-2\", \"ai-agents:lease-until\": FUTURE})\n    stranger = launch(ec2, {\"ai-agents:run-id\": \"run-3\", \"ai-agents:lease-until\": PAST})  # not managed: not ours\n\n    handler.handler({}, None)\n\n    assert state(ec2, orphan) == \"terminated\"\n    assert state(ec2, live) == \"running\"\n    assert state(ec2, stranger) == \"running\"",
-        "notes": [
-          {
-            "line": 2,
-            "text": "Reads one VM's state: running, stopped or terminated."
-          },
-          {
-            "line": 7,
-            "text": "Ours, with a lease five minutes in the past."
-          },
-          {
-            "line": 9,
-            "text": "Not ours: no ai-agents:managed tag."
-          },
-          {
-            "line": 11,
-            "text": "One sweep, exactly as the schedule would call it."
-          },
-          {
-            "line": 15,
-            "text": "The stranger survives, expired lease or not."
-          }
-        ]
-      }
-    }
+  {
+   "h": "Dry run first, and a role that only reaches our tags",
+   "p": [
+    "A tool that destroys machines should prove itself before it destroys anything. The sweeper starts with DRY_RUN on, so for the first days it only prints the JSON line for each machine it would terminate. A person reads those lines in the logs, and only then is dry run switched off.",
+    "The tag filter in the code is guidance: a good rule that a bug could break. The wall is the execution role. Its policy allows ec2:TerminateInstances only on instances that carry the tag ai-agents:managed=true, the condition you wrote in the IAM lesson. If a bug made the code pick the proxy, AWS would refuse the call, whatever the code says."
+   ],
+   "deeper": {
+    "h": "Go deeper: wiring the schedule, and the numbers it reports",
+    "p": [
+     "Three AWS calls connect the schedule to the function, and the infrastructure module makes them in Terraform: events put-rule with the schedule expression, lambda add-permission so the EventBridge service may invoke the function (a resource policy on the function, the mirror image of a trust policy), and events put-targets, which names the function as the rule's target. The function is not placed in the sandbox VPC, so it reaches the EC2 API like any client and needs no endpoints.",
+     "Each sweep also publishes CloudWatch metrics in the namespace AIAgents/Sweeper, such as OrphansTerminated and VolumesDeleted, and an alert watches them. A sudden rise in orphans means runs are dying without giving their VMs back, which is a bug to look for, not just a mess to clean."
+    ]
+   }
+  }
+ ],
+ "lab": {
+  "id": "p3-7",
+  "title": "Run the sweeper as a real Lambda on your laptop",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "Docker Desktop running (about 820 MB for the official Lambda Python image)",
+   "AWS CLI v2 and the LocalStack image from the p3-1 lab"
   ],
-  "lab": {
-    "title": "Test the sweeper against a fake EC2",
-    "youNeed": [
-      "uv (it installs Python 3.13 for you)",
-      "no Docker and no AWS account"
-    ],
-    "worked": [
-      {
-        "do": "mkdir -p ~/academy/sweeper && cd ~/academy/sweeper && uv init --bare --python 3.13 && uv add boto3 'moto[ec2,autoscaling]' pytest",
-        "see": "Resolved 28 packages in 1.1s\nInstalled 27 packages in 120ms\n(output trimmed; counts may differ)"
-      },
-      {
-        "do": "Save handler.py: parts 1, 2 and 3 in order, with two blank lines between parts",
-        "see": "a 62-line handler.py"
-      },
-      {
-        "do": "Save test_handler.py: parts 1 and 2 in order. Then: uv run pytest -q",
-        "see": ".                                                                        [100%]\n1 passed in 9.56s"
-      },
-      {
-        "do": "uv run pytest -q -s",
-        "see": "{\"action\": \"terminate\", \"id\": \"i-d73e9efd12a02c13a\", \"reason\": \"lease expired: no live run owns this VM\", \"dry_run\": false}\n.\n1 passed in 1.62s"
-      },
-      {
-        "do": "In the fixture, change DRY_RUN to \"true\" and run uv run pytest -q again",
-        "see": ">       assert state(ec2, orphan) == \"terminated\"\nE       AssertionError: assert 'running' == 'terminated'\n1 failed in 5.72s"
-      },
-      {
-        "do": "Put DRY_RUN back to \"false\" and run the tests once more",
-        "see": "1 passed"
-      }
-    ],
-    "faded": "Add test_long_stopped: launch a managed VM with no run-id, stop it with ec2.stop_instances, and run the handler. moto records the stop as now, so the 72-hour rule does not fire yet. Left to you: make the VM look old. Use monkeypatch.setattr(handler, \"stopped_since\", ...) with a lambda that returns 73 hours ago, then assert the VM is terminated.",
-    "alone": "Write test_orphaned_volumes. Create a 10 GiB volume tagged ai-agents:managed=true and one with no tags. Use ec2.create_volume with AvailabilityZone us-east-1a and TagSpecifications for the volume. Run the handler. Assert the tagged volume is gone from describe_volumes and the untagged one is still there.",
-    "done": "Three tests pass, the -s run prints one JSON line per action, and with DRY_RUN on the orphan survives."
+  "goal": "Run the sweeper in AWS's own Lambda image against three pretend VMs, see a cold and a warm start, and watch it terminate only the VM whose lease has passed.",
+  "guess": {
+   "q": "Three VMs: an orphan with our tag and a lease that passed 10 minutes ago, a live run with a lease 2 hours ahead, and the proxy, without our tag but with an old lease. The sweeper runs for real. Which VMs are terminated?",
+   "options": [
+    {
+     "text": "The orphan and the proxy, because both leases have passed.",
+     "correct": false,
+     "why": "The sweeper only looks at VMs tagged ai-agents:managed=true, and its role could not terminate the proxy anyway."
+    },
+    {
+     "text": "Only the orphan.",
+     "correct": true,
+     "why": "It is the only VM that is ours and has no live owner. The live run's lease is in the future, and the proxy is not ours."
+    },
+    {
+     "text": "None, because the orchestrator must confirm each one first.",
+     "correct": false,
+     "why": "The sweeper deliberately needs nothing from the orchestrator, so it still works when the orchestrator is down."
+    }
+   ]
   },
-  "quiz": [
-    {
-      "q": "Why does the sweeper decide from tags, not by asking Temporal which runs are alive?",
-      "options": [
-        {
-          "text": "Lambda cannot make HTTP calls to services on inf",
-          "correct": false,
-          "why": "It could, with networking set up. The reason is independence."
-        },
-        {
-          "text": "So it still cleans up when the orchestrator is down or a run crashed",
-          "correct": true,
-          "why": "Tags and leases live on the VM; they need nothing else to be working."
-        },
-        {
-          "text": "Temporal has no API to list running workflows",
-          "correct": false,
-          "why": "It has one. We avoid depending on it on purpose."
-        }
-      ]
-    },
-    {
-      "q": "Why does recycling a warm VM use ShouldDecrementDesiredCapacity=False?",
-      "options": [
-        {
-          "text": "Warm pools refuse calls that decrement",
-          "correct": false,
-          "why": "Decrementing is allowed; it would shrink the count."
-        },
-        {
-          "text": "So the VM is stopped instead of terminated",
-          "correct": false,
-          "why": "The call terminates the VM either way."
-        },
-        {
-          "text": "The group launches a replacement from the current template and newest image, so the pool keeps its size",
-          "correct": true,
-          "why": "That is how the pool tracks the newest image within a day."
-        }
-      ]
-    },
-    {
-      "q": "The role allows ec2:TerminateInstances only with aws:ResourceTag/ai-agents:managed=true. A bug makes the code terminate an untagged VM. What happens?",
-      "options": [
-        {
-          "text": "AWS refuses the call; the role is the wall, not the code",
-          "correct": true,
-          "why": "The condition is checked by IAM on every call, whatever the code believes."
-        },
-        {
-          "text": "The VM is terminated; conditions are only logged",
-          "correct": false,
-          "why": "IAM conditions are enforced, not advisory."
-        },
-        {
-          "text": "Lambda retries the call until it succeeds",
-          "correct": false,
-          "why": "An AccessDenied is not retried into success."
-        }
-      ]
-    }
+  "follow": [
+   {
+    "say": "Start LocalStack if it is not running from an earlier lab, and point the AWS CLI at it in a new folder.",
+    "do": "docker run --rm -d --name localstack -p 4566:4566 localstack/localstack:4.9 && sleep 15\nmkdir -p ~/academy-labs/p3-7 && cd ~/academy-labs/p3-7 && export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:4566",
+    "see": "(a container ID, or a name conflict if LocalStack is already running, which is fine)"
+   },
+   {
+    "say": "Launch three pretend VMs: an orphan whose lease passed 10 minutes ago, a live run with a lease 2 hours ahead, and the proxy, which is not ours.",
+    "do": "PAST=$(date -u -v-10M +%Y-%m-%dT%H:%M:%S+00:00); FUTURE=$(date -u -v+2H +%Y-%m-%dT%H:%M:%S+00:00)\nlaunch() { aws ec2 run-instances --image-id ami-03cf127a --instance-type m8i.xlarge --tag-specifications \"ResourceType=instance,Tags=[$1]\" --query 'Instances[0].InstanceId' --output text; }\nlaunch \"{Key=Name,Value=orphan},{Key=ai-agents:managed,Value=true},{Key=ai-agents:run-id,Value=nova-RH-1230},{Key=ai-agents:lease-until,Value=$PAST}\"\nlaunch \"{Key=Name,Value=live},{Key=ai-agents:managed,Value=true},{Key=ai-agents:run-id,Value=nova-RH-1234},{Key=ai-agents:lease-until,Value=$FUTURE}\"\nlaunch \"{Key=Name,Value=proxy},{Key=ai-agents:run-id,Value=nova-RH-1229},{Key=ai-agents:lease-until,Value=$PAST}\"",
+    "see": "i-b15cf3a235585fd90\ni-a324be5c1123c9100\ni-e7698d47f6c8506c3\n(your IDs are different)"
+   },
+   {
+    "say": "Save the sweeper from Understand. Then start it in AWS's official Lambda image for Python, which contains the same runtime as real Lambda plus a small emulator that accepts invocations on port 8080. Dry run is on.",
+    "do": "Save handler.py from Understand, then:\ndocker run -d --rm --name sweeper -p 9000:8080 -v \"$PWD:/var/task:ro\" -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test -e AWS_DEFAULT_REGION=us-east-1 -e AWS_ENDPOINT_URL=http://host.docker.internal:4566 -e DRY_RUN=true public.ecr.aws/lambda/python:3.13 handler.handler",
+    "see": "(a container ID; the first time, Docker also downloads the image)"
+   },
+   {
+    "say": "Invoke it the way the EventBridge schedule would, with a scheduled event, then read its log.",
+    "do": "curl -s -X POST http://localhost:9000/2015-03-31/functions/function/invocations -d '{\"source\": \"aws.events\", \"detail-type\": \"Scheduled Event\"}'; echo\ndocker logs sweeper 2>&1 | grep -E 'action|REPORT'",
+    "see": "{\"swept\": 1, \"dry_run\": true}\n{\"action\": \"terminate\", \"id\": \"i-b15cf3a235585fd90\", \"reason\": \"lease expired: no live run owns this VM\", \"dry_run\": true}\nREPORT RequestId: 813fed0a-c704-4717-839c-6190a83d0e60\tInit Duration: 0.03 ms\tDuration: 197.89 ms\tBilled Duration: 198 ms\t…"
+   },
+   {
+    "say": "Invoke it again at once. This time the warm copy is reused: Python, boto3 and the EC2 client are already loaded.",
+    "do": "curl -s -X POST http://localhost:9000/2015-03-31/functions/function/invocations -d '{\"source\": \"aws.events\", \"detail-type\": \"Scheduled Event\"}'; echo\ndocker logs sweeper 2>&1 | grep REPORT | tail -1",
+    "see": "{\"swept\": 1, \"dry_run\": true}\nREPORT RequestId: 5d7c55fa-f2f0-4cad-84f8-692701760747\tDuration: 6.22 ms\tBilled Duration: 7 ms\t…"
+   },
+   {
+    "say": "Dry run changed nothing, so all three VMs still run. Read the log, agree with it, then restart the function with dry run off and invoke it once more.",
+    "do": "aws ec2 describe-instances --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value, State.Name]' --output text\ndocker rm -f sweeper && docker run -d --rm --name sweeper -p 9000:8080 -v \"$PWD:/var/task:ro\" -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test -e AWS_DEFAULT_REGION=us-east-1 -e AWS_ENDPOINT_URL=http://host.docker.internal:4566 -e DRY_RUN=false public.ecr.aws/lambda/python:3.13 handler.handler\nsleep 3 && curl -s -X POST http://localhost:9000/2015-03-31/functions/function/invocations -d '{\"source\": \"aws.events\", \"detail-type\": \"Scheduled Event\"}'; echo\naws ec2 describe-instances --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value, State.Name]' --output text",
+    "see": "orphan\trunning\nlive\trunning\nproxy\trunning\n…\n{\"swept\": 1, \"dry_run\": false}\norphan\tterminated\nlive\trunning\nproxy\trunning"
+   }
   ],
-  "recall": [
-    "From p3-4: which tags does a claimed VM get, and what renews the lease?",
-    "From p3-1: what is the difference between a role's trust policy and its permission policy?"
+  "build": "Add the orphaned-disk rule. A disk (an EBS volume) that belongs to a finished run and is attached to no VM shows the status available. Add a function that lists volumes tagged ai-agents:managed=true with the status available, and make the handler delete each one through the same act() logging, so a dry run reports it first. Create two test disks in LocalStack, one tagged and one not (aws ec2 create-volume --availability-zone us-east-1a --size 120, with --tag-specifications for the tagged one), restart the function with dry run off, invoke it, and run aws ec2 describe-volumes to confirm that only the tagged disk is gone.",
+  "checks": [
+   "The dry-run invocation returns {\"swept\": 1, \"dry_run\": true} and logs one terminate line, for the orphan.",
+   "The second invocation's REPORT shows a much shorter duration than the first: a warm start.",
+   "After the real run, the orphan is terminated and the live VM and the proxy still run.",
+   "Your new rule deletes the tagged available disk and leaves the untagged one.",
+   "You stopped the function (docker stop sweeper) and LocalStack (docker stop localstack)."
   ],
-  "videos": [],
-  "words": [
+  "solution": {
+   "lang": "python",
+   "file": "handler.py (with the orphaned-disk rule)",
+   "text": "\"\"\"Sandbox sweeper: every 15 minutes, remove sandbox VMs and disks that no live run owns.\"\"\"\nimport datetime as dt\nimport json\nimport os\n\nimport boto3\n\nec2 = boto3.client(\"ec2\")\nDRY_RUN = os.environ.get(\"DRY_RUN\", \"true\") == \"true\"\nMANAGED = {\"Name\": \"tag:ai-agents:managed\", \"Values\": [\"true\"]}\n\n\ndef handler(event, context):\n    now = dt.datetime.now(dt.UTC)\n    swept = 0\n    for vm in managed_vms():\n        tags = {t[\"Key\"]: t[\"Value\"] for t in vm.get(\"Tags\", [])}\n        lease = tags.get(\"ai-agents:lease-until\")\n        if \"ai-agents:run-id\" in tags and (not lease or dt.datetime.fromisoformat(lease) < now):\n            act(\"terminate\", vm[\"InstanceId\"], \"lease expired: no live run owns this VM\")\n            swept += 1\n    for disk in orphan_disks():\n        act(\"delete-volume\", disk[\"VolumeId\"], \"disk attached to no VM\")\n        swept += 1\n    return {\"swept\": swept, \"dry_run\": DRY_RUN}\n\n\ndef managed_vms():\n    pages = ec2.get_paginator(\"describe_instances\").paginate(\n        Filters=[MANAGED, {\"Name\": \"instance-state-name\", \"Values\": [\"running\", \"stopped\"]}])\n    return [vm for page in pages for r in page[\"Reservations\"] for vm in r[\"Instances\"]]\n\n\ndef orphan_disks():\n    pages = ec2.get_paginator(\"describe_volumes\").paginate(\n        Filters=[MANAGED, {\"Name\": \"status\", \"Values\": [\"available\"]}])\n    return [disk for page in pages for disk in page[\"Volumes\"]]\n\n\ndef act(action, resource_id, reason):\n    print(json.dumps({\"action\": action, \"id\": resource_id, \"reason\": reason, \"dry_run\": DRY_RUN}))\n    if DRY_RUN:\n        return\n    if action == \"terminate\":\n        ec2.terminate_instances(InstanceIds=[resource_id])\n    else:\n        ec2.delete_volume(VolumeId=resource_id)\n\n# Test disks, then run the sweeper again with DRY_RUN=false:\n#   aws ec2 create-volume --availability-zone us-east-1a --size 120 \\\n#     --tag-specifications 'ResourceType=volume,Tags=[{Key=ai-agents:managed,Value=true}]'\n#   aws ec2 create-volume --availability-zone us-east-1a --size 8\n# Afterwards describe-volumes no longer lists the tagged 120 GiB disk; the untagged one stays."
+  },
+  "fix": "A teammate removed MANAGED from the instance filter \"to catch more orphans\". Make the same change, so the filter is only [{\"Name\": \"instance-state-name\", ...}], and launch a fresh proxy-like VM with an old lease (the third launch line from step 2). Restart the function with DRY_RUN=true and invoke it: the log now plans to terminate the proxy. Put the filter back. Then answer: if this version had run with dry run off in the real account, what would have stopped it, and why do we still want the filter in the code?",
+  "explain": [
+   "Why does the sweeper decide from tags and lease times instead of asking the orchestrator which runs are alive?",
+   "What runs during a cold start that does not run on a warm call, and why does the EC2 client sit outside the handler?",
+   "The code filters on ai-agents:managed=true and so does the execution role's condition. Which one is the wall, and what is the other one for?"
+  ],
+  "done": "The sweeper's dry run reports only the orphan, the real run terminates only the orphan, your disk rule deletes only the tagged disk, and nothing is left running."
+ },
+ "check": [
+  {
+   "q": "The orchestrator has been down for an hour. What does the sweeper do with the VMs of runs that were in flight?",
+   "options": [
     {
-      "term": "Lambda function",
-      "plain": "Code AWS runs when something calls it, with no server to manage; do not count on memory between calls."
+     "text": "Nothing, because it waits for the orchestrator to say which runs are alive",
+     "correct": false,
+     "why": "The sweeper never asks the orchestrator. It works from tags so it can work when the orchestrator cannot."
     },
     {
-      "term": "handler",
-      "plain": "The function AWS calls, here handler(event, context)."
+     "text": "It terminates every running VM to be safe",
+     "correct": false,
+     "why": "It terminates only VMs whose lease has passed. A VM with a lease in the future is left alone."
     },
     {
-      "term": "EventBridge schedule",
-      "plain": "A rule such as rate(15 minutes) that invokes a target on a timer."
-    },
-    {
-      "term": "execution role",
-      "plain": "The IAM role a Lambda runs as; its policies are all the function may do."
-    },
-    {
-      "term": "dry run",
-      "plain": "Log every decision but change nothing; how a cleanup job starts."
-    },
-    {
-      "term": "lease tag",
-      "plain": "ai-agents:lease-until, a time a live run keeps pushing forward; past it, the VM is fair game."
-    },
-    {
-      "term": "moto",
-      "plain": "A Python library and server that fakes AWS in memory, for tests and labs."
+     "text": "Their leases stop moving, and once a lease passes, the sweeper terminates that VM on its next 15-minute run",
+     "correct": true,
+     "why": "The lease is the only signal it needs: no one moving it forward means no live owner."
     }
+   ]
+  },
+  {
+   "q": "Why does the sweeper create its EC2 client outside the handler?",
+   "options": [
+    {
+     "text": "Because code outside the handler runs once per cold start, and warm calls reuse the client",
+     "correct": true,
+     "why": "Setup that is the same for every call belongs outside, so warm calls skip it. The handler itself must not depend on earlier calls."
+    },
+    {
+     "text": "Because the handler is not allowed to create AWS clients",
+     "correct": false,
+     "why": "It could, but then every call would pay for it again."
+    },
+    {
+     "text": "Because the client keeps the list of VMs from the last run",
+     "correct": false,
+     "why": "Nothing from an earlier call can be trusted to be there; each sweep lists the VMs again."
+    }
+   ]
+  },
+  {
+   "q": "A bug makes the sweeper try to terminate the egress proxy, which has no ai-agents:managed tag. What happens with our setup?",
+   "options": [
+    {
+     "text": "The proxy is terminated, because the sweeper's role can terminate instances",
+     "correct": false,
+     "why": "The role can terminate instances only when they carry ai-agents:managed=true."
+    },
+    {
+     "text": "AWS refuses the call, because the execution role's condition requires our tag",
+     "correct": true,
+     "why": "The code's filter is guidance that a bug can break; the role's condition is the wall that holds anyway."
+    },
+    {
+     "text": "Lambda refuses to run code with bugs",
+     "correct": false,
+     "why": "Lambda runs whatever you deploy. Safety comes from the role, not from the runtime."
+    }
+   ]
+  }
+ ],
+ "platform": {
+  "p": [
+   "The sweeper is a module in the infrastructure repo, copied from the existing Lambda that stops developers' VMs on a schedule: a Python Lambda on an EventBridge schedule of rate(15 minutes), not attached to any VPC, with an execution role that can terminate instances and delete volumes only when they carry ai-agents:managed=true. It starts with dry run on and logs one JSON line per action.",
+   "Its rules: a claimed VM whose lease has passed, a VM stopped for over 72 hours, an orphaned disk, and a warm-pool VM older than 24 hours. The orchestrator renews each claimed VM's lease every 5 minutes, and a parked VM gets a lease of 73 hours. The sweeper's metrics feed the platform's alerts, and the account's vCPU quotas are the final limit behind it."
   ],
   "tickets": [
-    {
-      "key": "G3-22",
-      "why": "The sweeper Lambda: four tag rules, dry run first, a tag-scoped role, metrics AIAgents/Sweeper."
-    },
-    {
-      "key": "G3-34",
-      "why": "Alerts read the sweeper's metrics: a rise in orphans means runs die without releasing VMs."
-    }
-  ],
-  "remember": "The sweeper trusts only tags: an expired lease, too old, or no owner means gone, and its role can touch nothing else."
+   {
+    "key": "G3-22",
+    "why": "The sweeper Lambda: its rules, the dry run, the tag-scoped role and the AIAgents/Sweeper metrics."
+   },
+   {
+    "key": "G3-20",
+    "why": "Renews the lease while a run lives, and sets the 73-hour lease on a parked VM."
+   },
+   {
+    "key": "G3-34",
+    "why": "The alerts that read the sweeper's metrics."
+   }
+  ]
+ },
+ "words": [
+  {
+   "term": "Lambda function",
+   "plain": "Code that AWS runs when an event arrives, on servers you never see; you pay for the milliseconds it runs."
+  },
+  {
+   "term": "handler",
+   "plain": "The function AWS calls for each event, such as handler(event, context)."
+  },
+  {
+   "term": "cold start",
+   "plain": "The first call to a fresh copy of the function, which also runs the code outside the handler; later warm calls skip it."
+  },
+  {
+   "term": "execution role",
+   "plain": "The IAM role a Lambda function wears; it decides everything the function can do."
+  },
+  {
+   "term": "EventBridge schedule",
+   "plain": "A rule that sends an event on a timetable, such as rate(15 minutes), to a target like a Lambda function."
+  },
+  {
+   "term": "lease",
+   "plain": "A tag with an expiry time that a live run keeps moving forward; a lease in the past means no live owner."
+  }
+ ],
+ "review": [
+  {
+   "q": "Name the three things a Lambda function needs, using the sweeper as the example.",
+   "a": "A handler (handler(event, context) in handler.py), a trigger (an EventBridge schedule, rate(15 minutes)) and an execution role (terminate only instances tagged ai-agents:managed=true)."
+  },
+  {
+   "q": "Explain how a lease lets the sweeper find abandoned VMs without asking the orchestrator.",
+   "a": "A claimed VM carries ai-agents:lease-until, which the orchestrator moves forward every 5 minutes while the run lives. If the run dies, the lease stops moving and passes, and the sweeper terminates any of our VMs with a run ID and a lease in the past."
+  },
+  {
+   "q": "Why does a new sweeper version start with DRY_RUN on?",
+   "a": "A tool that destroys machines should first show what it would do. People read its JSON lines in the logs, and only then is dry run turned off."
+  }
+ ],
+ "remember": "A Lambda is a handler, a trigger and a role: the sweeper runs every 15 minutes, terminates our VMs whose lease has passed, and its role makes sure it can touch nothing else."
 }

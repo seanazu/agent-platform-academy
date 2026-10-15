@@ -1,462 +1,332 @@
 {
+ "v": 2,
  "id": "p5-2",
  "title": "Helm releases through Terraform",
- "minutes": 50,
+ "minutes": 60,
  "youNeed": [
   "p5-1",
   "p4-2"
  ],
- "bridge": "A Helm chart is like an npm package of YAML templates, and its values are the props you pass in. A `helm_release` in Terraform is like adding that package to package.json. Except Terraform state remembers the release, and apply changes real pods on inf, so a person runs apply, never an agent.",
- "intro": "On inf-rhinohealth nothing is deployed by hand or by Argo CD. Each tool is a Terraform unit in the infrastructure repo that installs a Helm chart. n8n is the pattern; the agents' Temporal (G3-06), the gateway (G0-15), the broker (G3-17) and the brain bot (G6-22) copy it. This lesson shows the pattern end to end, from a chart on your laptop to a plan pasted into a PR.",
- "picture": {
-  "caption": "A unit feeds a module; the module renders a chart and asks the cluster for it; a person applies.",
-  "nodes": [
-   {
-    "id": "unit",
-    "label": "unit: ai-agents/temporal/repository/terragrunt.hcl",
-    "kind": "file"
-   },
-   {
-    "id": "mod",
-    "label": "modules/ai-agents-temporal/main.tf",
-    "kind": "file"
-   },
-   {
-    "id": "person",
-    "label": "DevOps on VPN: tofu plan, then apply",
-    "kind": "person"
-   },
-   {
-    "id": "chart",
-    "label": "chart temporal 1.5.0 (go.temporal.io)",
-    "kind": "cloud"
-   },
-   {
-    "id": "api",
-    "label": "inf control plane",
-    "kind": "service"
-   },
-   {
-    "id": "rds",
-    "label": "RDS Postgres (unit rds)",
-    "kind": "cloud"
-   },
-   {
-    "id": "secret",
-    "label": "ExternalSecret → Secret temporal-db",
-    "kind": "service"
-   }
+ "map": "temporal",
+ "hook": {
+  "story": [
+   "A bug in the broker made Nova's pushes fail now and then, and the fix is merged. The new image is built and waiting in the registry. It is late, so a teammate runs kubectl set image on inf to put the new image on the broker directly. It works, the errors stop, and everybody goes home.",
+   "Two weeks later, someone changes the broker's replica count the normal way, through the infrastructure repo, and a person applies it. The plan for that change said nothing about images. But after the apply the broker is running the old image again, the push errors are back, and nobody can see why, because the only record of the new image was a command typed in a terminal two weeks ago."
   ],
-  "steps": [
-   {
-    "from": "unit",
-    "to": "mod",
-    "text": "passes inputs: namespace, vault_path, db_endpoint"
-   },
-   {
-    "from": "person",
-    "to": "mod",
-    "text": "tofu plan shows: + helm_release.temporal, + ExternalSecret"
-   },
-   {
-    "from": "mod",
-    "to": "chart",
-    "text": "on apply, Helm fetches version 1.5.0 and renders it with our values"
-   },
-   {
-    "from": "mod",
-    "to": "secret",
-    "text": "the ExternalSecret is created first (depends_on)"
-   },
-   {
-    "from": "secret",
-    "to": "api",
-    "text": "External Secrets writes Secret temporal-db from Vault"
-   },
-   {
-    "from": "api",
-    "to": "rds",
-    "text": "Temporal pods start and connect with the password from the Secret"
-   },
-   {
-    "from": "person",
-    "to": "unit",
-    "text": "the plan is pasted into the PR; apply happens after approval"
-   }
-  ]
+  "question": "How does a new version of a service reach inf so that the change is written down, reviewed, and cannot quietly disappear?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Start with a chart on your laptop",
+   "h": "A chart is YAML with holes in it",
    "p": [
-    "A chart is a folder of YAML templates plus a values.yaml with defaults. `helm template` fills the templates with values and prints plain Kubernetes YAML. Nothing is installed; you are reading what would be sent to the cluster.",
-    "Try it on the real chart we will use for the agents' Temporal. It is the same chart (temporal 1.5.0, app 1.31.1) that gitops/cloud/temporal wraps for the product."
+    "In the last lesson you read a Deployment and a Service for the broker. The gateway, the orchestrator worker and the Slack app need almost the same two objects, with a different name, image and replica count. Copying the YAML four times would mean four places to fix every mistake, so instead we write it once as a Helm chart. A chart is a folder of Kubernetes YAML templates with holes in them, written as {{ .Values.something }}, plus a values.yaml file with a default for every hole. Helm is the tool that fills the holes and sends the result to the cluster.",
+    "If you know React, this will feel familiar: the templates are the component, the values are its props, and helm template is the render. The comparison stops at the output. A render goes to a screen and is gone, but Helm sends objects to a cluster and remembers each install as a release, with a numbered revision for every change, so it can show you the history and go back to an older revision."
    ],
-   "because": "Rendering first shows you exactly which Deployments and Services a chart creates before any Terraform is involved.",
    "code": {
-    "lang": "bash",
-    "file": "your laptop",
-    "text": "helm repo add temporalio https://go.temporal.io/helm-charts\nhelm search repo temporalio/temporal --version 1.5.0\nhelm show values temporalio/temporal --version 1.5.0 > defaults.yaml\ngrep -n numHistoryShards defaults.yaml\nhelm template temporal temporalio/temporal --version 1.5.0 -n ai-agents -f values.yaml > rendered.yaml\ngrep '^kind:' rendered.yaml | sort | uniq -c",
+    "lang": "yaml",
+    "file": "a chart made with helm create, and one render of it",
+    "text": "# ai-agents-service/templates/deployment.yaml (two of its lines)\n  replicas: {{ .Values.replicaCount }}\n          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n\n# ai-agents-service/values.yaml (the defaults)\nreplicaCount: 1\nimage:\n  repository: nginx\n  tag: \"\"\n\n# render it, with our values instead of the defaults\nhelm template broker ./ai-agents-service -n ai-agents \\\n  --set replicaCount=2 --set image.tag=1.27@sha256:6784fb08…",
     "notes": [
      {
-      "line": 1,
-      "text": "A chart repository is an index of charts, like an npm registry. go.temporal.io is Temporal's own."
+      "line": 2,
+      "text": "A hole. Helm puts the value of replicaCount here."
      },
      {
       "line": 3,
-      "text": "The chart's defaults. Our values file overrides only what we need, like props over default props."
+      "text": "Two holes in one line. The real file also falls back to the chart's version when tag is empty; that part is left out here."
+     },
+     {
+      "line": 6,
+      "text": "The defaults. Our values replace only what we need, the way props replace default props."
+     },
+     {
+      "line": 12,
+      "text": "helm template only prints the filled-in YAML. It never touches a cluster, so it is always safe to run."
+     },
+     {
+      "line": 13,
+      "text": "The tag holds a readable version and the digest after the @. The digest decides which image runs; the 1.27 is for people."
+     }
+    ]
+   },
+   "see": "kind: Deployment\n  replicas: 2\n          image: \"nginx:1.27@sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d\""
+  },
+  {
+   "h": "On inf, Terraform installs the chart",
+   "p": [
+    "You could install a chart yourself with helm install. On inf nobody does, for the reason in the story: a command typed in a terminal leaves no record that anyone reviews. Instead, every tool on inf, from Vault and n8n to our agent services, is a Terraform unit in the infrastructure repo. You met units in p4-2: one folder, one state, one plan. For a service on inf, the unit uses a resource called helm_release, which comes from Terraform's Helm provider and does what helm install and helm upgrade do, but from code. The product clusters use a different tool, Argo CD, and none of its apps point at inf.",
+    "All our agent services share one small local chart and one module around it, so the broker's unit only has to say its name, its replica count and its image. Below is the heart of that module. Notice that the chart sits inside the module folder: changing the chart is a pull request too."
+   ],
+   "code": {
+    "lang": "hcl",
+    "file": "the shape of modules/ai-agents-service/main.tf",
+    "text": "resource \"helm_release\" \"this\" {\n  name      = var.name\n  namespace = var.namespace\n  chart     = \"${path.module}/chart\"\n\n  values = [yamlencode({\n    fullnameOverride = var.name\n    replicaCount     = var.replicas\n    image            = var.image\n  })]\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The release name. Helm keeps this release's revisions in the cluster under this name."
      },
      {
       "line": 4,
-      "text": "Line 143 says numHistoryShards: 512 and that it cannot change after the first install. We set 128 (G3-06)."
-     },
-     {
-      "line": 5,
-      "text": "Render with our values (next section). The -n is the namespace written into every object."
+      "text": "A chart stored next to the module, not downloaded from the internet, so it changes only through a reviewed PR."
      },
      {
       "line": 6,
-      "text": "Count object kinds. With the values below you get 6 Deployments, 6 Services, 3 ConfigMaps, 1 Job and 1 Pod."
-     }
-    ]
-   },
-   "see": "   6 kind: Service\n   6 kind: Deployment\n   3 kind: ConfigMap\n   1 kind: Pod\n   1 kind: Job",
-   "ifInstead": "If instead you see 'No valid driver configured for default store', the chart has no database to render for. Pass the values.yaml from the next section with -f."
-  },
-  {
-   "h": "Values are the props",
-   "p": [
-    "Everything that differs between the product's Temporal and ours is a value. The module keeps them in a template file, templates/temporal_values.yml.tpl, and fills in the database endpoint and the shard count with `templatefile()`.",
-    "Three values matter most. `fullnameOverride: temporal` makes object names short (temporal-frontend, not temporal-temporal-frontend). `numHistoryShards: 128` is fixed forever after the first install, so it is chosen now, not tuned later. `existingSecret: temporal-db` points the server at the Secret that External Secrets writes."
-   ],
-   "because": "We put the database password in an existing Secret so the chart never sees the password and Terraform state never stores it.",
-   "code": {
-    "lang": "yaml",
-    "file": "values.yaml on your laptop (the shape of templates/temporal_values.yml.tpl)",
-    "text": "fullnameOverride: temporal\nserver:\n  config:\n    persistence:\n      numHistoryShards: 128        # cannot change after the first install\n      datastores:\n        default:\n          sql:\n            pluginName: postgres12\n            driverName: postgres12\n            databaseName: temporal\n            connectAddr: \"db.example.internal:5432\"   # the module passes the RDS endpoint here\n            connectProtocol: tcp\n            user: temporal\n            existingSecret: temporal-db   # written by External Secrets, never by Helm\n            secretKey: password\n            maxConns: 6\n        visibility:\n          sql:\n            pluginName: postgres12\n            driverName: postgres12\n            databaseName: temporal_visibility\n            connectAddr: \"db.example.internal:5432\"\n            user: temporal\n            existingSecret: temporal-db",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Short names. The Service other pods call is temporal-frontend, port 7233."
-     },
-     {
-      "line": 5,
-      "text": "128 shards for a small Temporal; the product's uses 512. Changing it later means a new install."
-     },
-     {
-      "line": 12,
-      "text": "In the module this is `${db_endpoint}`, an input from the rds unit. On your laptop any hostname renders."
-     },
-     {
-      "line": 15,
-      "text": "The chart only names the Secret. Lesson p5-3 shows how Vault fills it."
-     },
-     {
-      "line": 17,
-      "text": "maxConns 6 for the main store and 2 for visibility, the numbers from gitops/cloud/temporal/values.yaml."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "Old chart keys like `cassandra:` or `prometheus:` at the top level make 1.5.0 refuse to render. Copy values from gitops/cloud/temporal/values.yaml, which already targets this chart, not from an old blog post."
-   }
-  },
-  {
-   "h": "The n8n pattern: one folder, four units",
-   "p": [
-    "In the infrastructure repo, n8n lives at multi_tenant/accounts/infrastructure/n8n/ with one unit per piece. The units are secrets, sg, rds, elasticache, s3 and repository, plus an n8n.hcl with the shared facts (namespace, hostnames, Vault paths). The agents' Temporal copies this: multi_tenant/accounts/infrastructure/ai-agents/temporal/{secrets,sg,rds,repository} and an ai-agents.hcl.",
-    "A unit is a terragrunt.hcl that names a module and gives it inputs. Units depend on each other through `dependency` blocks: repository needs the rds unit's endpoint and the secrets unit's Vault path.",
-    "The brain bot's repository unit (G6-22) is the smallest example of the shape. Read it with the notes."
-   ],
-   "because": "One unit per piece keeps each plan small and lets a reviewer see exactly what a change touches.",
-   "code": {
-    "lang": "hcl",
-    "file": "infrastructure/multi_tenant/accounts/infrastructure/brain-bot/repository/terragrunt.hcl",
-    "text": "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n\nlocals {\n  bot = read_terragrunt_config(find_in_parent_folders(\"brain-bot.hcl\"))\n}\n\nterraform {\n  source = \"../../../../../modules/ai-agents-service//\"\n}\n\ndependency \"secrets\" {\n  config_path  = \"../secrets\"\n  mock_outputs = { vault_path = \"infrastructure/brain-bot\" }\n}\n\ninputs = {\n  name              = \"brain-bot\"\n  namespace         = local.bot.locals.namespace\n  image             = \"123456789012.dkr.ecr.us-east-1.amazonaws.com/rnd-kb-bot@${local.bot.locals.image_digest}\"\n  replicas          = 1\n  vault_secret_path = dependency.secrets.outputs.vault_path\n  expose            = false\n}",
-    "notes": [
-     {
-      "line": 2,
-      "text": "The old tree's root.hcl: remote state in S3, providers pinned (helm 3.1.1, kubernetes 3.0.1), the inf kubeconfig."
-     },
-     {
-      "line": 6,
-      "text": "Shared facts for all brain-bot units live in brain-bot.hcl next to them, like n8n.hcl for n8n."
-     },
-     {
-      "line": 10,
-      "text": "The module is a local folder in the repo. `//` marks the module root for Terragrunt."
-     },
-     {
-      "line": 13,
-      "text": "The secrets unit must be applied first; its output is the Vault path. mock_outputs let plan run before it exists."
-     },
-     {
-      "line": 21,
-      "text": "Image pinned by digest. The digest is a local in brain-bot.hcl, so bumping the bot is a one-line PR."
-     },
-     {
-      "line": 24,
-      "text": "No Service and no HTTPRoute: the bot dials out to Slack (Socket Mode), nothing dials in."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The module, part 1: namespace and Secret",
-   "p": [
-    "The module is plain Terraform. For Temporal it creates the Kubernetes namespace and an ExternalSecret that copies the DB password from Vault into a Secret. Then it creates the Helm release. Here is the first half of modules/ai-agents-temporal/main.tf from G3-06."
-   ],
-   "because": "The namespace and the Secret must exist before the chart's pods start, or the pods crash looking for a password.",
-   "code": {
-    "lang": "hcl",
-    "file": "infrastructure/modules/ai-agents-temporal/main.tf (part 1)",
-    "text": "resource \"kubernetes_namespace_v1\" \"this\" {\n  metadata { name = var.namespace } # \"ai-agents\"\n}\n\n# DB password from Vault (kvv2 infrastructure/ai-agents/temporal), synced by External Secrets.\nresource \"kubectl_manifest\" \"temporal_db_secret\" {\n  yaml_body = yamlencode({\n    apiVersion = \"external-secrets.io/v1\"\n    kind       = \"ExternalSecret\"\n    metadata   = { name = \"temporal-db\", namespace = kubernetes_namespace_v1.this.metadata[0].name }\n    spec = {\n      refreshInterval = \"5m\"\n      secretStoreRef  = { name = \"vault-store\", kind = \"ClusterSecretStore\" }\n      target          = { name = \"temporal-db\", creationPolicy = \"Owner\" }\n      data            = [{ secretKey = \"password\", remoteRef = { key = var.vault_path, property = \"DB_PASSWORD\" } }]\n    }\n  })\n}",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The Kubernetes namespace from p5-1, created by Terraform so the unit owns it."
-     },
-     {
-      "line": 6,
-      "text": "kubectl_manifest applies any YAML. We use it because ExternalSecret is not a built-in Kubernetes kind."
-     },
-     {
-      "line": 7,
-      "text": "yamlencode turns the HCL map into YAML, so you write HCL and get the same object as hand-written YAML."
-     },
-     {
-      "line": 13,
-      "text": "vault-store is the cluster-wide store that reads Vault's kvv2 mount. Lesson p5-3 looks at what it may read."
-     },
-     {
-      "line": 15,
-      "text": "Copy one key: property DB_PASSWORD at var.vault_path becomes key password in Secret temporal-db."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The module, part 2: the helm_release",
-   "p": [
-    "The second half installs the chart. `helm_release` is a Terraform resource from the helm provider: name, namespace, where the chart comes from, which version, and the values."
-   ],
-   "because": "Pinning the chart version and the shard count in code means the next person's plan shows no surprise upgrade.",
-   "code": {
-    "lang": "hcl",
-    "file": "infrastructure/modules/ai-agents-temporal/main.tf (part 2)",
-    "text": "resource \"helm_release\" \"temporal\" {\n  name        = \"temporal\"\n  namespace   = kubernetes_namespace_v1.this.metadata[0].name\n  repository  = \"https://go.temporal.io/helm-charts\"\n  chart       = \"temporal\"\n  version     = \"1.5.0\" # the same chart as product Temporal (gitops/cloud/temporal)\n  max_history = 10\n\n  values = [templatefile(\"${path.module}/templates/temporal_values.yml.tpl\", {\n    db_endpoint        = var.db_endpoint\n    num_history_shards = 128 # cannot change after the first install\n    temporal_namespace = \"ai-agents\" # retention 30d\n  })]\n\n  depends_on = [kubectl_manifest.temporal_db_secret]\n}",
-    "notes": [
-     {
-      "line": 2,
-      "text": "The release name. Helm stores each release's history in the cluster under this name."
-     },
-     {
-      "line": 6,
-      "text": "Exact chart version. Without it, apply would install whatever is newest that day."
-     },
-     {
-      "line": 7,
-      "text": "Keep 10 old revisions, so `helm rollback` can go back after a bad values change."
+      "text": "yamlencode turns a Terraform map into YAML, so the values are written in HCL and arrive at Helm as YAML."
      },
      {
       "line": 9,
-      "text": "The values file from section 2, with three holes filled by the module's inputs."
-     },
-     {
-      "line": 12,
-      "text": "The Temporal namespace (workflows), not the Kubernetes one (pods). Same word, different system."
-     },
-     {
-      "line": 15,
-      "text": "Order: Secret first, then the release. Without this, Terraform may start the pods before the password exists."
+      "text": "The broker's unit passes the image from our registry with its digest, for example …/ai-agents-broker@sha256:… ."
      }
+    ]
+   },
+   "deeper": {
+    "h": "Go deeper: a service with a database, the n8n way",
+    "p": [
+     "A service that needs more than pods gets more units in its folder. n8n set the pattern on inf: a secrets unit that generates the database password straight into Vault, an sg unit with a security group that lets only inf reach Postgres, an rds unit that creates the database, and a repository unit with the helm_release. Units depend on each other with dependency blocks, so the repository unit reads the database address from the rds unit's outputs. Our own Temporal on inf is built exactly this way, with the upstream Temporal chart instead of our small one.",
+     "Some values can only be chosen once. Temporal's numHistoryShards, which splits its work into a fixed number of parts, is written into the database at the first install and can never change afterwards. A plan that changes it looks harmless, but the server would refuse to start. That is why such numbers are decided in the ticket and marked with a comment in the code, not tuned later."
     ]
    }
   },
   {
-   "h": "RDS, digests and the other units",
+   "h": "The plan is the review, and the code is the only owner",
    "p": [
-    "The rds unit uses the registry module tfr:///terraform-aws-modules/rds/aws version 6.12.0: a db.t4g.small Postgres 17 with deletion_protection and 14-day backups. The sg unit opens port 5432 to the inf VPC only. The secrets unit generates the password straight into Vault at kvv2 infrastructure/ai-agents/temporal, so no person ever sees it.",
-    "Images come from inf ECR and are pinned by digest, like the brain bot's `rnd-kb-bot@${image_digest}`. A new image means a new digest in one .hcl file and a plan that shows one changed line. The ECR repo itself is one line in multi_tenant/accounts/infrastructure/artifacts/artifacts.hcl with `tags_immutability_enabled = true`.",
-    "G3-06 adds three more things you will meet later. A post-install Job creates the search attributes Agent, JiraKey and RunKind. An HTTPRoute on envoy-internal serves the web UI at temporal-ai-agents.example.com, VPN only.",
-    "An HTTPRoute is the rule that sends web traffic for one hostname to a Service. envoy-internal is inf's entry point that only the VPN reaches. A VMServiceScrape is a small Kubernetes object that tells the VictoriaMetrics agent which Service, port and path to read metrics from. VictoriaMetrics is our metrics database (p6-1), and Grafana (p6-3) draws charts from it, so this is how Grafana sees Temporal's metrics."
-   ]
-  },
-  {
-   "h": "Plan locally, paste it, a person applies",
-   "p": [
-    "The infrastructure repo's CI only checks formatting (`tofu fmt -check`, `terragrunt hcl format --check`). There is no plan in CI. The author runs `terragrunt plan` over VPN, pastes the plan into the PR, and a DevOps reviewer applies after approval.",
-    "This is also a wall for agents. An agent may write the unit and the module, run `tofu validate` and `helm template`, and post a plan a person produced. It never runs apply, destroy or sync. The DevOps routines (G8-13's infra-change skill) say the same in words; the missing credentials enforce it."
+    "Now a new broker image is a one-line change: the digest in the broker's unit. The author runs a plan, pastes it into the pull request, and the reviewer sees exactly what will happen before anything does. Here is the plan for such a change, from the lab you are about to do. One line goes, one line comes, and nothing else moves. After approval a person applies it, never an agent, and Helm records a new revision while the Deployment replaces the pods one by one.",
+    "The story at the top is the other half of this rule. A change made with kubectl does not appear in any plan, because Terraform compares the code with what it applied last time, not with the live pods. In the lab you will see a plan answer \"No changes\" while the cluster runs a different image. This difference between the code and what really runs is called drift. Then, at the next apply for any reason, Helm writes the whole recipe from the code again, and the hand-made change is gone without a word. So on inf the code is the only owner of a service, and the way to change a service is to change its code."
    ],
-   "callout": {
-    "kind": "wall",
-    "text": "Agents never apply, destroy, sync or dispatch. A plan in a PR is the most an agent produces; the apply is a person's click over VPN."
-   }
+   "see": "  ~ resource \"helm_release\" \"broker\" {\n      ~ values = [\n          ~ <<-EOT\n                \"image\":\n              -   \"tag\": \"1.27@sha256:6784fb08…\"\n              +   \"tag\": \"1.28@sha256:146adea4…\"\n                \"replicaCount\": 2\nPlan: 0 to add, 1 to change, 0 to destroy."
   }
  ],
  "lab": {
-  "title": "Render the real chart and plan a helm_release",
-  "youNeed": [
+  "id": "p5-2",
+  "title": "Ship a new image with a plan",
+  "minutes": 35,
+  "mode": "guided",
+  "needs": [
+   "The laptop cluster from p5-1 (or its first two steps again)",
    "helm (brew install helm)",
-   "OpenTofu (brew install opentofu)",
-   "the kind cluster from p5-1 running (kubectl config current-context says kind-academy)"
+   "OpenTofu (brew install opentofu)"
   ],
-  "worked": [
+  "goal": "Install a chart into your laptop cluster with a Terraform helm_release, ship a new image by changing one digest, and see why a change made by hand gets lost.",
+  "guess": {
+   "q": "The broker is running image A, installed by Terraform. Someone changes it to image B with kubectl set image. You run tofu plan without changing any code. What does the plan say?",
+   "options": [
+    {
+     "text": "1 to change: it wants to put image A back.",
+     "correct": false,
+     "why": "That would be nice, but Terraform compares your code with what it applied last time, and neither of those changed. It never looked at the live pods."
+    },
+    {
+     "text": "No changes, while the cluster runs image B.",
+     "correct": true,
+     "why": "The plan cannot see the hand-made change. That is what makes such changes dangerous: they are invisible until the next apply quietly removes them."
+    },
+    {
+     "text": "An error, because the cluster no longer matches the state file.",
+     "correct": false,
+     "why": "Nothing fails. The difference stays hidden, which is worse than an error."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "mkdir -p ~/academy/helm-lab && cd ~/academy/helm-lab && helm repo add temporalio https://go.temporal.io/helm-charts",
-    "see": "\"temporalio\" has been added to your repositories"
+    "say": "Start from a clean laptop cluster. If you stopped it, docker start academy brings it back; then remove the hand-made objects from p5-1, because from now on only code owns what runs.",
+    "do": "docker start academy && export KUBECONFIG=~/academy-k3s.yaml && kubectl get nodes && kubectl delete namespace ai-agents --ignore-not-found",
+    "see": "academy\nNAME      STATUS   ROLES                  AGE   VERSION\nacademy   Ready    control-plane,master   12m   v1.33.5+k3s1\nnamespace \"ai-agents\" deleted"
    },
    {
-    "do": "Save the values.yaml from section 2 in this folder. Then: helm template temporal temporalio/temporal --version 1.5.0 -n ai-agents -f values.yaml > rendered.yaml && grep '^kind:' rendered.yaml | sort | uniq -c",
-    "see": "   6 kind: Service\n   6 kind: Deployment\n   3 kind: ConfigMap\n   1 kind: Pod\n   1 kind: Job"
+    "say": "Make a chart. helm create writes a complete small chart for a web server, which is close to what our shared service chart looks like.",
+    "do": "mkdir -p ~/academy-labs/p5-2 && cd ~/academy-labs/p5-2 && helm create ai-agents-service && grep -n -E 'replicas:|image:' ai-agents-service/templates/deployment.yaml",
+    "see": "Creating ai-agents-service\n9:  replicas: {{ .Values.replicaCount }}\n37:          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}\""
    },
    {
-    "do": "grep -n 'numHistoryShards\\|name: temporal-db' rendered.yaml | head -3",
-    "see": "44:      numHistoryShards: 128\n535:                  name: temporal-db\n540:                  name: temporal-db"
+    "say": "Render it with our values before anything touches a cluster, so you see exactly what would be created.",
+    "do": "helm template broker ./ai-agents-service -n ai-agents --set fullnameOverride=broker --set replicaCount=2 --set image.tag=1.27@sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d | grep -E '^kind:|replicas:|image:'",
+    "see": "kind: ServiceAccount\nkind: Service\nkind: Deployment\n  replicas: 2\n          image: \"nginx:1.27@sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d\"\nkind: Pod\n      image: busybox"
    },
    {
-    "do": "Write main.tf. A terraform block with providers helm 3.1.1 and kubernetes 3.0.1, both pointed at config_path ~/.kube/config and config_context kind-academy. A kubernetes_namespace_v1 \"this\" named ai-agents. The helm_release from section 5 with values = [file(\"${path.module}/values.yaml\")] and no depends_on. Then: tofu init -input=false",
-    "see": "OpenTofu has been successfully initialized!"
+    "say": "Write the Terraform for the release. The provider points at your laptop cluster's key file, and the image is one local value, so a new image will be a one-line change.",
+    "do": "cat > main.tf <<'EOF'\nterraform {\n  required_providers {\n    helm = { source = \"hashicorp/helm\", version = \"3.1.1\" }\n  }\n}\n\nprovider \"helm\" {\n  kubernetes = { config_path = pathexpand(\"~/academy-k3s.yaml\") }\n}\n\nlocals {\n  broker_image = \"1.27@sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d\"\n}\n\nresource \"helm_release\" \"broker\" {\n  name             = \"broker\"\n  namespace        = \"ai-agents\"\n  create_namespace = true\n  chart            = \"./ai-agents-service\"\n\n  values = [yamlencode({\n    fullnameOverride = \"broker\"\n    replicaCount     = 2\n    image            = { tag = local.broker_image }\n  })]\n}\nEOF",
+    "see": "(no output; main.tf now exists next to the ai-agents-service folder)"
    },
    {
-    "do": "tofu plan -input=false",
-    "see": "  # helm_release.temporal will be created\n  + resource \"helm_release\" \"temporal\" {\n      + chart      = \"temporal\"\n      + version    = \"1.5.0\"\n  # kubernetes_namespace_v1.this will be created\nPlan: 2 to add, 0 to change, 0 to destroy."
+    "say": "Plan, the way the author of a pull request would, and read what will happen before it happens.",
+    "do": "tofu init -input=false && tofu plan -input=false",
+    "see": "- Installed hashicorp/helm v3.1.1 (signed, key ID 0C0AF313E5FD9F80)\nOpenTofu has been successfully initialized!\n…\n  # helm_release.broker will be created\n…\nPlan: 1 to add, 0 to change, 0 to destroy."
    },
    {
-    "do": "Read the plan for the line with numHistoryShards inside values, then stop. Do not run apply. The chart needs a Postgres that does not exist on your laptop, and the point of the lesson is the plan.",
-    "see": "(no command; you are reading)"
+    "say": "Apply it. On inf, a person does this after the pull request is approved; on your laptop cluster that person is you.",
+    "do": "tofu apply -auto-approve && kubectl -n ai-agents get pods",
+    "see": "helm_release.broker: Creation complete after 3s [id=broker]\nApply complete! Resources: 1 added, 0 changed, 0 destroyed.\nNAME                      READY   STATUS    RESTARTS   AGE\nbroker-59cc584469-q6kqq   1/1     Running   0          3s\nbroker-59cc584469-stfjb   1/1     Running   0          3s"
+   },
+   {
+    "say": "Ship a new image. In main.tf, change broker_image to the 1.28 image below, then plan again. This plan is what a reviewer reads.",
+    "do": "broker_image = \"1.28@sha256:146adea4768b83c607d0bdfa4188464e3da6e0a3ad4475db1d1d8f64f27c29cc\"   # then: tofu plan",
+    "see": "              -   \"tag\": \"1.27@sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d\"\n              +   \"tag\": \"1.28@sha256:146adea4768b83c607d0bdfa4188464e3da6e0a3ad4475db1d1d8f64f27c29cc\"\n                \"replicaCount\": 2\n…\nPlan: 0 to add, 1 to change, 0 to destroy."
+   },
+   {
+    "say": "Apply, then ask Helm for the release's history: every apply is a numbered revision you can point at.",
+    "do": "tofu apply -auto-approve && helm -n ai-agents history broker",
+    "see": "Apply complete! Resources: 0 added, 1 changed, 0 destroyed.\nREVISION  UPDATED                   STATUS      CHART                    DESCRIPTION\n1         Fri Oct 16 02:02:01 2026  superseded  ai-agents-service-0.1.0  Install complete\n2         Fri Oct 16 02:02:09 2026  deployed    ai-agents-service-0.1.0  Upgrade complete"
+   },
+   {
+    "say": "Now repeat the mistake from the story: change the image by hand, then ask Terraform what it sees.",
+    "do": "kubectl -n ai-agents set image deployment/broker ai-agents-service=nginx:1.27 && tofu plan",
+    "see": "deployment.apps/broker image updated\n…\nNo changes. Your infrastructure matches the configuration."
+   },
+   {
+    "say": "Make an unrelated change the normal way, replicaCount 2 to 3 in main.tf, apply it, and look at the image afterwards.",
+    "do": "tofu apply -auto-approve && kubectl -n ai-agents get deploy broker -o jsonpath='{.spec.replicas} {.spec.template.spec.containers[0].image}{\"\\n\"}'",
+    "see": "Apply complete! Resources: 0 added, 1 changed, 0 destroyed.\n3 nginx:1.28@sha256:146adea4768b83c607d0bdfa4188464e3da6e0a3ad4475db1d1d8f64f27c29cc"
    }
   ],
-  "faded": "Add `max_history = 10` to the release and a `depends_on` on the namespace resource, then run `tofu plan` again. It should still say 2 to add, with the new argument visible. The last step is yours: change `version` to \"1.4.0\". Before you run plan, say what the plan will show for the helm_release. Hint: nothing is installed yet, so it is not an update.",
-  "alone": "p5-3 needs the External Secrets operator in your kind cluster. Add the chart repo https://charts.external-secrets.io. Render chart external-secrets/external-secrets (pick the current version with `helm search repo`) with `--include-crds` into a file, and count the kinds. Then write a second helm_release for it in main.tf, namespace external-secrets, with `create_namespace = true`, and run `tofu plan`. Expect 3 to add. Keep this folder; p5-3 applies the external-secrets release there.",
-  "done": "You rendered the Temporal chart with our values and found numHistoryShards: 128 in the output. `tofu plan` showed the helm_release and namespace to be added, with nothing applied."
+  "build": "Give the gateway and the Slack app their own releases from the same chart, the way the shared module gives every agent service its own unit. Add a local gateway_image (use the 1.28 image), then two helm_release resources: gateway with 2 replicas and slack-app with 1, each with its own fullnameOverride. Run tofu plan and check that it says 2 to add, 0 to change, then apply and list the releases with helm -n ai-agents list.",
+  "checks": [
+   "helm template prints an image line that ends with the sha256 digest you passed",
+   "The first tofu plan says Plan: 1 to add, 0 to change, 0 to destroy",
+   "After you change broker_image, the plan shows one line with - and one with +, and says 1 to change",
+   "helm -n ai-agents history broker shows revision 2 with Upgrade complete",
+   "After the hand-made kubectl change, tofu plan says No changes, and the next apply puts the 1.28 digest back",
+   "helm -n ai-agents list shows broker, gateway and slack-app as deployed"
+  ],
+  "solution": {
+   "lang": "hcl",
+   "file": "main.tf (the parts you add)",
+   "text": "locals {\n  broker_image  = \"1.28@sha256:146adea4768b83c607d0bdfa4188464e3da6e0a3ad4475db1d1d8f64f27c29cc\"\n  gateway_image = \"1.28@sha256:146adea4768b83c607d0bdfa4188464e3da6e0a3ad4475db1d1d8f64f27c29cc\"\n}\n\n# … the broker release stays as it is …\n\nresource \"helm_release\" \"gateway\" {\n  name      = \"gateway\"\n  namespace = \"ai-agents\"\n  chart     = \"./ai-agents-service\"\n\n  values = [yamlencode({\n    fullnameOverride = \"gateway\"\n    replicaCount     = 2\n    image            = { tag = local.gateway_image }\n  })]\n\n  depends_on = [helm_release.broker]\n}\n\nresource \"helm_release\" \"slack_app\" {\n  name      = \"slack-app\"\n  namespace = \"ai-agents\"\n  chart     = \"./ai-agents-service\"\n\n  values = [yamlencode({\n    fullnameOverride = \"slack-app\"\n    replicaCount     = 1\n    image            = { tag = local.gateway_image }\n  })]\n\n  depends_on = [helm_release.broker]\n}"
+  },
+  "fix": "A teammate wanted to test the gateway before its unit existed, so they made its Service by hand with kubectl -n ai-agents create service clusterip gateway --tcp=80:80 and forgot it. Run that command before your build step's apply, and the apply fails with Service \"gateway\" in namespace \"ai-agents\" exists and cannot be imported into the current release. Read the message: who owns that Service today, and who should? Repair it so that Terraform is the only owner, and apply again until helm list shows the gateway.",
+  "explain": [
+   "Why does a chart have both templates and a values.yaml, and what did --set change in your render?",
+   "Why did tofu plan say No changes while the cluster ran a different image, and what removed that image later?",
+   "Why does the broker's image line carry a digest, and what does a reviewer see in the plan when the broker gets a new image?"
+  ],
+  "done": "A one-line digest change produced a one-line plan and a new Helm revision, the hand-made change was invisible to the plan and lost at the next apply, and three releases from one chart run in ai-agents."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Temporal is slow after the pilot and you want numHistoryShards 512 instead of 128. What happens if you change the value and a person applies?",
+   "q": "The broker needs a new image on inf today. What is the right way?",
    "options": [
     {
-     "text": "Helm upgrades the release in place and the pods restart with 512 shards",
+     "text": "kubectl set image on inf, then open a PR with the same change so the code catches up",
      "correct": false,
-     "why": "The shard count is written into the database at first install. The server refuses or corrupts with a different number."
+     "why": "For a while the cluster and the code disagree, and the plan cannot see it. If anyone applies another change from older code in between, the new image is silently replaced."
     },
     {
-     "text": "Nothing: the chart ignores the value after install",
-     "correct": false,
-     "why": "The value is read; it is the data that cannot follow. That is worse than ignored."
-    },
-    {
-     "text": "It cannot be changed: you would need a new install with a new database",
+     "text": "Change the digest in the broker's unit, paste the plan into the PR, and a person applies after approval",
      "correct": true,
-     "why": "G3-06 says 'fixed forever after the first install'. That is why the number is chosen in the ticket, not tuned later."
+     "why": "The change is written down, reviewed as a one-line plan, and becomes a Helm revision. The code stays the only owner of the service."
+    },
+    {
+     "text": "Ask Nova to apply the change, since it has the plan already",
+     "correct": false,
+     "why": "Agents never apply. An agent may write the change and show a plan that a person produced; the apply is always a person's action."
     }
    ]
   },
   {
-   "q": "Which of these does `helm template` do?",
+   "q": "What does helm template do?",
    "options": [
     {
-     "text": "Prints the YAML a chart would create, without touching any cluster",
+     "text": "It installs the chart into whichever cluster kubectl points at",
+     "correct": false,
+     "why": "That is helm install, and mixing the two up is a classic way to install something into the wrong cluster."
+    },
+    {
+     "text": "It downloads the images the chart needs",
+     "correct": false,
+     "why": "Helm never touches images. The nodes download them when pods start."
+    },
+    {
+     "text": "It fills the chart's templates with values and prints the YAML, without touching any cluster",
      "correct": true,
-     "why": "It only renders. That is why it is a safe first step on a laptop and a check an agent may run."
-    },
-    {
-     "text": "Installs the chart into the current kubectl context",
-     "correct": false,
-     "why": "That is `helm install`. People confuse the two and install into the wrong cluster."
-    },
-    {
-     "text": "Downloads the chart's images to your laptop",
-     "correct": false,
-     "why": "Images are pulled by the nodes when pods start, never by Helm."
+     "why": "That is why it is safe to run anywhere, and why it is the first thing to run when you want to know what a chart will create."
     }
    ]
   },
   {
-   "q": "Why does the repository unit's image say rnd-kb-bot@sha256:… instead of rnd-kb-bot:latest?",
+   "q": "Someone fixed the broker by hand with kubectl last week. Today an unrelated replica change is applied from the infrastructure repo. What happens to last week's fix?",
    "options": [
     {
-     "text": "Because ECR does not allow the latest tag",
+     "text": "It stays, because the plan only mentioned replicas",
      "correct": false,
-     "why": "ECR allows it. Our repos set tags_immutability_enabled, but a digest is still the real pin."
+     "why": "The plan only showed what changed in the code. The apply still sends the whole recipe from the code, including the old image."
     },
     {
-     "text": "Because a digest names exactly one image, so the plan shows a one-line change when the bot is bumped",
+     "text": "It disappears, because Helm writes the whole recipe from the code again",
      "correct": true,
-     "why": "The digest lives in brain-bot.hcl; bumping it is a reviewable PR and a visible plan line."
+     "why": "The code never knew about the fix, so the upgrade puts the code's version back. That is the story at the top of this lesson."
     },
     {
-     "text": "Because Kubernetes cannot pull by tag",
+     "text": "The apply fails with a conflict, so someone notices",
      "correct": false,
-     "why": "It can. We choose not to, so nobody can move what runs under a known name."
+     "why": "No conflict is raised. The fix is replaced without a word, which is why hand changes are so dangerous."
     }
    ]
   }
  ],
- "recall": [
-  "From p5-1: a Service picks pods by what, and why can a pod's IP never go in a config file?",
-  "From p4-2: what does a `dependency` block in terragrunt.hcl give you, and what are mock_outputs for?"
- ],
- "videos": [
-  {
-   "title": "What is Helm in Kubernetes? Helm and Helm Charts explained",
-   "url": "https://www.youtube.com/watch?v=-ykwb1d0DXU",
-   "channel": "TechWorld with Nana",
-   "minutes": 14,
-   "why": "Charts, values, templating and releases explained for first-timers."
-  },
-  {
-   "title": "How to Create Helm Charts - The Ultimate Guide",
-   "url": "https://www.youtube.com/watch?v=jUYNS90nq8U",
-   "channel": "DevOps Journey",
-   "minutes": 22,
-   "why": "Hands-on: write a chart, template values, install and upgrade a release."
-  }
- ],
+ "platform": {
+  "p": [
+   "On inf, every tool is a Terraform helm_release unit in the infrastructure repo, and no Argo CD app points at inf; Argo CD and the gitops repo serve the product clusters only. The agent services follow the n8n pattern under multi_tenant/accounts/infrastructure/ai-agents/: one folder per service (llm-gateway, broker, orchestrator-worker, slack-app), each a unit on the shared module modules/ai-agents-service, which wraps a small local chart with the Deployment, the Service, the ExternalSecret and a VMServiceScrape for metrics. Images come from our ECR repositories, which refuse to move a tag, and the units pin them by digest. The Helm and Kubernetes providers are pinned in the root config (helm 3.1.1, kubernetes 3.0.1).",
+   "Our Temporal is the same pattern with more units: secrets, sg, rds and repository, with the upstream Temporal chart 1.5.0, a db.t4g.small Postgres with deletion protection and 14-day backups, and numHistoryShards 128, chosen once for good. Today the author plans over VPN and pastes the plan into the PR; a later ticket posts read-only plans on infrastructure PRs automatically. Either way a person applies."
+  ],
+  "tickets": [
+   {
+    "key": "G0-15",
+    "why": "Creates modules/ai-agents-service and the first unit on it, the LLM gateway."
+   },
+   {
+    "key": "G3-17",
+    "why": "The broker, orchestrator worker and Slack app as units on the same module, images pinned by digest."
+   },
+   {
+    "key": "G3-06",
+    "why": "Our Temporal on inf: secrets, sg, rds and repository units, and the upstream chart as a helm_release."
+   },
+   {
+    "key": "G6-22",
+    "why": "The brain bot's unit: the smallest example, with the digest kept in one .hcl file."
+   },
+   {
+    "key": "G7-32",
+    "why": "Read-only Terragrunt plans posted on infrastructure PRs, so reviewers no longer depend on a pasted plan."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "chart",
-   "plain": "A folder of Kubernetes YAML templates plus default values, published in a chart repository."
+   "term": "Helm chart",
+   "plain": "A folder of Kubernetes YAML templates with holes, plus a values.yaml with a default for every hole."
   },
   {
    "term": "values",
-   "plain": "The settings you pass to a chart; they override the chart's defaults like props over default props."
-  },
-  {
-   "term": "helm_release",
-   "plain": "The Terraform resource that installs one chart at one version with your values into one namespace."
+   "plain": "The inputs that fill a chart's holes, like props for a component."
   },
   {
    "term": "release",
-   "plain": "One installed copy of a chart, with a name and a history of revisions Helm keeps in the cluster."
+   "plain": "One install of a chart in a cluster, with a numbered revision for every change."
   },
   {
-   "term": "unit",
-   "plain": "A terragrunt.hcl folder in the infrastructure repo that runs one module with inputs."
+   "term": "helm_release",
+   "plain": "The Terraform resource that installs or upgrades a chart from code, so the change shows in a plan."
   },
   {
-   "term": "digest",
-   "plain": "The sha256 of an image's content; pinning by digest means exactly those bytes run."
+   "term": "drift",
+   "plain": "A difference between what runs and what the code says, usually from a change made by hand."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-06",
-   "why": "The agents' Temporal is this lesson's module and values: RDS unit, ExternalSecret, helm_release at chart 1.5.0, shards 128."
+   "q": "Write the three things the broker's unit tells the shared module, and say which one changes when the broker gets a new image.",
+   "a": "Its name, its replica count and its image with a digest. A new image changes only the digest, which is a one-line plan."
   },
   {
-   "key": "G6-22",
-   "why": "The brain bot's repository unit is the terragrunt.hcl you read here, with the image pinned by digest."
+   "q": "A teammate says: \"I used kubectl set image on inf, but I also opened the PR, so it is fine.\" What can still go wrong before the PR is applied?",
+   "a": "Any apply from code that does not have the change yet puts the old image back without a word, and the plan in between shows No changes, so nobody notices."
   },
   {
-   "key": "G3-17",
-   "why": "The broker, worker and Slack app are three more units on the shared ai-agents-service module."
-  },
-  {
-   "key": "G0-15",
-   "why": "The gateway unit creates the shared module the other services reuse."
+   "q": "Why do some values, like Temporal's shard count, get a comment in the code saying they cannot change?",
+   "a": "They are fixed at the first install. A later plan would look harmless but break the service, so the decision is made once, in the ticket, and marked."
   }
  ],
- "remember": "A Terraform unit installs a pinned chart with our values. Render it with helm template first, and let a person apply the plan."
+ "remember": "On inf a service changes only through its code: a chart filled with values, installed by a helm_release, shown as a plan and applied by a person."
 }

@@ -1,399 +1,296 @@
 {
+ "v": 2,
  "id": "p8-6",
  "title": "Sessions that move between machines",
  "minutes": 45,
  "youNeed": [
   "p8-1"
  ],
- "bridge": "A session store is like a database replica for the transcript. Every batch written to the local file is also sent to your adapter. Except: the SDK never deletes from your store. On resume it reads your store before the claude process even starts, so the new machine needs nothing on its disk.",
- "intro": "The VM is only a workbench. Say the transcript lives only on the VM's disk. Then a question to the requester, a crash or a Spot loss throws away the run's thinking. This lesson shows where a session lives and how resume works. A SessionStore mirrors every transcript batch to S3 through the broker, so a run continues on a fresh VM.",
- "picture": {
-  "caption": "VM 1 writes the transcript locally and mirrors it; VM 2 resumes from the store and continues the same session.",
-  "nodes": [
-   {
-    "id": "vm1",
-    "label": "VM 1: session",
-    "kind": "machine"
-   },
-   {
-    "id": "local",
-    "label": "local transcript (.jsonl)",
-    "kind": "file"
-   },
-   {
-    "id": "store",
-    "label": "SessionStore adapter",
-    "kind": "service"
-   },
-   {
-    "id": "s3",
-    "label": "S3 (presigned by the broker)",
-    "kind": "cloud"
-   },
-   {
-    "id": "vm2",
-    "label": "VM 2: query({ resume, sessionStore })",
-    "kind": "machine"
-   },
-   {
-    "id": "session2",
-    "label": "the same session, continued",
-    "kind": "agent"
-   }
+ "map": "vm",
+ "hook": {
+  "story": [
+   "Nova is at step 4 of 6 on RH-1234. It has read the code, Sean has answered its question about the filter, and it knows why the card must not show while the table is loading. Then the VM freezes. Five minutes later the workflow declares it dead and claims a fresh VM.",
+   "The code is safe, because Nova pushed a checkpoint commit after each good step. But the conversation, everything Nova read and decided and the answer Sean gave, was a file on the dead machine's disk. A new session would start from zero, read everything again, and maybe ask Sean the same question twice."
   ],
-  "steps": [
-   {
-    "from": "vm1",
-    "to": "local",
-    "text": "every turn appends entries to the local JSONL file"
-   },
-   {
-    "from": "local",
-    "to": "store",
-    "text": "after the local write, the SDK calls store.append(key, entries)"
-   },
-   {
-    "from": "store",
-    "to": "s3",
-    "text": "the adapter PUTs one part file per batch"
-   },
-   {
-    "from": "vm2",
-    "to": "store",
-    "text": "resume: the SDK calls store.load(key) before spawning claude"
-   },
-   {
-    "from": "store",
-    "to": "s3",
-    "text": "lists the parts, reads them in order"
-   },
-   {
-    "from": "vm2",
-    "to": "session2",
-    "text": "the entries become a temp file; claude resumes from it"
-   }
-  ]
+  "question": "Where does a session's memory live, and how do I continue the same conversation on a different machine?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Where a session lives",
+   "h": "A session is a file, and resume reads it",
    "p": [
-    "Every session writes a transcript: one JSON object per line, in ~/.claude/projects/<folder for cwd>/<session_id>.jsonl. Each line is an entry: a user message, an assistant message, a tool result, a title. The session_id on the result message names this file.",
-    "resume: <session_id> in the options loads that file and continues the conversation. The model remembers everything, and the prompt cache is warm. That is how Nova continues after a question to the requester."
+    "Every session writes a transcript: a JSON Lines file, one JSON object per line, with every user message, assistant message and tool result in order. By default it lives in ~/.claude/projects/, in a folder named after the working folder with every character that is not a letter or a digit turned into a dash, so /work/fcp becomes -work-fcp. The file name is the session ID from the result message.",
+    "Pass that ID as resume in the next query() and the conversation continues with full context: the files it read, the decisions it made, the answers it got. Two related options are worth knowing. continue: true resumes the most recent session in the folder without an ID, and forkSession: true with resume starts a new branch that begins with a copy of the history. Remember what a session does not keep: files. It stores the conversation, not the working folder, which is why Nova also pushes checkpoint commits."
    ],
-   "callout": {
-    "kind": "why",
-    "text": "cwd is part of the key. The harness uses /work/fcp on every VM so a stored session resumes anywhere."
-   }
-  },
-  {
-   "h": "The SessionStore contract",
-   "p": [
-    "A SessionStore is an object with append(key, entries) and load(key), plus optional listSubkeys, listSessions and delete. The key has projectKey (derived from cwd unless you set one), sessionId, and an optional subpath for subagent transcripts.",
-    "append is called after the local write succeeded, in batches, about every 100 ms during a turn. Entries carry a uuid; treat it as an idempotency key, because retried batches repeat. If append rejects, the SDK retries three times, then drops the batch and emits a system message with subtype mirror_error. The session continues."
-   ],
-   "because": "We implement append first because mirroring is cheap insurance: the local write already succeeded, and our copy only has to be complete.",
    "code": {
     "lang": "typescript",
-    "file": "~/sdk-lab/src/lab6-store.ts (append)",
-    "text": "import { mkdir, readdir, readFile, writeFile } from \"node:fs/promises\";\nimport { query, type SessionKey, type SessionStore, type SessionStoreEntry } from \"@anthropic-ai/claude-agent-sdk\";\n\nclass FolderSessionStore implements SessionStore {\n  #seq = 0;\n  #dir(key: SessionKey): string {\n    return `store/${key.projectKey}/${key.sessionId}${key.subpath ? `/${key.subpath}` : \"\"}`;\n  }\n  async append(key: SessionKey, entries: SessionStoreEntry[]): Promise<void> {\n    const dir = this.#dir(key);\n    await mkdir(dir, { recursive: true });\n    const name = `part-${Date.now()}-${String(this.#seq++).padStart(6, \"0\")}.jsonl`; // wall clock: later parts sort later\n    await writeFile(`${dir}/${name}`, entries.map((e) => JSON.stringify(e)).join(\"\\n\"));\n    console.log(\"store: appended\", entries.length, \"entries to\", name);\n  }",
-    "notes": [
-     {
-      "line": 4,
-      "text": "implements SessionStore makes TypeScript check the method shapes against the SDK type."
-     },
-     {
-      "line": 7,
-      "text": "projectKey, sessionId and subpath become folders. S3 uses the same layout as a key prefix."
-     },
-     {
-      "line": 12,
-      "text": "Wall clock plus a counter: a part written later on another machine still sorts after these."
-     },
-     {
-      "line": 13,
-      "text": "One file per batch, JSON lines. The lab keeps every entry; Nova drops repeated uuids first."
-     }
-    ]
-   }
-  },
-  {
-   "h": "load and listSubkeys",
-   "p": [
-    "load(key) returns every entry, in order, or null for a key that was never written. The SDK calls it once, before it starts the claude process. It writes the entries to a temporary file the process resumes from. There is a timeout, loadTimeoutMs, 60 seconds by default.",
-    "listSubkeys(key) returns the subpaths under a session: the subagent transcripts. Without it, resume brings back the main transcript only, and a resumed Nova would have forgotten what its helpers found."
-   ],
-   "because": "We implement load to read parts in name order because that order is time order, across machines.",
-   "code": {
-    "lang": "typescript",
-    "file": "~/sdk-lab/src/lab6-store.ts (load, listSubkeys)",
-    "text": "  async load(key: SessionKey): Promise<SessionStoreEntry[] | null> {\n    const dir = this.#dir(key);\n    const parts = (await readdir(dir).catch(() => [] as string[])).filter((f) => f.startsWith(\"part-\")).sort();\n    if (parts.length === 0) return null; // never written: the SDK starts fresh\n    const lines = await Promise.all(parts.map((p) => readFile(`${dir}/${p}`, \"utf8\")));\n    console.log(\"store: loaded\", parts.length, \"parts\");\n    return lines.join(\"\\n\").split(\"\\n\").filter(Boolean).map((l) => JSON.parse(l) as SessionStoreEntry);\n  }\n  async listSubkeys(key: { projectKey: string; sessionId: string }): Promise<string[]> {\n    const names = await readdir(this.#dir(key), { withFileTypes: true }).catch(() => []);\n    return names.filter((d) => d.isDirectory()).map((d) => d.name); // subagent transcripts, if any\n  }\n}",
+    "file": "example: resume by ID",
+    "text": "// run 1: a new session; keep the ID from the result\nfor await (const msg of query({ prompt: \"Remember the word tulip.\", options })) {\n  if (msg.type === \"result\") sessionId = msg.session_id;\n}\n\n// later, maybe in another process: the same conversation goes on\nfor await (const msg of query({ prompt: \"Which flower?\", options: { ...options, resume: sessionId } })) {\n  if (msg.type === \"result\" && msg.subtype === \"success\") console.log(msg.result);\n}",
     "notes": [
      {
       "line": 3,
-      "text": "sort() on the names: part-<ms>-<seq> sorts by time. A missing folder is an empty list, not an error."
-     },
-     {
-      "line": 4,
-      "text": "null means 'never written'. Return it, not []; the SDK treats null as a fresh session."
+      "text": "Every result carries the session ID, errors included."
      },
      {
       "line": 7,
-      "text": "Entries must be deep-equal to what was appended. Key order may differ; bytes need not match."
-     },
-     {
-      "line": 9,
-      "text": "The key here has no subpath: you list what is under the session."
+      "text": "resume loads that transcript and the model continues with everything it knew."
      }
     ]
    }
   },
   {
-   "h": "Resume on another machine",
+   "h": "A store that outlives the machine",
    "p": [
-    "Pass sessionStore and, on the second run, resume with the session id from the first. To prove the store is used, the second run points CLAUDE_CONFIG_DIR at a fresh folder through env. So the local transcript from run one is not there. The answer can only come from the store.",
-    "Keep cwd identical between runs: it becomes projectKey. Leave enableFileCheckpointing off; the ticket notes the SDK refuses it together with a store. persistSession must stay true (the default), because the mirror fires after the local write."
+    "Resume only works if the transcript file is on this machine. To continue somewhere else, the SDK can mirror every transcript to storage you choose, through a session store: an object you write with two required methods. append(key, entries) is called after each batch of entries has been written to the local file, and load(key) returns all the entries of one session in order, or null for a session it never saw. The key has a projectKey, made from the working folder, a sessionId, and a subpath for transcripts of helper agents.",
+    "Two rules from the docs shape every store. First, a batch that fails is retried, up to three attempts in all, and after that the SDK drops it, sends a system message with the subtype mirror_error, and continues, because the local copy is safe. Retries mean the same entries can arrive twice, so a store should skip entries whose uuid it has already saved. Second, the SDK never deletes anything from your store, so how long transcripts are kept is your decision."
    ],
-   "because": "We hide the local transcript in the lab. A resume that works only when the old disk is still there proves nothing.",
    "code": {
     "lang": "typescript",
-    "file": "~/sdk-lab/src/lab6-store.ts (the session)",
-    "text": "const resume = process.argv[2]; // second run: pass the session id printed by the first\nconst prompt = resume ? \"Which flower did I ask you to remember?\" : \"Remember the word tulip. Reply with: noted.\";\nfor await (const msg of query({\n  prompt,\n  options: {\n    model: \"claude-haiku-5-5\",\n    effort: \"low\",\n    tools: [],\n    cwd: process.cwd(), // the same cwd both times: it becomes the store's projectKey\n    settingSources: [],\n    sessionStore: new FolderSessionStore(),\n    resume,\n    env: { ...process.env, CLAUDE_CONFIG_DIR: resume ? \"/tmp/fresh-vm-config\" : process.env.CLAUDE_CONFIG_DIR }, // run 2 pretends to be a new VM\n  },\n})) {\n  if (msg.type === \"system\" && msg.subtype === \"mirror_error\") console.log(\"store failed:\", msg.error);\n  if (msg.type === \"result\" && msg.subtype === \"success\") console.log(\"said:\", msg.result, \"\\nsession_id:\", msg.session_id);\n}",
+    "file": "~/sdk-lab/src/folder-store.ts (first half)",
+    "text": "import { mkdir, readdir, readFile, writeFile } from \"node:fs/promises\";\nimport { join } from \"node:path\";\nimport type { SessionKey, SessionStore, SessionStoreEntry } from \"@anthropic-ai/claude-agent-sdk\";\n\nexport class FolderSessionStore implements SessionStore {\n  #seq = 0;\n  #seen = new Set<string>();\n  constructor(private readonly root: string) {}\n\n  #dir(key: SessionKey) {\n    const session = join(this.root, key.projectKey, key.sessionId);\n    return key.subpath ? join(session, \"sub\", encodeURIComponent(key.subpath)) : join(session, \"main\");\n  }\n\n  async append(key: SessionKey, entries: SessionStoreEntry[]) {\n    const fresh = entries.filter((e) => !e.uuid || !this.#seen.has(e.uuid));\n    if (fresh.length === 0) return;\n    const dir = this.#dir(key);\n    await mkdir(dir, { recursive: true });\n    const name = `part-${Date.now()}-${String(this.#seq++).padStart(6, \"0\")}.jsonl`;\n    await writeFile(join(dir, name), fresh.map((e) => JSON.stringify(e)).join(\"\\n\"));\n    for (const e of fresh) if (e.uuid) this.#seen.add(e.uuid);\n  }\n\n  // load() and listSubkeys(): see the lab\n}",
     "notes": [
      {
-      "line": 1,
-      "text": "No argument: a new session. With an id: resume it."
-     },
-     {
-      "line": 11,
-      "text": "The adapter instance. append is called during run one; load during run two, before claude starts."
+      "line": 7,
+      "text": "The uuids already saved, so a retried batch does not create duplicate lines."
      },
      {
       "line": 12,
-      "text": "resume is undefined on run one, which is fine: the option is optional."
-     },
-     {
-      "line": 13,
-      "text": "env replaces the environment, so process.env is spread first (p8-8). A fresh config dir hides run one's local file."
+      "text": "Helper transcripts arrive with a subpath such as subagents/agent-a1; they get their own folder."
      },
      {
       "line": 16,
-      "text": "Count these in Nova and post_progress once if the store keeps failing: a resumed run's store copy is its only copy."
-     }
-    ]
-   },
-   "see": "run 1:\nstore: appended 4 entries to part-1760000000000-000000.jsonl\nsaid: noted.\nsession_id: 9c1f...\nrun 2 (npx tsx src/lab6-store.ts 9c1f...):\nstore: loaded 1 parts\nsaid: You asked me to remember the word tulip.",
-   "ifInstead": "If instead run 2 says it has no earlier conversation, the resume did not load. Check that run 2 printed 'store: loaded' and that cwd is the same. Check that the id is the one run 1 printed."
-  },
-  {
-   "h": "Nova's store: S3 through the broker (G3-23)",
-   "p": [
-    "The VM has no AWS credentials, so Nova's adapter cannot use S3Client. Every object goes through a URL the broker presigns for this run's prefix. append uses a PUT URL; load uses a GET URL. Anthropic's reference adapter in examples/session-stores/s3 is the starting point; the ticket says copy it and swap the client for fetch.",
-    "Retried batches repeat entries. The adapter keeps a set of uuids it already stored and filters them out, so a replay never duplicates a line."
-   ],
-   "because": "We go through presigned URLs because the only credential in the VM is the run token. The broker decides which prefix this run may write.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/harness/src/store.ts (append)",
-    "text": "import type { SessionKey, SessionStore, SessionStoreEntry } from \"@anthropic-ai/claude-agent-sdk/core\";\n\nexport class BrokerS3SessionStore implements SessionStore {\n  readonly #seen = new Set<string>(); // entry uuids already stored\n  #seq = 0;\n  constructor(private readonly broker: BrokerClient) {}\n\n  #prefix(key: SessionKey): string {\n    return `sessions/${key.projectKey}/${key.sessionId}${key.subpath ? `/${key.subpath}` : \"\"}`;\n  }\n\n  async append(key: SessionKey, entries: SessionStoreEntry[]): Promise<void> {\n    const fresh = entries.filter((e) => !(typeof e.uuid === \"string\" && this.#seen.has(e.uuid))); // retried batches repeat\n    if (fresh.length === 0) return;\n    // Wall-clock time, not a per-process counter: parts written later on another VM must sort after these.\n    const name = `${this.#prefix(key)}/part-${Date.now()}-${String(this.#seq++).padStart(6, \"0\")}.jsonl`;\n    const res = await fetch(await this.broker.artifactUrl(name, { write: true }), { method: \"PUT\", body: fresh.map((e) => JSON.stringify(e)).join(\"\\n\") });\n    if (!res.ok) throw new Error(`session store PUT failed: ${res.status}`); // the SDK retries, then reports mirror_error\n    for (const e of fresh) if (typeof e.uuid === \"string\") this.#seen.add(e.uuid);\n  }",
-    "notes": [
-     {
-      "line": 4,
-      "text": "A private field (#) holds the uuids. Entries without a uuid (titles, tags) are appended without dedupe."
+      "text": "Entries without a uuid, such as titles, are always appended."
      },
      {
-      "line": 6,
-      "text": "The broker client is injected: tests pass a fake broker."
-     },
-     {
-      "line": 9,
-      "text": "The broker adds runs/<run_id>/ in front, so one run can only write under its own prefix."
-     },
-     {
-      "line": 17,
-      "text": "artifactUrl asks the broker for a presigned PUT URL; fetch uploads the body. No AWS SDK in the VM."
-     },
-     {
-      "line": 18,
-      "text": "Throw on failure: the SDK retries, and after the third failure emits mirror_error."
+      "line": 20,
+      "text": "One part file per call. Parts sort by name, and the name starts with the time, so load reads them in order."
      }
     ]
    }
   },
   {
-   "h": "Load, subkeys and retention",
+   "h": "Resume on a machine that has never seen the session",
    "p": [
-    "load lists the parts under the prefix (the broker lists; names sort by time). It fetches each with a GET URL and joins the lines. listSubkeys asks the broker for the subpaths, so subagent transcripts resume too.",
-    "The bucket's 30-day expiry is the only retention: the SDK never deletes from a store. Test the adapter with the SDK's conformance suite against a fake broker, then one real resume across two VMs."
+    "With a store attached, resume works differently. Before the claude process even starts, the SDK calls load() on your store, writes the entries into a temporary config folder, and starts claude there. The new machine needs nothing on its disk. If you also give the store listSubkeys(), the SDK brings back the helpers' transcripts too; without it, only the main conversation returns.",
+    "Three details decide whether this works in practice. The projectKey comes from the working folder, so every machine must use the same one; the harness always works in /work/fcp. A run resumed from the store deletes its local copy at the end, so from then on the store holds the only copy, and a lost batch is really lost. And two options cannot be combined with a store: persistSession: false, because the mirror is built from the local writes, and file checkpointing."
    ],
-   "because": "We let the bucket policy do retention because an adapter that deletes is an adapter that can delete the wrong thing.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/harness/src/store.ts (load, listSubkeys)",
-    "text": "  async load(key: SessionKey): Promise<SessionStoreEntry[] | null> {\n    const parts = await this.broker.listArtifacts(`${this.#prefix(key)}/part-`); // sorted by name = by time\n    if (parts.length === 0) return null;\n    const entries: SessionStoreEntry[] = [];\n    for (const part of parts) {\n      const body = await (await fetch(await this.broker.artifactUrl(part, { write: false }))).text();\n      entries.push(...body.split(\"\\n\").filter(Boolean).map((line) => JSON.parse(line) as SessionStoreEntry));\n    }\n    return entries;\n  }\n\n  async listSubkeys(key: { projectKey: string; sessionId: string }): Promise<string[]> {\n    return this.broker.listSubkeys(this.#prefix(key)); // restores subagent transcripts too\n  }\n}",
+    "file": "~/sdk-lab/src/remember.ts",
+    "text": "import { query } from \"@anthropic-ai/claude-agent-sdk\";\nimport { FolderSessionStore } from \"./folder-store.js\";\n\nconst resume = process.argv[2]; // run 2: the session ID that run 1 printed\nconst prompt = resume ? \"Which flower did I ask you to remember?\" : \"Remember the word tulip. Reply with: noted.\";\n\nfor await (const msg of query({\n  prompt,\n  options: {\n    model: \"claude-haiku-5-5\",\n    tools: [],\n    settingSources: [],\n    sessionStore: new FolderSessionStore(\"store\"),\n    resume,\n    env: { ...process.env, CLAUDE_CONFIG_DIR: resume ? \"/tmp/fresh-machine\" : process.env.CLAUDE_CONFIG_DIR },\n  },\n})) {\n  if (msg.type === \"system\" && msg.subtype === \"mirror_error\") console.log(\"store failed:\", msg.error);\n  if (msg.type === \"result\" && msg.subtype === \"success\") console.log(msg.result, \"| session\", msg.session_id);\n}",
     "notes": [
      {
-      "line": 2,
-      "text": "A prefix listing through the broker, read-only. The names carry the wall-clock time, so sorted names are in order."
-     },
-     {
-      "line": 3,
-      "text": "null for never written: the SDK starts a fresh session instead of failing."
-     },
-     {
-      "line": 6,
-      "text": "A GET URL per part. Parts are read in order and concatenated; the SDK dedupes nothing, we did that on write."
-     },
-     {
       "line": 13,
-      "text": "The same prefix without a subpath; the broker returns the subpaths beneath it."
+      "text": "Every batch is mirrored to the store folder, next to the normal local transcript."
+     },
+     {
+      "line": 14,
+      "text": "On run 2 this is the ID from run 1, and the SDK loads it from the store."
+     },
+     {
+      "line": 15,
+      "text": "Run 2 pretends to be a new machine: a config folder with no transcripts at all."
+     },
+     {
+      "line": 18,
+      "text": "A batch the store could not save after its retries shows up here."
      }
     ]
    },
-   "callout": {
-    "kind": "gotcha",
-    "text": "Key layout: runs/<run_id>/sessions/<projectKey>/<sessionId>/[<subpath>/]part-<ms>-<seq>.jsonl. Change it and every old run becomes unresumable."
+   "deeper": {
+    "h": "Go deeper: real stores and the contract test",
+    "p": [
+     "The SDK repositories ship reference stores you can copy: one for an object store (S3, one part file per append, like ours), one for a key-value store (Redis) and one for a database (Postgres). They are examples, not packages, and each takes a client you configure yourself.",
+     "The TypeScript examples also include a conformance suite, a set of tests every store must pass, which you copy into your own tests. And the SDK exports InMemorySessionStore for experiments. Note that it does not skip duplicate uuids, as you will see in the lab: dropping duplicates is the job of a production store."
+    ]
    }
   }
  ],
  "lab": {
+  "id": "p8-6",
   "title": "Mirror a session to a folder, resume it as a new machine",
-  "youNeed": [
-   "The ~/sdk-lab project",
-   "A Claude Code login"
+  "minutes": 30,
+  "needs": [
+   "The ~/sdk-lab project from p8-1",
+   "For the last step only: your own Anthropic API key"
   ],
-  "worked": [
+  "goal": "Write a session store, prove its contract with tests and no model, then continue a conversation from a config folder that has never seen it.",
+  "mode": "guided",
+  "guess": {
+   "q": "Your store's append() throws for every batch because the network is down. What happens to the session?",
+   "options": [
+    {
+     "text": "The session stops with error_during_execution.",
+     "correct": false,
+     "why": "A store outage does not stop the agent. The local transcript is written first and is safe."
+    },
+    {
+     "text": "It continues; each failed batch is retried, then dropped with a mirror_error message.",
+     "correct": true,
+     "why": "Up to three attempts per batch, then a system message with subtype mirror_error, and the work goes on."
+    },
+    {
+     "text": "The SDK keeps the batches in memory and sends them later.",
+     "correct": false,
+     "why": "After the last attempt the batch is dropped. That is why a run resumed from the store can lose data if you ignore mirror_error."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "Create src/lab6-store.ts with the FolderSessionStore class and the session from above",
-    "see": "A 50-line file; the class has append, load and listSubkeys"
+    "say": "See how a working folder becomes a folder name under ~/.claude/projects/. Every character that is not a letter or a digit becomes a dash.",
+    "do": "node -e \"console.log('/Users/you/sdk-lab'.replace(/[^a-zA-Z0-9]/g, '-'))\"",
+    "see": "-Users-you-sdk-lab"
    },
    {
-    "do": "npx tsx src/lab6-store.ts",
-    "see": "store: appended 4 entries to part-1760000000000-000000.jsonl\nsaid: noted.\nsession_id: 9c1f... (copy it)"
+    "say": "Write the whole store, src/folder-store.ts. The second half adds load() and listSubkeys().",
+    "do": "cd ~/sdk-lab\ncat > src/folder-store.ts <<'EOF'\nimport { mkdir, readdir, readFile, writeFile } from \"node:fs/promises\";\nimport { join } from \"node:path\";\nimport type { SessionKey, SessionStore, SessionStoreEntry } from \"@anthropic-ai/claude-agent-sdk\";\n\nexport class FolderSessionStore implements SessionStore {\n  #seq = 0;\n  #seen = new Set<string>();\n  constructor(private readonly root: string) {}\n\n  #dir(key: SessionKey) {\n    const session = join(this.root, key.projectKey, key.sessionId);\n    return key.subpath ? join(session, \"sub\", encodeURIComponent(key.subpath)) : join(session, \"main\");\n  }\n\n  async append(key: SessionKey, entries: SessionStoreEntry[]) {\n    const fresh = entries.filter((e) => !e.uuid || !this.#seen.has(e.uuid));\n    if (fresh.length === 0) return;\n    const dir = this.#dir(key);\n    await mkdir(dir, { recursive: true });\n    const name = `part-${Date.now()}-${String(this.#seq++).padStart(6, \"0\")}.jsonl`;\n    await writeFile(join(dir, name), fresh.map((e) => JSON.stringify(e)).join(\"\\n\"));\n    for (const e of fresh) if (e.uuid) this.#seen.add(e.uuid);\n  }\n\n  async load(key: SessionKey) {\n    const dir = this.#dir(key);\n    const parts = (await readdir(dir).catch(() => [])).filter((f) => f.startsWith(\"part-\")).sort();\n    if (parts.length === 0) return null;\n    const texts = await Promise.all(parts.map((p) => readFile(join(dir, p), \"utf8\")));\n    return texts.join(\"\\n\").split(\"\\n\").filter(Boolean).map((line) => JSON.parse(line) as SessionStoreEntry);\n  }\n\n  async listSubkeys(key: { projectKey: string; sessionId: string }) {\n    const names = await readdir(join(this.root, key.projectKey, key.sessionId, \"sub\")).catch(() => []);\n    return names.map((n) => decodeURIComponent(n));\n  }\n}\nEOF\nnpx tsc && echo clean",
+    "see": "clean"
    },
    {
-    "do": "find store -name 'part-*' | head",
-    "see": "store/<projectKey>/9c1f.../part-1760000000000-000000.jsonl"
+    "say": "Test the contract without any model: unknown sessions, order, retried batches and helper transcripts.",
+    "do": "cat > test/folder-store.test.ts <<'EOF'\nimport assert from \"node:assert/strict\";\nimport { mkdtemp } from \"node:fs/promises\";\nimport { tmpdir } from \"node:os\";\nimport { join } from \"node:path\";\nimport { test } from \"node:test\";\nimport { FolderSessionStore } from \"../src/folder-store.js\";\n\nconst key = { projectKey: \"-work-fcp\", sessionId: \"9c1f0b7e-0000-4000-8000-000000000001\" };\nconst entry = (uuid: string, text: string) => ({ type: \"user\", uuid, message: { role: \"user\", content: text } });\nconst fresh = async () => new FolderSessionStore(await mkdtemp(join(tmpdir(), \"store-\")));\n\ntest(\"a session that was never written loads as null\", async () => {\n  assert.equal(await (await fresh()).load(key), null);\n});\n\ntest(\"entries come back in the order they were appended\", async () => {\n  const store = await fresh();\n  await store.append(key, [entry(\"u1\", \"Remember the word tulip.\")]);\n  await store.append(key, [entry(\"u2\", \"Which flower?\")]);\n  assert.deepEqual((await store.load(key))!.map((e) => e.uuid), [\"u1\", \"u2\"]);\n});\n\ntest(\"a retried batch does not create duplicate lines\", async () => {\n  const store = await fresh();\n  const batch = [entry(\"u1\", \"hello\"), entry(\"u2\", \"again\")];\n  await store.append(key, batch);\n  await store.append(key, batch);\n  assert.equal((await store.load(key))!.length, 2);\n});\n\ntest(\"subagent transcripts are listed so resume can bring them back\", async () => {\n  const store = await fresh();\n  await store.append({ ...key, subpath: \"subagents/agent-a1\" }, [entry(\"s1\", \"found it\")]);\n  assert.deepEqual(await store.listSubkeys(key), [\"subagents/agent-a1\"]);\n});\nEOF\nnode --import tsx --test --test-reporter=spec test/folder-store.test.ts",
+    "see": "✔ a session that was never written loads as null (3.10275ms)\n✔ entries come back in the order they were appended (5.29875ms)\n✔ a retried batch does not create duplicate lines (0.765041ms)\n✔ subagent transcripts are listed so resume can bring them back (0.83075ms)\nℹ tests 4\nℹ pass 4"
    },
    {
-    "do": "npx tsx src/lab6-store.ts 9c1f... (paste your id)",
-    "see": "store: loaded 1 parts\nsaid: You asked me to remember the word tulip."
+    "say": "Now the real thing, with your key. Run 1 starts a session and mirrors it into ./store. Copy the session ID it prints.",
+    "do": "export ANTHROPIC_API_KEY=sk-ant-...   # your own key\nnpx tsx src/remember.ts\nfind store -name 'part-*' | head -3",
+    "see": "(Needs your key; your ID differs.) noted. | session 9c1f…\nThen one or more part files under store/<projectKey>/<sessionId>/main/."
    },
    {
-    "do": "ls /tmp/fresh-vm-config/projects",
-    "see": "A folder for the cwd with a new local copy: the resumed session wrote its own transcript on the 'new VM'."
+    "say": "Run 2 passes the ID and uses an empty config folder, like a machine that has never seen this session. The answer can only come from your store.",
+    "do": "npx tsx src/remember.ts <paste-the-session-id>",
+    "see": "(Needs your key.) An answer that names tulip, with the same session ID."
    }
   ],
-  "faded": "Make append fail: throw new Error('S3 down') on every third call and count mirror_error messages in the loop. Left to you: decide where the counter lives (a module-level let is fine) and print the count on the result.",
-  "alone": "Write src/alone6.ts: a store that dedupes by uuid like Nova's (a Set of seen uuids). Run one session, then call store.append twice by hand with the same entries array. Show with find that only one part file exists per batch. Then write a node:test that checks load() returns null for an unknown key.",
-  "done": "Run two answers 'tulip' with the local transcript hidden, and you can explain which store method ran at which moment."
+  "build": "Turn your tests into a contract you can run against any store. Write test/contract.test.ts with a function contract(name, make) that registers two tests for a store made by make(): an unknown session loads as null, and a batch appended twice is stored once. Run it for your FolderSessionStore and for the SDK's InMemorySessionStore, and explain the one failure you see.",
+  "checks": [
+   "Your four store tests pass with no API key.",
+   "The contract passes for FolderSessionStore and fails for InMemorySessionStore on the retried batch (4 entries instead of 2).",
+   "With your key, run 1 leaves part files under store/.",
+   "With your key, run 2 answers tulip from an empty config folder."
+  ],
+  "solution": {
+   "lang": "typescript",
+   "file": "~/sdk-lab/test/contract.test.ts",
+   "text": "import assert from \"node:assert/strict\";\nimport { mkdtemp } from \"node:fs/promises\";\nimport { tmpdir } from \"node:os\";\nimport { join } from \"node:path\";\nimport { test } from \"node:test\";\nimport { InMemorySessionStore, type SessionStore } from \"@anthropic-ai/claude-agent-sdk\";\nimport { FolderSessionStore } from \"../src/folder-store.js\";\n\nconst key = { projectKey: \"-work-fcp\", sessionId: \"9c1f0b7e-0000-4000-8000-000000000001\" };\nconst batch = [{ type: \"user\", uuid: \"u1\" }, { type: \"assistant\", uuid: \"u2\" }];\n\nconst contract = (name: string, make: () => Promise<SessionStore>) => {\n  test(`${name}: unknown session loads as null`, async () => assert.equal(await (await make()).load(key), null));\n  test(`${name}: a retried batch is stored once`, async () => {\n    const store = await make();\n    await store.append(key, batch);\n    await store.append(key, batch);\n    assert.equal((await store.load(key))!.length, 2);\n  });\n};\n\ncontract(\"folder\", async () => new FolderSessionStore(await mkdtemp(join(tmpdir(), \"store-\"))));\ncontract(\"in-memory\", async () => new InMemorySessionStore());"
+  },
+  "fix": "A teammate's store names each part part-<n>.jsonl, where n is a counter that starts at 0 in every process. A run on VM 1 wrote part-0 to part-11. The run moved to VM 2 after a crash and wrote part-0 to part-3 again, into the same folder. Now a resumed session sees Sean's answer before the question it answers. Find why, and change the part names so parts written later on any machine always sort after earlier ones.",
+  "explain": [
+   "What does a session keep across a resume, and what does it not keep?",
+   "When exactly does the SDK call append() and load(), and what happens when append() keeps failing?",
+   "Why must every machine run the session from the same working folder for a stored session to resume?"
+  ],
+  "done": "Your store passes its contract tests, and you can continue a conversation from a machine that never had the transcript."
  },
- "quiz": [
+ "check": [
   {
-   "q": "When does the SDK call store.load()?",
+   "q": "Nova's VM dies and the run moves to a fresh VM. What brings back what Nova already knew?",
    "options": [
     {
-     "text": "Once per turn, to check the mirror is in sync",
-     "correct": false,
-     "why": "load runs only on resume; append is the per-turn call."
-    },
-    {
-     "text": "Once, on resume, before it starts the claude process",
+     "text": "Resuming the session from the store with the same session ID",
      "correct": true,
-     "why": "The entries are written to a temp file the new process resumes from."
+     "why": "load() runs before the claude process starts, so the new VM continues the same conversation."
     },
     {
-     "text": "When append fails, as a fallback",
+     "text": "The checkpoint commits on the branch",
      "correct": false,
-     "why": "A failed append is retried and then reported as mirror_error; load is not involved."
+     "why": "Commits bring back the files, not the conversation. Both are needed."
+    },
+    {
+     "text": "Starting a new session with the same prompt",
+     "correct": false,
+     "why": "A new session starts from zero: it reads everything again and may ask the same questions."
     }
    ]
   },
   {
-   "q": "Why does Nova's adapter keep a Set of entry uuids?",
+   "q": "Your store sometimes receives the same entries twice. Why, and what should it do?",
    "options": [
     {
-     "text": "Retried batches repeat entries; the uuid is the idempotency key",
+     "text": "A bug in the SDK; report it and ignore the duplicates",
+     "correct": false,
+     "why": "It is expected behaviour. A rejected batch is retried, and part of it may already have landed."
+    },
+    {
+     "text": "The model repeated itself; filter by message text",
+     "correct": false,
+     "why": "Text can repeat legitimately. Each entry carries a uuid for exactly this purpose."
+    },
+    {
+     "text": "Failed batches are retried, so skip entries whose uuid is already stored",
      "correct": true,
-     "why": "Without it a retry duplicates lines in S3 and a resumed session sees messages twice."
-    },
-    {
-     "text": "To count tokens per entry",
-     "correct": false,
-     "why": "Token counts come from modelUsage; uuids identify entries."
-    },
-    {
-     "text": "So load() can sort the entries",
-     "correct": false,
-     "why": "Order comes from the part file names; uuids are not ordered."
+     "why": "The docs say to treat uuid as an idempotency key, so a retry never creates duplicate lines."
     }
    ]
   },
   {
-   "q": "What deletes old transcripts from the S3 store?",
+   "q": "The run on VM 1 used /work/fcp as its working folder; the resume on VM 2 runs in /home/agent/fcp. What happens?",
    "options": [
     {
-     "text": "The SDK, after cleanupPeriodDays",
+     "text": "It works, because the session ID is unique",
      "correct": false,
-     "why": "That setting sweeps local disk only; the SDK never deletes from a store."
+     "why": "The store's key also contains the projectKey, which comes from the working folder."
     },
     {
-     "text": "The adapter's delete() method on run end",
-     "correct": false,
-     "why": "delete is optional and Nova does not implement it; a deleting adapter can delete the wrong thing."
-    },
-    {
-     "text": "The bucket's 30-day expiry rule",
+     "text": "The store is asked for a different projectKey and finds nothing to resume",
      "correct": true,
-     "why": "Retention is a bucket policy; the ticket says that is the only retention."
+     "why": "Keep the same working folder on every machine; the harness always uses /work/fcp."
+    },
+    {
+     "text": "The SDK fixes the path automatically",
+     "correct": false,
+     "why": "There is no such translation; the key is made from the folder the session runs in."
     }
    ]
   }
  ],
- "recall": [
-  "In p8-1, which field on the result message do you keep in order to resume later?",
-  "From p8-2: what does settingSources: [] change, and why do the lab sessions set it?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "Nova's harness passes a session store that writes to S3 through the broker, because the VM has no AWS credentials: each append is a PUT to a URL the broker signs for this run, and load lists and reads the run's parts in order. Part names start with the wall-clock time, so parts written later on another VM sort after earlier ones, and entries are skipped by uuid. The store implements listSubkeys so helper transcripts resume too.",
+   "Every VM uses /work/fcp as its working folder, so the projectKey is the same everywhere. The harness watches for mirror_error and posts once if the store keeps failing, since a resumed run's store copy is its only copy. The bucket's 30-day expiry is the only retention, because the SDK never deletes from a store."
+  ],
+  "tickets": [
+   {
+    "key": "G3-23",
+    "why": "store.ts: the S3 store through broker URLs, the key layout, uuid dedupe and listSubkeys."
+   },
+   {
+    "key": "G4-01",
+    "why": "The workflow spike kills a session halfway and resumes it, which depends on this lesson."
+   }
+  ]
+ },
  "words": [
   {
    "term": "transcript",
-   "plain": "The session's history as JSON lines: one entry per message, tool result or marker."
+   "plain": "The JSON Lines file of a session: every message and tool result, in order."
   },
   {
    "term": "resume",
-   "plain": "The option that continues an earlier session by id, with its whole history and a warm cache."
+   "plain": "The option that loads a session by ID, so the conversation continues with full context."
   },
   {
-   "term": "SessionStore",
-   "plain": "Your adapter with append and load (plus listSubkeys, delete) that mirrors the transcript elsewhere."
+   "term": "session store",
+   "plain": "Your object with append() and load() that mirrors transcripts to storage you choose."
   },
   {
-   "term": "SessionKey",
-   "plain": "{ projectKey, sessionId, subpath? }: projectKey comes from cwd, subpath names a subagent transcript."
-  },
-  {
-   "term": "idempotency key",
-   "plain": "A value (the entry uuid) that lets you ignore a repeat of something you already stored."
+   "term": "projectKey",
+   "plain": "The part of a store key made from the working folder; it must match on every machine."
   },
   {
    "term": "mirror_error",
-   "plain": "The system message the SDK emits when append failed three times and a batch was dropped."
-  },
-  {
-   "term": "presigned URL",
-   "plain": "An S3 URL with a signature inside it that allows one PUT or GET for a short time; the broker makes them."
+   "plain": "The system message the SDK sends when a batch could not be saved to the store after its retries."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-23",
-   "why": "store.ts is the adapter built here, with presigned URLs instead of the folder. The key layout and uuid dedupe are from this lesson."
+   "q": "Name the two required methods of a session store and when each is called.",
+   "a": "append(key, entries) after each batch is written locally; load(key) once, before the claude process starts, when you resume."
   },
   {
-   "key": "G4-01",
-   "why": "The spike kills a session mid-workflow and resumes it with RESUME_SESSION_ID; resume and the store are what make that work."
+   "q": "Why do Nova's part names start with the time and not a counter?",
+   "a": "A counter restarts on each new VM, so later parts could sort before earlier ones. Wall-clock time keeps the order across machines."
   }
  ],
- "remember": "append mirrors after every local write, load runs once before resume, the SDK never deletes; keep cwd and the key layout stable."
+ "remember": "A session is a transcript; mirror it with a store, keep the working folder the same, and any machine can resume it."
 }
