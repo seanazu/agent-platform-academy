@@ -11,7 +11,7 @@ test.describe('islands map', () => {
     });
     await test.step('When the learner opens the Clock Tower and starts its lesson', async () => {
       await page.getByRole('button', { name: /^Clock Tower:/ }).click();
-      await page.getByRole('button', { name: /^▶ Start: One ticket, one run/ }).click();
+      await page.locator('.isl-lesson', { hasText: 'One ticket, one run' }).click();
     });
     await test.step('And jumps straight to the checkpoint, skipping everything before it', async () => {
       await page.locator('.isl-trail-step', { hasText: 'Checkpoint' }).click();

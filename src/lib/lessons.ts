@@ -16,7 +16,7 @@ const parse = (raw: string, id: string): AnyLesson | undefined => {
   try {
     const data = JSON.parse(raw) as Partial<Lesson> & Partial<LessonV2>;
     if (!data || typeof data !== 'object') return undefined;
-    if (data.v === 2) return data.watch && data.hook ? ({ ...data, id } as LessonV2) : undefined;
+    if (data.v === 2) return data.hook && Array.isArray(data.read) ? ({ ...data, id } as LessonV2) : undefined;
     if (!Array.isArray(data.sections) || !data.picture) return undefined;
     return { ...data, id } as Lesson;
   } catch {

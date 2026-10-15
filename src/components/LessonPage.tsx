@@ -21,6 +21,11 @@ function LessonPage({ id }: { id: string }) {
   useEffect(() => {
     if (ref) visit(id);
   }, [id, ref, visit]);
+  // Rebuilt lessons live on the islands map: send old links there.
+  const rebuilt = lesson !== undefined && isV2(lesson);
+  useEffect(() => {
+    if (rebuilt) window.location.replace(href.islands(islandOfLesson(id)?.id, id));
+  }, [rebuilt, id]);
 
   if (!ref) {
     return (
@@ -33,10 +38,7 @@ function LessonPage({ id }: { id: string }) {
   if (!lesson) return <LessonMissing lessonRef={ref} />;
 
   const { part } = ref;
-  if (isV2(lesson)) {
-    window.location.replace(href.islands(islandOfLesson(id)?.id, id));
-    return null;
-  }
+  if (isV2(lesson)) return null;
   const { prev, next } = neighbours(id);
   const done = progress.done[id] === true;
   const quizAnswers = progress.quiz[id] ?? {};
