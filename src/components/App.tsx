@@ -1,3 +1,5 @@
+import CastPage from './v2/CastPage';
+import TicketCardPage from './v2/TicketCardPage';
 import { useEffect } from 'react';
 import Header from './Header';
 import Home from './Home';
@@ -26,8 +28,10 @@ function App() {
         {route.name === 'home' && <Home />}
         {route.name === 'part' && <PartPage id={route.id} />}
         {route.name === 'lesson' && <LessonPage id={route.id} />}
+        {route.name === 'card' && <TicketCardPage ticketKey={route.key} />}
         {route.name === 'tickets' && <TicketsPage focusKey={route.key} />}
         {route.name === 'words' && <WordsPage />}
+        {route.name === 'cast' && <CastPage />}
         {route.name === 'search' && <SearchPage initial={route.q} />}
       </main>
       <footer className="site-foot">

@@ -4,8 +4,10 @@ export type Route =
   | { name: 'home' }
   | { name: 'part'; id: string }
   | { name: 'lesson'; id: string }
+  | { name: 'card'; key: string }
   | { name: 'tickets'; key?: string }
   | { name: 'words' }
+  | { name: 'cast' }
   | { name: 'search'; q?: string };
 
 export const parseHash = (hash: string): Route => {
@@ -16,8 +18,10 @@ export const parseHash = (hash: string): Route => {
   const [head, id] = parts;
   if (head === 'part' && id) return { name: 'part', id };
   if (head === 'lesson' && id) return { name: 'lesson', id };
+  if (head === 'card' && id) return { name: 'card', key: id };
   if (head === 'tickets') return { name: 'tickets', key: params.get('k') ?? undefined };
   if (head === 'words') return { name: 'words' };
+  if (head === 'cast') return { name: 'cast' };
   if (head === 'search') return { name: 'search', q: params.get('q') ?? undefined };
   return { name: 'home' };
 };
@@ -36,7 +40,9 @@ export const href = {
   home: () => '#/',
   part: (id: string) => `#/part/${id}`,
   lesson: (id: string) => `#/lesson/${id}`,
+  card: (key: string) => `#/card/${key}`,
   tickets: (key?: string) => (key ? `#/tickets?k=${encodeURIComponent(key)}` : '#/tickets'),
   words: () => '#/words',
+  cast: () => '#/cast',
   search: (q?: string) => (q ? `#/search?q=${encodeURIComponent(q)}` : '#/search'),
 };

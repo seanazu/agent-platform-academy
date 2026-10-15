@@ -8,8 +8,9 @@ import Section from './Section';
 import TicketCard from './TicketCard';
 import VideoCard from './VideoCard';
 import WordList from './WordList';
+import LessonV2Page from './v2/LessonV2Page';
 import { course, findLesson, lessonNumber, neighbours } from '../lib/course';
-import { getLesson, isSample } from '../lib/lessons';
+import { getLesson, isSample, isV2 } from '../lib/lessons';
 import { useProgress } from '../lib/progress';
 import { href } from '../lib/router';
 
@@ -32,6 +33,7 @@ function LessonPage({ id }: { id: string }) {
   if (!lesson) return <LessonMissing lessonRef={ref} />;
 
   const { part } = ref;
+  if (isV2(lesson)) return <LessonV2Page lesson={lesson} part={part} />;
   const { prev, next } = neighbours(id);
   const done = progress.done[id] === true;
   const quizAnswers = progress.quiz[id] ?? {};

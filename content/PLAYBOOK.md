@@ -1,40 +1,26 @@
-# Teaching playbook (research summary, 13 Oct 2026)
+# Teaching playbook: the research behind STYLE.md
 
-## How to teach so it sticks
-1. Cognitive load and chunking (Sweller; Hermans, The Programmer's Brain). Rule: one new concept per lesson, at most 5–7 new terms; code blocks ≤ 20–25 lines that change one thing from the previous block.
-2. Worked examples, then faded scaffolding (Sweller & Cooper; Renkl & Atkinson). Rule: every lab is a 3-rung ladder: full worked example with a label per step; the same task with the last step blank; a new task of the same shape, alone.
-3. Concrete before abstract, "concreteness fading" (Fyfe, McNeil & Borjas 2015). Rule: real file on the laptop → drawing → general rule. Never open with the definition.
-4. Mental models and analogies (Clancy; Halasz & Moran). Rule: "X is like Y, except Z", and Z is in the same paragraph.
-5. Retrieval practice and spacing (Dunlosky et al. 2013). Rule: 3 questions from memory at the end; 1–2 recall questions from earlier lessons at the start; every answer comes with one line of why.
-6. Show the result after each step (Diátaxis). Rule: every command has a "You should see" block (≤ 8 lines) and an "If instead you see … then …" line for the most likely error.
-7. Why before how (Mayer, pre-training principle; Brown & Wilson). Rule: one sentence "We do this because …" before each code block; ask the reader to predict before a demo.
-8. Tutorial failure modes: wall of text (≤ 4 sentences per paragraph; a picture or code every ≤ 150 words); skipped steps (run the lab on a clean machine); assumed knowledge (a "You need" box); jargon (define on first use, one word per thing); options (show one way; alternatives go to a "Later" note); non-native readers (≤ 20 words per sentence, active voice).
+Collected 15 Oct 2026 for the v2 rebuild: 137 web searches by four research agents, plus a full audit of the v1 lessons.
+The full plan is the "Academy 2.0" page. Short notes, with the sources named:
 
-## Bridge analogies for a React/TypeScript developer (each says where it breaks)
-- Temporal workflow ≈ a React component as a state machine, re-run from its history. Breaks: it replays a stored event log and crashes on non-determinism (no Date.now(), Math.random(), I/O in the workflow).
-- Activity ≈ an API call from inside that component. Breaks: Temporal retries it, so it must be idempotent; results are recorded, not re-run on replay.
-- Terraform ≈ package.json + lockfile for machines. Breaks: state records what exists; apply changes real infrastructure and can destroy it.
-- Terragrunt ≈ monorepo workspaces for Terraform (shared root config, per-env folders, run-all). Breaks: it only generates and calls Terraform.
-- Packer AMI ≈ a Docker image for a whole VM. Breaks: no layers or cache; rebuilds take minutes; region-specific.
-- Docker layers ≈ the npm cache. Breaks: changing one layer invalidates everything after it, so order matters.
-- Pod / Deployment / Helm release ≈ `npm start` on many machines. Breaks: pods are disposable and get new IPs; you never ssh and restart.
-- Vault + ExternalSecrets ≈ .env files copied in by an operator. Breaks: values rotate without a redeploy; a Kubernetes Secret is only base64, so access control matters.
-- IAM role ≈ a user with a scoped token, except nobody holds a password: the machine assumes the role and gets short-lived credentials.
-- VPC / subnets / NAT ≈ an office network. Breaks: "private" means no route out, not a firewall.
-- SSM ≈ SSH without port 22 or keys: the agent dials out, IAM decides who may connect. Breaks: command logging is off unless turned on.
-- GitHub App installation token ≈ a 1-hour API key that acts as the bot. Breaks: minted from a private key each time; nothing static to paste.
-- Reusable workflow ≈ a shared React component with inputs as props. Breaks: its own job; no shared files without artifacts.
-- OIDC for CI ≈ "login with Google": GitHub vouches for the job, AWS hands out temporary credentials. Breaks: the trust policy must pin repo and branch.
-- OpenTelemetry ≈ console.log that goes to a dashboard, with a trace ID across services. Breaks: spans have start, end and parents.
-- Prometheus counter ≈ a Redux counter that only goes up. Breaks: it is scraped; you query rates on a server, never read it back in code.
-- Squid egress allow-list ≈ a browser CSP for outbound traffic from a VM. Breaks: it also stops curl, pip and the agent.
-- systemd unit ≈ pm2 owned by the OS (restart policy, logs, start on boot). Breaks: no file watching; production, not dev.
-- Python venv / uv ≈ node_modules / npm. Breaks: you activate it (or use `uv run`); the interpreter version is part of it.
-- pytest fixture ≈ beforeEach that returns a value, requested by parameter name. Breaks: fixtures have scopes and depend on each other.
-- Django model / serializer / viewset ≈ Prisma model + zod schema + API route. Breaks: Django generates migrations and the admin; a viewset gives all CRUD routes.
-- Celery ≈ a background job queue (BullMQ). Breaks: tasks are plain functions registered by import path; a worker must import the same code.
-- Agent SDK query() ≈ a fetch that returns an async iterator. Breaks: it runs tools and many turns on your machine; it has interrupt().
-- MCP tool ≈ a function the model can call (name, description, zod input, handler returning content). Breaks: the model chooses when to call it; the description is the API.
-- Hook ≈ Express middleware on agent events. Breaks: per event, not per request; PreToolUse runs even when permissions would auto-allow.
-- Sandbox VM ≈ a fresh CI runner. Breaks: it holds a live agent with network access, so egress rules and secrets matter more.
-- Broker ≈ a backend-for-frontend that holds the secrets. Breaks: it must also decide which sandbox may ask for what, or it is only a secret relay.
+## R-visual (30 searches)
+- Click-Next diagram = weakest interactivity. Best: predict-then-reveal (pretesting effect, hypercorrection), puzzles gating, break-it sims (guided tour -> sandbox, Nicky Case), add-one-variable (samwho load balancing: pause/play/reset/speed), counterfactual same-seed replay (Faultline), linked colour-coded terms text<->widget (Ciechanowski), Epic Web diff vs solution, Scrimba editable screencasts, Execute Program executable prompts + SRS 2d/1w/3w/2m.
+- Gamification lowest value; progress map + review queue only.
+- Existing examples: Temporal UI timeline (no replay scrubber = our gap), VPC sim engineersuniverse, Rover terraform, kube-scheduler-simulator, OAuth playground/PKCE visualizer, samwho retries/queueing (encore.dev/blog/retries), no agent-loop visualizer exists (gap).
+- Libs: React Flow (own step state), Motion layout, D3 for math, Rive for state art, Remotion/Motion Canvas for clips only; Sandpack maybe unmaintained; WebContainers commercial licence.
+- 8 widgets: FlowPlayer, HistoryReplayer, PathTracer, ChaosLab, DiffExplorer, PlacementToy, AgentLoopInspector(+OTel waterfall), CredentialBreaker. Loop: guided -> predict -> reveal -> break -> sandbox.
+## R-writing (26 searches)
+- Old rules backfired: readability formulas != comprehension (1979-80 studies); Blau 1982 ESL: complex sentences with connectives beat short ones; McNamara&Kintsch 1996 low-knowledge readers need cohesion; one-fact-per-sentence = transmissionism (Matuschak); forced analogy template -> strained analogies (Evans 13 patterns, Glynn TWA); Anthropic guide: say what to do + why, ban "overly short bullet points", style of prompt bleeds into output; curse of knowledge.
+- Rules: problem first (productive failure, Kapur 53 studies); why before what; concrete first (Evans "scenes"); one running example/story (narrative meta-analysis); connected paragraphs w/ because/so/which means; vary sentence length; name the parts first (Mayer pre-training, segmenting); keep real jargon defined in place; analogies only when they earn it + where it breaks; conversational you/we (personalization d≈0.79); realistic examples; coherence + signaling; make reader act (LearnLM); non-native: simplify words/idioms not structure; write for one reader + test; style guide = outcomes + reasons + 3-5 example passages; separate reviewer pass for substance (Leinonen: LLM explanations rated fluent but learning unmeasured).
+- Sources: jvns.ca/blog/confusing-explanations, platform.claude.com prompting best practices, paulgraham.com/simply.html, Mayer 2020, ajet personalization, gov.uk non-native tips, andymatuschak.org/books
+## R-labs (24 searches)
+- CodeCrafters: stage tests local, `test --previous` regression, tagged logs. Instruqt/Killercoda: check script w/ named-cause failure, setup/solve/cleanup, CI runs solve+check. SadServers/Rustlings: broken-on-purpose, clue ladder, watch mode, est time. Execute Program: runnable reviews 2d/1w/3w/2m, prereq gating, ~5 lessons/day cap. iximiuz/Codespaces devcontainer (CS50 80k users). Exercism/Boot.dev CLI: try vs check. TutorialKit/WebContainers for Node-only pieces. Capstone: build your own mini platform.
+- Science: Dunlosky 2013 testing+spacing only high-utility; self-explanation g=.55 (Bisra 2018); expertise reversal -> adaptive fading, allow skip; interleaving g=.42; desirable difficulty w/ manageable load; PRIMM, Parsons; deliberate practice needs feedback; cognitive apprenticeship (show expert thinking, explore).
+- Gamification: small effects; badges/leaderboards no effect in programming; levels/unlocks/story helped; forgiving streak; never charge for hints.
+- Names: Guess / Follow along / Fill the gaps / Build it / Fix it / Explain it. CLI: `course lab 7-2`, `course check` (watch, rechecks earlier), `course hint`, `course diff`, `course skip`, `course explain`. Lab folder: README, setup.sh, check.ts, solve.sh, hints.md, broken/, review/. devcontainer w/ Temporal dev server, LocalStack, kind, terraform.
+
+## What the audit of the v1 lessons found
+
+- Sentences averaged 10-14 words in every lesson; up to 30 ticket keys in one lesson; 66 of 140 lessons had no video.
+- The best v1 openings were stories (g5-4 "At 10:02 a runner image update breaks npm ci", g3-11 "A Spot VM disappears at step 4"); the worst opened with definitions or a list of tickets.
+- The old rules caused most problems: the 20-word cap, the required "Except" analogy, a "because" before every code block, at least three notes per code block, lessons sized by ticket bundles.

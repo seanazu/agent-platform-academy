@@ -1,0 +1,417 @@
+{
+  "key": "G3-25",
+  "title": "[Platform] Fan-out walls: one run per thing, fixed slots, kill switch",
+  "lesson": "p7-4",
+  "goal": "Build the walls that stop agent storms: one function that is the only way to start a run (named after the thing it works on, on its agent's own task queue), a slots workflow per agent that lets only a fixed number of VMs run at once, and a kill switch that is read when a run starts and before every step.",
+  "outcome": "In the Temporal UI, assigning RH-1234 to Nova and then typing /nova RH-1234 shows one run, nova:RH-1234, tagged Agent=nova. With three Nova tickets building, a fourth one waits in line for a slot and starts the moment another run parks or finishes. When a platform engineer turns the kill switch on for nova, new starts are refused, and every open Nova run ends cleanly before its next step with its branch kept.",
+  "dependsOn": [
+    {
+      "key": "G3-24",
+      "why": "startRun starts ticketToPr, and this card edits ticketToPr to take a slot and read the kill switch. It is the ticket's only listed dependency.",
+      "proof": "gh api repos/RhinoHealth/ai-agents/contents/orchestrator/src/workflows/ticket-to-pr.ts --jq .path   # prints the path when it is on main"
+    },
+    {
+      "key": "G3-20",
+      "why": "The orchestrator's brokerInternal client (used by workInSandbox) is how the kill-switch check reads the broker. ticketToPr needs it too, so it is merged when G3-24 is.",
+      "proof": "gh api \"repos/RhinoHealth/ai-agents/contents/orchestrator/src/activities/run.ts\" --jq .path"
+    },
+    {
+      "key": "G3-07",
+      "why": "The kill switch is \"a row per agent in the broker DB\", so the broker service and its Postgres database must exist.",
+      "proof": "gh api repos/RhinoHealth/ai-agents/contents/broker/src --jq \".[].name\"   # lists the broker sources, including scopes.ts"
+    },
+    {
+      "key": "G3-06",
+      "why": "Every run is tagged with the Agent search attribute. Temporal refuses a start that uses an attribute the namespace does not know, so Agent must be registered on namespace ai-agents.",
+      "proof": "kubectl -n ai-agents exec deploy/temporal-admintools -- temporal operator search-attribute list --namespace ai-agents   # shows Agent  Keyword"
+    },
+    {
+      "key": "G0-13",
+      "why": "The third part of the kill switch: bumping an agent's epoch in the LLM gateway kills all its live run tokens. The code in this card works without it, but the switch is not complete until it exists.",
+      "proof": "Ask the gateway owner how the epoch is bumped today; see the gaps, because no ticket says."
+    }
+  ],
+  "access": [
+    {
+      "what": "Write access to RhinoHealth/ai-agents and one approval from another engineer (the main ruleset asks for exactly one; there is no CODEOWNERS file).",
+      "who": "The repo admin who created ai-agents in G3-01 (Platform)."
+    },
+    {
+      "what": "The broker's database user may create a table (the flags table is created by the broker at start).",
+      "who": "DevOps, who created the broker DB user on the ai-agents RDS in G3-17."
+    },
+    {
+      "what": "Temporal UI at temporal-ai-agents.rhinohealth.com, to see runs, slots and the batch stop.",
+      "who": "DevOps (G3-06); it is reachable over VPN or Teleport only."
+    },
+    {
+      "what": "kubectl access to namespace ai-agents on inf-rhinohealth, to turn the kill switch on for real before a Slack button exists.",
+      "who": "DevOps."
+    },
+    {
+      "what": "On your laptop: the Temporal CLI (brew install temporal) and Node 24 with the repo's npm workspaces.",
+      "who": "Nobody; no grant needed."
+    }
+  ],
+  "decide": [
+    {
+      "q": "Where exactly does the kill switch live, and how does the orchestrator read it? The ticket only says \"a row per agent in the broker DB\".",
+      "owner": "The broker owner (G3-07) with the Platform lead.",
+      "fallback": "One flags table in the broker DB with GET, PUT and DELETE /internal/flags/<name> on the broker's internal port, as in this card. The kill switch is the flag agent:<agent>:stopped, and G5 later stores its routine flags (routine:<name>:paused, routines:fixers:paused) in the same table."
+    },
+    {
+      "q": "Who starts the slots:<agent> workflows, and on which task queue? No ticket says.",
+      "owner": "You (the G3-25 owner).",
+      "fallback": "ensureSlots() at worker start, on the housekeeping queue ai-agents-orchestrator, with the USE_EXISTING conflict policy so a restart joins the running ones."
+    },
+    {
+      "q": "How does a person turn the kill switch on before the Slack app has a button for it?",
+      "owner": "The Platform lead with DevOps.",
+      "fallback": "A platform engineer with inf access port-forwards to the broker's internal port and sends one PUT (the commands are in the steps), then runs the batch stop, then asks the gateway owner for the epoch bump."
+    },
+    {
+      "q": "What does the batch stop pass as the stop signal's \"by\" argument? The ticket's command has no --input.",
+      "owner": "The ticketToPr owner (G3-24 and G3-38 define the stop signal).",
+      "fallback": "The text \"kill-switch\": --input '\"kill-switch\"'."
+    },
+    {
+      "q": "One worker process for all eight task queues, or one deployment per queue?",
+      "owner": "DevOps (G3-17 deploys orchestrator-worker).",
+      "fallback": "One orchestrator-worker deployment with 2 replicas, as G3-17 sets, running eight Worker objects that share one connection and one workflow bundle."
+    }
+  ],
+  "files": [
+    {
+      "path": "orchestrator/src/fanout.ts",
+      "what": "The only way to start a run. startRun builds the ID <agent>:<thing> and the queue ai-agents-<agent>, joins an open run with USE_EXISTING, tags the run with Agent, and refuses to start when the kill switch is on. startOrSignal is the signal-with-start form for routines that join a run by root cause (G5-09 uses it).",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/fanout.ts",
+        "text": "// orchestrator/src/fanout.ts: the only way to start a run. Only the orchestrator calls it; a VM can't reach Temporal.\nimport { type Client, type Workflow, WorkflowIdConflictPolicy, WorkflowIdReusePolicy } from \"@temporalio/client\";\nimport { defineSearchAttributeKey, SearchAttributeType, type SignalDefinition, TypedSearchAttributes } from \"@temporalio/common\";\nimport { readFlag } from \"./flags.js\";\n\nexport const AGENT = defineSearchAttributeKey(\"Agent\", SearchAttributeType.KEYWORD);\nexport const agentAttribute = (agent: string) => new TypedSearchAttributes([{ key: AGENT, value: agent }]);\n\nexport class AgentStopped extends Error {\n  constructor(readonly agent: string, reason: string) {\n    super(`The kill switch is on for ${agent} (${reason}), so no new run starts.`);\n  }\n}\n\nconst refuseIfStopped = async (agent: string): Promise<void> => {\n  const flag = await readFlag(`agent:${agent}:stopped`);\n  if (flag) throw new AgentStopped(agent, flag.reason);\n};\n\n/** nova:RH-1234 on ai-agents-nova. A second start for the same thing joins the open run. */\nexport const startRun = async (client: Client, agent: string, thing: string, wf: string | Workflow, ...args: unknown[]) => {\n  await refuseIfStopped(agent);\n  return client.workflow.start(wf, {\n    workflowId: `${agent}:${thing}`, // nova:RH-1234 | bugfix:RH-1240\n    taskQueue: `ai-agents-${agent}`, // one queue per agent: nobody starves anybody\n    workflowIdConflictPolicy: WorkflowIdConflictPolicy.USE_EXISTING,\n    typedSearchAttributes: agentAttribute(agent), // the batch stop finds runs by Agent\n    args,\n  });\n};\n\n/** The same ID, queue and Agent, for triggers that carry news: signal the open run, or start it and then signal it. */\nexport const startOrSignal = async <T>(\n  client: Client, agent: string, thing: string, wf: string | Workflow, input: unknown,\n  signal: SignalDefinition<[T]>, signalArg: T,\n) => {\n  await refuseIfStopped(agent);\n  return client.workflow.signalWithStart(wf, {\n    workflowId: `${agent}:${thing}`, // cifix:fcp:<fingerprint> | upgrade:fcp:pr-<n>\n    taskQueue: `ai-agents-${agent}`,\n    typedSearchAttributes: agentAttribute(agent),\n    workflowIdReusePolicy: WorkflowIdReusePolicy.REJECT_DUPLICATE, // a root cause whose run closed never starts again\n    args: [input],\n    signal,\n    signalArgs: [signalArg],\n  });\n};",
+        "notes": [
+          {
+            "line": 6,
+            "text": "A typed key for the Agent search attribute. Keyword means an exact-match tag you can filter on."
+          },
+          {
+            "line": 9,
+            "text": "Callers can catch this and skip. The Jira poll must do that, or its activity retries forever (see the gaps)."
+          },
+          {
+            "line": 26,
+            "text": "Conflict policy: what a start does while a run with this ID is open. USE_EXISTING returns the open run instead of failing."
+          },
+          {
+            "line": 42,
+            "text": "Reuse policy: about closed runs. A root cause whose run already finished may not start again; a person looks instead."
+          },
+          {
+            "line": 45,
+            "text": "One signal argument (a Trigger for routines). The SDK's types need a fixed tuple here, so the helper takes one value."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/flags.ts",
+      "what": "Reads a flag from the broker's flag store through G3-20's brokerInternal client. null means the flag is not set.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/flags.ts",
+        "text": "// orchestrator/src/flags.ts: read a flag from the broker's flag store (internal port, orchestrator only).\n// Names: agent:<agent>:stopped (the kill switch). G5 adds routine:<name>:paused and routines:fixers:paused.\nimport { brokerInternal } from \"./broker-internal.js\";\n\nexport interface Flag {\n  name: string;\n  value: string;\n  reason: string;\n  setBy: string;\n  setAt: string;\n}\n\n/** null when the flag is not set. */\nexport const readFlag = (name: string): Promise<Flag | null> =>\n  brokerInternal.get<Flag | null>(`/internal/flags/${encodeURIComponent(name)}`);"
+      }
+    },
+    {
+      "path": "orchestrator/src/temporal.ts",
+      "what": "One shared Temporal client per process (G3-28's sketch already calls temporalClient()). Create it only if it is not there yet.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/temporal.ts",
+        "text": "// orchestrator/src/temporal.ts: one Temporal client per process, used by activities and triggers.\nimport { Client, Connection } from \"@temporalio/client\";\n\nlet client: Promise<Client> | undefined;\n\nexport const temporalClient = (): Promise<Client> =>\n  (client ??= Connection.connect({ address: process.env.TEMPORAL_ADDRESS ?? \"localhost:7233\" }).then(\n    (connection) => new Client({ connection, namespace: \"ai-agents\" }),\n  ));"
+      }
+    },
+    {
+      "path": "orchestrator/src/workflows/slots.ts",
+      "what": "The slots workflow, one per agent, ID slots:<agent>. It keeps a list of holders and a line of waiting runs, grants a slot by signal, takes slots back from runs that died without giving them back, and continues as new when Temporal suggests it (continue-as-new starts a fresh history with the same ID, so the history never grows too large).",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/workflows/slots.ts",
+        "text": "// orchestrator/src/workflows/slots.ts: workflow code (deterministic). One slots:<agent> workflow per agent, forever.\nimport {\n  condition, continueAsNew, defineSignal, getExternalWorkflowHandle, log, proxyLocalActivities, setHandler, workflowInfo,\n} from \"@temporalio/workflow\";\nimport type * as activities from \"../activities/index.js\";\n\nexport const SLOTS: Record<string, number> = { nova: 3, cifix: 2, upgrade: 2, flaky: 1, bugfix: 2, health: 1, security: 1 };\nexport const request = defineSignal<[workflowId: string]>(\"request\");\nexport const release = defineSignal<[workflowId: string]>(\"release\"); // when the VM is parked or released\nexport const slotGranted = defineSignal(\"slotGranted\");\nconst { stillOpen } = proxyLocalActivities<typeof activities>({ startToCloseTimeout: \"1 minute\" });\n\nexport async function slots(agent: string, holders: string[] = [], waiting: string[] = []): Promise<void> {\n  setHandler(request, (id) => {\n    if (!holders.includes(id) && !waiting.includes(id)) waiting.push(id); // a retried request is not a second place in line\n  });\n  setHandler(release, (id) => {\n    holders = holders.filter((h) => h !== id);\n    waiting = waiting.filter((w) => w !== id); // stopped while still in line\n  });\n  while (!workflowInfo().continueAsNewSuggested) {\n    const free = await condition(() => waiting.length > 0 && holders.length < (SLOTS[agent] ?? 1), \"1 hour\");\n    if (!free) {\n      holders = await stillOpen(holders); // a terminated run never ran its finally: take its slot back\n      continue;\n    }\n    const holder = waiting.shift()!;\n    holders.push(holder);\n    try {\n      await getExternalWorkflowHandle(holder).signal(slotGranted);\n    } catch (err) {\n      holders = holders.filter((h) => h !== holder); // it ended while it waited in line\n      log.warn(\"slot holder is gone\", { agent, holder, err: String(err) });\n    }\n  }\n  await continueAsNew<typeof slots>(agent, holders, waiting);\n}",
+        "notes": [
+          {
+            "line": 7,
+            "text": "VMs in parallel per agent, to start with. Raising one is a one-line PR."
+          },
+          {
+            "line": 15,
+            "text": "A retried request must not take a second place in line."
+          },
+          {
+            "line": 19,
+            "text": "A run that is stopped while it waits leaves the line."
+          },
+          {
+            "line": 21,
+            "text": "The SDK says when the history is getting long; better than counting events by hand."
+          },
+          {
+            "line": 24,
+            "text": "Runs only after an hour with nobody granted. A terminated run skips its finally block, so without this its slot is lost forever."
+          },
+          {
+            "line": 31,
+            "text": "The run ended while it waited in line. Without this catch, the slots workflow itself fails and every run of this agent waits forever."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/workflows/with-slot.ts",
+      "what": "How a run holds a slot: takeSlot before acquireSandbox and before wakeSandbox, giveSlot after parkSandbox and after releaseSandbox. withSlot wraps a whole step. The ticket puts these in slots.ts; they are split only to keep each file short.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/workflows/with-slot.ts",
+        "text": "// orchestrator/src/workflows/with-slot.ts: workflow code. How ticketToPr and routineRun hold a VM slot.\nimport { CancellationScope, condition, getExternalWorkflowHandle, setHandler, workflowInfo } from \"@temporalio/workflow\";\nimport { release, request, slotGranted } from \"./slots.js\";\n\n/** Wait in line for one of the agent's VM slots. Call it before acquireSandbox and before wakeSandbox. */\nexport const takeSlot = async (agent: string): Promise<void> => {\n  let granted = false;\n  setHandler(slotGranted, () => {\n    granted = true;\n  });\n  await getExternalWorkflowHandle(`slots:${agent}`).signal(request, workflowInfo().workflowId);\n  try {\n    await condition(() => granted);\n  } catch (err) {\n    await giveSlot(agent); // cancelled while in line: leave the line\n    throw err;\n  }\n};\n\n/** Give the slot back. Call it after parkSandbox and after releaseSandbox; it runs even when the run is cancelled. */\nexport const giveSlot = (agent: string): Promise<void> =>\n  CancellationScope.nonCancellable(() =>\n    getExternalWorkflowHandle(`slots:${agent}`).signal(release, workflowInfo().workflowId),\n  );\n\nexport const withSlot = async <T>(agent: string, fn: () => Promise<T>): Promise<T> => {\n  await takeSlot(agent);\n  try {\n    return await fn();\n  } finally {\n    await giveSlot(agent);\n  }\n};",
+        "notes": [
+          {
+            "line": 8,
+            "text": "Set the handler before asking, so a fast grant is never missed."
+          },
+          {
+            "line": 15,
+            "text": "If the run is cancelled while in line, it tells the slots workflow to forget it."
+          },
+          {
+            "line": 22,
+            "text": "Giving the slot back must happen even when the run is being cancelled."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/workflows/kill-switch.ts",
+      "what": "The workflow-side check. killed(agent) runs a local activity (an activity that runs inside the same worker, without a round trip through the task queue), so reading the switch before every step costs milliseconds.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/workflows/kill-switch.ts",
+        "text": "// orchestrator/src/workflows/kill-switch.ts: workflow code. Read the kill switch before every step.\nimport { proxyLocalActivities } from \"@temporalio/workflow\";\nimport type * as activities from \"../activities/index.js\";\n\n// A local activity: it runs in the worker that runs the workflow, so the check costs milliseconds.\nconst { agentStopped } = proxyLocalActivities<typeof activities>({ startToCloseTimeout: \"30 seconds\" });\n\n/** true: end the run cleanly before the next step and keep the branch and notes. */\nexport const killed = (agent: string): Promise<boolean> => agentStopped(agent);"
+      }
+    },
+    {
+      "path": "orchestrator/src/activities/fanout.ts",
+      "what": "The two activities behind the walls: agentStopped reads the kill switch flag; stillOpen asks Temporal which slot holders are still running. Export both from activities/index.ts.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/activities/fanout.ts",
+        "text": "// orchestrator/src/activities/fanout.ts: activities for the fan-out walls (plain async functions; Node APIs allowed).\nimport { WorkflowNotFoundError } from \"@temporalio/client\";\nimport { readFlag } from \"../flags.js\";\nimport { temporalClient } from \"../temporal.js\";\n\nexport const agentStopped = async (agent: string): Promise<boolean> => (await readFlag(`agent:${agent}:stopped`)) !== null;\n\n/** The slot holders whose runs are still running. A run that was terminated never gave its slot back. */\nexport const stillOpen = async (workflowIds: string[]): Promise<string[]> => {\n  const client = await temporalClient();\n  const open: string[] = [];\n  for (const id of workflowIds) {\n    const status = await client.workflow.getHandle(id).describe().then(\n      (d) => d.status.name,\n      (err: unknown) => {\n        if (err instanceof WorkflowNotFoundError) return \"NOT_FOUND\";\n        throw err; // Temporal unreachable: keep every holder rather than free a slot by mistake\n      },\n    );\n    if (status === \"RUNNING\") open.push(id);\n  }\n  return open;\n};",
+        "notes": [
+          {
+            "line": 16,
+            "text": "Only \"this run does not exist\" frees a slot. Any other error (Temporal busy) keeps the holder."
+          }
+        ]
+      }
+    },
+    {
+      "path": "broker/src/flags.ts",
+      "what": "The flag store in the broker: a flags table created at broker start and three internal routes. Mount flagRoute on the internal listener next to POST /internal/runs, never on the sandbox-facing port, and write each PUT and DELETE to the broker's existing audit log.",
+      "code": {
+        "lang": "typescript",
+        "file": "broker/src/flags.ts",
+        "text": "// broker/src/flags.ts: the flag store behind the kill switch. Mount it on the internal listener only, next to\n// POST /internal/runs; the sandbox-facing port never serves it (only orchestrator-worker reaches the internal port).\nimport type { IncomingMessage, ServerResponse } from \"node:http\";\nimport type { Pool } from \"pg\";\n\nexport interface Flag { name: string; value: string; reason: string; setBy: string; setAt: string }\n\nconst NAME = /^(agent|routine|routines):[a-z0-9-]+:[a-z_]+$/; // agent:nova:stopped, routine:fe-ci-fixer:paused\nconst json = (res: ServerResponse, body: unknown) =>\n  void res.writeHead(200, { \"content-type\": \"application/json\" }).end(JSON.stringify(body));\n\nexport const ensureFlagsTable = (db: Pool) =>\n  db.query(`CREATE TABLE IF NOT EXISTS flags (name text PRIMARY KEY, value text NOT NULL, reason text NOT NULL,\n    set_by text NOT NULL, set_at timestamptz NOT NULL DEFAULT now())`);\n\nconst readBody = async (req: IncomingMessage): Promise<string> => {\n  let body = \"\";\n  for await (const chunk of req) {\n    body += String(chunk);\n    if (body.length > 4096) throw new Error(\"flag body too large\");\n  }\n  return body;\n};\n\n/** GET | PUT | DELETE /internal/flags/<name>. GET answers null when the flag is not set. */\nexport const flagRoute = async (req: IncomingMessage, res: ServerResponse, db: Pool, name: string): Promise<void> => {\n  if (!NAME.test(name)) return void res.writeHead(400).end(\"bad flag name\");\n  if (req.method === \"GET\") {\n    const { rows } = await db.query<Flag>(\n      `SELECT name, value, reason, set_by AS \"setBy\", set_at AS \"setAt\" FROM flags WHERE name = $1`, [name]);\n    return json(res, rows[0] ?? null);\n  }\n  if (req.method === \"PUT\") {\n    const { value = \"on\", reason, setBy } = JSON.parse(await readBody(req)) as Partial<Flag>;\n    if (!reason || !setBy) return void res.writeHead(400).end(\"reason and setBy are required\");\n    await db.query(`INSERT INTO flags (name, value, reason, set_by) VALUES ($1, $2, $3, $4)\n      ON CONFLICT (name) DO UPDATE SET value = $2, reason = $3, set_by = $4, set_at = now()`, [name, value, reason, setBy]);\n    return json(res, { ok: true });\n  }\n  if (req.method === \"DELETE\") {\n    await db.query(\"DELETE FROM flags WHERE name = $1\", [name]);\n    return json(res, { ok: true });\n  }\n  res.writeHead(405).end();\n};",
+        "notes": [
+          {
+            "line": 8,
+            "text": "Only names of this shape are accepted, so a typo cannot create a flag nobody reads."
+          },
+          {
+            "line": 35,
+            "text": "Every switch says who turned it on and why; the Slack alert and the runbook show it."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/main.ts",
+      "what": "The orchestrator-worker entry point (ts_platform.md runs dist/main.js). One Temporal worker per task queue, all sharing one connection and one workflow bundle, and ensureSlots() so every slots:<agent> workflow exists before any run asks for a slot. If G3-24 already created main.ts, merge these lines into it.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/main.ts",
+        "text": "// orchestrator/src/main.ts: the orchestrator-worker process. One Temporal worker per task queue, one shared bundle.\nimport { fileURLToPath } from \"node:url\";\nimport { WorkflowIdConflictPolicy } from \"@temporalio/client\";\nimport { bundleWorkflowCode, NativeConnection, Worker } from \"@temporalio/worker\";\nimport * as activities from \"./activities/index.js\";\nimport { temporalClient } from \"./temporal.js\";\nimport { SLOTS, slots } from \"./workflows/slots.js\";\n\nconst QUEUES = [\"nova\", \"cifix\", \"upgrade\", \"flaky\", \"bugfix\", \"health\", \"security\", \"orchestrator\"];\n\n/** Start slots:<agent> for every agent. Safe on every worker start: USE_EXISTING joins the one that runs. */\nconst ensureSlots = async (): Promise<void> => {\n  const client = await temporalClient();\n  for (const agent of Object.keys(SLOTS)) {\n    await client.workflow.start(slots, {\n      workflowId: `slots:${agent}`,\n      taskQueue: \"ai-agents-orchestrator\", // housekeeping queue, like the Jira polls\n      args: [agent],\n      workflowIdConflictPolicy: WorkflowIdConflictPolicy.USE_EXISTING,\n    });\n  }\n};\n\nconst connection = await NativeConnection.connect({ address: process.env.TEMPORAL_ADDRESS ?? \"localhost:7233\" });\nconst workflowBundle = await bundleWorkflowCode({\n  workflowsPath: fileURLToPath(new URL(\"./workflows/index.js\", import.meta.url)),\n});\nconst workers = await Promise.all(\n  QUEUES.map((q) => Worker.create({ connection, namespace: \"ai-agents\", taskQueue: `ai-agents-${q}`, workflowBundle, activities })),\n);\nawait ensureSlots();\n// G3-28: await ensureSchedules(await temporalClient());\nawait Promise.all(workers.map((w) => w.run())); // each worker polls only its own queue",
+        "notes": [
+          {
+            "line": 9,
+            "text": "One queue per agent, plus ai-agents-orchestrator for housekeeping, so a storm of one agent cannot take the workers another agent needs."
+          },
+          {
+            "line": 4,
+            "text": "Bundle the workflow code once; eight Worker.create calls with workflowsPath would bundle it eight times at start."
+          },
+          {
+            "line": 31,
+            "text": "Before any run starts: a run that signals a slots workflow that does not exist fails."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/workflows/ticket-to-pr.ts (edit)",
+      "what": "The change to G3-24's ticketToPr: take a slot before claiming a VM, give it back when the VM is parked or released, take it again before waking, and read the kill switch before the plan step and the build step. The diff is written against G3-24's sketch; apply the same idea to the real file.",
+      "code": {
+        "lang": "diff",
+        "file": "orchestrator/src/workflows/ticket-to-pr.ts (edit)",
+        "text": "--- a/orchestrator/src/workflows/ticket-to-pr.ts\n+++ b/orchestrator/src/workflows/ticket-to-pr.ts\n@@ imports\n import { act } from \"../policies.js\";\n import { waitForPerson } from \"../waiting.js\";\n+import { killed } from \"./kill-switch.js\";\n+import { giveSlot, takeSlot } from \"./with-slot.js\";\n@@ const inSandbox = async (task: Task, size: Size): Promise<RunResult> => {\n+    await takeSlot(\"nova\"); // wait in line: at most 3 Nova VMs at once\n     const vm = await act.acquireSandbox({ runId: workflowInfo().runId, size, agent: \"nova\", jiraKey: t.key });\n@@ while (result.needsAnswer) {\n         if (idle) await act.parkSandbox(vm);\n+        if (idle) await giveSlot(\"nova\"); // a stopped VM costs almost nothing, so its slot goes back\n         if (!(await waitForPerson(run, \"question\", () => run.answer !== undefined, t))) return { ...result, parked: true };\n+        if (idle) await takeSlot(\"nova\"); // wait in line again before the VM starts\n         if (idle) await act.wakeSandbox(vm);\n@@ } finally {\n       await CancellationScope.nonCancellable(() => act.releaseSandbox(vm));\n+      await giveSlot(\"nova\"); // giving back twice (after a park) is harmless\n     }\n@@ the steps\n+  if (await killed(\"nova\")) return \"stopped\"; // the kill switch is read before every step; the branch stays\n   const plan = await inSandbox(planTask(t), \"lite\");\n@@\n+  if (await killed(\"nova\")) return \"stopped\";\n   const built = await inSandbox(buildTask(t, plan), \"full\");"
+      }
+    },
+    {
+      "path": "orchestrator/test/workflows/fanout.ts",
+      "what": "Three tiny workflows for the tests, bundled together with the real slots workflow: one that stays open, one that holds a Nova slot until told \"done\", and one with three steps and a kill-switch check before each.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/test/workflows/fanout.ts",
+        "text": "// orchestrator/test/workflows/fanout.ts: small workflows for the fan-out tests, bundled with the real slots workflow.\nimport { condition, defineQuery, defineSignal, proxyActivities, setHandler } from \"@temporalio/workflow\";\nimport { killed } from \"../../src/workflows/kill-switch.js\";\nimport { giveSlot, takeSlot } from \"../../src/workflows/with-slot.js\";\nexport { slots } from \"../../src/workflows/slots.js\";\n\nexport const done = defineSignal(\"done\");\nexport const hasSlot = defineQuery<boolean>(\"hasSlot\");\n\n/** Stays open until \"done\", like a run that waits for plan approval. */\nexport async function waitForDone(): Promise<void> {\n  let finished = false;\n  setHandler(done, () => void (finished = true));\n  await condition(() => finished);\n}\n\n/** Takes a Nova slot and holds it until \"done\". */\nexport async function holdSlot(): Promise<void> {\n  let finished = false;\n  let mine = false;\n  setHandler(done, () => void (finished = true));\n  setHandler(hasSlot, () => mine);\n  await takeSlot(\"nova\");\n  mine = true;\n  await condition(() => finished);\n  await giveSlot(\"nova\");\n}\n\nconst { step } = proxyActivities<{ step(n: number): Promise<void> }>({ startToCloseTimeout: \"1 minute\" });\n\n/** Three steps with the kill switch read before each one, as ticketToPr does. */\nexport async function threeSteps(): Promise<string> {\n  for (const n of [1, 2, 3]) {\n    if (await killed(\"nova\")) return `stopped before step ${n}`;\n    await step(n);\n  }\n  return \"done\";\n}"
+      }
+    },
+    {
+      "path": "orchestrator/test/fanout.test.ts",
+      "what": "The three tests the ticket asks for, with TestWorkflowEnvironment.createLocal (a real local dev server with the Agent attribute registered) and a fake flag store. These tests were run against Temporal SDK 1.24.0 and pass.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/test/fanout.test.ts",
+        "text": "// orchestrator/test/fanout.test.ts: run with `npm test`. Starts a local Temporal dev server through the testing package.\nimport assert from \"node:assert/strict\";\nimport { after, before, mock, test } from \"node:test\";\nimport { setTimeout as sleep } from \"node:timers/promises\";\nimport { fileURLToPath } from \"node:url\";\nimport { TestWorkflowEnvironment } from \"@temporalio/testing\";\nimport { Worker } from \"@temporalio/worker\";\nimport { agentStopped } from \"../src/activities/fanout.js\";\nimport { brokerInternal } from \"../src/broker-internal.js\";\nimport { AgentStopped, startRun } from \"../src/fanout.js\";\nimport { done, hasSlot } from \"./workflows/fanout.js\";\n\nconst stopped = new Set<string>(); // the fake flag store: flag names that are on\nmock.method(brokerInternal, \"get\", (async (path: string) =>\n  stopped.has(decodeURIComponent(path.split(\"/\").at(-1)!)) ? { reason: \"test\" } : null) as typeof brokerInternal.get);\n\nlet env: TestWorkflowEnvironment, worker: Worker, running: Promise<void>;\nconst eventually = async (check: () => Promise<boolean>) => {\n  for (let i = 0; i < 100 && !(await check()); i++) await sleep(100);\n  assert.ok(await check());\n};\n\nbefore(async () => {\n  env = await TestWorkflowEnvironment.createLocal({ server: { extraArgs: [\"--search-attribute\", \"Agent=Keyword\"] } });\n  worker = await Worker.create({\n    connection: env.nativeConnection, taskQueue: \"ai-agents-nova\",\n    workflowsPath: fileURLToPath(new URL(\"./workflows/fanout.ts\", import.meta.url)),\n    activities: {\n      agentStopped, stillOpen: async (ids: string[]) => ids,\n      step: async (n: number) => void (n === 1 && stopped.add(\"agent:nova:stopped\")), // the switch flips during step 1\n    },\n  });\n  running = worker.run();\n});\nafter(async () => {\n  worker.shutdown();\n  await running;\n  await env.teardown();\n});\n\ntest(\"two starts for the same ticket give one run\", async () => {\n  const a = await startRun(env.client, \"nova\", \"RH-1234\", \"waitForDone\");\n  const b = await startRun(env.client, \"nova\", \"RH-1234\", \"waitForDone\"); // the poll, then /nova in Slack\n  assert.equal(a.firstExecutionRunId, b.firstExecutionRunId);\n  await a.signal(done);\n});\n\ntest(\"a 4th Nova ticket waits for a slot until one is given back\", async () => {\n  await env.client.workflow.start(\"slots\", { workflowId: \"slots:nova\", taskQueue: \"ai-agents-nova\", args: [\"nova\"] });\n  const runs = await Promise.all([1, 2, 3, 4].map((n) =>\n    env.client.workflow.start(\"holdSlot\", { workflowId: `nova:T-${n}`, taskQueue: \"ai-agents-nova\" })));\n  const slotsHeld = () => Promise.all(runs.map((r) => r.query(hasSlot)));\n  await eventually(async () => (await slotsHeld()).filter(Boolean).length === 3); // the line order is not fixed\n  const held = await slotsHeld();\n  const waiter = runs[held.indexOf(false)];\n  await runs[held.indexOf(true)].signal(done); // one run finishes and gives its slot back\n  await eventually(() => waiter.query(hasSlot));\n});\n\ntest(\"the kill switch stops a run between steps and refuses new starts\", async () => {\n  const result = await env.client.workflow.execute(\"threeSteps\", { workflowId: \"nova:RH-77\", taskQueue: \"ai-agents-nova\" });\n  assert.equal(result, \"stopped before step 2\");\n  await assert.rejects(startRun(env.client, \"nova\", \"RH-78\", \"waitForDone\"), AgentStopped);\n});",
+        "notes": [
+          {
+            "line": 14,
+            "text": "Replace the broker call with a set of names, so the tests need no broker and no database."
+          },
+          {
+            "line": 53,
+            "text": "Four runs ask at the same moment, so which one waits is not known in advance. Find it, do not assume it is the 4th."
+          },
+          {
+            "line": 62,
+            "text": "The fake step 1 turns the switch on, so the run must stop before step 2 and never run it."
+          }
+        ]
+      }
+    }
+  ],
+  "steps": [
+    {
+      "do": "Update main and make a branch in your ai-agents clone.",
+      "cmd": "git switch main && git pull && git switch -c g3-25-fan-out-walls"
+    },
+    {
+      "do": "Check that nothing else starts runs today, so you know every caller you have to move to startRun.",
+      "cmd": "grep -rn \"workflow.start(\\|signalWithStart(\" orchestrator/src slack-app/src",
+      "see": "No lines, or only lines you are about to replace. After this card, the only hits are fanout.ts and ensureSlots in main.ts."
+    },
+    {
+      "do": "Add orchestrator/src/temporal.ts (if missing), flags.ts and fanout.ts from the files list."
+    },
+    {
+      "do": "Add the workflow files slots.ts, with-slot.ts and kill-switch.ts, and export them from orchestrator/src/workflows/index.ts.",
+      "cmd": "printf 'export * from \"./slots.js\";\\nexport * from \"./with-slot.js\";\\nexport * from \"./kill-switch.js\";\\n' >> orchestrator/src/workflows/index.ts"
+    },
+    {
+      "do": "Add orchestrator/src/activities/fanout.ts and export it from the activities barrel.",
+      "cmd": "echo 'export * from \"./fanout.js\";' >> orchestrator/src/activities/index.ts"
+    },
+    {
+      "do": "Add broker/src/flags.ts. In the broker's startup code call ensureFlagsTable(db) once, and route /internal/flags/<name> on the internal listener to flagRoute. Ask the broker owner where the audit line goes."
+    },
+    {
+      "do": "Put the worker start code in orchestrator/src/main.ts (eight queues, one bundle, ensureSlots)."
+    },
+    {
+      "do": "Apply the ticketToPr change from the diff: takeSlot and giveSlot around the VM, killed(\"nova\") before each step."
+    },
+    {
+      "do": "Start a local Temporal dev server in a second terminal and leave it open. The tests start their own server, but you will use this one to look around.",
+      "cmd": "temporal server start-dev --search-attribute Agent=Keyword",
+      "see": "Temporal Server:  localhost:7233\nWeb UI:           http://localhost:8233"
+    },
+    {
+      "do": "Run the fan-out tests.",
+      "cmd": "node --import tsx --test orchestrator/test/fanout.test.ts",
+      "see": "ok 1 - two starts for the same ticket give one run\nok 2 - a 4th Nova ticket waits for a slot until one is given back\nok 3 - the kill switch stops a run between steps and refuses new starts\n# pass 3\n# fail 0"
+    },
+    {
+      "do": "Run the whole repo check (lint, types, every test, build), the same as CI.",
+      "cmd": "npm run check",
+      "see": "Every step ends without errors; the test summary shows # fail 0."
+    },
+    {
+      "do": "Run G3-29's replay test if it exists. The ticketToPr change adds new steps, so saved histories of older runs may no longer replay (see the gaps for when you need patched()).",
+      "cmd": "node --import tsx --test orchestrator/test/replay.test.ts",
+      "see": "# fail 0, or a non-determinism error that tells you to wrap the new lines in patched(\"g3-25-slots\")."
+    },
+    {
+      "do": "Commit, push and open the PR (checklist below).",
+      "cmd": "git add -A && git commit -m \"[Platform] G3-25: fan-out walls: one run per thing, slots, kill switch\" && git push -u origin HEAD && gh pr create --fill"
+    }
+  ],
+  "prove": [
+    {
+      "do": "Locally: the three tests are the proof the ticket asks for. Run them twice to make sure they are stable.",
+      "cmd": "node --import tsx --test orchestrator/test/fanout.test.ts",
+      "see": "# pass 3\n# fail 0"
+    },
+    {
+      "do": "Locally: see the rule startRun relies on with your own eyes. With the dev server from step 9 running, start the same ID twice with the conflict policy USE_EXISTING (no worker is needed; the run just waits), then list the runs.",
+      "cmd": "for i in 1 2; do temporal workflow start --type ticketToPr --task-queue ai-agents-nova --workflow-id nova:RH-1234 --id-conflict-policy UseExisting --search-attribute 'Agent=\"nova\"' | grep RunId; done\ntemporal workflow list --query 'Agent=\"nova\" AND ExecutionStatus=\"Running\"'",
+      "see": "The same RunId printed twice, and one row: Running  nova:RH-1234  ticketToPr"
+    },
+    {
+      "do": "After deploy: turn the switch on for nova in a quiet moment (a platform engineer with inf access).",
+      "cmd": "kubectl -n ai-agents port-forward deploy/broker <internal-port>:<internal-port> &\ncurl -X PUT localhost:<internal-port>/internal/flags/agent:nova:stopped -H \"content-type: application/json\" -d '{\"reason\":\"kill-switch drill\",\"setBy\":\"sean\"}'",
+      "see": "{\"ok\":true}"
+    },
+    {
+      "do": "After deploy: stop every running Nova run at once with the batch stop, then check the list is empty.",
+      "cmd": "temporal workflow signal --namespace ai-agents --query 'Agent=\"nova\" AND ExecutionStatus=\"Running\"' --name stop --input '\"kill-switch\"' --yes\ntemporal workflow list --namespace ai-agents --query 'Agent=\"nova\" AND ExecutionStatus=\"Running\"'",
+      "see": "Started batch for job ID: <uuid>, and then no running rows once each run reaches its next step."
+    },
+    {
+      "do": "After deploy: assign a test ticket to Nova while the switch is on. The poll must not start a run.",
+      "see": "No new nova:<key> run in the Temporal UI, and a log line about the kill switch from the poll."
+    },
+    {
+      "do": "After deploy: turn the switch off again.",
+      "cmd": "curl -X DELETE localhost:<internal-port>/internal/flags/agent:nova:stopped",
+      "see": "{\"ok\":true}"
+    },
+    {
+      "do": "In staging, check the network wall: from a sandbox VM (SSM session), Temporal must be unreachable.",
+      "cmd": "curl -m 5 -sS https://temporal-ai-agents.rhinohealth.com",
+      "see": "A timeout or a refusal from the egress proxy, never a page."
+    }
+  ],
+  "gaps": [
+    "Nobody starts the slots:<agent> workflows (also in TICKET_ISSUES.md). If they do not exist, the first takeSlot signal fails and the run fails. Recommendation: ensureSlots() at worker start on ai-agents-orchestrator with USE_EXISTING, as in main.ts here.",
+    "The sketch's slots workflow signals slotGranted with no error handling. If the run at the front of the line ended while it waited, the signal throws, the slots workflow fails, and every later run of that agent waits forever. This card catches the error and drops that holder.",
+    "A run that is terminated (not cancelled) never runs its finally block, so in the sketch its slot is never given back and the agent permanently loses capacity (Nova has only 3). This card adds an hourly stillOpen check that takes back slots from runs that are no longer running.",
+    "The sketch lets one run stand in line twice (a retried request). This card ignores a request from a run that already holds a slot or is already waiting, and also removes a run from the line when it releases while still waiting.",
+    "withSlot(agent, fn) alone cannot give the slot back while the VM is parked, because parking happens inside the step. The ticket says a parked run gives its slot back, so this card adds takeSlot and giveSlot and calls them around parkSandbox and wakeSandbox in ticketToPr.",
+    "The batch stop command in the ticket has no --input, but the stop signal takes a \"by\" argument (also in TICKET_ISSUES.md). Recommendation: --input '\"kill-switch\"'.",
+    "G3-24's sketch never sets a handler for the stop signal (TICKET_ISSUES.md), so until G3-38 adds it, the batch stop is buffered and does nothing. In this card the per-step kill-switch check is what really ends the runs.",
+    "The kill switch is \"a row per agent in the broker DB\", but no ticket defines the table, the endpoint, or who may write it. G3-17's NetworkPolicy lets only orchestrator-worker reach the broker's internal port, so neither a person nor the Slack app can flip it directly. Recommendation: the flags table and routes in this card, a port-forward for people until the Slack app gets a button that goes through the orchestrator.",
+    "G0-13 says bumping an agent's epoch kills its gateway tokens, but no ticket says where the epoch is stored or how it is bumped (no endpoint, no store). Until the gateway owner answers, the kill switch has two of its three parts; run tokens still die with each run.",
+    "startRun now throws AgentStopped while the switch is on. G3-28's startMatches calls startRun inside an activity whose retry policy has no attempt limit, so it would retry forever. Recommendation for G3-28: catch AgentStopped and skip (or check the switch once per poll before the loop).",
+    "G3-20 uses brokerInternal but no ticket names its file. This card imports it from orchestrator/src/broker-internal.ts; change the import if it lives elsewhere.",
+    "G3-29 asks for patched() around any new workflow step. The ticketToPr change here adds signals and local activities, so it would break the replay of runs that started before the deploy. Before the pilot (G4-28) no Nova run is open in production, so plain code is fine; if any run is open when this deploys, wrap the new lines in patched(\"g3-25-slots\").",
+    "No ticket sets a PR title format for the ai-agents repo. fcp uses \"[FE] RH-6589: ...\" and add-jira-links reads the Jira key from the title. Recommendation: \"[Platform] RH-<n>: ...\" with this ticket's Jira key once it is filed."
+  ],
+  "pr": [
+    "Title: \"[Platform] RH-<n>: Fan-out walls: one run per thing, slots, kill switch\" (no ticket fixes the format for ai-agents; this follows fcp's style).",
+    "Required checks green: lint, test and evals (the ai-agents main ruleset from G3-01).",
+    "Exactly one approval from someone else; a new push dismisses it, so push before you ask.",
+    "Ask the broker owner to read broker/src/flags.ts, because it adds a table and internal routes to the broker.",
+    "Paste the fan-out test output (# pass 3) into the PR body, and say whether the replay test needed patched().",
+    "Say in the body which decisions you took the fallback for (flag store, who starts slots, the batch-stop input).",
+    "No change under .github/ or the other protected paths in settings/protected-paths.yaml.",
+    "After merge: post the kill-switch commands in the misbehaving-agent runbook (G3-34) and tell the gateway owner about the missing epoch bump."
+  ],
+  "rollback": "Revert the PR and redeploy orchestrator-worker and the broker; the flags table can stay, because nothing reads it any more. If runs started with the new code are still open, stop them with the batch stop first, then end the slots workflows with: temporal workflow terminate --namespace ai-agents --query 'WorkflowType=\"slots\"' --reason \"G3-25 rollback\".",
+  "prompt": "You are helping Sean do ticket G3-25 (\"Fan-out walls: one run per thing, fixed slots, kill switch\") in the RhinoHealth/ai-agents repo (TypeScript on Node 24, npm workspaces, ESM with .js import paths, node:test through tsx, exact-pinned dependencies).\n\nGoal: every run starts through one function (startRun / startOrSignal in orchestrator/src/fanout.ts) with the ID <agent>:<thing>, the queue ai-agents-<agent>, the Agent search attribute and USE_EXISTING; a slots:<agent> workflow per agent hands out VM slots (nova 3, cifix 2, upgrade 2, flaky 1, bugfix 2, health 1, security 1); a kill switch (flag agent:<agent>:stopped in the broker's flag store) is read by startRun and before every workflow step.\n\nStart from the card: ~/Projects/ai-agents-course/content/cards/G3-25.json. Its files[].code.text holds tested code for orchestrator/src/{fanout,flags,temporal,main}.ts, orchestrator/src/workflows/{slots,with-slot,kill-switch}.ts, orchestrator/src/activities/fanout.ts, broker/src/flags.ts, a diff for ticket-to-pr.ts, and the tests. Read the real repo first and adapt the code to it (for example where brokerInternal really lives, how the broker routes its internal port, what ticketToPr really looks like). Read the card's \"decide\" and \"gaps\" lists; where a decision is still open, use the fallback and tell me.\n\nWalls (do not cross):\n- Workflow code stays deterministic: no Node APIs, no fetch, no Date.now() for logic; all I/O in activities.\n- Only the orchestrator starts runs. Nothing reachable from a VM may start a run.\n- No maxTurns, budgets or time limits on agents. Timeouts are safety nets only.\n- Do not touch .github/ or anything in settings/protected-paths.yaml.\n- Do not commit, push or open a PR; show me the diff when you are done.\n- If you use subagents, use at most two and tell them not to start their own.\n\nDone when:\n1. `node --import tsx --test orchestrator/test/fanout.test.ts` prints \"# pass 3\" and \"# fail 0\" (the test starts a local dev server; the temporal CLI is installed).\n2. `npm run check` is green.\n3. `grep -rn \"workflow.start(\\|signalWithStart(\" orchestrator/src slack-app/src` shows only fanout.ts and ensureSlots in main.ts.\n4. You list which \"decide\" fallbacks you used and anything in the repo that did not match the card."
+}

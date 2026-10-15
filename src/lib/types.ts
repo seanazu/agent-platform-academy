@@ -87,3 +87,88 @@ export type Ticket = {
   why?: string;
   how?: string[];
 };
+
+// ---------- Lesson format v2 (content/SCHEMA-v2.md) ----------
+export type ActorKind = NodeKind | 'queue' | 'data';
+export type SceneActor = { id: string; label: string; kind: ActorKind; at: [number, number]; sub?: string };
+export type SceneLink = { from: string; to: string };
+export type Tone = 'ok' | 'bad' | 'accent';
+export type Cue = {
+  focus?: string[];
+  send?: { from: string; to: string; label?: string; tone?: Tone };
+  mark?: { id: string; badge: string; tone?: Tone };
+  unmark?: string;
+  fail?: string;
+  heal?: string;
+  caption?: string;
+  reset?: boolean;
+};
+export type Scene = { cols: number; rows: number; actors: SceneActor[]; links: SceneLink[] };
+export type NarrationLine = { say: string; cue?: Cue };
+export type Chapter = { title: string; lines: NarrationLine[]; check?: QuizQuestion };
+export type Watch = { scene: Scene; chapters: Chapter[] };
+
+export type PlayTask = { kind: 'guess' | 'break' | 'explore'; text: string };
+export type Play = { widget: string; intro: string; config?: Record<string, unknown>; tasks: PlayTask[] };
+
+export type ReadCode = { lang: CodeLang; file: string; text: string; notes?: CodeNote[] };
+export type ReadSection = { h: string; p: string[]; code?: ReadCode; see?: string; deeper?: { h: string; p: string[]; code?: ReadCode } };
+
+export type LabGuess = { q: string; options: QuizOption[] };
+export type LabFollowStep = { say: string; do?: string; see?: string };
+export type LabV2 = {
+  id: string;
+  title: string;
+  minutes: number;
+  needs: string[];
+  goal: string;
+  guess: LabGuess;
+  follow: LabFollowStep[];
+  build: string;
+  fix?: string;
+  explain: string[];
+  done: string;
+};
+
+export type VideoClip = Video & { start?: number; end?: number };
+export type ReviewItem = { q: string; a: string };
+
+export type LessonV2 = {
+  v: 2;
+  id: string;
+  title: string;
+  minutes: number;
+  youNeed: string[];
+  map: string;
+  hook: { story: string[]; question: string };
+  watch: Watch;
+  play: Play;
+  read: ReadSection[];
+  lab: LabV2;
+  check: QuizQuestion[];
+  platform: { p: string[]; tickets: LessonTicket[] };
+  words: Word[];
+  videos: VideoClip[];
+  review: ReviewItem[];
+  remember: string;
+};
+
+export type CardDep = { key: string; why: string; proof?: string };
+export type CardStep = { do: string; cmd?: string; see?: string };
+export type TicketCardData = {
+  key: string;
+  title: string;
+  lesson: string;
+  goal: string;
+  outcome: string;
+  dependsOn: CardDep[];
+  access: { what: string; who: string }[];
+  decide: { q: string; owner: string; fallback: string }[];
+  files: { path: string; what: string; code?: ReadCode }[];
+  steps: CardStep[];
+  prove: CardStep[];
+  gaps: string[];
+  pr: string[];
+  rollback: string;
+  prompt: string;
+};

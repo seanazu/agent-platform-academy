@@ -7,6 +7,7 @@ function Header({ route, theme, onToggleTheme }: Props) {
   const links = [
     { name: 'home', label: 'Path', to: href.home() },
     { name: 'tickets', label: 'Tickets', to: href.tickets() },
+    { name: 'cast', label: "Who's who", to: href.cast() },
     { name: 'words', label: 'Words', to: href.words() },
     { name: 'search', label: 'Search', to: href.search() },
   ] as const;

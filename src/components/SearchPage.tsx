@@ -15,7 +15,7 @@ function SearchPage({ initial }: { initial?: string }) {
       hits.push({ kind: 'lesson', title: lesson.title, detail: lesson.goal, lessonId: lesson.id, part: part.title });
       const data = getLesson(lesson.id);
       if (!data) continue;
-      for (const s of data.sections) hits.push({ kind: 'heading', title: s.h, detail: lesson.title, lessonId: lesson.id, part: part.title });
+      for (const s of 'sections' in data ? data.sections : data.read) hits.push({ kind: 'heading', title: s.h, detail: lesson.title, lessonId: lesson.id, part: part.title });
       for (const w of data.words) hits.push({ kind: 'word', title: w.term, detail: w.plain, lessonId: lesson.id, part: part.title });
     }
     return hits;

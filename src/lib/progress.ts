@@ -3,18 +3,19 @@ import { useCallback, useSyncExternalStore } from 'react';
 export type Progress = {
   done: Record<string, true>;
   quiz: Record<string, Record<number, number>>;
+  labs: Record<string, true>;
   lastLesson?: string;
 };
 
 const KEY = 'apa.progress.v1';
-const empty: Progress = { done: {}, quiz: {} };
+const empty: Progress = { done: {}, quiz: {}, labs: {} };
 
 const read = (): Progress => {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return empty;
     const data = JSON.parse(raw) as Partial<Progress>;
-    return { done: data.done ?? {}, quiz: data.quiz ?? {}, lastLesson: data.lastLesson };
+    return { done: data.done ?? {}, quiz: data.quiz ?? {}, labs: data.labs ?? {}, lastLesson: data.lastLesson };
   } catch {
     return empty;
   }
@@ -53,5 +54,8 @@ export const useProgress = () => {
     if (state.lastLesson === id) return;
     write({ ...state, lastLesson: id });
   }, []);
-  return { progress, setDone, answer, visit };
+  const passLab = useCallback((id: string) => {
+    write({ ...state, labs: { ...state.labs, [id]: true } });
+  }, []);
+  return { progress, setDone, answer, visit, passLab };
 };

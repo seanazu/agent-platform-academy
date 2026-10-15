@@ -1,0 +1,353 @@
+{
+  "key": "G5-08",
+  "title": "[Platform] routineRun workflow: Nova's harness driven by a charter",
+  "lesson": "g5-2",
+  "goal": "Build routineRun, the one Temporal workflow every routine runs: load the routine's charter, let triggers with the same root cause gather for a few minutes, pass the gate, do the work in one fresh VM with Nova's harness, and then either keep the result (shadow mode) or ship it through the same PR steps as Nova.",
+  "outcome": "In the Temporal UI, a red build on main shows one routineRun called cifix:fcp:<fingerprint>, tagged Routine=fe-ci-fixer, RunKind=cifix and Stage=shadow. Three red pushes inside the 7-minute gather window still use one VM. A paused routine waits at the gate without any VM. When the run ends, its RoutineOutcome attribute says shadow, failed or stopped, and its result holds what the harness did.",
+  "dependsOn": [
+    {
+      "key": "G5-06",
+      "why": "The ticket's listed dependency: the charter YAML format, the Charter type in the shared package, the loadCharter(name, sha) activity and the first charter, fe-ci-fixer.",
+      "proof": "gh api repos/RhinoHealth/ai-agents/contents/routines/charters/fe-ci-fixer.yaml --jq .path"
+    },
+    {
+      "key": "G3-25",
+      "why": "routineRun takes a VM slot with takeSlot/giveSlot, reads the kill switch with killed(), and its triggers start it with startRun/startOrSignal.",
+      "proof": "gh api repos/RhinoHealth/ai-agents/contents/orchestrator/src/workflows/slots.ts --jq .path"
+    },
+    {
+      "key": "G3-24",
+      "why": "routineRun reuses ticketToPr's activities unchanged: acquireSandbox (G3-18), workInSandbox and releaseSandbox (G3-20).",
+      "proof": "gh api repos/RhinoHealth/ai-agents/contents/orchestrator/src/activities/run.ts --jq .path"
+    },
+    {
+      "key": "G3-29",
+      "why": "The activity presets: act (LONG: 7 days start-to-close, 2-minute heartbeats, AWS retries) and peopleApis (retries with back-off for GitHub, Jira and the broker).",
+      "proof": "gh api repos/RhinoHealth/ai-agents/contents/orchestrator/src/policies.ts --jq .path"
+    },
+    {
+      "key": "G5-02",
+      "why": "The gate's fourth check, one open PR per routine (mayOpenPr). Shadow runs skip it, so it is only needed before a routine leaves shadow.",
+      "proof": "gh api repos/RhinoHealth/ai-agents/contents/orchestrator/src/activities/noise.ts --jq .path"
+    },
+    {
+      "key": "G3-06",
+      "why": "The new search attributes Routine, RoutineOutcome and Stage must be registered on namespace ai-agents before the first run, or every routineRun fails on its first upsert. RunKind is already there.",
+      "proof": "kubectl -n ai-agents exec deploy/temporal-admintools -- temporal operator search-attribute list --namespace ai-agents | grep -E \"Routine|Stage\""
+    }
+  ],
+  "access": [
+    {
+      "what": "Write access to RhinoHealth/ai-agents and one approval from another engineer.",
+      "who": "The repo admin (Platform, G3-01)."
+    },
+    {
+      "what": "Registering Routine, RoutineOutcome and Stage (Keyword) on namespace ai-agents, by adding them to the post-install search-attribute job.",
+      "who": "DevOps, the G3-06 owner (Andy reviews Temporal changes)."
+    },
+    {
+      "what": "Time from the G4 owner to move the PR half of ticketToPr into the shared child workflow shipPr.",
+      "who": "The owner of G4-26/G4-27 (agree the split with them, as the ticket says)."
+    }
+  ],
+  "decide": [
+    {
+      "q": "Who moves the PR half of ticketToPr (scope judge, draft PR, Byte, findings, ready) into the shared child workflow shipPr, and when?",
+      "owner": "The G4 owner, with you.",
+      "fallback": "Land routineRun now with the ship-pr.ts placeholder in this card, which fails loudly. Every charter stays at stage: shadow (fe-ci-fixer and the G5-20 rollout start there anyway), so no run reaches it until the real shipPr exists."
+    },
+    {
+      "q": "Who pins charterSha? loadCharter needs it, but the triggers in G5-09 and G5-13 never pass one (also in TICKET_ISSUES.md).",
+      "owner": "You, with the G5-06 owner.",
+      "fallback": "The commit the orchestrator image was built from, passed in an AI_AGENTS_SHA environment variable by images.yml and exported as CHARTER_SHA from routines/agent-for.ts. Triggers put it in every RoutineRequest; schedules get the new value on each deploy."
+    },
+    {
+      "q": "Where does a shadow result live, so the weekly report (G5-16) can compare it with the human fix?",
+      "owner": "The G5-16 owner.",
+      "fallback": "The harness already stores the diff and the proof under s3://rhino-ai-agents-runs/runs/<run_id>/ (G3-13). routineRun returns the harness result as the workflow's result and sets Stage=shadow and RoutineOutcome=shadow; G5-16's sketch already finds runs with Stage = 'shadow', and Temporal keeps results for the namespace's 30 days."
+    },
+    {
+      "q": "Which RoutineOutcome does a shadow run or a stopped run get? G5-21's list (merged, closed, rejected, failed, handed_off, not_needed) has neither.",
+      "owner": "The G5-21 owner.",
+      "fallback": "Add shadow and stopped. Neither counts against the circuit breaker, which only counts failed and rejected."
+    },
+    {
+      "q": "Which routines does incident mode (routines:fixers:paused) hold at the gate?",
+      "owner": "The G5-17 owner.",
+      "fallback": "Every charter whose queue is cifix, because G5-17 counts storm runs with RunKind = 'cifix'."
+    },
+    {
+      "q": "What is the 'agent' a routine passes to acquireSandbox and to the slots: the routine name (fe-ci-fixer) as in the sketch, or the queue family (cifix)?",
+      "owner": "The G3-18 owner.",
+      "fallback": "The queue family, because the slots, the kill switch and the Agent attribute are all keyed by it. The routine name goes in the Routine attribute."
+    }
+  ],
+  "files": [
+    {
+      "path": "shared/src/routine.ts",
+      "what": "The types routineRun and its triggers share: Trigger (a GitHub run, a Jira ticket or a schedule), RoutineRequest, GateVerdict and RoutineOutcome. Export it from shared/src/index.ts. The sketch imports these names from the shared package, but no ticket wrote them down.",
+      "code": {
+        "lang": "typescript",
+        "file": "shared/src/routine.ts",
+        "text": "// shared/src/routine.ts: the types routineRun and its triggers share. Export them from shared/src/index.ts.\nexport type Stage = \"shadow\" | \"drafts\" | \"normal\";\n\n/** One event that woke a routine. Every event with the same root cause joins one run (addTrigger). */\nexport type Trigger =\n  | { kind: \"github.workflow_run\"; repo: string; runId: number; headSha: string; jobs: { name: string; firstError: string }[] }\n  | { kind: \"jira\"; key: string }\n  | { kind: \"schedule\"; name: string };\n\n/** What a trigger passes to routineRun. charterSha pins the charter to one ai-agents commit. */\nexport interface RoutineRequest {\n  routine: string; // the charter name, e.g. fe-ci-fixer\n  charterSha: string;\n  trigger?: Trigger; // schedules and the Jira poll start with a trigger; GitHub events arrive as addTrigger\n}\n\n/** The gate's answer before any VM: go, wait and look again later, or stop for good. */\nexport type GateVerdict =\n  | { verdict: \"go\" }\n  | { verdict: \"wait\"; reason: string; recheckMinutes: number }\n  | { verdict: \"stop\"; reason: string };\n\n/** The RoutineOutcome search attribute: G5-21's list, plus shadow and stopped (see the card's gaps). */\nexport type RoutineOutcome =\n  | \"merged\" | \"closed\" | \"rejected\" | \"failed\" | \"handed_off\" | \"not_needed\" | \"shadow\" | \"stopped\";",
+        "notes": [
+          {
+            "line": 13,
+            "text": "Required, so a trigger cannot forget it (see the decisions)."
+          },
+          {
+            "line": 21,
+            "text": "stop is for the kill switch: end the run. wait means look again later without a VM."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/search-attributes.ts",
+      "what": "Typed keys for the four routine search attributes (a search attribute is an indexed field you can filter runs by, like a database column). Pure code, so workflows may import it.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/search-attributes.ts",
+        "text": "// orchestrator/src/search-attributes.ts: typed keys for the routine search attributes (pure: workflows may import it).\n// Register them on namespace ai-agents first. Agent, JiraKey and RunKind already exist; Routine, RoutineOutcome and\n// Stage are new.\nimport { defineSearchAttributeKey, SearchAttributeType } from \"@temporalio/common\";\n\nexport const ROUTINE = defineSearchAttributeKey(\"Routine\", SearchAttributeType.KEYWORD);\nexport const RUN_KIND = defineSearchAttributeKey(\"RunKind\", SearchAttributeType.KEYWORD);\nexport const ROUTINE_OUTCOME = defineSearchAttributeKey(\"RoutineOutcome\", SearchAttributeType.KEYWORD);\nexport const STAGE = defineSearchAttributeKey(\"Stage\", SearchAttributeType.KEYWORD);"
+      }
+    },
+    {
+      "path": "orchestrator/src/routines/task-spec.ts",
+      "what": "TaskSpec.fromCharter: pure code that turns the charter and the triggers into the harness task (goal, done list, skills, allowed and denied paths, model and effort). No turn, budget or time limit is set; the charter's done list says when the work is finished.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/routines/task-spec.ts",
+        "text": "// orchestrator/src/routines/task-spec.ts: pure code (no I/O, no clock), so routineRun may call it inside the workflow.\nimport type { Charter, Trigger } from \"@rhinohealth/ai-agents-shared\";\n\n/** The harness task for one routine run. workInSandbox writes it to /run/nova/task.json. */\nexport interface RoutineTask {\n  job: \"routine\";\n  routine: string;\n  goal: string;\n  done: string[];\n  skills: string[];\n  allowedPaths: string[];\n  deniedPaths: string[];\n  never: string[];\n  model: string;\n  effort: string;\n  onFailedChecks?: string;\n  setup?: string;\n  triggers: Trigger[];\n}\n\nconst describeTrigger = (t: Trigger): string => {\n  switch (t.kind) {\n    case \"github.workflow_run\":\n      return `CI run ${t.runId} in ${t.repo} failed at ${t.headSha.slice(0, 7)}. ` +\n        t.jobs.map((j) => `Job \"${j.name}\" first error: ${j.firstError}`).join(\" \");\n    case \"jira\":\n      return `Jira ticket ${t.key}.`;\n    case \"schedule\":\n      return `Scheduled run ${t.name}.`;\n  }\n};\n\n/** No maxTurns, no budget and no time limit: the charter's done list says when the work is finished. */\nexport const TaskSpec = {\n  fromCharter: (charter: Charter, triggers: Trigger[]): RoutineTask => ({\n    job: \"routine\",\n    routine: charter.name,\n    goal: [`Routine ${charter.name}.`, ...triggers.map(describeTrigger)].join(\"\\n\"),\n    done: charter.done,\n    skills: charter.skills,\n    allowedPaths: charter.allowed_paths, // the harness hook refuses edits outside them; the git proxy checks again\n    deniedPaths: charter.denied_paths ?? [],\n    never: charter.never ?? [],\n    model: charter.model.name,\n    effort: charter.model.effort,\n    onFailedChecks: charter.model.on_failed_checks,\n    setup: charter.setup,\n    triggers,\n  }),\n};",
+        "notes": [
+          {
+            "line": 5,
+            "text": "workInSandbox's task type must accept this shape; agree it with the harness owner (see the gaps)."
+          },
+          {
+            "line": 41,
+            "text": "G5-06 enforces these twice: a harness hook gives an early refusal, and the git proxy checks again at push."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/activities/pre-run-gate.ts",
+      "what": "The gate before any VM, in the ticket's order: the kill switch, the routine's own pause flag, incident mode, and one open PR per routine. Also effectiveStage, the lower of the charter's stage and an override flag (G5-15 writes the override later; until then it is never set). Export both from activities/index.ts.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/activities/pre-run-gate.ts",
+        "text": "// orchestrator/src/activities/pre-run-gate.ts: the checks before any VM, in the ticket's order. Activities may do I/O.\nimport type { Charter, GateVerdict, Stage } from \"@rhinohealth/ai-agents-shared\";\nimport { readFlag } from \"../flags.js\";\nimport { mayOpenPr } from \"./noise.js\"; // G5-02\n\nconst STAGES: Stage[] = [\"shadow\", \"drafts\", \"normal\"];\n\n/** The lower of the charter's stage and the override G5-15 writes. Read once, at the start of the run. */\nexport const effectiveStage = async (charter: Charter): Promise<Stage> => {\n  const override = (await readFlag(`routine:${charter.name}:stage_override`))?.value as Stage | undefined;\n  if (!override || !STAGES.includes(override)) return charter.stage;\n  return STAGES[Math.min(STAGES.indexOf(charter.stage), STAGES.indexOf(override))] ?? \"shadow\";\n};\n\nexport const preRunGate = async (charter: Charter, stage: Stage): Promise<GateVerdict> => {\n  const killed = await readFlag(`agent:${charter.queue}:stopped`); // 1. the kill switch (G3-25)\n  if (killed) return { verdict: \"stop\", reason: `kill switch: ${killed.reason}` };\n  const paused = await readFlag(`routine:${charter.name}:paused`); // 2. paused by its owner or the breaker\n  if (paused) return { verdict: \"wait\", reason: `${charter.name} is paused: ${paused.reason}`, recheckMinutes: 60 };\n  const incident = charter.queue === \"cifix\" ? await readFlag(\"routines:fixers:paused\") : null; // 3. incident mode\n  if (incident) return { verdict: \"wait\", reason: `incident mode: ${incident.reason}`, recheckMinutes: 60 };\n  if (stage === \"shadow\") return { verdict: \"go\" }; // shadow opens no PR, so rule 4 can't block it\n  const pr = await mayOpenPr(charter.name, charter.repo ?? \"RhinoHealth/fcp\"); // 4. one open PR per routine\n  if (pr.verdict === \"wait\") return { verdict: \"wait\", reason: pr.reason, recheckMinutes: 60 };\n  return { verdict: \"go\" };\n};",
+        "notes": [
+          {
+            "line": 16,
+            "text": "G3-25's kill switch flag, keyed by the queue family."
+          },
+          {
+            "line": 19,
+            "text": "The tickets give an hourly re-check only for the open-PR rule; this card uses it for every wait (see the gaps)."
+          },
+          {
+            "line": 22,
+            "text": "A shadow run opens nothing, so the one-open-PR rule cannot block it."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/routines/agent-for.ts",
+      "what": "agentFor(routine) reads the routine's queue family from its charter (fe-ci-fixer to cifix), and CHARTER_SHA is the commit this worker was built from. G5-09 and G5-13 use both. This replaces the sketch's queueFor, because G3-25's startRun already derives the queue from the agent.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/routines/agent-for.ts",
+        "text": "// orchestrator/src/routines/agent-for.ts: which agent (queue family) runs a routine, read from its charter.\nimport { loadCharter } from \"./charter.js\"; // G5-06\n\n/** The ai-agents commit this worker was built from; triggers pin each run's charter to it. */\nexport const CHARTER_SHA = process.env.AI_AGENTS_SHA ?? \"local\";\n\n/** fe-ci-fixer → cifix. The agent names the task queue (ai-agents-cifix), the VM slots and the kill switch. */\nexport const agentFor = async (routine: string): Promise<string> => (await loadCharter(routine, CHARTER_SHA)).queue;\n\nexport const queueFor = async (routine: string): Promise<string> => `ai-agents-${await agentFor(routine)}`;"
+      }
+    },
+    {
+      "path": "orchestrator/src/workflows/ship-pr.ts",
+      "what": "Placeholder for shipPr, the PR half of ticketToPr that Nova and every routine will share. It fails loudly. Replace it with the real child workflow once the G4 owner has agreed the split; that is also where 'create or link the Jira ticket before the PR' goes.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/workflows/ship-pr.ts",
+        "text": "// orchestrator/src/workflows/ship-pr.ts: the PR half of ticketToPr (scope judge, draft PR, Byte, findings, ready),\n// shared by Nova and every routine. Until the G4 owner moves that code here, this placeholder fails loudly, and\n// every routine stays in shadow, so no run reaches it.\nimport { ApplicationFailure } from \"@temporalio/workflow\";\nimport type { Charter, RoutineOutcome, RunOutcome, Stage } from \"@rhinohealth/ai-agents-shared\";\n\nexport interface ShipPrInput { charter: Charter; stage: Stage; run: RunOutcome }\nexport interface ShipPrResult { outcome: RoutineOutcome; prUrl?: string }\n\nexport async function shipPr(input: ShipPrInput): Promise<ShipPrResult> {\n  throw ApplicationFailure.nonRetryable(`shipPr is not split out of ticketToPr yet; keep ${input.charter.name} in shadow`, \"NeedsPerson\");\n}"
+      }
+    },
+    {
+      "path": "orchestrator/src/workflows/routine-run.ts",
+      "what": "The workflow. Export it from orchestrator/src/workflows/index.ts. It reuses ticketToPr's activities through G3-29's act preset, so the heartbeat timeout is 2 minutes, not the sketch's 5.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/workflows/routine-run.ts",
+        "text": "// orchestrator/src/workflows/routine-run.ts: workflow code (deterministic: no Node APIs, no fetch, no clock for logic).\nimport {\n  CancellationScope, condition, defineSignal, executeChild, isCancellation, setHandler, upsertSearchAttributes, workflowInfo,\n} from \"@temporalio/workflow\";\nimport type { PlanDecision, RoutineOutcome, RoutineRequest, RunOutcome, Trigger } from \"@rhinohealth/ai-agents-shared\";\nimport { act, peopleApis } from \"../policies.js\"; // LONG preset: 7 days start-to-close, 2-minute heartbeats (G3-29)\nimport { TaskSpec } from \"../routines/task-spec.js\";\nimport { ROUTINE, ROUTINE_OUTCOME, RUN_KIND, STAGE } from \"../search-attributes.js\";\nimport { killed } from \"./kill-switch.js\";\nimport { shipPr } from \"./ship-pr.js\";\nimport { giveSlot, takeSlot } from \"./with-slot.js\";\n\nexport const addTrigger = defineSignal<[Trigger]>(\"addTrigger\"); // a later event with the same root cause joins\nexport const decidePlan = defineSignal<[PlanDecision]>(\"decidePlan\"); // handler comes with the bug fixers (G5-27)\nexport const stop = defineSignal<[by: string]>(\"stop\"); // the kill switch's batch stop, or a person took the bug\n\nexport interface RoutineResult { outcome: RoutineOutcome; reason?: string; run?: RunOutcome; prUrl?: string }\n\nexport async function routineRun(req: RoutineRequest): Promise<RoutineResult> {\n  const triggers: Trigger[] = req.trigger ? [req.trigger] : [];\n  let stoppedBy: string | undefined;\n  setHandler(addTrigger, (t) => void triggers.push(t));\n  setHandler(stop, (by) => void (stoppedBy = by));\n  const end = (outcome: RoutineOutcome, more: Omit<RoutineResult, \"outcome\"> = {}): RoutineResult => {\n    upsertSearchAttributes([{ key: ROUTINE_OUTCOME, value: outcome }]); // G5-21's breaker reads it\n    return { outcome, ...more };\n  };\n  const charter = await act.loadCharter(req.routine, req.charterSha);\n  const stage = await act.effectiveStage(charter);\n  upsertSearchAttributes([{ key: ROUTINE, value: charter.name }, { key: RUN_KIND, value: charter.queue }, { key: STAGE, value: stage }]);\n  if (charter.gather_minutes) await condition(() => stoppedBy !== undefined, `${charter.gather_minutes} minutes`);\n  for (;;) { // the gate: a run that must wait sleeps on a durable timer and never holds a VM\n    if (stoppedBy) return end(\"stopped\", { reason: `stopped by ${stoppedBy}` });\n    const gate = await peopleApis.preRunGate(charter, stage);\n    if (gate.verdict === \"go\") break;\n    if (gate.verdict === \"stop\") return end(\"stopped\", { reason: gate.reason });\n    await condition(() => stoppedBy !== undefined, `${gate.recheckMinutes} minutes`);\n  }\n  const task = TaskSpec.fromCharter(charter, triggers);\n  let run: RunOutcome | undefined;\n  while (!run || run.state === \"preempted\") { // AWS took the Spot VM back: same step, fresh VM\n    await takeSlot(charter.queue);\n    const vm = await act.acquireSandbox({ runId: workflowInfo().runId, agent: charter.queue, ...charter.vm });\n    const work = new CancellationScope();\n    void condition(() => stoppedBy !== undefined).then(() => work.cancel()); // Stop also ends a step in progress\n    try {\n      run = await work.run(() => act.workInSandbox(vm, task));\n    } catch (err) {\n      if (!isCancellation(err)) throw err;\n      return end(\"stopped\", { reason: `stopped by ${stoppedBy}` });\n    } finally {\n      await CancellationScope.nonCancellable(() => act.releaseSandbox(vm));\n      await giveSlot(charter.queue);\n    }\n  }\n  if (run.state !== \"done\") return end(\"failed\", { run });\n  if (stage === \"shadow\") return end(\"shadow\", { run }); // opens nothing; the weekly report reads Stage=shadow runs\n  if ((await killed(charter.queue)) || stoppedBy) return end(\"stopped\", { run });\n  const shipped = await executeChild(shipPr, { args: [{ charter, stage, run }], workflowId: `${workflowInfo().workflowId}:pr` });\n  return end(shipped.outcome, { run, prUrl: shipped.prUrl });\n}",
+        "notes": [
+          {
+            "line": 14,
+            "text": "Defined but no handler yet: Temporal keeps an early click in a buffer until G5-27 sets the handler. A no-op handler would throw the click away."
+          },
+          {
+            "line": 15,
+            "text": "The sketch had no stop signal, but the kill switch's batch stop and G5-13's 'a person took the bug' both send one."
+          },
+          {
+            "line": 28,
+            "text": "The charter at one ai-agents commit, so a retry or a later step sees the same rules."
+          },
+          {
+            "line": 25,
+            "text": "Fails the run if the attributes are not registered on the namespace, so register them before the first deploy."
+          },
+          {
+            "line": 31,
+            "text": "The gather window: 7 minutes for red main, 0 for bugs. addTrigger signals arriving meanwhile land in the triggers list."
+          },
+          {
+            "line": 32,
+            "text": "A gate that says wait parks the run on a durable timer and asks again; no VM is claimed until it says go."
+          },
+          {
+            "line": 41,
+            "text": "G3-20: when AWS takes a Spot VM back, the harness saves its work and exits as preempted, and the same step runs again on a fresh VM."
+          },
+          {
+            "line": 45,
+            "text": "Stop also ends a step that is already working: cancelling the scope cancels the heartbeating activity."
+          },
+          {
+            "line": 52,
+            "text": "As in ticketToPr: the VM is released even when the run is being cancelled. The sketch's finally missed this."
+          },
+          {
+            "line": 57,
+            "text": "Shadow opens nothing. The result (with where the harness stored the diff and proof) is the workflow result."
+          },
+          {
+            "line": 59,
+            "text": "The PR half as a child workflow with a findable ID, for example cifix:fcp:9c1e4b7a2f03:pr."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/test/workflows/routines.ts",
+      "what": "The workflows the tests bundle: the real slots and routineRun.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/test/workflows/routines.ts",
+        "text": "// orchestrator/test/workflows/routines.ts: the workflows the routineRun tests bundle.\nexport { slots } from \"../../src/workflows/slots.js\";\nexport { routineRun } from \"../../src/workflows/routine-run.js\";"
+      }
+    },
+    {
+      "path": "orchestrator/test/routine-run.test.ts",
+      "what": "Two tests on a local dev server with fake activities: three events in the gather window use one VM and a shadow run opens nothing; a gate that says wait never claims a VM and a stop ends the run. They were run against Temporal SDK 1.24.0 and pass (the first takes about a minute, the real gather window).",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/test/routine-run.test.ts",
+        "text": "// orchestrator/test/routine-run.test.ts: routineRun with fake activities on a local Temporal dev server.\nimport assert from \"node:assert/strict\";\nimport { after, before, beforeEach, test } from \"node:test\";\nimport { setTimeout as sleep } from \"node:timers/promises\";\nimport { fileURLToPath } from \"node:url\";\nimport { TestWorkflowEnvironment } from \"@temporalio/testing\";\nimport { Worker } from \"@temporalio/worker\";\nimport type { Charter, GateVerdict, RoutineRequest, Trigger } from \"@rhinohealth/ai-agents-shared\";\nimport { addTrigger, routineRun, stop } from \"../src/workflows/routine-run.js\";\n\nconst SEARCH_ATTRIBUTES = [\"Agent\", \"Routine\", \"RunKind\", \"RoutineOutcome\", \"Stage\"].flatMap((a) => [\"--search-attribute\", `${a}=Keyword`]);\nconst charter: Charter = {\n  name: \"fe-ci-fixer\", stage: \"shadow\", trigger: { kind: \"github.workflow_run\" }, gather_minutes: 1, queue: \"cifix\",\n  vm: { size: \"lite\", spot: true }, model: { name: \"claude-opus-5-5\", effort: \"low\" },\n  allowed_paths: [\"frontend/**\"], skills: [\"fix-ci\"], done: [\"npm run verify is green\"],\n};\nconst red = (runId: number): Trigger => ({ kind: \"github.workflow_run\", repo: \"fcp\", runId, headSha: \"4b7e2a9\", jobs: [] });\nconst req: RoutineRequest = { routine: \"fe-ci-fixer\", charterSha: \"abc123\", trigger: red(1) };\nlet calls: string[] = [];\nlet gate: GateVerdict = { verdict: \"go\" };\nlet env: TestWorkflowEnvironment, worker: Worker, running: Promise<void>;\n\nbefore(async () => {\n  env = await TestWorkflowEnvironment.createLocal({ server: { extraArgs: SEARCH_ATTRIBUTES } });\n  worker = await Worker.create({\n    connection: env.nativeConnection, taskQueue: \"ai-agents-cifix\",\n    workflowsPath: fileURLToPath(new URL(\"./workflows/routines.ts\", import.meta.url)),\n    activities: {\n      loadCharter: async (name: string) => ({ ...charter, gather_minutes: name === \"no-gather\" ? 0 : 1 }),\n      effectiveStage: async () => charter.stage, preRunGate: async () => gate,\n      agentStopped: async () => false, stillOpen: async (ids: string[]) => ids,\n      acquireSandbox: async () => (calls.push(\"acquire\"), { instanceId: \"i-1\", size: \"lite\", runId: \"r1\" }),\n      workInSandbox: async (_vm: unknown, task: { triggers: Trigger[] }) => (calls.push(`work:${task.triggers.length}`), { state: \"done\" }),\n      releaseSandbox: async () => void calls.push(\"release\"),\n    },\n  });\n  running = worker.run();\n  await env.client.workflow.start(\"slots\", { workflowId: \"slots:cifix\", taskQueue: \"ai-agents-cifix\", args: [\"cifix\"] });\n});\nbeforeEach(() => void (calls = []));\nafter(async () => {\n  worker.shutdown();\n  await running;\n  await env.teardown();\n});\n\ntest(\"events in the gather window join one run, and shadow opens nothing\", async () => {\n  const run = await env.client.workflow.start(routineRun, { workflowId: \"cifix:fcp:aaa\", taskQueue: \"ai-agents-cifix\", args: [req] });\n  await run.signal(addTrigger, red(2)); // 10:05: another push fails the same way\n  await run.signal(addTrigger, red(3));\n  assert.equal((await run.result()).outcome, \"shadow\"); // takes about a minute: the gather window\n  assert.deepEqual(calls, [\"acquire\", \"work:3\", \"release\"]); // one VM for three events\n});\n\ntest(\"a gate that says wait never claims a VM\", async () => {\n  gate = { verdict: \"wait\", reason: \"incident mode\", recheckMinutes: 60 };\n  const run = await env.client.workflow.start(routineRun, {\n    workflowId: \"cifix:fcp:bbb\", taskQueue: \"ai-agents-cifix\", args: [{ ...req, routine: \"no-gather\" }] });\n  await sleep(2_000); // no gather window here: the run is parked at the gate by now\n  await run.signal(stop, \"sean\");\n  assert.equal((await run.result()).outcome, \"stopped\");\n  assert.deepEqual(calls, []);\n});",
+        "notes": [
+          {
+            "line": 11,
+            "text": "The dev server must know every attribute routineRun sets, the same as the real namespace."
+          },
+          {
+            "line": 52,
+            "text": "One VM for three events: the task saw all three triggers."
+          }
+        ]
+      }
+    }
+  ],
+  "steps": [
+    {
+      "do": "Update main and make a branch in your ai-agents clone.",
+      "cmd": "git switch main && git pull && git switch -c g5-08-routine-run"
+    },
+    {
+      "do": "Check the pieces you build on are there: the charter loader, the slot helpers and the activity presets.",
+      "cmd": "ls orchestrator/src/routines/charter.ts orchestrator/src/workflows/slots.ts orchestrator/src/policies.ts routines/charters/fe-ci-fixer.yaml",
+      "see": "All four paths print. If one is missing, its ticket has not merged; see dependsOn."
+    },
+    {
+      "do": "Add shared/src/routine.ts and export it from the shared package.",
+      "cmd": "echo 'export * from \"./routine.js\";' >> shared/src/index.ts"
+    },
+    {
+      "do": "Add orchestrator/src/search-attributes.ts, routines/task-spec.ts and routines/agent-for.ts."
+    },
+    {
+      "do": "Add orchestrator/src/activities/pre-run-gate.ts and export it from the activities barrel.",
+      "cmd": "echo 'export * from \"./pre-run-gate.js\";' >> orchestrator/src/activities/index.ts"
+    },
+    {
+      "do": "Add workflows/ship-pr.ts (the placeholder, unless the real shipPr already exists) and workflows/routine-run.ts, and export routineRun.",
+      "cmd": "echo 'export * from \"./routine-run.js\";' >> orchestrator/src/workflows/index.ts"
+    },
+    {
+      "do": "Make images.yml pass the build commit into the orchestrator image, so CHARTER_SHA is real in production (for example a build argument that ends up as ENV AI_AGENTS_SHA). Ask the G3-01 owner how they want it."
+    },
+    {
+      "do": "Ask DevOps to add Routine, RoutineOutcome and Stage (all Keyword) to the post-install search-attribute job of the ai-agents Temporal, before you deploy. For a namespace you can reach yourself, the CLI command is shown here.",
+      "cmd": "for a in Routine RoutineOutcome Stage; do temporal operator search-attribute create --namespace ai-agents --name $a --type Keyword; done"
+    },
+    {
+      "do": "Add the two test files and run them. The first test waits the real one-minute gather window.",
+      "cmd": "node --import tsx --test orchestrator/test/routine-run.test.ts",
+      "see": "ok 1 - events in the gather window join one run, and shadow opens nothing\nok 2 - a gate that says wait never claims a VM\n# pass 2\n# fail 0"
+    },
+    {
+      "do": "Run the whole check, the same as CI.",
+      "cmd": "npm run check",
+      "see": "No lint or type errors; # fail 0."
+    },
+    {
+      "do": "Commit, push and open the PR.",
+      "cmd": "git add -A && git commit -m \"[Platform] G5-08: routineRun workflow driven by a charter\" && git push -u origin HEAD && gh pr create --fill"
+    }
+  ],
+  "prove": [
+    {
+      "do": "Run the routineRun tests; they start their own dev server with all five search attributes.",
+      "cmd": "node --import tsx --test orchestrator/test/routine-run.test.ts",
+      "see": "# pass 2\n# fail 0"
+    },
+    {
+      "do": "Run G3-29's replay test so the new workflow cannot break deploys later; add a saved routineRun history to test/histories/ once a real shadow run exists.",
+      "cmd": "node --import tsx --test orchestrator/test/replay.test.ts",
+      "see": "# fail 0"
+    },
+    {
+      "do": "After deploy, with G5-09 and G5-12 live: make one real shadow run (for example the renovate/test-trigger canary from the G5-12 card) and find it by its attributes.",
+      "cmd": "temporal workflow list --namespace ai-agents --query \"WorkflowType='routineRun' AND Stage='shadow'\"",
+      "see": "One row per root cause, with RoutineOutcome set when it has finished."
+    },
+    {
+      "do": "After deploy: pause the routine with its flag and send another event. The run must wait at the gate, and the Temporal UI must show no acquireSandbox in its history.",
+      "cmd": "curl -X PUT localhost:<internal-port>/internal/flags/routine:fe-ci-fixer:paused -H \"content-type: application/json\" -d '{\"reason\":\"gate drill\",\"setBy\":\"sean\"}'",
+      "see": "{\"ok\":true}, then a run whose history ends in a timer, not in an activity."
+    }
+  ],
+  "gaps": [
+    "heartbeatTimeout is 5 minutes in the G5-08 sketch and the old g5-2 lesson, but the ticket also says to reuse ticketToPr's activities, whose LONG preset is 2 minutes (G3-29; STORY.md contradiction 4). The 5 minutes is the separate harness-silence rule inside workInSandbox (G3-27). This card uses G3-29's act, so 2 minutes.",
+    "loadCharter needs a charterSha, but G5-09 and G5-13 start routineRun without one (TICKET_ISSUES.md). Recommendation: CHARTER_SHA from the image build, as in the decisions.",
+    "The sketch has no stop signal, yet G3-25's batch stop signals every running cifix/upgrade/bugfix run and G5-13 stops a bug run when a person takes the ticket. This card adds stop, and the run ends with RoutineOutcome=stopped.",
+    "The sketch releases the VM in a plain finally. ticketToPr wraps it in CancellationScope.nonCancellable so a cancelled run still frees its VM; this card does the same.",
+    "G3-25 says routineRun takes a slot before acquireSandbox and gives it back afterwards, but the sketch never does. This card calls takeSlot/giveSlot with the queue family.",
+    "The sketch calls park(charter, gate), which no ticket defines. This card writes the gate loop: wait on a durable timer and ask again. Only the open-PR rule has an interval in the tickets (hourly, G5-02), so every wait uses 60 minutes; G5-17 may want parked runs to wake sooner, for example on the \"Resume fixers\" button.",
+    "G3-20 says a preempted Spot step is retried on a fresh VM; the sketch does not. This card loops on preempted. No ticket caps the number of preemptions; recommendation: count them with the lost-VM counter of G3-27.",
+    "G3-27 says runWithRecovery is used by ticketToPr and routineRun, but its RunContext needs a Handoff (Jira key and requester) that a routine does not have before its Jira ticket exists. Until that is settled, a SandboxDead error fails the run and RoutineOutcome stays empty (the breaker reads it as unknown). Recommendation: once G3-27 is merged, wrap the work loop with key = the thing part of the workflow ID and requester = the charter's owner.",
+    "The sketch reads charter.effectiveStage, but nothing computes it before G5-15. This card reads the stage_override flag itself (harmless while it is never set), so G5-15 only has to write the flag.",
+    "G5-08 says to register Routine, RunKind, RoutineOutcome and Stage, but G3-06 already registers RunKind. Only three are new. No ticket says what RunKind holds for Nova runs.",
+    "A result of needs_answer (a routine asking a person) is treated as failed until G5-27 adds the question and plan-approval loop for bug fixers.",
+    "workInSandbox takes a Task (G3-19, G3-24) whose schema no ticket writes down. RoutineTask here has job: \"routine\"; agree with the harness owner that the harness accepts it.",
+    "The ticket's 'create or link the Jira ticket before the PR' belongs in shipPr, which does not exist yet; it is not in this card's code."
+  ],
+  "pr": [
+    "Title: \"[Platform] RH-<n>: routineRun workflow driven by a charter\" (no ticket fixes the format for ai-agents; this follows fcp's style).",
+    "Required checks green: lint, test, evals. Exactly one approval from someone else.",
+    "Ask the G4 owner to review the shipPr placeholder and agree the split in the PR thread.",
+    "Before merging: DevOps confirms Routine, RoutineOutcome and Stage are registered on namespace ai-agents (otherwise every run fails on its first upsert).",
+    "Say in the body that every charter must stay at stage: shadow until shipPr is real.",
+    "Paste the test output (# pass 2).",
+    "No change under .github/ or other protected paths."
+  ],
+  "rollback": "Revert the PR and redeploy orchestrator-worker. Open routineRun runs are shadow runs that opened nothing, so end them with: temporal workflow terminate --namespace ai-agents --query \"WorkflowType='routineRun' AND ExecutionStatus='Running'\" --reason 'G5-08 rollback'. The registered search attributes can stay.",
+  "prompt": "You are helping Sean do ticket G5-08 (\"routineRun workflow: Nova's harness driven by a charter\") in the RhinoHealth/ai-agents repo (TypeScript on Node 24, npm workspaces, ESM with .js import paths, node:test through tsx).\n\nGoal: add routineRun, the Temporal workflow every routine runs. It loads the charter at a pinned commit, waits the charter's gather window while addTrigger signals join, asks the pre-run gate (kill switch, the routine's pause flag, incident mode, one open PR per routine) and parks on a timer while the gate says wait, then takes a VM slot, claims one VM, runs Nova's harness with a task built from the charter, always releases the VM, and in shadow mode returns the result without opening anything; otherwise it runs the shared child workflow shipPr.\n\nStart from the card: ~/Projects/ai-agents-course/content/cards/G5-08.json. files[].code.text holds tested code for shared/src/routine.ts, orchestrator/src/search-attributes.ts, routines/task-spec.ts, routines/agent-for.ts, activities/pre-run-gate.ts, workflows/ship-pr.ts (a placeholder), workflows/routine-run.ts and the tests. Read the real repo first (charter loader from G5-06, slot helpers from G3-25, policies.ts from G3-29, the sandbox activities from G3-18/G3-20) and adapt to what is really there. Use the card's \"decide\" fallbacks where nothing is decided, and tell me which.\n\nWalls:\n- Reuse ticketToPr's activities through G3-29's act preset (2-minute heartbeats). Do not add the sketch's 5-minute heartbeat.\n- Workflow code stays deterministic: no Node APIs, no fetch, no clock for logic.\n- No maxTurns, budgets or time limits on the harness task.\n- Every charter stays in shadow; do not build shipPr yourself (that split belongs to the G4 owner).\n- Do not touch .github/ or protected paths. Do not commit or push; show me the diff.\n- If you use subagents, at most two, and tell them not to start their own.\n\nDone when:\n1. `node --import tsx --test orchestrator/test/routine-run.test.ts` prints \"# pass 2\" and \"# fail 0\".\n2. `npm run check` is green.\n3. You list the decisions you took the fallback for, and any place where the repo did not match the card."
+}

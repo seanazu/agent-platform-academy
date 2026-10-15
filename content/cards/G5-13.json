@@ -1,0 +1,284 @@
+{
+  "key": "G5-13",
+  "title": "[Platform] Jira Bug and Temporal schedule triggers for routines",
+  "lesson": "g5-2",
+  "goal": "Start bug fixers from triaged Bug tickets through the Jira poll that already exists, and start the scheduled routines and housekeeping jobs from Temporal schedules at odd minutes in Israel time, with no new public webhook.",
+  "outcome": "In the Temporal UI's Schedules page you see sched:<name> for each scheduled job whose code has merged (daily ones Sunday to Thursday in Asia/Jerusalem time), plus poll-jira-bugfix-fe and poll-jira-bugfix-be every 5 minutes once Security has named its label. A Bug in RH that is in To Do, unassigned and labelled FE starts bugfix:RH-<n> on ai-agents-bugfix, and a second poll does nothing new. When a person assigns that bug to themselves, its run stops within about 5 minutes.",
+  "dependsOn": [
+    {
+      "key": "G5-08",
+      "why": "Listed dependency: routineRun with its stop signal, CHARTER_SHA, and agentFor.",
+      "proof": "gh api repos/RhinoHealth/ai-agents/contents/orchestrator/src/routines/agent-for.ts --jq .path"
+    },
+    {
+      "key": "G5-09",
+      "why": "Listed dependency: the trigger side is in place and the bugfix:<key> and sched:<name> ID rules are agreed.",
+      "proof": "gh api repos/RhinoHealth/ai-agents/contents/orchestrator/src/triggers/github-events.ts --jq .path"
+    },
+    {
+      "key": "G3-28",
+      "why": "The Jira query registry (QUERIES), ensureSchedules, the Jira client, and schedules.ts itself. G4-04 changed toStart to an async function that may skip a match.",
+      "proof": "gh api -H \"Accept: application/vnd.github.raw\" repos/RhinoHealth/ai-agents/contents/orchestrator/src/triggers/schedules.ts | grep -n \"QUERIES\\|ensureSchedules\""
+    },
+    {
+      "key": "G3-25",
+      "why": "startRun gives every bug run the ID bugfix:<key> on ai-agents-bugfix, so a repeat poll is a no-op; agentAttribute tags scheduled routine runs.",
+      "proof": "gh api repos/RhinoHealth/ai-agents/contents/orchestrator/src/fanout.ts --jq .path"
+    },
+    {
+      "key": "G5-07",
+      "why": "The guilds' answer on how a Bug counts as triaged into a team (proposal: the label FE or BE).",
+      "proof": "gh api -H \"Accept: application/vnd.github.raw\" repos/RhinoHealth/ai-agents/contents/config/people.yaml | grep -A3 \"^triage:\""
+    }
+  ],
+  "access": [
+    {
+      "what": "Write access to RhinoHealth/ai-agents and one approval.",
+      "who": "The repo admin (Platform, G3-01)."
+    },
+    {
+      "what": "The label that keeps a ticket away from agents when it might hold customer data.",
+      "who": "Security (Ronen)."
+    },
+    {
+      "what": "The Nova Jira service account can browse Bugs in project RH (the poll runs the JQL as Nova).",
+      "who": "A Jira site admin (G4-04 created the account)."
+    }
+  ],
+  "decide": [
+    {
+      "q": "Which label keeps a Bug away from agents because it might hold customer data?",
+      "owner": "Security (Ronen).",
+      "fallback": "Do not register the bug queries at all: registerBugQueries is not called and no Bug reaches an agent. The schedules still land. PHI never enters a prompt, so \"no answer\" must mean \"off\"."
+    },
+    {
+      "q": "How does a Bug count as triaged into a team?",
+      "owner": "The guilds (G5-07).",
+      "fallback": "The label FE or BE on a Bug in To Do, as G5-07 proposes."
+    },
+    {
+      "q": "When a person takes the bug, should the run also post what it found and move the ticket?",
+      "owner": "The G5-27 owner (bug fixers).",
+      "fallback": "The run ends as stopped and keeps its branch and notes; posting a summary comes with G5-27."
+    },
+    {
+      "q": "G5-30 says the flaky-test tickets are \"picked up by the G5-13 poller\", but G5-13 registers no such query. Who adds it?",
+      "owner": "The G5-30 owner.",
+      "fallback": "G5-30 registers its own query in QUERIES the same way, with its own ID rule (flaky:fcp:<hash>)."
+    }
+  ],
+  "files": [
+    {
+      "path": "orchestrator/src/triggers/bugs.ts",
+      "what": "The bug query and its registration in G3-28's registry. Each match starts routineRun through startRun as bugfix:<key> on ai-agents-bugfix, so polling again every 5 minutes never starts a second run.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/triggers/bugs.ts",
+        "text": "// orchestrator/src/triggers/bugs.ts: triaged Bug tickets start a bug fixer through G3-28's Jira poll. No webhook.\nimport { CHARTER_SHA } from \"../routines/agent-for.js\";\nimport { routineRun } from \"../workflows/routine-run.js\";\nimport { QUERIES } from \"./schedules.js\";\n\n/** To Do, unassigned, triaged into the team, and not opted out or marked as possibly holding customer data. */\nexport const BUG_JQL = (teamLabel: string, customerDataLabel: string): string =>\n  `project = RH AND issuetype = Bug AND statusCategory = \"To Do\" AND assignee is EMPTY ` +\n  `AND labels = \"${teamLabel}\" AND labels not in (\"no-routine\", \"${customerDataLabel}\")`;\n\n/** Call it at worker start, before ensureSchedules, once Security has named the customer-data label. */\nexport const registerBugQueries = (customerDataLabel: string): void => {\n  for (const team of [\"fe\", \"be\"] as const) {\n    QUERIES.set(`bugfix-${team}`, {\n      name: `bugfix-${team}`,\n      agent: \"bugfix\", // startRun: bugfix:RH-1240 on ai-agents-bugfix, so a repeat poll is a no-op\n      every: \"5 minutes\",\n      jql: BUG_JQL(team.toUpperCase(), customerDataLabel), // FE / BE: the triage labels proposed in G5-07\n      toStart: async (issue) => [\n        routineRun,\n        { routine: `${team}-bug-fixer`, charterSha: CHARTER_SHA, trigger: { kind: \"jira\", key: issue.key } },\n      ],\n    });\n  }\n};",
+        "notes": [
+          {
+            "line": 9,
+            "text": "Anyone can opt a bug out with no-routine. Values are quoted because JQL treats a dash as special."
+          },
+          {
+            "line": 12,
+            "text": "Called at worker start only once the customer-data label exists (see the decisions)."
+          },
+          {
+            "line": 19,
+            "text": "Async, as G4-04 changed G3-28's registry; the sketch returned a plain array."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/triggers/schedules.ts (append)",
+      "what": "G5's part of the file G3-28 created: the cron table and ensureCronSchedules(), which creates each schedule or updates it when it exists. An entry whose workflow or charter has not merged yet is skipped, so each owning ticket only has to export its workflow (or add its charter) and the schedule appears on the next deploy.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/triggers/schedules.ts (append)",
+        "text": "// ---- G5-13: routine and housekeeping schedules (append to orchestrator/src/triggers/schedules.ts) ----\n// Add to the file's imports: agentAttribute from \"../fanout.js\", agentFor and CHARTER_SHA from\n// \"../routines/agent-for.js\", and `import * as workflows from \"../workflows/index.js\"`.\n\ninterface CronEntry { cron: string; workflow: string; routine?: string; args?: unknown[] }\n\n// Odd minutes, Asia/Jerusalem time; 0-4 = Sunday to Thursday. Each line's owner ticket builds its workflow or charter.\nexport const CRON: Record<string, CronEntry> = {\n  \"fe-dead-code\": { cron: \"17 4 * * 0-4\", workflow: \"routineRun\", routine: \"fe-dead-code\" }, // G5-31\n  \"kb-ingest\": { cron: \"41 6 * * 1\", workflow: \"routineRun\", routine: \"kb-ingest\" }, // G6-20\n  \"noise-close\": { cron: \"23 3 * * *\", workflow: \"noiseSweep\", args: [\"fcp\"] }, // G5-02\n  \"team-digest\": { cron: \"37 6 * * 0-4\", workflow: \"teamDigest\" }, // G5-03\n  \"trust-ladder\": { cron: \"51 5 * * *\", workflow: \"trustLadder\" }, // G5-15\n  \"shadow-report\": { cron: \"13 7 * * 0\", workflow: \"shadowReport\" }, // G5-16\n  \"bugfix-taken\": { cron: \"2-59/5 * * * *\", workflow: \"bugTakenSweep\" }, // a person took the bug: stop its run\n};\n\n/** At worker start, after G3-28's ensureSchedules. Safe to run twice: an existing schedule is updated. */\nexport const ensureCronSchedules = async (client: Client): Promise<string[]> => {\n  const made: string[] = [];\n  for (const [name, entry] of Object.entries(CRON)) {\n    if (!(entry.workflow in workflows)) continue; // its ticket hasn't merged yet\n    const agent = entry.routine ? await agentFor(entry.routine).catch(() => undefined) : \"orchestrator\";\n    if (!agent) continue; // no charter yet\n    const scheduleId = `sched:${name}`;\n    const action = {\n      type: \"startWorkflow\" as const, workflowType: entry.workflow, workflowId: scheduleId, taskQueue: `ai-agents-${agent}`,\n      args: entry.routine ? [{ routine: entry.routine, charterSha: CHARTER_SHA, trigger: { kind: \"schedule\", name } }] : entry.args ?? [],\n      ...(entry.routine ? { typedSearchAttributes: agentAttribute(agent) } : {}), // so the kill switch's batch stop finds it\n    };\n    const spec = { cronExpressions: [entry.cron], timezone: \"Asia/Jerusalem\" };\n    const policies = { overlap: ScheduleOverlapPolicy.SKIP, catchupWindow: \"1 hour\" }; // no stacking, no backlog replay\n    await client.schedule.create({ scheduleId, action, spec, policies }).catch(async (err: unknown) => {\n      if (!(err instanceof ScheduleAlreadyRunning)) throw err;\n      await client.schedule.getHandle(scheduleId).update((previous) => ({ ...previous, action, spec, policies }));\n    });\n    made.push(scheduleId);\n  }\n  return made;\n};",
+        "notes": [
+          {
+            "line": 5,
+            "text": "Workflow names are strings, so this file compiles before G5-02, G5-03, G5-15, G5-16 and G5-31 exist."
+          },
+          {
+            "line": 9,
+            "text": "04:17 Sunday to Thursday, Israel time (0-4 = Sunday-Thursday). The same cron as G5-31."
+          },
+          {
+            "line": 15,
+            "text": "Not in the sketch: the bug JQL drops assigned tickets, so the poll can never see that a person took one. This sweep can."
+          },
+          {
+            "line": 22,
+            "text": "Skipped until its ticket merges."
+          },
+          {
+            "line": 27,
+            "text": "Routines run on their family's queue (fe-dead-code on ai-agents-health); housekeeping on ai-agents-orchestrator."
+          },
+          {
+            "line": 28,
+            "text": "Every deploy updates the schedule, so scheduled runs always use the charter of the code that is running."
+          },
+          {
+            "line": 29,
+            "text": "Schedules start runs without startRun, so they must set Agent themselves, or the kill switch's batch stop cannot find them."
+          },
+          {
+            "line": 32,
+            "text": "Not in the sketch: after an outage, do not replay a backlog of missed days (G3-28 does the same for the Jira polls)."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/activities/bug-taken.ts",
+      "what": "stopTakenBugs: lists running bug-fixer runs, asks Jira which of their tickets now have an assignee, and sends each of those runs the stop signal with the person who assigned it.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/activities/bug-taken.ts",
+        "text": "// orchestrator/src/activities/bug-taken.ts: a person took a bug while its fixer runs, so stop that run.\nimport { jira } from \"../jira.js\"; // G3-28's client; the Jira token stays in the orchestrator\nimport { temporalClient } from \"../temporal.js\";\nimport { stop } from \"../workflows/routine-run.js\";\n\nconst RUNNING_BUG_FIXES = \"WorkflowType = 'routineRun' AND Agent = 'bugfix' AND ExecutionStatus = 'Running'\";\n\n/** Returns the keys whose runs were told to stop. */\nexport const stopTakenBugs = async (): Promise<string[]> => {\n  const client = await temporalClient();\n  const keys: string[] = [];\n  for await (const run of client.workflow.list({ query: RUNNING_BUG_FIXES })) {\n    keys.push(run.workflowId.slice(\"bugfix:\".length)); // bugfix:RH-1240 → RH-1240\n  }\n  if (!keys.length) return [];\n  const taken = await jira.searchAll(`key in (${keys.join(\", \")}) AND assignee is not EMPTY`);\n  for (const { key } of taken) {\n    const change = (await jira.changelog(key)).filter((h) => h.items.some((i) => i.field === \"assignee\")).at(-1);\n    await client.workflow.getHandle(`bugfix:${key}`).signal(stop, change?.author.accountId ?? \"jira\");\n  }\n  return taken.map((i) => i.key);\n};",
+        "notes": [
+          {
+            "line": 6,
+            "text": "A visibility query: Temporal's list of runs filtered by type, the Agent attribute and status."
+          },
+          {
+            "line": 16,
+            "text": "Bug fixers are never assigned the ticket, so any assignee is a person who took it."
+          },
+          {
+            "line": 19,
+            "text": "Who assigned it, from the changelog, the same way G4-04 finds the requester."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/workflows/bug-taken-sweep.ts",
+      "what": "The tiny workflow the sched:bugfix-taken schedule runs every 5 minutes.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/workflows/bug-taken-sweep.ts",
+        "text": "// orchestrator/src/workflows/bug-taken-sweep.ts: workflow code; the sched:bugfix-taken schedule runs it every 5 minutes.\nimport { peopleApis } from \"../policies.js\"; // Jira and Temporal calls: retried with back-off, no attempt limit\n\nexport async function bugTakenSweep(): Promise<string[]> {\n  return peopleApis.stopTakenBugs();\n}"
+      }
+    },
+    {
+      "path": "orchestrator/src/activities/index.ts and workflows/index.ts (edit)",
+      "what": "Export the new activity and workflow so the worker registers them.",
+      "code": {
+        "lang": "diff",
+        "file": "orchestrator/src/activities/index.ts and workflows/index.ts (edit)",
+        "text": "--- a/orchestrator/src/activities/index.ts\n+++ b/orchestrator/src/activities/index.ts\n+export * from \"./bug-taken.js\";\n--- a/orchestrator/src/workflows/index.ts\n+++ b/orchestrator/src/workflows/index.ts\n+export * from \"./bug-taken-sweep.js\";"
+      }
+    },
+    {
+      "path": "orchestrator/src/main.ts (edit)",
+      "what": "Register the bug queries before ensureSchedules (once Security has answered), then create the cron schedules.",
+      "code": {
+        "lang": "diff",
+        "file": "orchestrator/src/main.ts (edit)",
+        "text": "--- a/orchestrator/src/main.ts\n+++ b/orchestrator/src/main.ts\n@@ imports\n+import { registerBugQueries } from \"./triggers/bugs.js\";\n+import { ensureCronSchedules, ensureSchedules } from \"./triggers/schedules.js\";\n@@ after ensureSlots()\n await ensureSlots();\n+// registerBugQueries(\"<label from Security>\"); // turn on once Security names the customer-data label\n-// G3-28: await ensureSchedules(await temporalClient());\n+await ensureSchedules(await temporalClient()); // G3-28: the Jira polls, now including the bug queries\n+await ensureCronSchedules(await temporalClient()); // G5-13: routines and housekeeping"
+      }
+    },
+    {
+      "path": "orchestrator/test/schedules.test.ts",
+      "what": "Three tests: the bug JQL has every condition, no schedule runs on the hour or half hour, and ensureCronSchedules run twice on a local dev server updates instead of duplicating. Run against Temporal SDK 1.24.0, all three pass.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/test/schedules.test.ts",
+        "text": "// orchestrator/test/schedules.test.ts: the bug query, the cron table, and ensureCronSchedules run twice.\nimport assert from \"node:assert/strict\";\nimport { test } from \"node:test\";\nimport { TestWorkflowEnvironment } from \"@temporalio/testing\";\nimport { BUG_JQL } from \"../src/triggers/bugs.js\";\nimport { CRON, ensureCronSchedules } from \"../src/triggers/schedules.js\";\n\ntest(\"the bug query takes only unassigned, triaged bugs and honours both opt-out labels\", () => {\n  const jql = BUG_JQL(\"FE\", \"customer-data\");\n  for (const part of [\"issuetype = Bug\", 'statusCategory = \"To Do\"', \"assignee is EMPTY\", 'labels = \"FE\"', '\"no-routine\"', '\"customer-data\"']) {\n    assert.ok(jql.includes(part), `the JQL is missing ${part}`);\n  }\n});\n\ntest(\"no schedule runs on the hour or the half hour\", () => {\n  for (const [name, { cron }] of Object.entries(CRON)) {\n    const minute = cron.split(\" \")[0] ?? \"\";\n    assert.ok(![\"0\", \"30\", \"*\"].includes(minute), `${name} runs at minute ${minute}`);\n  }\n});\n\ntest(\"ensureCronSchedules is safe to run twice\", async () => {\n  const env = await TestWorkflowEnvironment.createLocal({ server: { extraArgs: [\"--search-attribute\", \"Agent=Keyword\"] } });\n  try {\n    const first = await ensureCronSchedules(env.client);\n    const second = await ensureCronSchedules(env.client); // a worker restart updates; it never adds a second schedule\n    assert.deepEqual(second, first);\n    assert.ok(first.includes(\"sched:bugfix-taken\"));\n    const sweep = await env.client.schedule.getHandle(\"sched:bugfix-taken\").describe();\n    assert.equal(sweep.spec.timezone, \"Asia/Jerusalem\");\n    assert.equal(sweep.action.taskQueue, \"ai-agents-orchestrator\");\n    assert.equal(sweep.policies.overlap, \"SKIP\");\n  } finally {\n    await env.teardown();\n  }\n});"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "do": "Update main and make a branch.",
+      "cmd": "git switch main && git pull && git switch -c g5-13-bug-and-schedule-triggers"
+    },
+    {
+      "do": "Check what G3-28 really built: the registry type, ensureSchedules and the Jira client.",
+      "cmd": "grep -n \"interface JiraQuery\\|export const QUERIES\\|ensureSchedules\\|searchAll\\|changelog\" orchestrator/src/triggers/schedules.ts orchestrator/src/jira.ts",
+      "see": "toStart returns a Promise (G4-04's change). If it still returns a plain array, change bugs.ts to match and note it in the PR."
+    },
+    {
+      "do": "Add orchestrator/src/triggers/bugs.ts."
+    },
+    {
+      "do": "Append the G5-13 block to orchestrator/src/triggers/schedules.ts and add its imports at the top of the file (agentAttribute, agentFor, CHARTER_SHA, and `import * as workflows from \"../workflows/index.js\"`)."
+    },
+    {
+      "do": "Add activities/bug-taken.ts and workflows/bug-taken-sweep.ts, and export both."
+    },
+    {
+      "do": "Edit main.ts: ensureSchedules, then ensureCronSchedules. Leave registerBugQueries commented until Security names the label."
+    },
+    {
+      "do": "Add the test and run it.",
+      "cmd": "node --import tsx --test orchestrator/test/schedules.test.ts",
+      "see": "ok 1 - the bug query takes only unassigned, triaged bugs and honours both opt-out labels\nok 2 - no schedule runs on the hour or the half hour\nok 3 - ensureCronSchedules is safe to run twice\n# pass 3\n# fail 0"
+    },
+    {
+      "do": "Run the whole check.",
+      "cmd": "npm run check",
+      "see": "# fail 0, no lint or type errors."
+    },
+    {
+      "do": "Commit, push and open the PR.",
+      "cmd": "git add -A && git commit -m \"[Platform] G5-13: Jira Bug and schedule triggers for routines\" && git push -u origin HEAD && gh pr create --fill"
+    }
+  ],
+  "prove": [
+    {
+      "do": "Locally: start a dev server that has the ai-agents namespace and the search attributes, then start the worker from your branch in a second terminal.",
+      "cmd": "temporal server start-dev --namespace ai-agents --search-attribute Agent=Keyword --search-attribute Routine=Keyword --search-attribute RunKind=Keyword --search-attribute RoutineOutcome=Keyword --search-attribute Stage=Keyword\nnode --import tsx orchestrator/src/main.ts",
+      "see": "The worker starts without errors; the Temporal UI (http://localhost:8233, namespace ai-agents) shows the seven slots:<agent> workflows running."
+    },
+    {
+      "do": "List the schedules the worker created.",
+      "cmd": "temporal schedule list --namespace ai-agents",
+      "see": "sched:bugfix-taken, plus one sched:<name> for each job whose workflow or charter is already on main."
+    },
+    {
+      "do": "Run one schedule now instead of waiting, and look at the run it started.",
+      "cmd": "temporal schedule trigger --namespace ai-agents --schedule-id sched:bugfix-taken\ntemporal workflow list --namespace ai-agents --query \"WorkflowType='bugTakenSweep'\" --limit 1",
+      "see": "Completed  sched:bugfix-taken-<time>  bugTakenSweep  (Temporal adds the time to the ID; seen while writing this card. With no bug runs open, it completes at once with an empty list and never calls Jira.)"
+    },
+    {
+      "do": "After deploy and Security's label: label a test Bug FE in To Do, unassigned. Within 5 minutes a run appears; poll again and nothing new appears.",
+      "cmd": "temporal workflow list --namespace ai-agents --query \"WorkflowId='bugfix:RH-<n>'\"",
+      "see": "One row, Running, routineRun."
+    },
+    {
+      "do": "Assign that test Bug to yourself and wait up to 5 minutes.",
+      "cmd": "temporal workflow describe --namespace ai-agents --workflow-id bugfix:RH-<n>",
+      "see": "Status Completed, with RoutineOutcome stopped."
+    }
+  ],
+  "gaps": [
+    "The sketch imports noiseSweep, teamDigest, trustLadder and shadowReport, and starts fe-dead-code and kb-ingest, but those workflows and charters come from G5-02, G5-03, G5-15, G5-16, G5-31 and G6-20, which are not dependencies of G5-13. Importing them would break the build. This card names workflows as strings and skips any entry whose workflow is not exported or whose charter does not exist yet.",
+    "Schedules start workflows without startRun, so in the sketch scheduled routine runs have no Agent attribute, and the kill switch's batch stop cannot find them. This card sets typedSearchAttributes on routine schedules. routineRun's gate also reads the kill switch, so a stopped agent's scheduled run ends at once.",
+    "The sketch calls queueFor(name) with schedule names such as noise-close, which are not routines. This card sends housekeeping to ai-agents-orchestrator and routines to their family's queue.",
+    "Temporal adds the scheduled time to the workflow ID of every run a schedule starts (seen on the dev server: sched:bugfix-taken-2026-10-15T17:58:56Z). So sched:<name> in STORY.md's canon is the schedule's ID, not the run's ID, and \"one run per thing\" for schedules comes from overlap SKIP, not from the ID.",
+    "The sketch's toStart returns a plain array, but G3-28's registry (after G4-04's change) expects an async function that may return undefined. This card uses async.",
+    "routineRun is started without a charterSha in the sketch (TICKET_ISSUES.md). This card passes CHARTER_SHA; each deploy updates the schedules with the new commit.",
+    "The ticket says to stop the run when the assignee changes, but no ticket says who watches for that, and the bug JQL drops assigned tickets, so the poll cannot see it. This card adds the bugfix-taken sweep every 5 minutes. G5-08's sketch also had no stop signal (the G5-08 card adds it).",
+    "The \"how\" says \"Weekly code-health routines run on Sunday\", but fe-dead-code's cron (here and in G5-31) runs Sunday to Thursday every day. Keep the cron from G5-31 and fix the sentence.",
+    "G5-30 says flaky-test tickets are picked up by \"the G5-13 poller\", but G5-13 registers no flaky query, and the ID flaky:fcp:<hash> appears in neither G3-25's nor G5-09's list of IDs.",
+    "The sketch sets no catchupWindow on the cron schedules, so after a long outage Temporal could start missed runs late. This card sets 1 hour, as G3-28 does for the polls.",
+    "reconcile.md notes that the Jira poller work is counted three times (G3-28, G4-04, G5-13, about a day). This card only adds registrations to G3-28's mechanism."
+  ],
+  "pr": [
+    "Title: \"[Platform] RH-<n>: Jira Bug and schedule triggers for routines\" (no ticket fixes the format for ai-agents).",
+    "Required checks green: lint, test, evals. Exactly one approval.",
+    "Say clearly in the body that the bug queries stay off until Security (Ronen) names the customer-data label, and link that conversation.",
+    "List which CRON entries will appear on deploy and which wait for their tickets.",
+    "Paste the test output (# pass 3).",
+    "No change under .github/ or other protected paths."
+  ],
+  "rollback": "Revert the PR and redeploy, then delete the schedules this card created, because a revert does not remove schedules from Temporal: for each sched:<name> and poll-jira-bugfix-fe/-be run temporal schedule delete --namespace ai-agents --schedule-id <id>. Bug runs already started can be stopped with the batch stop on Agent=\"bugfix\".",
+  "prompt": "You are helping Sean do ticket G5-13 (\"Jira Bug and Temporal schedule triggers for routines\") in the RhinoHealth/ai-agents repo (TypeScript on Node 24, npm workspaces, ESM with .js import paths, node:test through tsx).\n\nGoal:\n1. Bug fixers: register two queries (bugfix-fe, bugfix-be) in G3-28's Jira query registry, every 5 minutes: Bugs in project RH, To Do, unassigned, labelled FE or BE, not labelled no-routine or the customer-data label. Each match starts routineRun through startRun as bugfix:<key> on ai-agents-bugfix.\n2. A sweep every 5 minutes that stops a running bug fix when a person has taken the ticket (stop signal).\n3. ensureCronSchedules(): Temporal schedules at odd minutes, Asia/Jerusalem, overlap SKIP, created or updated at every worker start.\n\nStart from the card: ~/Projects/ai-agents-course/content/cards/G5-13.json. files[].code.text has tested code for triggers/bugs.ts, the block to append to triggers/schedules.ts, activities/bug-taken.ts, workflows/bug-taken-sweep.ts, the main.ts change and the test. First read what G3-28 really built (schedules.ts, jira.ts) and adapt.\n\nWalls:\n- The bug queries stay OFF (registerBugQueries not called) until Security names the customer-data label. PHI never enters a prompt.\n- No new public webhook; Jira is only polled.\n- Every routine start goes through startRun, or sets the Agent search attribute itself (schedules).\n- Do not touch .github/ or protected paths. Do not commit or push; show me the diff.\n- If you use subagents, at most two, and tell them not to start their own.\n\nDone when:\n1. `node --import tsx --test orchestrator/test/schedules.test.ts` prints \"# pass 3\" and \"# fail 0\".\n2. `npm run check` is green.\n3. You tell me which CRON entries will be created on deploy and which are skipped, and what in the repo did not match the card."
+}

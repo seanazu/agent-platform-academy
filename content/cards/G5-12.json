@@ -1,0 +1,175 @@
+{
+  "key": "G5-12",
+  "title": "[Platform] Trigger Action on fcp-runner-set: red main, failed Renovate PRs",
+  "lesson": "g5-2",
+  "goal": "Add a small workflow to fcp that runs when one of the four CI workflows fails on main or on a renovate/ branch, and sends only the run ID to the trigger service, proving who it is with a GitHub OIDC token instead of a secret.",
+  "outcome": "In fcp's Actions tab, every failed [FRONTEND], [CLOUD], [CLIENT] or [SDK] CI run on main or a renovate/ branch is followed by a short \"[AI-AGENTS] - Routine trigger\" run whose log ends with \"trigger service answered 202: {...}\". Failures on other branches start nothing, and while every routine is in shadow, nothing is opened anywhere.",
+  "dependsOn": [
+    {
+      "key": "G5-09",
+      "why": "The ticket's listed dependency: the trigger service must be live at an in-cluster URL, and its allow-list must accept fcp's workflow file on main.",
+      "proof": "kubectl -n <runner namespace> run curl --rm -it --image=curlimages/curl --restart=Never -- curl -s <AI_AGENTS_TRIGGER_URL>/health   # prints ok"
+    },
+    {
+      "key": "G3-17",
+      "why": "The orchestrator runs on inf-rhinohealth, and a NetworkPolicy must let the fcp-runner-set pods reach its events port.",
+      "proof": "The same curl as above; a timeout means the NetworkPolicy is still missing."
+    }
+  ],
+  "access": [
+    {
+      "what": "Push a branch to RhinoHealth/fcp and one approval on the PR (fcp's main ruleset; required checks).",
+      "who": "Any fcp engineer can review; the change is a workflow file, so ask someone from DevOps to look too."
+    },
+    {
+      "what": "Create the repository variable AI_AGENTS_TRIGGER_URL in fcp.",
+      "who": "An fcp repo admin."
+    },
+    {
+      "what": "The in-cluster URL of the trigger service and the NetworkPolicy from the runner namespace.",
+      "who": "DevOps."
+    }
+  ],
+  "decide": [
+    {
+      "q": "What is the value of AI_AGENTS_TRIGGER_URL?",
+      "owner": "DevOps (with the G5-09 owner).",
+      "fallback": "Merge the workflow without it. The job checks that the variable is set, so until it exists every run is skipped and nothing turns red."
+    },
+    {
+      "q": "Copy the file into infrastructure and gitops now, or together with the pipeline fixer (G5-25)?",
+      "owner": "DevOps (the G5-25 owner).",
+      "fallback": "With G5-25. The trigger service has no routines for those repos yet, so it would only answer 202 with workflowId null; G5-25 adds the routes and the OIDC allow-list entries in one go."
+    },
+    {
+      "q": "Which workflows in infrastructure and gitops should the copies watch? The ticket names only \"[TERRAGRUNT] Lint and the other check workflows\".",
+      "owner": "DevOps.",
+      "fallback": "Decide when G5-25 starts; nothing in this card depends on it."
+    }
+  ],
+  "files": [
+    {
+      "path": ".github/workflows/ai-agents-routine-trigger.yml (in fcp)",
+      "what": "The whole workflow. It runs on workflow_run when one of the four CI workflows completes, keeps only failures on main or renovate/ branches of fcp itself, asks GitHub for an OIDC token with audience rhino-ai-agents, and posts {kind, repo, run_id} to the trigger service. It never checks out code and never puts an event field into a shell, so nothing in a branch name or a commit message can be run as a command.",
+      "code": {
+        "lang": "yaml",
+        "file": ".github/workflows/ai-agents-routine-trigger.yml (in fcp)",
+        "text": "# .github/workflows/ai-agents-routine-trigger.yml (fcp): tell the trigger service that a CI run failed.\n# It only reports. No checkout, no secrets, and no event field ever reaches a shell.\nname: \"[AI-AGENTS] - Routine trigger\"\n\non:\n  workflow_run:\n    workflows: [\"[FRONTEND] - CI\", \"[CLOUD] - CI\", \"[CLIENT] - CI\", \"[SDK] - CI\"]\n    types: [completed]\n    branches: [main, \"renovate/**\"] # other branches never even start a job\n\npermissions:\n  id-token: write # the OIDC token proves \"this workflow, on main, in RhinoHealth/fcp\"\n  contents: read\n\njobs:\n  report:\n    if: >-\n      vars.AI_AGENTS_TRIGGER_URL != '' &&\n      github.event.workflow_run.conclusion == 'failure' &&\n      github.event.workflow_run.head_repository.full_name == github.repository &&\n      (github.event.workflow_run.head_branch == 'main' ||\n       startsWith(github.event.workflow_run.head_branch, 'renovate/'))\n    runs-on: fcp-runner-set # inside inf-rhinohealth, so it reaches the internal trigger service\n    timeout-minutes: 5\n    steps:\n      - uses: actions/github-script@v9 # pin by SHA before merge (see the steps)\n        env:\n          TRIGGER_URL: ${{ vars.AI_AGENTS_TRIGGER_URL }}\n        with:\n          script: |\n            const run = context.payload.workflow_run\n            const token = await core.getIDToken(\"rhino-ai-agents\")\n            const res = await fetch(`${process.env.TRIGGER_URL}/v1/events`, {\n              method: \"POST\",\n              headers: { authorization: `Bearer ${token}`, \"content-type\": \"application/json\" },\n              body: JSON.stringify({ kind: \"github.workflow_run\", repo: context.repo.repo, run_id: run.id }),\n            })\n            const answer = await res.text()\n            if (!res.ok) core.setFailed(`trigger service answered ${res.status}: ${answer}`)\n            else core.info(`trigger service answered ${res.status}: ${answer}`)",
+        "notes": [
+          {
+            "line": 9,
+            "text": "Not in the sketch: without it, every failed CI run on any branch starts a job that only skips itself."
+          },
+          {
+            "line": 12,
+            "text": "Lets the job ask GitHub for an OIDC token: a short-lived note, signed by GitHub, that says \"this workflow, on main, in RhinoHealth/fcp\"."
+          },
+          {
+            "line": 18,
+            "text": "The file can merge before the URL exists; until then the job is skipped."
+          },
+          {
+            "line": 20,
+            "text": "Not in the sketch: ignore runs from forks, whose branch names anyone can choose."
+          },
+          {
+            "line": 23,
+            "text": "Our self-hosted runners live inside inf-rhinohealth, so they can reach the internal trigger service. GitHub-hosted runners could not."
+          },
+          {
+            "line": 26,
+            "text": "fcp already uses @v9 (weekly-dependency-upgrades.yml). Pin it by commit SHA before merging; step 3 shows how."
+          },
+          {
+            "line": 31,
+            "text": "Event fields are read in JavaScript, so they stay data. Writing ${{ github.event... }} inside a script would paste them in as code."
+          },
+          {
+            "line": 32,
+            "text": "The audience must match the trigger service's check exactly."
+          },
+          {
+            "line": 36,
+            "text": "Only the run ID really matters: the service re-reads the run from GitHub and takes the repository from the token, not from this body."
+          }
+        ]
+      }
+    }
+  ],
+  "steps": [
+    {
+      "do": "Update fcp main and make a branch.",
+      "cmd": "git -C ~/Projects/fcp switch main && git -C ~/Projects/fcp pull && git -C ~/Projects/fcp switch -c rh-<n>-routine-trigger"
+    },
+    {
+      "do": "Create .github/workflows/ai-agents-routine-trigger.yml with the content from the files list."
+    },
+    {
+      "do": "Find the commit SHA of github-script v9 and pin it, keeping the version as a comment.",
+      "cmd": "gh api repos/actions/github-script/commits/v9 --jq .sha",
+      "see": "A 40-character SHA. Change the line to: uses: actions/github-script@<sha> # v9"
+    },
+    {
+      "do": "Check that the workflow names in the file match fcp exactly, because workflow_run matches by name.",
+      "cmd": "grep -h \"^name:\" ~/Projects/fcp/.github/workflows/{frontend-ci.yaml,cloud-ci.yml,client-ci.yml,sdk-ci.yml}",
+      "see": "name: \"[FRONTEND] - CI\"\nname: \"[CLOUD] - CI\"\nname: \"[CLIENT] - CI\"\nname: \"[SDK] - CI\""
+    },
+    {
+      "do": "Lint the file if you have actionlint (fcp's .github/actionlint.yaml already knows the fcp-runner-set label).",
+      "cmd": "actionlint .github/workflows/ai-agents-routine-trigger.yml",
+      "see": "No output."
+    },
+    {
+      "do": "Ask an fcp repo admin to create the variable once DevOps gives the URL.",
+      "cmd": "gh variable set AI_AGENTS_TRIGGER_URL --repo RhinoHealth/fcp --body \"<url from DevOps>\"",
+      "see": "✓ Created variable AI_AGENTS_TRIGGER_URL for RhinoHealth/fcp"
+    },
+    {
+      "do": "Commit, push and open the PR.",
+      "cmd": "git add .github/workflows/ai-agents-routine-trigger.yml && git commit -m \"[Platform] RH-<n>: Report failed CI runs to the routine trigger service\" && git push -u origin HEAD && gh pr create --fill"
+    }
+  ],
+  "prove": [
+    {
+      "do": "A workflow_run workflow only runs from the copy on the default branch, so nothing can be tested before merge. After merge, and only while every routine is in shadow, make a throwaway branch with a planted SDK formatting error. Use SDK, not frontend: SDK CI runs on any push and fails in its cheap lint job, while frontend CI on a PR builds a preview environment. Never use workflow_dispatch to test.",
+      "cmd": "cd ~/Projects/fcp && git switch -c renovate/test-trigger origin/main && printf 'x=1\\n' >> sdk/rhino_health/__init__.py && git commit -am \"test: planted failure for the routine trigger (do not merge)\" && git push -u origin renovate/test-trigger"
+    },
+    {
+      "do": "Wait for SDK CI to fail on that branch.",
+      "cmd": "gh run list -R RhinoHealth/fcp --branch renovate/test-trigger --workflow \"[SDK] - CI\" --limit 1",
+      "see": "completed  failure  ...  [SDK] - CI  renovate/test-trigger  push"
+    },
+    {
+      "do": "Find the trigger run and read its answer.",
+      "cmd": "gh run list -R RhinoHealth/fcp --workflow \"[AI-AGENTS] - Routine trigger\" --limit 1\ngh run view <run id> -R RhinoHealth/fcp --log | grep \"trigger service answered\"",
+      "see": "trigger service answered 202: {\"workflowId\":null}\n(null because be-upgrade-fixer has no charter and the branch has no PR yet; once both exist it names upgrade:fcp:pr-<n>)"
+    },
+    {
+      "do": "Check that a failure on any other branch starts no trigger run: the list from the previous step shows no new run for your normal feature branches."
+    },
+    {
+      "do": "Clean up the throwaway branch.",
+      "cmd": "git push origin --delete renovate/test-trigger && git switch main && git branch -D renovate/test-trigger"
+    }
+  ],
+  "gaps": [
+    "A workflow_run workflow only fires from the default branch's copy (the ticket says so), so the first real test happens after merge. That is why the job is gated on the variable and every routine stays in shadow.",
+    "The sketch has no branches filter on the trigger, so every failed CI run on every branch would start a runner job just to skip it. This card adds branches: [main, \"renovate/**\"].",
+    "The sketch does not check where the run came from. This card adds head_repository == github.repository, so a fork cannot trigger a fixer with a crafted renovate/ branch name.",
+    "The body sends repo: context.repo.repo (\"fcp\"); the trigger service ignores it and uses the repository from the token (see the G5-09 card).",
+    "github-script is used unpinned in fcp today (@v9 in weekly-dependency-upgrades.yml, @v7 in add-jira-links.yml). The ticket says to pin by SHA with the rest of the Actions (G5-04), so this card pins it now.",
+    "Do not copy fcp's frontend-ci-slack-notify.yml as a model: it pastes ${{ github.event.workflow_run.head_commit.message }} into a shell script, which is exactly the injection this Action avoids. That file is worth fixing separately.",
+    "The canary in \"prove\" reaches be-upgrade-fixer ([SDK] - CI on a renovate/ branch), which needs both a charter and an open PR before a run starts. No ticket gives a way to see a full cifix run end to end without breaking main; the first real red main in shadow is that test.",
+    "The ticket says to copy the file into infrastructure and gitops, but the trigger service has no routines or allow-list entries for them until G5-25. This card leaves the copies to G5-25 (see the decisions)."
+  ],
+  "pr": [
+    "Title in fcp's style with the Jira key, for example \"[Platform] RH-<n>: Report failed CI runs to the routine trigger service\" (add-jira-links reads the key from the title).",
+    "Use fcp's PR template (Summary of Changes, Implementation Details, Testing Performed, References); under Testing, say that workflow_run cannot run before merge and describe the canary you will run after it.",
+    "One approval, from DevOps if possible, because this is a new workflow with id-token: write.",
+    "github-script is pinned by SHA with the version in a comment.",
+    "Check that the file never checks out code and never uses ${{ }} inside the script block.",
+    "This is a person's PR, so the locked-checks rule for agent PRs (.github/** is locked for rhino-ai-agents[bot]) does not block it; an agent must never make this change."
+  ],
+  "rollback": "Delete the repository variable AI_AGENTS_TRIGGER_URL; the job is then skipped on every run, at once and without a PR. To remove it for good, revert the PR.",
+  "prompt": "You are helping Sean do ticket G5-12 (\"Trigger Action on fcp-runner-set: red main, failed Renovate PRs\") in the RhinoHealth/fcp repo (local clone ~/Projects/fcp).\n\nGoal: add .github/workflows/ai-agents-routine-trigger.yml. On workflow_run (completed) of \"[FRONTEND] - CI\", \"[CLOUD] - CI\", \"[CLIENT] - CI\" and \"[SDK] - CI\", for failures on main or renovate/** branches of fcp itself, it runs on fcp-runner-set, gets an OIDC token with audience rhino-ai-agents, and POSTs {kind: \"github.workflow_run\", repo, run_id} to ${AI_AGENTS_TRIGGER_URL}/v1/events, printing the answer.\n\nThe tested file is in ~/Projects/ai-agents-course/content/cards/G5-12.json (files[0].code.text). Use it, check the four workflow names against fcp's workflow files, and pin actions/github-script by commit SHA (gh api repos/actions/github-script/commits/v9 --jq .sha) with \"# v9\" as a comment.\n\nWalls:\n- No checkout, no secrets, permissions only id-token: write and contents: read.\n- Never put ${{ }} expressions inside the script; read event fields from context.payload in JavaScript.\n- The job is skipped while vars.AI_AGENTS_TRIGGER_URL is empty.\n- Do not edit any other workflow file, and never run workflow_dispatch to test.\n- Do not commit or push; show me the file and the diff.\n\nDone when: the file parses (actionlint shows nothing, if installed), the four names match, github-script is pinned, and you have written the post-merge canary steps from the card's \"prove\" list into the PR description draft for me."
+}

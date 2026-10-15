@@ -1,0 +1,302 @@
+{
+  "key": "G5-09",
+  "title": "[Platform] Start routine runs by root cause with signal-with-start",
+  "lesson": "g5-2",
+  "goal": "Add the trigger service: an internal POST /v1/events endpoint in the orchestrator that checks the caller's GitHub OIDC token, re-reads the failed CI run through the broker, names the root cause (the fingerprint), and starts or joins exactly one routineRun per root cause with signal-with-start.",
+  "outcome": "When frontend CI goes red on main and a second push fails the same way, the Temporal UI shows one run, cifix:fcp:<12 hex characters>, with both triggers in it. A red Renovate branch gives one run per PR, upgrade:fcp:pr-<n>. A root cause that comes back after its run has closed produces one message in #ai-agents-alerts instead of a new run, and a call without a valid token gets 401.",
+  "dependsOn": [
+    {
+      "key": "G5-08",
+      "why": "The ticket's listed dependency: routineRun, its addTrigger signal, and agentFor/CHARTER_SHA from routines/agent-for.ts.",
+      "proof": "gh api repos/RhinoHealth/ai-agents/contents/orchestrator/src/workflows/routine-run.ts --jq .path"
+    },
+    {
+      "key": "G3-25",
+      "why": "startOrSignal, the signal-with-start form of startRun, with the same ID, queue, Agent attribute and kill-switch check.",
+      "proof": "gh api -H \"Accept: application/vnd.github.raw\" repos/RhinoHealth/ai-agents/contents/orchestrator/src/fanout.ts | grep -c startOrSignal   # 1 or more"
+    },
+    {
+      "key": "G3-07",
+      "why": "The broker, which must give the orchestrator read-only GitHub access (actions: read): the run, its failed jobs with their logs, the last green run on main, and the PR of a branch.",
+      "proof": "Ask the broker owner which internal routes serve these reads; see the decisions."
+    },
+    {
+      "key": "G3-17",
+      "why": "The orchestrator service runs on inf-rhinohealth; this card adds an HTTP port to it that the fcp-runner-set pods must reach.",
+      "proof": "kubectl -n ai-agents get deploy orchestrator-worker"
+    },
+    {
+      "key": "G5-11",
+      "why": "Saved logs from real red builds for the fingerprint test. Not a hard dependency: the test runs on whatever case folders exist.",
+      "proof": "ls evals/routine-bench/cases/red-builds/*/ | head"
+    }
+  ],
+  "access": [
+    {
+      "what": "Write access to RhinoHealth/ai-agents and one approval.",
+      "who": "The repo admin (Platform, G3-01)."
+    },
+    {
+      "what": "A port, a ClusterIP Service and a NetworkPolicy so that only the fcp-runner-set pods reach POST /v1/events, plus egress from the orchestrator pods to token.actions.githubusercontent.com to fetch GitHub's signing keys.",
+      "who": "DevOps (G3-17 deploys the orchestrator)."
+    },
+    {
+      "what": "Read-only GitHub routes on the broker for the orchestrator.",
+      "who": "The broker owner (G3-07)."
+    },
+    {
+      "what": "A review of the token check (oidc.ts), because it is the only thing that stands between a runner and starting agent runs.",
+      "who": "Security; G3-40 reviews the built runtime anyway."
+    }
+  ],
+  "decide": [
+    {
+      "q": "Which port and which in-cluster URL does the events endpoint get? That URL becomes the fcp variable AI_AGENTS_TRIGGER_URL in G5-12.",
+      "owner": "DevOps.",
+      "fallback": "A second port on orchestrator-worker (EVENTS_PORT), a ClusterIP Service in namespace ai-agents, and a NetworkPolicy that admits only the ARC runner namespace. No Ingress and no public route."
+    },
+    {
+      "q": "How does the orchestrator read GitHub through the broker? G3-07 only defines /v1/gh for sandboxes.",
+      "owner": "The broker owner.",
+      "fallback": "Internal read-only routes on the broker's internal port (run, failed jobs with logs, last green run of a workflow on a branch, PR for a branch), backed by a one-repo token with actions: read and contents: read. GitHubReader in github-events.ts is the interface they must satisfy."
+    },
+    {
+      "q": "Which library checks the JWT (the signed OIDC token)?",
+      "owner": "You, with Security.",
+      "fallback": "jose, exact-pinned, because it fetches and caches GitHub's keys and checks the issuer, audience and algorithm in one call. Hand-written checks with node:crypto are possible but easy to get wrong."
+    },
+    {
+      "q": "What counts as a job's \"first error line\"? No ticket defines it.",
+      "owner": "You, with the BE engineer who checks the G5-11 cases.",
+      "fallback": "The card's firstError: the first ##[error] annotation that is not GitHub's \"Process completed with exit code\" line, else the first line with the word error, fail or failed that is not a passing test. Tune it on the G5-11 logs."
+    },
+    {
+      "q": "How does the orchestrator post to #ai-agents-alerts?",
+      "owner": "The G3-34 owner.",
+      "fallback": "Through the same Slack client the orchestrator already uses for its notify activity (G3-30/G3-35); Alerts in github-events.ts is the one-method interface it must satisfy."
+    }
+  ],
+  "files": [
+    {
+      "path": "orchestrator/src/triggers/fingerprint.ts",
+      "what": "Pure functions that name a root cause: firstError picks the line that says what went wrong, normalize removes what changes between two runs of the same failure, and fingerprint hashes the last green commit plus each failing job's name and normalized first error into 12 hex characters.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/triggers/fingerprint.ts",
+        "text": "// orchestrator/src/triggers/fingerprint.ts: name the root cause of a red build. Pure functions, tested on real logs.\nimport { createHash } from \"node:crypto\";\n\nconst TIMESTAMP = /^\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?Z?\\s?/; // GitHub starts every log line with one\nconst EXIT_LINE = /^##\\[error\\]process completed with exit code/i; // says that a step failed, not why\nconst PASSED = /^[✓√]/; // a passing test whose name contains \"error\"\n\n/** The first line that says what went wrong: a ##[error] annotation, else a line with \"error\" or \"fail\". */\nexport const firstError = (log: string): string => {\n  const lines = log.split(\"\\n\").map((l) => l.replace(TIMESTAMP, \"\").trim()).filter(Boolean);\n  return (\n    lines.find((l) => l.startsWith(\"##[error]\") && !EXIT_LINE.test(l)) ??\n    lines.find((l) => /\\b(error|fail|failed)\\b/i.test(l) && !PASSED.test(l)) ??\n    lines.at(-1) ??\n    \"\"\n  );\n};\n\n/** Drop what changes between two runs of the same failure: temp folders, hashes, numbers, spacing. */\nexport const normalize = (line: string): string =>\n  line\n    .toLowerCase()\n    .replace(/\\/tmp\\/[^/\\s]+/g, \"/tmp/x\") // runner temp folders such as /tmp/ci-8sk2pq\n    .replace(/\\b\\d+(\\.\\d+)?\\s?(ms|s)\\b/g, \"<time>\") // 48ms, 1.2s\n    .replace(/\\b[0-9a-f]{7,40}\\b|0x[0-9a-f]+/g, \"<hex>\")\n    .replace(/\\d+(\\.\\d+)?/g, \"<n>\")\n    .replace(/\\s+/g, \" \")\n    .trim()\n    .slice(0, 200);\n\n/** The last green commit, plus each failing job's name and normalized first error, as 12 hex characters. */\nexport const fingerprint = (lastGreenSha: string, jobs: { name: string; firstError: string }[]): string => {\n  const parts = jobs.map((j) => `${j.name}|${normalize(j.firstError)}`).sort(); // GitHub lists jobs in any order\n  return createHash(\"sha256\").update([lastGreenSha, ...parts].join(\"\\n\")).digest(\"hex\").slice(0, 12);\n};",
+        "notes": [
+          {
+            "line": 4,
+            "text": "GitHub puts a timestamp at the start of every log line; it must go, or every run gets a new ID."
+          },
+          {
+            "line": 5,
+            "text": "GitHub writes this for every failed step. It is the same for every failure, so it says nothing about the cause."
+          },
+          {
+            "line": 23,
+            "text": "Not in the ticket's normalize. Random temp folders gave five builds with one cause five different IDs in the g5-2 lab fixtures."
+          },
+          {
+            "line": 24,
+            "text": "Also new: \"48ms\" and \"1.2s\" are the same test failing; the ticket's rule turned them into different text."
+          },
+          {
+            "line": 33,
+            "text": "Sorted, so the order in which GitHub lists the jobs never changes the ID."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/triggers/oidc.ts",
+      "what": "Checks who is calling. A GitHub OIDC token is a short-lived note signed by GitHub that says which repository and which workflow file is running. We accept only fcp's trigger workflow on main, with audience rhino-ai-agents. No shared secret exists anywhere.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/triggers/oidc.ts",
+        "text": "// orchestrator/src/triggers/oidc.ts: prove who calls POST /v1/events. A GitHub OIDC token, never a shared secret.\nimport { createRemoteJWKSet, jwtVerify } from \"jose\";\n\nconst ISSUER = \"https://token.actions.githubusercontent.com\";\nconst JWKS = createRemoteJWKSet(new URL(`${ISSUER}/.well-known/jwks`)); // fetched once, then cached\n// Repository → the one workflow file on main allowed to call us. Add infrastructure and gitops with the pipeline fixer.\nconst CALLERS: Record<string, string> = {\n  \"RhinoHealth/fcp\": \"RhinoHealth/fcp/.github/workflows/ai-agents-routine-trigger.yml@refs/heads/main\",\n};\n\nexport class CallerRefused extends Error {}\n\n/** The verified repository, e.g. RhinoHealth/fcp. Throws CallerRefused or a jose error otherwise. */\nexport const verifyCaller = async (authorization: string | undefined): Promise<string> => {\n  if (!authorization?.startsWith(\"Bearer \")) throw new CallerRefused(\"no bearer token\");\n  const { payload } = await jwtVerify(authorization.slice(\"Bearer \".length), JWKS, {\n    issuer: ISSUER,\n    audience: \"rhino-ai-agents\", // what the Action asks for with core.getIDToken(\"rhino-ai-agents\")\n    algorithms: [\"RS256\"],\n  });\n  const repository = String(payload.repository ?? \"\");\n  if (!CALLERS[repository] || CALLERS[repository] !== payload.job_workflow_ref) {\n    throw new CallerRefused(`${repository} ${String(payload.job_workflow_ref)} may not report events`);\n  }\n  return repository;\n};",
+        "notes": [
+          {
+            "line": 2,
+            "text": "GitHub's public keys, fetched from the issuer and cached; the orchestrator pods need egress to this host."
+          },
+          {
+            "line": 7,
+            "text": "Repository and the exact workflow file on main. A copy of the workflow on another branch, or in another repo, is refused."
+          },
+          {
+            "line": 19,
+            "text": "Accept only the algorithm GitHub signs with."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/triggers/github-events.ts",
+      "what": "onFailedRun: re-read the run through the broker (never trust the request body), map the CI workflow and branch to a routine, compute the workflow ID, and start or join the run with startOrSignal. A root cause whose run already closed goes to #ai-agents-alerts instead.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/triggers/github-events.ts",
+        "text": "// orchestrator/src/triggers/github-events.ts: one failed CI run → one routineRun per root cause.\nimport { type Client, WorkflowExecutionAlreadyStartedError } from \"@temporalio/client\";\nimport type { Trigger } from \"@rhinohealth/ai-agents-shared\";\nimport { AgentStopped, startOrSignal } from \"../fanout.js\";\nimport { agentFor, CHARTER_SHA } from \"../routines/agent-for.js\";\nimport { addTrigger, routineRun } from \"../workflows/routine-run.js\";\nimport { fingerprint, firstError } from \"./fingerprint.js\";\n\nexport interface GitHubRun {\n  id: number; name: string; workflow_id: number; head_branch: string; head_sha: string;\n  conclusion: string | null; head_repository: { full_name: string };\n}\n/** Read-only GitHub through the broker (actions: read). The trigger service holds no GitHub token. */\nexport interface GitHubReader {\n  getRun(repo: string, runId: number): Promise<GitHubRun>;\n  lastGreenSha(repo: string, workflowId: number, branch: string): Promise<string>;\n  failedJobs(repo: string, runId: number): Promise<{ name: string; log: string }[]>;\n  prForBranch(repo: string, branch: string): Promise<number | undefined>;\n}\nexport interface Alerts { post(text: string): Promise<void> } // #ai-agents-alerts\n\nconst ROUTINES: Record<string, string> = { // \"<workflow name>|<main or renovate>\" → routine\n  \"[FRONTEND] - CI|main\": \"fe-ci-fixer\", \"[CLOUD] - CI|main\": \"be-ci-fixer\", \"[CLIENT] - CI|main\": \"be-ci-fixer\",\n  \"[FRONTEND] - CI|renovate\": \"fe-upgrade-fixer\", \"[CLOUD] - CI|renovate\": \"be-upgrade-fixer\",\n  \"[CLIENT] - CI|renovate\": \"be-upgrade-fixer\", \"[SDK] - CI|renovate\": \"be-upgrade-fixer\",\n};\n\n/** repo is the verified OIDC repository (RhinoHealth/fcp). Returns the run's workflow ID, or undefined when no routine applies. */\nexport const onFailedRun = async (temporal: Client, gh: GitHubReader, alerts: Alerts, repo: string, runId: number) => {\n  const run = await gh.getRun(repo, runId); // re-read from GitHub: never trust the request body\n  if (run.conclusion !== \"failure\" || run.head_repository.full_name !== repo) return undefined;\n  const kind = run.head_branch === \"main\" ? \"main\" : run.head_branch.startsWith(\"renovate/\") ? \"renovate\" : undefined;\n  const routine = kind && ROUTINES[`${run.name}|${kind}`];\n  if (!routine) return undefined;\n  const agent = await agentFor(routine).catch(() => undefined);\n  if (!agent) return undefined; // no charter for this routine yet\n  const short = repo.split(\"/\")[1]; // IDs use the short name: cifix:fcp:<fingerprint>\n  const jobs = (await gh.failedJobs(repo, run.id)).map((j) => ({ name: j.name, firstError: firstError(j.log) }));\n  let thing: string;\n  if (kind === \"renovate\") {\n    const pr = await gh.prForBranch(repo, run.head_branch);\n    if (!pr) return undefined; // the PR isn't open yet; the next red run on the branch will find it\n    thing = `${short}:pr-${pr}`;\n  } else {\n    thing = `${short}:${fingerprint(await gh.lastGreenSha(repo, run.workflow_id, \"main\"), jobs)}`;\n  }\n  const trigger: Trigger = { kind: \"github.workflow_run\", repo: short, runId: run.id, headSha: run.head_sha, jobs };\n  const workflowId = `${agent}:${thing}`;\n  try {\n    await startOrSignal(temporal, agent, thing, routineRun, { routine, charterSha: CHARTER_SHA }, addTrigger, trigger);\n  } catch (err) {\n    if (err instanceof WorkflowExecutionAlreadyStartedError) {\n      await alerts.post(`${workflowId} came back after its run closed. That is probably ping-pong, so a person should look.`);\n    } else if (!(err instanceof AgentStopped)) {\n      throw err;\n    }\n  }\n  return workflowId;\n};",
+        "notes": [
+          {
+            "line": 14,
+            "text": "What the orchestrator needs from the broker. Passing it in also makes the function easy to test with a fake."
+          },
+          {
+            "line": 31,
+            "text": "A run from a fork, or for another repo, is ignored."
+          },
+          {
+            "line": 22,
+            "text": "The workflow names must match fcp exactly (\"[FRONTEND] - CI\"...). Renaming a CI workflow in fcp silently turns its fixer off."
+          },
+          {
+            "line": 36,
+            "text": "Before a routine's charter exists, its events are accepted and ignored, so the Action can go live early."
+          },
+          {
+            "line": 37,
+            "text": "The token says RhinoHealth/fcp; the canon IDs use the short name: cifix:fcp:<fingerprint>."
+          },
+          {
+            "line": 42,
+            "text": "The sketch would have built upgrade:fcp:pr-undefined here."
+          },
+          {
+            "line": 50,
+            "text": "G3-25's helper: signal the open run, or start it and then signal it, with REJECT_DUPLICATE and the kill-switch check."
+          },
+          {
+            "line": 52,
+            "text": "REJECT_DUPLICATE refused the start: this root cause had a run that already closed. Probably ping-pong, so a person decides."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/triggers/events-server.ts",
+      "what": "The HTTP endpoint on node:http (no framework, like Byte's broker): GET /health, and POST /v1/events, which checks the token before it reads the body, and answers 202 with the workflow ID, 400, 401 or 500.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/src/triggers/events-server.ts",
+        "text": "// orchestrator/src/triggers/events-server.ts: POST /v1/events on an internal port (no public route, no webhook).\nimport { createServer, type IncomingMessage } from \"node:http\";\nimport type { Client } from \"@temporalio/client\";\nimport { errors } from \"jose\";\nimport { type Alerts, type GitHubReader, onFailedRun } from \"./github-events.js\";\nimport { CallerRefused, verifyCaller } from \"./oidc.js\";\n\nclass BadEvent extends Error {}\n\nconst readRunId = async (req: IncomingMessage): Promise<number> => {\n  let body = \"\";\n  for await (const chunk of req) {\n    body += String(chunk);\n    if (body.length > 4096) throw new BadEvent(\"body too large\");\n  }\n  const ev = JSON.parse(body) as { kind?: unknown; run_id?: unknown }; // a SyntaxError becomes a 400\n  if (ev.kind !== \"github.workflow_run\" || typeof ev.run_id !== \"number\" || !Number.isSafeInteger(ev.run_id)) {\n    throw new BadEvent(\"expected { kind: github.workflow_run, run_id }\");\n  }\n  return ev.run_id;\n};\n\nexport const startEventServer = (port: number, temporal: Client, gh: GitHubReader, alerts: Alerts) =>\n  createServer(async (req, res) => {\n    if (req.method === \"GET\" && req.url === \"/health\") return void res.end(\"ok\");\n    if (req.method !== \"POST\" || req.url !== \"/v1/events\") return void res.writeHead(404).end();\n    try {\n      const repo = await verifyCaller(req.headers.authorization); // the repo comes from the signed token, not the body\n      const workflowId = await onFailedRun(temporal, gh, alerts, repo, await readRunId(req));\n      res.writeHead(202, { \"content-type\": \"application/json\" }).end(JSON.stringify({ workflowId: workflowId ?? null }));\n    } catch (err) {\n      const refused = err instanceof CallerRefused || err instanceof errors.JOSEError;\n      const status = refused ? 401 : err instanceof BadEvent || err instanceof SyntaxError ? 400 : 500;\n      if (status === 500) console.error(\"POST /v1/events failed\", err);\n      res.writeHead(status).end();\n    }\n  }).listen(port);",
+        "notes": [
+          {
+            "line": 28,
+            "text": "The repository comes from the signed token, never from the body."
+          },
+          {
+            "line": 14,
+            "text": "The real body is about 60 bytes; anything large is refused."
+          }
+        ]
+      }
+    },
+    {
+      "path": "orchestrator/src/main.ts (edit)",
+      "what": "Start the events server next to the Temporal workers. githubReader and alerts are the two clients from the decisions.",
+      "code": {
+        "lang": "diff",
+        "file": "orchestrator/src/main.ts (edit)",
+        "text": "--- a/orchestrator/src/main.ts\n+++ b/orchestrator/src/main.ts\n@@ imports\n+import { startEventServer } from \"./triggers/events-server.js\";\n@@ after ensureSlots()\n await ensureSlots();\n+// githubReader: the broker's read-only GitHub client; alerts: the Slack client the orchestrator already uses.\n+startEventServer(Number(process.env.EVENTS_PORT), await temporalClient(), githubReader, alerts);"
+      }
+    },
+    {
+      "path": "orchestrator/test/github-events.test.ts",
+      "what": "node:test on saved logs: for each case folder, two red pushes with the same cause must give the same ID; plus small tests for normalize, firstError and job order. Copy pairs of logs from G5-11's cases into orchestrator/test/fixtures/red-builds/<case>/ (case.json, first.log, second.log). Run on one case built from the g5-2 lab fixtures, all four tests pass.",
+      "code": {
+        "lang": "typescript",
+        "file": "orchestrator/test/github-events.test.ts",
+        "text": "// orchestrator/test/github-events.test.ts: the fingerprint rules, on saved logs from real red builds.\n// Each case folder holds case.json ({ \"lastGreenSha\", \"job\" }), first.log and second.log: two red pushes, one cause.\nimport assert from \"node:assert/strict\";\nimport { readdirSync, readFileSync } from \"node:fs\";\nimport { test } from \"node:test\";\nimport { fingerprint, firstError, normalize } from \"../src/triggers/fingerprint.js\";\n\nconst cases = new URL(\"./fixtures/red-builds/\", import.meta.url);\n\nfor (const name of readdirSync(cases)) {\n  test(`${name}: two red pushes with the same cause get the same ID`, () => {\n    const read = (file: string) => readFileSync(new URL(`${name}/${file}`, cases), \"utf8\");\n    const { lastGreenSha, job } = JSON.parse(read(\"case.json\")) as { lastGreenSha: string; job: string };\n    const id = (log: string) => fingerprint(lastGreenSha, [{ name: job, firstError: firstError(log) }]);\n    assert.equal(id(read(\"first.log\")), id(read(\"second.log\")));\n  });\n}\n\ntest(\"normalize drops what changes between runs\", () => {\n  assert.equal(\n    normalize(\"FAIL /tmp/ci-8sK2pq/fcp/frontend/src/a.test.tsx > shows a card 48ms\"),\n    normalize(\"FAIL /tmp/ci-Lx3qe9/fcp/frontend/src/a.test.tsx > shows a card 1.2s\"),\n  );\n  assert.equal(normalize(\"at commit 4b7e2a91c0d3, line 42\"), \"at commit <hex>, line <n>\");\n});\n\ntest(\"firstError skips the exit-code line and passing tests\", () => {\n  const log = [\n    \"2026-10-13T10:02:11.1180032Z  ✓ src/ErrorBoundary/error.test.tsx (3 tests)\",\n    \"2026-10-13T10:02:12.1257809Z src/api/projects.ts(12,7): error TS2339: Property 'emptyState' does not exist\",\n    \"2026-10-13T10:02:13.1335586Z ##[error]Process completed with exit code 2.\",\n  ].join(\"\\n\");\n  assert.equal(firstError(log), \"src/api/projects.ts(12,7): error TS2339: Property 'emptyState' does not exist\");\n});\n\ntest(\"the job order does not change the ID\", () => {\n  const a = { name: \"lint\", firstError: \"error x\" };\n  const b = { name: \"test\", firstError: \"FAIL y\" };\n  assert.equal(fingerprint(\"9f2c4e1\", [a, b]), fingerprint(\"9f2c4e1\", [b, a]));\n});",
+        "notes": [
+          {
+            "line": 10,
+            "text": "One test per saved case, so a new case needs no code."
+          }
+        ]
+      }
+    }
+  ],
+  "steps": [
+    {
+      "do": "Update main and make a branch.",
+      "cmd": "git switch main && git pull && git switch -c g5-09-root-cause-triggers"
+    },
+    {
+      "do": "Add jose as an exact-pinned dependency of the orchestrator workspace (check the latest version first).",
+      "cmd": "npm view jose version && npm install --save-exact jose@<that version> -w @rhinohealth/ai-agents-orchestrator"
+    },
+    {
+      "do": "Add the four source files under orchestrator/src/triggers/."
+    },
+    {
+      "do": "Make the test cases: for at least 10 red streaks from G5-11 (or from `gh run list --workflow \"[FRONTEND] - CI\" --branch main --status failure`), save the failed log of the first and the second red run, and the last green commit before them.",
+      "cmd": "gh run view <run id> -R RhinoHealth/fcp --log-failed > orchestrator/test/fixtures/red-builds/<case>/first.log",
+      "see": "A plain-text log with a timestamp at the start of each line."
+    },
+    {
+      "do": "Run the fingerprint tests and fix firstError or normalize until every pair matches.",
+      "cmd": "node --import tsx --test orchestrator/test/github-events.test.ts",
+      "see": "One \"ok\" line per case, then\n# fail 0"
+    },
+    {
+      "do": "Wire the events server into main.ts once the broker read routes and the port are agreed."
+    },
+    {
+      "do": "Run the whole check.",
+      "cmd": "npm run check",
+      "see": "# fail 0 and no lint or type errors."
+    },
+    {
+      "do": "Ask DevOps for the Service, the NetworkPolicy and the egress rule, and send the resulting URL to whoever does G5-12."
+    },
+    {
+      "do": "Commit, push and open the PR.",
+      "cmd": "git add -A && git commit -m \"[Platform] G5-09: start routine runs by root cause\" && git push -u origin HEAD && gh pr create --fill"
+    }
+  ],
+  "prove": [
+    {
+      "do": "Locally: the fingerprint tests pass on real logs.",
+      "cmd": "node --import tsx --test orchestrator/test/github-events.test.ts",
+      "see": "# fail 0"
+    },
+    {
+      "do": "Locally: see one run per cause for a storm. Run the card's fingerprint over the 7 made-up red builds of the g5-2 lab (3 causes). The ticket's original normalize gave 7 runs here (checked while writing this card).",
+      "cmd": "node --import tsx --input-type=module -e 'import { readdirSync, readFileSync } from \"node:fs\"; import { fingerprint, firstError } from \"./orchestrator/src/triggers/fingerprint.ts\"; const dir = process.env.HOME + \"/Projects/ai-agents-course/labs/g5-2/start/fixtures/\"; const ids = new Set(readdirSync(dir).map((f) => { const b = JSON.parse(readFileSync(dir + f, \"utf8\")); return fingerprint(b.lastGreenSha, b.jobs.map((j) => ({ name: j.name, firstError: firstError(j.log) }))); })); console.log(ids.size, \"runs for 7 red builds\");'",
+      "see": "3 runs for 7 red builds"
+    },
+    {
+      "do": "After deploy: from a pod in the runner namespace, a call without a token is refused.",
+      "cmd": "kubectl -n <runner namespace> run curl --rm -it --image=curlimages/curl --restart=Never -- curl -s -o /dev/null -w \"%{http_code}\\n\" -X POST <AI_AGENTS_TRIGGER_URL>/v1/events",
+      "see": "401"
+    },
+    {
+      "do": "After deploy and G5-12: the canary in the G5-12 card reaches this service, and the trigger Action's log shows the answer.",
+      "see": "trigger service answered 202: {\"workflowId\":null} (no charter for be-upgrade-fixer yet), or a workflow ID once its charter exists."
+    }
+  ],
+  "gaps": [
+    "The ticket's normalize does not remove random temp folders, a space-separated timestamp, or duration units. On the g5-2 lab fixtures (5 builds with one broken test, 2 with lint and type errors) it gave 7 different IDs, so 7 fixers; the card's version gives 3. The fixtures are made up for the course, so check the rule on the G5-11 logs before trusting it.",
+    "No ticket defines \"the first error line\". GitHub's own \"##[error]Process completed with exit code N\" line is the same for every failure, so a naive rule would group unrelated failures of the same job.",
+    "G5-11 keeps only the first red run of each red streak, so its cases contain no pair \"the same failure on two commits\" that this ticket's test needs. Recommendation: G5-11 also saves the second red run of each streak. G5-11 also drops cases with the same fingerprint, which makes a \"different causes give different IDs\" test circular; that one needs people's labels instead.",
+    "The trigger Action sends repo: context.repo.repo, which is \"fcp\", while the OIDC allow-list and the broker need \"RhinoHealth/fcp\". The card takes the repository from the verified token and uses the short name only inside workflow IDs.",
+    "The sketch calls client.workflow.signalWithStart directly, but the ticket says to use G3-25's startOrSignal so the kill switch and the Agent attribute are the same for every start. The card uses startOrSignal.",
+    "routineRun is started without a charterSha (TICKET_ISSUES.md). The card passes CHARTER_SHA from G5-08's agent-for.ts.",
+    "G3-17 deploys orchestrator-worker with no HTTP listener and no Service, and its NetworkPolicies only cover the broker's internal port and Temporal. Nothing yet lets runner pods reach /v1/events, and the pods need egress to token.actions.githubusercontent.com for the keys.",
+    "No ticket defines the broker's read API for the orchestrator (run, job logs, last green run, PR for a branch) or the alerts client. Both are interfaces in this card.",
+    "REJECT_DUPLICATE remembers an ID only as long as the namespace keeps closed runs (30 days, G3-06). The same root cause after that starts a new run, which is fine, but it means the ping-pong alert only covers 30 days.",
+    "ROUTINES has no entries for infrastructure and gitops workflows yet; the pipeline fixer (G5-25) adds them, together with their CALLERS entries in oidc.ts."
+  ],
+  "pr": [
+    "Title: \"[Platform] RH-<n>: Start routine runs by root cause\" (no ticket fixes the format for ai-agents).",
+    "Required checks green: lint, test, evals. Exactly one approval; ask Security to read oidc.ts and events-server.ts.",
+    "Include the saved log cases under orchestrator/test/fixtures/red-builds/, scrubbed of tokens (G5-11 runs gitleaks before saving).",
+    "Paste the test output and say how many of the cases matched before and after your firstError/normalize tuning.",
+    "List the DevOps and broker follow-ups (Service, NetworkPolicy, egress, read routes) with links.",
+    "No change under .github/ or other protected paths."
+  ],
+  "rollback": "Revert the PR and redeploy; with no listener, the trigger Action's calls fail and its job turns red, which starts nothing. To silence it at once, delete the fcp variable AI_AGENTS_TRIGGER_URL (the G5-12 workflow skips its job when the variable is empty). Runs already started are shadow runs; end them with temporal workflow terminate --query \"WorkflowType='routineRun'\" if needed.",
+  "prompt": "You are helping Sean do ticket G5-09 (\"Start routine runs by root cause with signal-with-start\") in the RhinoHealth/ai-agents repo (TypeScript on Node 24, npm workspaces, ESM with .js import paths, node:test through tsx, exact-pinned dependencies).\n\nGoal: an internal POST /v1/events endpoint in the orchestrator. It verifies a GitHub OIDC token (issuer https://token.actions.githubusercontent.com, audience rhino-ai-agents, repository RhinoHealth/fcp, job_workflow_ref = fcp's .github/workflows/ai-agents-routine-trigger.yml on refs/heads/main), re-reads the failed run through the broker, and starts or joins one routineRun per root cause: cifix:fcp:<fingerprint> for red main (fingerprint = last green commit + each failing job's name and normalized first error, 12 hex) and upgrade:fcp:pr-<n> for a red renovate/ branch. It uses G3-25's startOrSignal (REJECT_DUPLICATE); a closed root cause that comes back goes to #ai-agents-alerts.\n\nStart from the card: ~/Projects/ai-agents-course/content/cards/G5-09.json. files[].code.text has tested code for orchestrator/src/triggers/{fingerprint,oidc,github-events,events-server}.ts and the test. The broker read client and the alerts client are interfaces (GitHubReader, Alerts); ask me before inventing broker routes. Read the \"gaps\" list: the ticket's own normalize was too weak, and the body's repo field must not be trusted.\n\nWalls:\n- Never trust the request body: the repository comes from the verified token, the run is re-read from GitHub.\n- No public route, no webhook, no shared secret. The orchestrator never calls workflow_dispatch or re-runs jobs.\n- No GitHub token in the orchestrator: all GitHub reads go through the broker.\n- Do not touch .github/ or protected paths. Do not commit or push; show me the diff.\n- If you use subagents, at most two, and tell them not to start their own.\n\nDone when:\n1. `node --import tsx --test orchestrator/test/github-events.test.ts` passes on at least 10 saved cases (I will give you the run IDs, or use G5-11's cases).\n2. `npm run check` is green.\n3. You list the decisions you used the fallback for."
+}
