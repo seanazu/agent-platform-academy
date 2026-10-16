@@ -1,442 +1,308 @@
 {
+ "v": 2,
  "id": "g5-4",
  "title": "Storm control and the circuit breaker",
- "minutes": 40,
+ "minutes": 50,
  "youNeed": [
   "g5-2",
   "g5-3",
-  "p7-2"
+  "p7-5"
  ],
- "bridge": "Storm control is like the circuit breaker in a house: too much current at once cuts the power until someone resets it. Except: the current here is new fix runs, and the breaker also pages a person. Each routine also has its own small breaker for repeated failures.",
- "intro": "Sometimes main goes red because of the runners, the registry or the QA environment, not the code. Agents cannot fix that, and a storm of fix runs only costs money and attention. This lesson waits so failures gather, pauses all fixers when too many new causes appear, and pauses one routine that keeps failing.",
- "picture": {
-  "caption": "Many red runs become one run per cause; too many causes at once become one page to a person.",
-  "nodes": [
-   {
-    "id": "red",
-    "label": "red main runs",
-    "kind": "check"
-   },
-   {
-    "id": "run",
-    "label": "cifix routineRun (gather 7 min)",
-    "kind": "service"
-   },
-   {
-    "id": "storm",
-    "label": "stormCheck (15-minute window)",
-    "kind": "check"
-   },
-   {
-    "id": "flag",
-    "label": "routines:fixers:paused",
-    "kind": "file"
-   },
-   {
-    "id": "person",
-    "label": "on-call person",
-    "kind": "person"
-   },
-   {
-    "id": "breaker",
-    "label": "circuitBreaker (last 5 runs)",
-    "kind": "check"
-   },
-   {
-    "id": "owner",
-    "label": "routine owner",
-    "kind": "person"
-   }
+ "map": "temporal",
+ "hook": {
+  "story": [
+   "Tuesday, 10:02. You know this morning already: a merged PR broke a test in the projects table, main went red, and one CI fixer is gathering every red build of that one problem. The fingerprint is doing its job. Then, at 10:14, a new image for our GitHub runners rolls out, and it cannot reach the package mirror. Every install step starts to fail: npm ci in frontend CI, uv sync in cloud and client CI. Each job dies on a different package, so each red build has a different first error line, and by 10:26 seven new fingerprints have arrived.",
+   "Seven fingerprints means seven fixer runs. Each one would claim a VM, run the failed commands, find them green in the VM, because the VM's network is fine, and post its own hand-off to the alerts channel. That is seven machines and seven messages for one broken runner image, which no agent can fix anyway. What the morning needs is not seven agents. It needs one person, paged once."
   ],
-  "steps": [
-   {
-    "from": "red",
-    "to": "run",
-    "text": "same cause: addTrigger joins the open run during the gather window"
-   },
-   {
-    "from": "storm",
-    "to": "flag",
-    "text": "more than 5 new fingerprints in 15 minutes: pause every fixer"
-   },
-   {
-    "from": "flag",
-    "to": "person",
-    "text": "one PagerDuty page and one post in #ai-agents-alerts"
-   },
-   {
-    "from": "person",
-    "to": "flag",
-    "text": "clears it with a Slack button; parked runs re-check, most end as not_needed"
-   },
-   {
-    "from": "breaker",
-    "to": "owner",
-    "text": "3 of the last 5 runs failed or were rejected: pause this routine and DM the owner"
-   }
-  ]
+  "question": "How does the platform notice that red builds have stopped being a code problem, and stop every fixer at once?"
  },
- "sections": [
+ "read": [
   {
-   "h": "A red main at 10:02",
+   "h": "Count causes, not builds",
    "p": [
-    "At 10:02 a runner image update breaks npm ci. In two minutes, frontend CI fails on main, and every PR fails the same way. Cloud and client CI fail too, each with its own first error line.",
-    "Without care, each red run would start a fixer. Each fixer would claim a VM to fix code that is not broken. That is a storm of agents.",
-    "Three defences stop it. A gather window turns red runs with the same cause into one run. Incident mode pauses every fixer when too many new causes appear at once. A circuit breaker pauses one routine that keeps failing."
+    "The last lesson gave every problem a name: one fingerprint, one fixer run. That makes counting easy. Ten red builds of one broken test are still one run, so the number of fixer runs that started recently is the number of new root causes. On a normal day that number is one, sometimes two. Real code breaks one thing at a time, because each merge is one change. When many new causes appear at once, across frontend, cloud and client, the common cause is almost always the environment: the runners, the package mirror, the QA environment. Agents cannot fix any of those, so the rule is simple. More than 5 new fingerprints in 15 minutes switches on incident mode.",
+    "The count comes from Temporal itself, with no extra database. Temporal keeps a searchable list of every run, called visibility, and you can ask it questions in a small SQL-like language. Each routine run carries search attributes, which are indexed fields we set ourselves: Routine says which routine it is, and RunKind says what kind of work, such as cifix for a red-main fixer. So \"how many fixer runs started in the last 15 minutes?\" is one query and one call."
    ],
-   "callout": {
-    "kind": "why",
-    "text": "Many new failures at once point to infrastructure: runners, the registry or QA. Agents cannot fix that, so a person is paged instead."
-   }
-  },
-  {
-   "h": "The gather window, then is it still red?",
-   "p": [
-    "CI and pipeline-fixer charters set gather_minutes: 7. routineRun sleeps that long before its gate (lesson g5-2), while addTrigger signals for the same fingerprint pile up. The sleep is a durable Temporal timer, so a worker restart does not reset it.",
-    "After the window, the run first checks that main is still red at its latest commit. Someone may have fixed it in those 7 minutes. If main is green, the run ends as not_needed, with nothing to do."
-   ],
-   "because": "Waiting a few minutes costs nothing, and often the problem is gone or fully visible by then.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/activities/storm.ts (stillRed)",
-    "text": "export async function stillRed(repo: string, workflowName: string): Promise<boolean> {\n  const latest = await broker.github.latestRun(repo, workflowName, { branch: \"main\" });\n  return latest.conclusion === \"failure\";  // main went green during the gather window → nothing to do\n}",
-    "notes": [
-     {
-      "line": 1,
-      "text": "An activity: it calls GitHub through the broker, which a workflow may not do."
-     },
-     {
-      "line": 2,
-      "text": "The latest run of this workflow on main."
-     },
-     {
-      "line": 3,
-      "text": "Still red: carry on. Green: the run ends as not_needed."
-     }
-    ]
-   }
-  },
-  {
-   "h": "stormCheck: count new causes, page once",
-   "p": [
-    "One cifix run is one fingerprint (lesson g5-2). So counting cifix runs started in the last 15 minutes counts new root causes. More than 5 means incident mode.",
-    "The count is a Temporal visibility query on the Routine and RunKind search attributes, through client.workflow.count. It is an activity: it reads the clock and calls services.",
-    "In incident mode, the flag routines:fixers:paused is set with the reason. The on-call person is paged through PagerDuty (ask DevOps for an ai-agents service). The fingerprints and their first error lines go to #ai-agents-alerts."
-   ],
-   "because": "We page once per incident, not once per run, so a storm becomes one clear message to one person.",
    "code": {
     "lang": "typescript",
     "file": "ai-agents/orchestrator/src/activities/storm.ts (stormCheck)",
-    "text": "// ai-agents/orchestrator/src/activities/storm.ts: sketch\nconst WINDOW_MS = 15 * 60_000, MAX_NEW = 5;  // 15 minutes\nconst FIXERS = [\"fe-ci-fixer\", \"be-ci-fixer\", \"pipeline-fixer\"];\n\nexport async function stormCheck(repo: string): Promise<\"normal\" | \"incident\"> {\n  const since = new Date(Date.now() - WINDOW_MS).toISOString();\n  const names = FIXERS.map((r) => `'${r}'`).join(\", \");\n  const query = `WorkflowType = 'routineRun' AND RunKind = 'cifix' AND Routine IN (${names}) AND StartTime > '${since}'`;\n  const { count: newFingerprints } = await temporal.workflow.count(query);  // one cifix run = one fingerprint (G5-09)\n  if (newFingerprints <= MAX_NEW) {\n    return \"normal\";\n  }\n  const reason = `${newFingerprints} new failure fingerprints in 15 minutes on ${repo}: likely infrastructure, not code`;\n  if (await flags.setIfAbsent(\"routines:fixers:paused\", reason)) {  // page once per incident, not per run\n    await pagerduty.trigger({ service: \"ai-agents\", summary: reason });\n    await slack.post(\"#ai-agents-alerts\", reason, { details: await firstErrors(query), buttons: [\"Resume fixers\"] });\n  }\n  return \"incident\";\n}",
-    "notes": [
-     {
-      "line": 2,
-      "text": "A 15-minute window, and at most 5 new causes in it."
-     },
-     {
-      "line": 3,
-      "text": "The routines that fix red CI. Upgrade and bug fixers are not part of a storm."
-     },
-     {
-      "line": 6,
-      "text": "15 minutes ago, as an ISO date for the query."
-     },
-     {
-      "line": 8,
-      "text": "routineRun workflows of kind cifix, for these routines, started after since."
-     },
-     {
-      "line": 9,
-      "text": "Temporal counts matching workflows. One cifix run equals one fingerprint."
-     },
-     {
-      "line": 10,
-      "text": "5 or fewer: normal."
-     },
-     {
-      "line": 13,
-      "text": "A plain reason: likely infrastructure, not code."
-     },
-     {
-      "line": 14,
-      "text": "Set the flag only if it is not set. Only the first caller pages."
-     },
-     {
-      "line": 15,
-      "text": "Page the on-call person once."
-     },
-     {
-      "line": 16,
-      "text": "A person clears the flag with one click."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "The G5-17 ticket does not say who calls stormCheck. One sensible place is routineRun, right after the gather window and before the pre-run gate. Agree it with the G5-08 owner and write it in the PR."
-   }
-  },
-  {
-   "h": "Incident mode, and how to test it",
-   "p": [
-    "While the flag is set, new cifix runs park at the gate: preRunGate sees incident mode and never claims a VM. The parked runs wait on a timer.",
-    "A person looks, fixes the runner or the registry, and clears the flag with the Slack button. The parked runs re-check. Most find main green and end as not_needed.",
-    "Test it with a replay in a test namespace. Send 8 saved red-build events in 2 minutes. The result must be one page and zero VMs."
-   ],
-   "callout": {
-    "kind": "wall",
-    "text": "No time or turn limit is involved. Storm control decides whether a run starts at all; it never cuts a running agent short."
-   }
-  },
-  {
-   "h": "The circuit breaker, part 1: the last runs",
-   "p": [
-    "A routine that keeps failing wastes VMs and reviewer time. After every run, its last 5 finished runs are checked. If 3 failed or were rejected, the routine is paused and its owner told.",
-    "routineRun sets the search attribute RoutineOutcome when it ends: merged, closed, rejected, failed, handed_off or not_needed. Rejected covers a scope-judge veto, a false heal, or a PR closed by a person. Only failed and rejected count; handed_off (an environment problem) and not_needed are not the routine's fault."
-   ],
-   "because": "A pause after 3 bad runs out of 5, with the reasons attached, is cheaper than a slow drift into noise.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/activities/storm.ts (circuitBreaker, part 1)",
-    "text": "// ai-agents/orchestrator/src/activities/storm.ts (continued): sketch\nimport type { WorkflowExecutionInfo } from \"@temporalio/client\";\nimport { defineSearchAttributeKey, SearchAttributeType } from \"@temporalio/common\";\n\nconst COUNTS_AGAINST = new Set([\"failed\", \"rejected\"]);  // handed_off and not_needed are not the routine's fault\nconst ROUTINE_OUTCOME = defineSearchAttributeKey(\"RoutineOutcome\", SearchAttributeType.KEYWORD);\n\nexport async function circuitBreaker(routine: string, owner: string): Promise<boolean> {\n  const query = `WorkflowType = 'routineRun' AND Routine = '${routine}' AND ExecutionStatus != 'Running'`;\n  const finished: WorkflowExecutionInfo[] = [];\n  for await (const w of temporal.workflow.list({ query })) {\n    finished.push(w);\n    if (finished.length === 20) break;\n  }",
-    "notes": [
-     {
-      "line": 2,
-      "text": "The shape Temporal returns for each listed workflow."
-     },
-     {
-      "line": 3,
-      "text": "A typed key for reading a search attribute from a listed workflow."
-     },
-     {
-      "line": 5,
-      "text": "Only failed and rejected count against the routine."
-     },
-     {
-      "line": 6,
-      "text": "RoutineOutcome is a keyword attribute that routineRun sets at the end."
-     },
-     {
-      "line": 8,
-      "text": "Called as the last step of every run, with the routine and its owner."
-     },
-     {
-      "line": 9,
-      "text": "Only finished runs of this routine."
-     },
-     {
-      "line": 11,
-      "text": "An async iterator over matching workflows."
-     },
-     {
-      "line": 13,
-      "text": "20 is plenty to find the last 5; stop reading there."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The circuit breaker, part 2: trip and tell",
-   "p": [
-    "Sort by close time, newest first, keep 5, and count the bad ones. Fewer than 5 runs, or fewer than 3 bad: nothing happens.",
-    "On a trip, routine:<name>:paused is set and the owner gets a DM with the 5 runs and reasons. The next team digest lists it. Resuming is a Slack button for the owner.",
-    "Ping-pong is already covered elsewhere. A fingerprint that comes back after its run closed is refused by REJECT_DUPLICATE (lesson g5-2) and goes to a person."
-   ],
-   "because": "The owner sees which runs failed and why, so resuming is an informed choice, not a guess.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/activities/storm.ts (circuitBreaker, part 2)",
-    "text": "  const closedAt = (w: WorkflowExecutionInfo): number => w.closeTime?.getTime() ?? 0;\n  const last5 = finished.sort((a, b) => closedAt(b) - closedAt(a)).slice(0, 5);\n  const bad = last5.filter((w) => COUNTS_AGAINST.has(outcome(w)));\n  if (last5.length < 5 || bad.length < 3) {\n    return false;\n  }\n  const reason = `3 of its last 5 runs failed or were rejected: ${bad.map((w) => w.workflowId).join(\", \")}`;\n  await flags.set(`routine:${routine}:paused`, reason);\n  await slack.dm(owner, `${routine} is paused. ${reason}`, { buttons: [\"Resume\", \"Keep paused\"] });\n  return true;\n}\n\nfunction outcome(w: WorkflowExecutionInfo): string {\n  return w.typedSearchAttributes.get(ROUTINE_OUTCOME) ?? \"unknown\";  // set by routineRun at the end\n}",
+    "text": "const WINDOW_MS = 15 * 60_000, MAX_NEW = 5;\nconst FIXERS = [\"fe-ci-fixer\", \"be-ci-fixer\", \"pipeline-fixer\"];\n\nexport const stormCheck = async (repo: string): Promise<\"normal\" | \"incident\"> => {\n  const since = new Date(Date.now() - WINDOW_MS).toISOString();\n  const names = FIXERS.map((r) => `'${r}'`).join(\", \");\n  const query = `WorkflowType = 'routineRun' AND RunKind = 'cifix' AND Routine IN (${names}) AND StartTime > '${since}'`;\n  const { count: newFingerprints } = await temporal.workflow.count(query);\n  if (newFingerprints <= MAX_NEW) return \"normal\";\n\n  const reason = `${newFingerprints} new failure fingerprints in 15 minutes on ${repo}: likely infrastructure, not code`;\n  if (await flags.setIfAbsent(\"routines:fixers:paused\", reason)) {\n    await pagerduty.trigger({ service: \"ai-agents\", summary: reason });\n    await slack.post(\"#ai-agents-alerts\", reason, { details: await firstErrors(query), buttons: [\"Resume fixers\"] });\n  }\n  return \"incident\";\n};",
     "notes": [
      {
       "line": 1,
-      "text": "Close time in milliseconds, or 0 if missing."
+      "text": "A 15-minute window, and at most 5 new causes in it."
      },
      {
       "line": 2,
-      "text": "Newest first, the last 5 finished runs."
-     },
-     {
-      "line": 3,
-      "text": "Those whose outcome is failed or rejected."
-     },
-     {
-      "line": 4,
-      "text": "Too few runs, or fewer than 3 bad: do not trip."
+      "text": "Only the routines that fix red CI. Upgrade and bug fixers are not part of a red-main storm."
      },
      {
       "line": 7,
-      "text": "The reason names the bad runs' workflow IDs, so the owner can open each one."
+      "text": "The visibility query: fixer runs of these routines started after since."
      },
      {
       "line": 8,
-      "text": "The same pause flag the merge-rate rule uses. The gate reads it."
+      "text": "One fixer run is one fingerprint, so this counts new root causes."
      },
      {
-      "line": 9,
-      "text": "A DM with Resume and Keep paused buttons."
+      "line": 12,
+      "text": "setIfAbsent returns true only for the caller that set the flag. Everyone after it finds the flag already there."
      },
      {
       "line": 13,
-      "text": "Read RoutineOutcome from the listed workflow, or unknown."
+      "text": "So the on-call person is paged once per incident, not once per run."
      }
+    ]
+   }
+  },
+  {
+   "h": "One page, then everybody waits",
+   "p": [
+    "Incident mode is one flag, routines:fixers:paused, in the same flag store that the kill switch uses. Setting it does three things. The on-call person gets one page, through PagerDuty. The alerts channel, #ai-agents-alerts, gets one post with each fingerprint's first error line and a Resume fixers button. And every new fixer run parks at its gate: the pre-run gate sees incident mode, waits on a Temporal timer, and never claims a VM. A parked run costs nothing, because a sleeping workflow holds no machine.",
+    "The trick that makes the page come only once is setIfAbsent: set the flag only if nobody has set it yet, and tell me whether I was the one who set it. Seven runs may ask the question within a minute. The first one sets the flag and pages, and the other six see the flag already set and stay quiet. You will build exactly this in the lab with a file that is created only if it does not exist.",
+    "At 10:40 a person rolls the runner image back and presses Resume fixers. The parked runs wake up and first check that main is still red at its latest commit. For the seven install failures it is green now, so each ends as not_needed, with nothing to do. The run for the broken test from 10:02 is a real code problem, so it is still red, and it carries on to its VM. The storm costs one page and zero VMs, and the real problem still gets its fixer."
+   ],
+   "deeper": {
+    "h": "Go deeper: testing the storm before it happens",
+    "p": [
+     "Nobody wants to discover in a real storm that the rule is wrong. The plan tests it with a replay: in a test namespace, eight saved red-build events are sent within two minutes, and the test passes only if there is exactly one page and zero acquireSandbox calls. Fakes stand in for PagerDuty and Slack, and the visibility count is the real one from a Temporal test server."
+    ]
+   }
+  },
+  {
+   "h": "A smaller breaker for one routine",
+   "p": [
+    "Storm control watches all fixers together. One routine can also go wrong on its own: a new skill confuses it, and its runs start to fail or be rejected one after another. The answer has the same shape, in a smaller size. It is called a circuit breaker, after the switch in a house that cuts the power when too much current flows and stays off until someone resets it. After every run, the routine's last 5 finished runs are checked. If 3 of them failed or were rejected, the breaker trips: the routine is paused with routine:<name>:paused, and its owner gets a message with the 5 runs and their reasons, and a Resume button.",
+    "What counts matters. When a run ends, routineRun sets the search attribute RoutineOutcome: merged, closed, rejected (a scope-judge veto, a false heal, or a PR a person closed), failed (no fix found), handed_off or not_needed. Only failed and rejected count against the routine. handed_off usually means the environment was the problem, and not_needed means main healed by itself, and neither is the routine's fault. Without that line, a routine would be paused for the runner image's mistakes too."
+   ],
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/orchestrator/src/activities/storm.ts (circuitBreaker)",
+    "text": "const COUNTS_AGAINST = new Set([\"failed\", \"rejected\"]);\n\nexport const circuitBreaker = async (routine: string, owner: string): Promise<boolean> => {\n  const last5 = await lastFinishedRuns(routine, 5);  // newest first, with RoutineOutcome\n  const bad = last5.filter((run) => COUNTS_AGAINST.has(run.outcome));\n  if (last5.length < 5 || bad.length < 3) return false;\n\n  const reason = `3 of its last 5 runs failed or were rejected: ${bad.map((r) => r.workflowId).join(\", \")}`;\n  await flags.set(`routine:${routine}:paused`, reason);\n  await slack.dm(owner, `${routine} is paused. ${reason}`, { buttons: [\"Resume\", \"Keep paused\"] });\n  return true;\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Only these two outcomes are the routine's own fault."
+     },
+     {
+      "line": 4,
+      "text": "A Temporal visibility list of this routine's finished runs, newest first."
+     },
+     {
+      "line": 6,
+      "text": "Fewer than 5 runs, or fewer than 3 bad: no trip."
+     },
+     {
+      "line": 9,
+      "text": "The same pause flag the merge-rate rule uses, so the gate needs to read only one flag per routine."
+     }
+    ]
+   },
+   "deeper": {
+    "h": "Go deeper: why there is no third breaker for ping-pong",
+    "p": [
+     "Ping-pong is two fixes undoing each other: one fixer's change breaks something, the next fixer reverts part of it, and the original failure comes back. The fingerprint already catches this. A fingerprint that returns after its run closed means main was never green in between, and the REJECT_DUPLICATE reuse policy from the last lesson refuses the start and sends the problem to a person. So the platform needs no extra rule for it."
     ]
    }
   }
  ],
  "lab": {
-  "title": "Trip the breakers on paper (reading lab)",
-  "youNeed": [
-   "~/Desktop/agentic-plan-app/tickets/g5.json",
-   "this lesson's code blocks",
-   "a text editor"
+  "id": "g5-4",
+  "title": "A storm on your laptop",
+  "minutes": 30,
+  "needs": [
+   "Node 22.18 or newer (it runs .ts files directly)",
+   "The temporal CLI (brew install temporal)",
+   "Two terminal tabs"
   ],
-  "worked": [
+  "goal": "Start a storm of fixer runs on a local Temporal server, count new fingerprints with a visibility query, and write a storm check that pages only once.",
+  "mode": "guided",
+  "guess": {
+   "q": "Between 10:14 and 10:26, seven new fingerprints arrive, and each new run calls stormCheck. With setIfAbsent, how many pages does the on-call person get?",
+   "options": [
+    {
+     "text": "Seven, one for each new fingerprint.",
+     "correct": false,
+     "why": "That would be a page per run, which is the noise this lesson removes."
+    },
+    {
+     "text": "Two: the sixth run crosses the limit and pages, and the seventh pages again.",
+     "correct": false,
+     "why": "The seventh run finds the flag already set, so setIfAbsent returns false and it stays quiet."
+    },
+    {
+     "text": "One: the first run that sees more than 5 sets the flag and pages, and later runs find the flag set.",
+     "correct": true,
+     "why": "setIfAbsent lets exactly one caller win. The page goes out once per incident."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "At 10:02 frontend CI fails on main. At 10:05 another push fails with the same job and first error. How many runs exist at 10:10?",
-    "see": "One: the same fingerprint, so signal-with-start added a trigger to the open run, which is still in its 7-minute gather window."
+    "say": "Start a local Temporal server that knows our two search attributes, Routine and RunKind. Leave this terminal open.",
+    "do": "temporal server start-dev --search-attribute Routine=Keyword --search-attribute RunKind=Keyword",
+    "see": "Temporal CLI 1.9.1 (Server 1.32.0, UI 2.54.1)\n\nTemporal Server:      localhost:7233\nTemporal Persistence: in-memory\nTemporal UI:          http://localhost:8233"
    },
    {
-    "do": "From 10:02 to 10:12, cifix runs start for 6 different fingerprints. What does stormCheck return for the sixth?",
-    "see": "\"incident\". 6 > 5: routines:fixers:paused is set, one page goes out, and #ai-agents-alerts gets the first errors."
+    "say": "In a second terminal, start the 10:02 fixer run for the broken test. There is no worker, so the run just stays open, which is all we need for counting.",
+    "do": "mkdir -p ~/academy-labs/g5-4 && cd ~/academy-labs/g5-4\ntemporal workflow start --type routineRun --task-queue ai-agents-cifix --workflow-id cifix:fcp:3fa91c27d0e4 \\\n  --search-attribute 'Routine=\"fe-ci-fixer\"' --search-attribute 'RunKind=\"cifix\"'",
+    "see": "Running execution:\n  WorkflowId  cifix:fcp:3fa91c27d0e4\n  RunId       01a142b4-97d8-7196-8b9b-48c9e3cce18b\n  Type        routineRun\n  Namespace   default\n  TaskQueue   ai-agents-cifix"
    },
    {
-    "do": "A seventh fingerprint arrives at 10:13. Is a second page sent?",
-    "see": "No. setIfAbsent returns false because the flag is already set. The run parks at the gate."
+    "say": "Ask Temporal how many fixer runs started in the last 15 minutes. This is the question stormCheck asks.",
+    "do": "SINCE=$(node -e 'console.log(new Date(Date.now() - 15 * 60_000).toISOString())')\ntemporal workflow count --query \"WorkflowType='routineRun' AND RunKind='cifix' AND StartTime > '$SINCE'\"",
+    "see": "Total: 1"
    },
    {
-    "do": "At 10:40 a person fixes the runner image and clears the flag. What do the parked runs do?",
-    "see": "They re-check. stillRed finds main green for most, and they end as not_needed."
+    "say": "Now the runner image breaks: seven new fingerprints from frontend and backend CI, each with its own fixer run.",
+    "do": "for run in fe-ci-fixer:9c1e04b2a7f3 fe-ci-fixer:52d8e1a0c4b9 be-ci-fixer:e07a3b9d2c15 be-ci-fixer:4b6f0d81e2a7 \\\n           be-ci-fixer:b2c9a7e40f13 fe-ci-fixer:71a0f3c8d9e2 be-ci-fixer:0d4e8b2f6a91; do\n  temporal workflow start --type routineRun --task-queue ai-agents-cifix --workflow-id \"cifix:fcp:${run#*:}\" \\\n    --search-attribute \"Routine=\\\"${run%%:*}\\\"\" --search-attribute 'RunKind=\"cifix\"' > /dev/null\n  echo \"started cifix:fcp:${run#*:}  (${run%%:*})\"\ndone",
+    "see": "started cifix:fcp:9c1e04b2a7f3  (fe-ci-fixer)\nstarted cifix:fcp:52d8e1a0c4b9  (fe-ci-fixer)\nstarted cifix:fcp:e07a3b9d2c15  (be-ci-fixer)\n…\nstarted cifix:fcp:0d4e8b2f6a91  (be-ci-fixer)"
    },
    {
-    "do": "be-ci-fixer's last 5 outcomes: merged, failed, handed_off, rejected, failed. Does the breaker trip?",
-    "see": "Yes: failed, rejected, failed are 3 bad of 5. handed_off does not count, merged is good."
+    "say": "Count again. One cause an hour is normal; eight in a few minutes is a storm.",
+    "do": "SINCE=$(node -e 'console.log(new Date(Date.now() - 15 * 60_000).toISOString())')\ntemporal workflow count --query \"WorkflowType='routineRun' AND RunKind='cifix' AND StartTime > '$SINCE'\"",
+    "see": "Total: 8"
    },
    {
-    "do": "Same, but the last 5 are: failed, handed_off, handed_off, not_needed, rejected. Trip?",
-    "see": "No: only 2 bad. handed_off and not_needed are not the routine's fault."
+    "say": "Install the Temporal client and write the flag store. A file created with the wx flag fails if it already exists, which is exactly setIfAbsent.",
+    "do": "npm init -y >/dev/null && npm pkg set type=module && npm install @temporalio/client\ncat > flags.ts <<'EOF'\nimport { mkdirSync, rmSync, writeFileSync } from \"node:fs\";\n\nmkdirSync(\"flags\", { recursive: true });\n\n// true if this call set the flag, false if it was already set (like a database \"insert if absent\")\nexport const setIfAbsent = (name: string, reason: string): boolean => {\n  try {\n    writeFileSync(`flags/${name}`, reason, { flag: \"wx\" });\n    return true;\n  } catch {\n    return false;\n  }\n};\n\nexport const clear = (name: string) => rmSync(`flags/${name}`, { force: true });\nEOF",
+    "see": "added 43 packages, and audited 44 packages in 4s\nfound 0 vulnerabilities"
    }
   ],
-  "faded": "Write the PagerDuty summary and the Slack post for the 10:12 incident above, using reason from stormCheck. The first error lines (one per fingerprint) are left to you to invent from a runner-image failure.",
-  "alone": "Design the replay test from G5-17 as a node:test sketch: a fake temporal.workflow.count, a fake flag store and a fake pagerduty. Send 8 events in 2 minutes and assert one page and zero acquireSandbox calls. Write it as test names plus one assertion each.",
-  "done": "Given fingerprints with times, or a routine's last 5 outcomes, you can say what pauses and who hears about it."
+  "build": "Write storm.ts. It connects to Temporal (use process.env.TEMPORAL_ADDRESS ?? \"localhost:7233\"), counts routineRun runs with RunKind 'cifix' that started in the last 15 minutes with client.workflow.count(query), and prints normal when the count is 5 or less. Above 5 it calls setIfAbsent(\"routines-fixers-paused\", reason): if that returns true it prints that the fixers are paused and the on-call person is paged once; if false it prints that the fixers were already paused and no second page goes out. Run it twice, then delete the flags folder (that is pressing Resume fixers) and run it once more.",
+  "checks": [
+   "The first node storm.ts prints incident: fixers paused, paging on-call once: 8 new failure fingerprints in 15 minutes.",
+   "The second run prints incident: already paused, no second page.",
+   "After rm -rf flags, the next run pages again, because a new incident starts.",
+   "If you change WINDOW_MS to one minute and wait two minutes, storm.ts prints normal: 0 new fingerprints in 15 minutes (the message still says 15; the window is what changed).",
+   "You stopped the dev server with Ctrl+C at the end, which also deletes every run, because it keeps them in memory."
+  ],
+  "solution": {
+   "lang": "typescript",
+   "file": "~/academy-labs/g5-4/storm.ts",
+   "text": "import { Client, Connection } from \"@temporalio/client\";\nimport { setIfAbsent } from \"./flags.ts\";\n\nconst WINDOW_MS = 15 * 60_000;\nconst MAX_NEW = 5;\n\nconst connection = await Connection.connect({ address: process.env.TEMPORAL_ADDRESS ?? \"localhost:7233\" });\nconst client = new Client({ connection });\n\nconst since = new Date(Date.now() - WINDOW_MS).toISOString();\nconst query = `WorkflowType = 'routineRun' AND RunKind = 'cifix' AND StartTime > '${since}'`;\nconst { count } = await client.workflow.count(query);\n\nif (count <= MAX_NEW) {\n  console.log(`normal: ${count} new fingerprints in 15 minutes`);\n} else {\n  const reason = `${count} new failure fingerprints in 15 minutes: likely infrastructure, not code`;\n  if (setIfAbsent(\"routines-fixers-paused\", reason)) {\n    console.log(`incident: fixers paused, paging on-call once: ${reason}`);\n  } else {\n    console.log(`incident: already paused, no second page (${count} fingerprints)`);\n  }\n}\nawait connection.close();"
+  },
+  "fix": "A teammate found setIfAbsent \"too clever\". Setting a flag twice is harmless, they said, so they changed flags.ts to always write the file and always return true. Make the same change and run node storm.ts three times: the on-call person is paged three times for one broken runner image, and in a real storm every new fixer run would page again. Explain why setting the flag twice is harmless but paging twice is not, and put setIfAbsent back.",
+  "explain": [
+   "Why does counting fixer runs count root causes, and not red builds?",
+   "Why are many new fingerprints at once a sign of the environment rather than the code?",
+   "In the circuit breaker, why do handed_off and not_needed not count against a routine?"
+  ],
+  "done": "Your storm check counts eight fingerprints, pages once, stays quiet the second time, and pages again after the flag is cleared."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Why does stormCheck count cifix runs instead of red CI events?",
+   "q": "Why does stormCheck count fixer runs instead of red CI builds?",
    "options": [
     {
-     "text": "Runs are cheaper to count than events",
+     "text": "Because red builds are not stored anywhere the orchestrator can read",
      "correct": false,
-     "why": "Cost is not the reason."
+     "why": "GitHub keeps every run. The reason is what the count means, not where the data is."
     },
     {
-     "text": "Each cifix run is one fingerprint, so the count is the number of new root causes",
+     "text": "Because each fixer run is one fingerprint, so the count is the number of new root causes",
      "correct": true,
-     "why": "Ten red events with one cause are one run. Many new causes at once suggest infrastructure."
+     "why": "Ten red builds of one broken test are one run. Many runs in a short time means many causes at once, which points to the environment."
     },
     {
-     "text": "Events are not stored anywhere",
+     "text": "Because counting runs is cheaper than counting builds",
      "correct": false,
-     "why": "The point is counting causes, which the workflow IDs already encode."
+     "why": "Both are one query. Counting builds would answer a different, less useful question."
     }
    ]
   },
   {
-   "q": "Which outcome does NOT count against a routine in the circuit breaker?",
+   "q": "Incident mode is on. A new fingerprint arrives and its fixer run reaches the gate. What does it do?",
    "options": [
     {
-     "text": "rejected, after a scope-judge veto",
+     "text": "It claims a VM but waits inside it until the incident is over",
      "correct": false,
-     "why": "A veto is the routine's own fault: it counts."
+     "why": "A VM that waits costs money. The point of parking at the gate is that no machine is claimed."
     },
     {
-     "text": "failed, with no fix found",
+     "text": "It pages the on-call person again, because this is a new problem",
      "correct": false,
-     "why": "No fix is a failure of the routine: it counts."
+     "why": "setIfAbsent already returned true for one caller. Later runs see the flag and do not page."
     },
     {
-     "text": "handed_off, because the job needs the QA environment",
+     "text": "It parks on a Temporal timer, holds no VM, and re-checks whether main is still red when the flag is cleared",
      "correct": true,
-     "why": "An environment problem is not the routine's fault, so it is not counted."
+     "why": "A parked run costs nothing. After Resume, most such runs find main green and end as not_needed."
     }
    ]
   },
   {
-   "q": "Main went green during the 7-minute gather window. What does the run do?",
+   "q": "be-ci-fixer's last 5 finished runs ended merged, failed, handed_off, rejected and failed. Does the circuit breaker trip?",
    "options": [
     {
-     "text": "Claims a VM anyway, to check",
-     "correct": false,
-     "why": "stillRed checks through the broker without a VM."
-    },
-    {
-     "text": "Ends as not_needed, with nothing to do",
+     "text": "Yes: failed, rejected and failed are 3 bad runs out of 5",
      "correct": true,
-     "why": "stillRed finds the latest run green, so there is nothing to fix."
+     "why": "Only failed and rejected count, and there are three of them. handed_off and merged do not count."
     },
     {
-     "text": "Waits another 7 minutes",
+     "text": "No, because one of its runs was merged",
      "correct": false,
-     "why": "One window, then a check. Green means done."
+     "why": "One good run does not cancel three bad ones. The rule only counts the bad outcomes."
+    },
+    {
+     "text": "No, because handed_off means the breaker must wait for the environment",
+     "correct": false,
+     "why": "handed_off is simply not counted. The other three bad outcomes are still enough to trip."
     }
    ]
   }
  ],
- "recall": [
-  "From lesson g5-3: what does mergeRate return for a routine with only 12 closed PRs, and why?",
-  "From lesson g5-2: what makes later pushes on a red main produce the same fingerprint?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "storm.ts lives in orchestrator/src/activities/ next to stillRed. The CI and pipeline-fixer charters set gather_minutes: 7, so routineRun sleeps before its gate while addTrigger signals pile up. stormCheck counts with client.workflow.count on the Routine and RunKind search attributes that routineRun registers on the ai-agents namespace. Above 5 in 15 minutes it sets routines:fixers:paused in the G3 kill-switch flag store, pages through a PagerDuty service for ai-agents that DevOps creates, and posts the fingerprints to #ai-agents-alerts with a Resume fixers button. preRunGate parks cifix runs while the flag is set.",
+   "circuitBreaker is in the same file and runs as the last step of every routineRun. routineRun sets RoutineOutcome when it ends (merged, closed, rejected, failed, handed_off, not_needed). A trip sets routine:<name>:paused, messages the owner with the 5 runs, and shows up in the next team digest. The storm test is a replay in a test namespace: 8 saved red-build events in 2 minutes must give one page and zero VMs."
+  ],
+  "tickets": [
+   {
+    "key": "G5-17",
+    "why": "The gather window, stillRed, stormCheck, incident mode and the one page."
+   },
+   {
+    "key": "G5-21",
+    "why": "RoutineOutcome and the circuit breaker: 3 failed or rejected of the last 5 pause the routine."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "storm",
-   "plain": "Many fix runs started at once by one underlying problem, usually infrastructure."
-  },
-  {
    "term": "incident mode",
-   "plain": "The state set by routines:fixers:paused: new fixer runs park, and a person is paged."
+   "plain": "A flag that parks every new fixer run and pages one person, set when more than 5 new fingerprints arrive in 15 minutes."
   },
   {
    "term": "visibility query",
-   "plain": "A Temporal search over workflows by type, status and search attributes."
+   "plain": "A question to Temporal's searchable list of runs, in a small SQL-like language, for example counting runs started after a time."
   },
   {
-   "term": "RoutineOutcome",
-   "plain": "A search attribute routineRun sets at the end: merged, closed, rejected, failed, handed_off or not_needed."
+   "term": "search attribute",
+   "plain": "An indexed field set on a run, such as Routine or RunKind, that visibility queries can filter on."
+  },
+  {
+   "term": "setIfAbsent",
+   "plain": "Set a flag only if nobody has set it yet, and report whether this call was the one that set it."
   },
   {
    "term": "circuit breaker",
-   "plain": "The check that pauses a routine when 3 of its last 5 runs failed or were rejected."
-  },
-  {
-   "term": "not_needed",
-   "plain": "The outcome of a run whose problem was gone before it started work."
+   "plain": "A rule that pauses one routine when 3 of its last 5 finished runs failed or were rejected, until its owner resumes it."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G5-17",
-   "why": "This lesson walked through the gather window, stormCheck, stillRed and incident mode.",
-   "walk": [
-    "Set gather_minutes: 7 in the CI and pipeline-fixer charters; routineRun sleeps before its gate.",
-    "Add stormCheck and stillRed to orchestrator/src/activities/storm.ts (code above).",
-    "Ask DevOps for a PagerDuty service for ai-agents. Page once per incident with setIfAbsent.",
-    "Make preRunGate park cifix runs while routines:fixers:paused is set. A Slack button clears it.",
-    "After the window, call stillRed; a green main ends the run as not_needed.",
-    "Test with a replay in a test namespace: 8 saved red-build events in 2 minutes give one page and zero VMs."
-   ]
+   "q": "From memory: the storm rule (how many, in what window) and the three things incident mode does.",
+   "a": "More than 5 new fingerprints in 15 minutes. It sets routines:fixers:paused, pages the on-call person once, and posts the first errors to #ai-agents-alerts with a Resume button; new fixer runs then park at the gate."
   },
   {
-   "key": "G5-21",
-   "why": "This lesson walked through the outcomes and circuitBreaker.",
-   "walk": [
-    "Make routineRun set RoutineOutcome when it ends: merged, closed, rejected, failed, handed_off or not_needed.",
-    "Add circuitBreaker to orchestrator/src/activities/storm.ts (code above) and call it as the last step of every run.",
-    "Count only failed and rejected.",
-    "On a trip: set routine:<name>:paused, DM the owner the 5 runs and reasons, list it in the next digest. Resume is a Slack button."
-   ]
+   "q": "After the incident is cleared, what happens to the parked runs, and why does the 10:02 broken-test run still get fixed?",
+   "a": "Each re-checks that main is still red at its latest commit. The install failures are green after the runner fix, so those end as not_needed. The broken test is a real code problem, still red, so its run goes on to a VM."
+  },
+  {
+   "q": "Which run outcomes count against a routine in the circuit breaker, and why not the others?",
+   "a": "Only failed and rejected. handed_off is usually the environment and not_needed means main healed itself; neither is the routine's fault."
   }
  ],
- "remember": "Wait for failures to gather, page one person when too many causes appear, and pause a routine that keeps failing."
+ "remember": "Count causes, not builds: many new fingerprints at once means the environment, so park every fixer and page one person once; a routine that keeps failing pauses itself."
 }

@@ -1,632 +1,310 @@
 {
+ "v": 2,
  "id": "g2-4",
  "title": "Routing, risk labels and live metrics",
- "minutes": 55,
+ "minutes": 50,
  "youNeed": [
   "g2-2",
-  "g2-3",
   "p8-8"
  ],
- "bridge": "Routing a review is like code splitting in a React app. A small page loads a small bundle, and a big page loads more. Except here the bundle is the model's effort and the review mode. And each route must prove on BYTE-GOLD that it still catches the bugs the expensive route catches.",
- "intro": "Today every Byte review runs Opus 5.5 at high effort, even a one-line docs fix. This lesson sizes each review to its PR. Effort follows size and kind, and a risk label tells the one reviewer where to look. A deep panel runs only where a miss hurts most. First, though, live numbers that show whether people act on Byte at all.",
- "picture": {
-  "caption": "One PR event: the gate sizes the review and labels the risk; after the merge, each finding gets a fate.",
-  "nodes": [
-   {
-    "id": "pr",
-    "label": "fcp PR opened or pushed",
-    "kind": "file"
-   },
-   {
-    "id": "gate",
-    "label": "Byte gate: lists the files",
-    "kind": "service"
-   },
-   {
-    "id": "route",
-    "label": "reviewRoute: model and effort",
-    "kind": "service"
-   },
-   {
-    "id": "risk",
-    "label": "riskFor: risk label and neutral check",
-    "kind": "check"
-   },
-   {
-    "id": "mode",
-    "label": "reviewMode: standard or deep",
-    "kind": "service"
-   },
-   {
-    "id": "review",
-    "label": "the review: one session or the panel",
-    "kind": "agent"
-   },
-   {
-    "id": "harvest",
-    "label": "weekly harvest: finding fates",
-    "kind": "service"
-   },
-   {
-    "id": "grafana",
-    "label": "G1 metrics and Grafana",
-    "kind": "service"
-   }
+ "map": "byte",
+ "hook": {
+  "story": [
+   "On Monday morning Byte, our review agent, reviews two PRs. The first fixes a typo in a README: two changed lines. The second changes the permission check that decides who may read a dataset. Byte gives both exactly the same review: Opus 5.5 at high effort, about five minutes and two dollars each, one comment window, nothing that tells the human reviewer which of the two deserves their full attention.",
+   "That is wasteful at one end and thin at the other. The typo needed a quick look. The permission change deserved more than our normal review, and its reviewer should have been warned before they opened it."
   ],
-  "steps": [
-   {
-    "from": "pr",
-    "to": "gate",
-    "text": "a PR event reaches Byte's gate"
-   },
-   {
-    "from": "gate",
-    "to": "route",
-    "text": "changed lines and kind pick low, medium or high effort"
-   },
-   {
-    "from": "gate",
-    "to": "risk",
-    "text": "byte-risk.yml labels the PR risk:low, risk:med or risk:high, with the reason"
-   },
-   {
-    "from": "risk",
-    "to": "mode",
-    "text": "risk:high, more than 800 lines, or @byte-review deep means the panel"
-   },
-   {
-    "from": "mode",
-    "to": "review",
-    "text": "Byte reviews with that route and mode"
-   },
-   {
-    "from": "review",
-    "to": "harvest",
-    "text": "after the merge, each finding is addressed or open, and wrong or not"
-   },
-   {
-    "from": "harvest",
-    "to": "grafana",
-    "text": "nightly: addressed and wrong ratios per team; monthly: live recall"
-   }
-  ]
+  "question": "How does Byte decide, from the files a PR changes, how hard to look and how loudly to warn?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Gold is fixed; live is real",
+   "h": "A route: how hard to look",
    "p": [
-    "BYTE-GOLD from lessons g2-1 and g2-2 is a fixed set of 240 PRs. It tells us if a change to Byte makes it better or worse. It cannot tell us if people act on Byte's findings in real PRs, and that is the point of a reviewer.",
-    "G2-10 adds three live numbers. Addressed: a HIGH finding that was dealt with before the merge. Wrong: a finding a person with write access marked with a thumbs-down. Live recall: each month, how many shipped bugs Byte had flagged on the PR that introduced them.",
-    "The targets are at least 65% of HIGH findings addressed and under 3% marked wrong. 'Addressed' is counted the way Uber's uReview, its in-house AI reviewer, counts it. So our numbers compare with what others publish."
+    "Effort is the setting that tells Claude how much to reason before it answers. More effort means more thinking tokens, more minutes and more money, and often better answers on hard problems. Byte uses high effort on every review today, because that was the safe default. But Anthropic measured medium effort matching the old high on many tasks at about half the tokens, and a README typo needs even less.",
+    "So Byte's gate now chooses a route for each review: a model, an effort and a reason, computed from the PR's changed files. Size is additions plus deletions, without lockfiles and generated files, because a 4,000-line package-lock.json says nothing about how risky a change is. If every counted file is documentation, or every file is a test, or every file is a dependency list, the review runs at low. A big PR, over 400 changed lines, keeps high. Everything else gets medium. The model stays Opus 5.5 for all of them; only the effort moves. A team that sets its own model in Byte's policy still wins over the route."
+   ],
+   "code": {
+    "lang": "typescript",
+    "file": "src/route.ts (RhinoHealth/byte)",
+    "text": "const LARGE_PR_LINES = 400;\nconst GENERATED = /(^|\\/)(package-lock\\.json|uv\\.lock|yarn\\.lock)$|_pb2(_grpc)?\\.pyi?$/;\nconst DOCS = /\\.(md|mdx|txt)$|(^|\\/)docs\\//;\nconst TESTS = /(^|\\/)(tests?|e2e|__tests__)\\/|\\.(test|spec)\\.[jt]sx?$|(^|\\/)test_[^/]+\\.py$/;\nconst DEPS = /(^|\\/)(package\\.json|pyproject\\.toml|requirements[^/]*\\.txt)$/;\n\nexport function reviewRoute(files: PullRequestFile[]): ReviewRoute {\n  const counted = files.filter((file) => !GENERATED.test(file.filename));\n  const lines = counted.reduce((sum, file) => sum + file.additions + file.deletions, 0);\n  const all = (pattern: RegExp): boolean => counted.every((file) => pattern.test(file.filename));\n  if (all(DOCS) || all(TESTS) || all(DEPS)) {\n    return { model: DEFAULT_MODEL, effort: \"low\", reason: \"docs-, test- or dependency-only\" };\n  }\n  if (lines > LARGE_PR_LINES) {\n    return { model: DEFAULT_MODEL, effort: \"high\", reason: `${lines} changed lines` };\n  }\n  return { model: DEFAULT_MODEL, effort: \"medium\", reason: `${lines} changed lines` };\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Lockfiles and generated gRPC code: left out of the count, and never decide the kind."
+     },
+     {
+      "line": 10,
+      "text": "every() on the counted files: a PR is docs-only only if all of them are docs."
+     },
+     {
+      "line": 11,
+      "text": "Docs-only, test-only or dependency-only: low effort, whatever the size."
+     },
+     {
+      "line": 14,
+      "text": "Over 400 counted lines: keep today's high effort."
+     }
+    ]
+   }
+  },
+  {
+   "h": "A route must earn its place",
+   "p": [
+    "A cheaper route is a guess until BYTE-GOLD says otherwise. Each route is replayed on its slice of the dev cases: the docs-only cases at low, the ordinary ones at medium. It stays only if its recall on high bugs is within 3 points of what high effort catches on the same cases, and clean PRs get no more false alarms. A route that loses returns to high. The change itself ships through the gate from the replay lesson, like any change to Byte's model or effort.",
+    "The plumbing is small. The gate gets a new output, effort, next to the model it already returns. The review workflow passes it to the worker as --effort, and the worker uses it instead of the constant it uses today. The route and its reason appear on Byte's dashboard and in its status comment, so anyone can see why a review was light."
    ]
   },
   {
-   "h": "FindingFate, part 1: the row",
+   "h": "A risk label: where the reviewer should look",
    "p": [
-    "The weekly-harvest stage of src/weekly.ts already reads merged PRs. G2-10 gives each Byte finding comment on those PRs a fate: one row with ids and enums. The sketch is 25 lines, so it comes in two blocks; nothing is removed between them."
+    "Every fcp PR gets exactly one human approval. For that one reviewer, it matters a lot whether a PR touches a database migration, the permission checks or the contract between the cloud and the on-prem client. So Byte gives every PR a label, risk:low, risk:med or risk:high, and a check named Byte risk that lists the reasons. High comes from a list of paths agreed with the frontend and backend guilds. Low means every file is documentation, a Storybook story or a test. Everything else is med, and a PR over 800 changed lines is raised one level.",
+    "Two choices keep the label honest. First, the tiers live in Byte's own policy file, which is built into Byte's signed image, and never in a file inside fcp. If they lived in fcp, a PR could edit them and lower its own tier. Second, the label informs and never decides: the check's result is neutral (neither green nor red), it is not a required check, and it never changes who may approve or how many approvals a PR needs."
    ],
-   "because": "We store ids and enums only, so the rows can sit on the telemetry branch without carrying any code or comment text.",
    "code": {
     "lang": "typescript",
-    "file": "src/weekly.ts (RhinoHealth/byte, G2-10), lines 1-12",
-    "text": "// One row per Byte finding on a merged PR: ids, severity and enums only,\n// never a path or a body (the same rule as runs.jsonl).\nexport interface FindingFate {\n  schema: 1;\n  repository: string;\n  prNumber: number;\n  commentId: number;\n  severity: \"high\" | \"medium\" | \"low\" | null;\n  fate: \"addressed\" | \"open\";\n  wrong: boolean;\n  mergedAt: string;\n}",
+    "file": "src/risk.ts (RhinoHealth/byte)",
+    "text": "// In config/repositories.json, per repository, baked into Byte's signed image:\n// \"risk\": { \"high\": { \"paths\": [\"cloud/rhinoCloud/rhinoCore/migrations/**\", ...], \"reason\": \"schema change\" },\n//           \"low\":  { \"paths\": [\"**/*.md\", \"**/*.stories.tsx\", \"**/tests/**\"], \"reason\": \"docs or tests only\" } }\nconst RAISE_ABOVE_LINES = 800;\nconst ORDER: RiskTier[] = [\"low\", \"med\", \"high\"];\n\nexport function riskFor(files: PullRequestFile[], policy: RiskPolicy): { tier: RiskTier; reasons: string[] } {\n  const { high, low } = policy;\n  const reasons: string[] = [];\n  let tier: RiskTier = low !== undefined && files.every((f) => isPathAllowed(f.filename, low.paths)) ? \"low\" : \"med\";\n  const risky = high === undefined ? [] : files.filter((f) => isPathAllowed(f.filename, high.paths));\n  if (high !== undefined && risky.length > 0) {\n    tier = \"high\";\n    reasons.push(`${risky.length} file(s): ${high.reason}`);\n  }\n  const lines = files.reduce((sum, f) => sum + f.additions + f.deletions, 0);\n  if (lines > RAISE_ABOVE_LINES && tier !== \"high\") {\n    tier = ORDER[ORDER.indexOf(tier) + 1] ?? \"high\";\n    reasons.push(`${lines} changed lines`);\n  }\n  return { tier, reasons: reasons.length > 0 ? reasons : [tier === \"low\" ? (low?.reason ?? \"low\") : \"no high-risk paths\"] };\n}",
     "notes": [
      {
       "line": 1,
-      "text": "The privacy rule of every Byte telemetry file: no path, no body. The same rule as runs.jsonl."
-     },
-     {
-      "line": 4,
-      "text": "A schema number, so a later change to the row can be read side by side with old rows."
-     },
-     {
-      "line": 6,
-      "text": "The PR and the comment, by number only. Enough to find them again on GitHub."
-     },
-     {
-      "line": 8,
-      "text": "Byte's severity. null when the finding had none; the dashboards count it as its own group."
-     },
-     {
-      "line": 9,
-      "text": "The fate: addressed before the merge, or still open at the merge."
+      "text": "The tiers are policy, read from Byte's image. A PR to fcp cannot change them."
      },
      {
       "line": 10,
-      "text": "wrong is separate from fate. A finding can be addressed and still marked wrong."
-     },
-     {
-      "line": 11,
-      "text": "When the PR merged, so the nightly job can group rows by week."
-     }
-    ]
-   }
-  },
-  {
-   "h": "findingFate, part 2: the rules",
-   "p": [
-    "A finding is addressed in one of two ways. A later sniff called it fulfilled and sure (lesson g2-3). Or GitHub marks the comment outdated at merge: its line is null because the code under it changed. A rebase can also outdate a comment, so the sniff is the stronger signal.",
-    "A reply alone does not address anything. Wrong counts only thumbs-downs from write collaborators, people with write access to the repo. The caller filters the reactions and passes the count in."
-   ],
-   "because": "We decide the fate in one small pure function, so the rules can be tested with three fake comments and no GitHub.",
-   "code": {
-    "lang": "typescript",
-    "file": "src/weekly.ts (RhinoHealth/byte, G2-10), lines 14-25",
-    "text": "// Addressed = a later sniff called it fulfilled and sure, or GitHub marks the\n// comment outdated at merge (`line` is null: the code under it changed). A\n// rebase can also outdate a comment, so the sniff verdict is the stronger signal.\nexport function findingFate(\n  comment: ReviewComment,\n  sniff: { verdict: string; sure: boolean } | undefined,\n  thumbsDownFromWriters: number,\n): Pick<FindingFate, \"fate\" | \"wrong\"> {\n  const outdated = comment.line === null && typeof comment.original_line === \"number\";\n  const fulfilled = sniff?.verdict === \"fulfilled\" && sniff.sure;\n  return { fate: outdated || fulfilled ? \"addressed\" : \"open\", wrong: thumbsDownFromWriters > 0 };\n}",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The two ways a finding counts as addressed, written next to the code that applies them."
-     },
-     {
-      "line": 4,
-      "text": "Inputs: the GitHub review comment, the sniff verdict for that finding if one exists, and a count."
-     },
-     {
-      "line": 5,
-      "text": "sniff is undefined when no sniff looked at this finding, for example on a PR with one push."
-     },
-     {
-      "line": 6,
-      "text": "Only thumbs-downs from writers are counted. The caller does the filtering."
-     },
-     {
-      "line": 7,
-      "text": "The return type is two fields of FindingFate; the caller fills in the ids."
-     },
-     {
-      "line": 9,
-      "text": "Outdated: GitHub set line to null but kept original_line, so the comment once had a line."
-     },
-     {
-      "line": 10,
-      "text": "Fulfilled counts only with sure: a fulfilled verdict below the confidence bar does not."
-     },
-     {
-      "line": 11,
-      "text": "Either signal makes it addressed. Any writer's thumbs-down makes it wrong."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "tip",
-    "text": "The rows go to finding-fates.jsonl, uploaded as byte-finding-fates-<runId> like the fix fates. The hourly sweep in src/telemetry.ts merges them into data/finding-fates.jsonl, and the G1 nightly job turns them into byte_findings_addressed_ratio{severity,team} and byte_findings_wrong_ratio{team}."
-   }
-  },
-  {
-   "h": "Routing, part 1: what counts as small",
-   "p": [
-    "Every review runs at high effort today: CLAUDE_EFFORT in src/limits.ts. Anthropic measured medium matching the old high at about half the tokens. The routing table says low for docs-, test- and dependency-only PRs.",
-    "G2-11 adds src/route.ts. reviewRoute(files) returns a model, an effort and a reason. Size is additions plus deletions, with lockfiles and generated files left out, because a 5,000-line package-lock.json says nothing about risk. The sketch is 26 lines, in two blocks with nothing removed."
-   ],
-   "because": "We name the file patterns once at the top, so a reviewer can check what counts as docs, tests or dependencies.",
-   "code": {
-    "lang": "typescript",
-    "file": "src/route.ts (RhinoHealth/byte, G2-11), lines 1-13",
-    "text": "import { DEFAULT_MODEL } from \"./limits.js\";\nimport type { PullRequestFile } from \"./types.js\";\n\nexport type Effort = \"low\" | \"medium\" | \"high\";\nexport interface ReviewRoute { model: string; effort: Effort; reason: string }\n\n// Starting values from the routing table. Each route stays only while its\n// BYTE-GOLD slice holds (HIGH recall within 3 points of `high`).\nconst LARGE_PR_LINES = 400;\nconst GENERATED = /(^|\\/)(package-lock\\.json|uv\\.lock|yarn\\.lock)$|_pb2(_grpc)?\\.pyi?$/;\nconst DOCS = /\\.(md|mdx|txt)$|(^|\\/)docs\\//;\nconst TESTS = /(^|\\/)(tests?|e2e|__tests__)\\/|\\.(test|spec)\\.[jt]sx?$|(^|\\/)test_[^/]+\\.py$/;\nconst DEPS = /(^|\\/)(package\\.json|pyproject\\.toml|requirements[^/]*\\.txt)$/;",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The default model stays Opus 5.5. Routing changes the effort, not the reviewer."
-     },
-     {
-      "line": 2,
-      "text": "PullRequestFile gains additions and deletions in src/types.ts; GitHub already returns them."
-     },
-     {
-      "line": 4,
-      "text": "Three effort levels used for reviews. The SDK has more, but Byte only routes between these."
-     },
-     {
-      "line": 9,
-      "text": "Above 400 changed lines, a PR keeps today's high effort."
-     },
-     {
-      "line": 10,
-      "text": "Lockfiles and generated gRPC stubs (_pb2.py and .pyi). They never count towards size."
-     },
-     {
-      "line": 11,
-      "text": "Docs: Markdown and text files, and anything under a docs/ folder."
+      "text": "Low only if every file matches a low path; otherwise start at med."
      },
      {
       "line": 12,
-      "text": "Tests: test folders, *.test.ts and *.spec.ts files, and Python test_*.py files."
+      "text": "One file on a high path makes the whole PR high."
      },
      {
-      "line": 13,
-      "text": "Dependencies: package.json, pyproject.toml and requirements files."
+      "line": 17,
+      "text": "Size raises the tier one step, so a huge ordinary PR gets a warning too."
      }
     ]
-   }
-  },
-  {
-   "h": "Routing, part 2: reviewRoute",
-   "p": [
-    "The function filters out generated files and adds up the lines. Then it asks one question per kind: is every remaining file of this kind? A PR that is only docs, only tests or only dependencies gets low. A big PR keeps high, and everything else gets medium.",
-    "The gate calls reviewRoute() where it resolves the model today, and a team model set in policy still wins. A new effort gate output reaches review.yml, which passes --effort \"$EFFORT\". cli.ts reads it as optional, with CLAUDE_EFFORT as the default, and engines.ts uses it instead of the constant.",
-    "Each route must earn its place. On its BYTE-GOLD dev slice, HIGH recall must stay within 3 points of today's high. False alarms on clean PRs must not rise. A route that loses goes back to high, and the change ships through the G2-09 gate."
-   ],
-   "because": "We route on facts GitHub gives us, size and file kinds, so the choice is repeatable and shows its reason.",
-   "code": {
-    "lang": "typescript",
-    "file": "src/route.ts (RhinoHealth/byte, G2-11), lines 15-26",
-    "text": "export function reviewRoute(files: PullRequestFile[]): ReviewRoute {\n  const counted = files.filter((file) => !GENERATED.test(file.filename));\n  const lines = counted.reduce((sum, file) => sum + file.additions + file.deletions, 0);\n  const all = (pattern: RegExp): boolean => counted.every((file) => pattern.test(file.filename));\n  if (all(DOCS) || all(TESTS) || all(DEPS)) {\n    return { model: DEFAULT_MODEL, effort: \"low\", reason: \"docs-, test- or dependency-only\" };\n  }\n  if (lines > LARGE_PR_LINES) {\n    return { model: DEFAULT_MODEL, effort: \"high\", reason: `${lines} changed lines` };\n  }\n  return { model: DEFAULT_MODEL, effort: \"medium\", reason: `${lines} changed lines` };\n}",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Input: the PR's files with their line counts. Output: model, effort and a reason for the status comment."
-     },
-     {
-      "line": 2,
-      "text": "Drop lockfiles and generated stubs first, so they affect neither size nor kind."
-     },
-     {
-      "line": 3,
-      "text": "Changed lines: additions plus deletions over the files that count."
-     },
-     {
-      "line": 4,
-      "text": "A small helper: true when every counted file matches the pattern."
-     },
-     {
-      "line": 5,
-      "text": "All docs, all tests or all dependencies: the cheapest route."
-     },
-     {
-      "line": 8,
-      "text": "Big PRs keep today's high effort. The reason names the line count."
-     },
-     {
-      "line": 11,
-      "text": "Everything else: medium, which Anthropic measured close to the old high."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "G2-11 also adds claude-sonnet-5-5 to SUPPORTED_MODELS, for the panel's conventions lens later. Reviews themselves stay on Opus 5.5; only the effort moves."
-   }
-  },
-  {
-   "h": "Risk labels, part 1: tiers live in Byte's policy",
-   "p": [
-    "With exactly one approval per PR, the reviewer needs to know which PRs touch migrations, permissions or the cloud-client contract. G2-12 gives every fcp PR a label, risk:low, risk:med or risk:high, with the reason in a check named Byte risk. It tells the reviewer where to look. It never changes who may approve or how many approvals are needed.",
-    "The tiers live in Byte's config/repositories.json, as a risk block per repository. Policy is baked into Byte's signed image and never read from the reviewed repo, so a PR cannot lower its own tier. The sketch is 30 lines, in two blocks with nothing removed."
-   ],
-   "because": "We keep the tier rules out of fcp, because any file in fcp is a file a PR to fcp can change.",
-   "code": {
-    "lang": "typescript",
-    "file": "src/risk.ts (RhinoHealth/byte, G2-12), lines 1-13",
-    "text": "import { isPathAllowed } from \"./policy.js\";\nimport type { PullRequestFile } from \"./types.js\";\n\n// Per repository in config/repositories.json, baked into the signed image:\n// \"risk\": { \"high\": { \"paths\": [\"cloud/rhinoCloud/rhinoCore/migrations/**\", ...], \"reason\": \"schema change\" },\n//           \"low\":  { \"paths\": [\"**/*.md\", \"**/*.stories.tsx\", \"**/tests/**\"], \"reason\": \"docs or tests only\" } }\n// Files no rule claims are \"med\".\nexport type RiskTier = \"low\" | \"med\" | \"high\";\ninterface RiskRule { paths: string[]; reason: string }\nexport interface RiskPolicy { high?: RiskRule; low?: RiskRule }\n\nconst RAISE_ABOVE_LINES = 800;\nconst ORDER: RiskTier[] = [\"low\", \"med\", \"high\"];",
-    "notes": [
-     {
-      "line": 1,
-      "text": "isPathAllowed is Byte's existing glob matcher from src/policy.ts. The tiers reuse it."
-     },
-     {
-      "line": 4,
-      "text": "Where the rules live: the repository's entry in config/repositories.json, inside the signed image."
-     },
-     {
-      "line": 5,
-      "text": "High-risk globs with one reason, for example migrations: a schema change."
-     },
-     {
-      "line": 6,
-      "text": "Low-risk globs: docs, stories and tests only."
-     },
-     {
-      "line": 7,
-      "text": "Anything no rule claims is med. That is the default, not a third list."
-     },
-     {
-      "line": 9,
-      "text": "A rule is a list of globs and the reason shown to the reviewer."
-     },
-     {
-      "line": 12,
-      "text": "Above 800 changed lines, a PR goes up one tier."
-     },
-     {
-      "line": 13,
-      "text": "The order used to go up one step: low, then med, then high."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "why",
-    "text": "fcp's draft high list comes from the BE and FE guilds. It holds rhinoCore migrations and permissions.py, both rhinoAgentRpc folders, frontend auth routes and the API auth folder. It also holds frontend/src/proxy.ts and .github/workflows. Low is docs, stories and tests only."
-   }
-  },
-  {
-   "h": "Risk labels, part 2: riskFor",
-   "p": [
-    "riskFor starts at low if every file is low, else med. One high file makes the PR high. Then size can raise the tier one step. If nothing matched, the reason still says why the PR got its tier.",
-    "A new risk subcommand in src/cli.ts lists the PR's files with the read token and calls riskFor. It sets the one label and removes the other two. Then it creates a completed check run, Byte risk, with conclusion neutral and the matched rules. A neutral check shows information and is neither green nor red.",
-    "fcp gets a new caller, .github/workflows/byte-risk.yml, on pull_request opened, reopened, synchronize and ready_for_review. It is not added to byte-review.yml, because adding opened there would start a full review on every new PR. The check is never added to the ruleset."
-   ],
-   "because": "We compute the tier in a pure function over file names and line counts, so tests need no GitHub.",
-   "code": {
-    "lang": "typescript",
-    "file": "src/risk.ts (RhinoHealth/byte, G2-12), lines 15-30",
-    "text": "export function riskFor(files: PullRequestFile[], policy: RiskPolicy): { tier: RiskTier; reasons: string[] } {\n  const { high, low } = policy;\n  const reasons: string[] = [];\n  let tier: RiskTier = low !== undefined && files.every((f) => isPathAllowed(f.filename, low.paths)) ? \"low\" : \"med\";\n  const risky = high === undefined ? [] : files.filter((f) => isPathAllowed(f.filename, high.paths));\n  if (high !== undefined && risky.length > 0) {\n    tier = \"high\";\n    reasons.push(`${risky.length} file(s): ${high.reason}`);\n  }\n  const lines = files.reduce((sum, f) => sum + f.additions + f.deletions, 0);\n  if (lines > RAISE_ABOVE_LINES && tier !== \"high\") {\n    tier = ORDER[ORDER.indexOf(tier) + 1] ?? \"high\";\n    reasons.push(`${lines} changed lines`);\n  }\n  return { tier, reasons: reasons.length > 0 ? reasons : [tier === \"low\" ? (low?.reason ?? \"low\") : \"no high-risk paths\"] };\n}",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Inputs: the files and the repository's risk policy. Output: a tier and the reasons."
-     },
-     {
-      "line": 4,
-      "text": "Low only when a low rule exists and every file matches it. Otherwise med."
-     },
-     {
-      "line": 5,
-      "text": "The files that match a high glob, or none when the policy has no high rule."
-     },
-     {
-      "line": 7,
-      "text": "One high-risk file is enough for the whole PR to be high."
-     },
-     {
-      "line": 8,
-      "text": "The reason says how many files and why, for example 1 file(s): schema change."
-     },
-     {
-      "line": 10,
-      "text": "Lines are counted over all files here, unlike reviewRoute."
-     },
-     {
-      "line": 12,
-      "text": "Go up one step in ORDER. High is already the top, so it never moves."
-     },
-     {
-      "line": 15,
-      "text": "Always return at least one reason, so the check run is never empty."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "wall",
-    "text": "The label informs the one reviewer. It never adds or removes an approval and is never a required check. Every PR keeps exactly one approval, never by the requester."
    }
   },
   {
    "h": "Deep mode only where a miss hurts",
    "p": [
-    "The panel from lesson g2-5 runs five review lenses and a skeptic. Anthropic's multi-agent review costs about $15-25 a PR at list price, against about $2 for Byte today. G2-17 runs it only on risk:high PRs, PRs over 800 changed lines, or when someone comments @byte-review deep.",
-    "Before widening it, W10 measures it. Replay the BYTE-GOLD dev split in both modes. Compare HIGH recall, precision, clean false alarms, cost and minutes per PR, per lens. Deep mode ships for risk:high only if HIGH recall is not lower and clean false alarms stay at most 0.2 per PR.",
-    "Widening it to more PRs, or making the panel the default, is Sean and Nave's call from those numbers. Runs are tagged mode: deep in data/runs.jsonl, and the result goes into Byte's ROADMAP.md with what would change the decision."
+    "Byte also has a much heavier way to review, the panel: five separate review sessions, each looking through one lens, and then a skeptic that tries to disprove every finding. The last lesson of this part builds it. Reviews like that cost roughly $15 to $25 per PR at list price, against about $2 for Byte today, so they belong only on the PRs where a missed bug hurts most.",
+    "reviewMode uses the risk tier for that. A risk:high PR, a PR over 800 changed lines, or a comment @byte-review deep runs the panel; every other PR keeps today's single session. Both paths end in the same review and the same check run, so nothing else changes. Before deep mode runs on real PRs, both modes are replayed on BYTE-GOLD and compared on recall, false alarms, cost and minutes. Deep mode ships for risk:high only if it does not lower recall on high bugs and keeps clean false alarms at 0.2 per PR or less."
    ],
-   "because": "We decide the mode from the tier and the size the gate already has, so the choice costs nothing and explains itself.",
    "code": {
     "lang": "typescript",
-    "file": "src/route.ts (RhinoHealth/byte, G2-17)",
-    "text": "import type { RiskTier } from \"./risk.js\";\n\nexport type ReviewMode = \"standard\" | \"deep\";\nconst DEEP_ABOVE_LINES = 800;\n\n// Deep = the panel (lenses, then a skeptic per finding, then rank). Starting\n// rule; widened only from the W10 BYTE-GOLD numbers (cost and quality per PR).\nexport function reviewMode(input: { risk: RiskTier; changedLines: number; asked?: \"deep\" }): { mode: ReviewMode; reason: string } {\n  if (input.asked === \"deep\") {\n    return { mode: \"deep\", reason: \"asked with @byte-review deep\" };\n  }\n  if (input.risk === \"high\") {\n    return { mode: \"deep\", reason: \"risk:high\" };\n  }\n  if (input.changedLines > DEEP_ABOVE_LINES) {\n    return { mode: \"deep\", reason: `${input.changedLines} changed lines` };\n  }\n  return { mode: \"standard\", reason: \"single review session\" };\n}",
+    "file": "src/route.ts (RhinoHealth/byte), deep mode",
+    "text": "export function reviewMode(input: { risk: RiskTier; changedLines: number; asked?: \"deep\" }): { mode: ReviewMode; reason: string } {\n  if (input.asked === \"deep\") {\n    return { mode: \"deep\", reason: \"asked with @byte-review deep\" };\n  }\n  if (input.risk === \"high\") {\n    return { mode: \"deep\", reason: \"risk:high\" };\n  }\n  if (input.changedLines > DEEP_ABOVE_LINES) {\n    return { mode: \"deep\", reason: `${input.changedLines} changed lines` };\n  }\n  return { mode: \"standard\", reason: \"single review session\" };\n}",
     "notes": [
      {
-      "line": 1,
-      "text": "Only the type is imported: the tier itself comes from riskFor(), called in the gate."
+      "line": 2,
+      "text": "A person can always ask for the panel on one PR."
      },
      {
-      "line": 3,
-      "text": "Two modes. Standard is today's single CLAUDE_BUILTIN session."
-     },
-     {
-      "line": 4,
-      "text": "The same 800-line line as the risk raise, so big PRs get both."
-     },
-     {
-      "line": 8,
-      "text": "asked is set when the command parser reads deep after @byte-review: a mode, not a team."
-     },
-     {
-      "line": 9,
-      "text": "A person asking wins over every other rule."
-     },
-     {
-      "line": 12,
-      "text": "risk:high gets the panel, the case the W10 numbers must justify."
-     },
-     {
-      "line": 15,
-      "text": "Very large PRs also get the panel."
-     },
-     {
-      "line": 18,
-      "text": "Everything else stays on the single session."
+      "line": 5,
+      "text": "The risk label from the previous section decides the expensive review too."
      }
+    ]
+   },
+   "deeper": {
+    "h": "Go deeper: do people act on Byte at all?",
+    "p": [
+     "BYTE-GOLD tells us whether a change makes Byte better or worse on a fixed set. It cannot tell us whether people act on Byte's comments in real PRs, which is the whole point of a reviewer. So Byte's weekly job gives each finding on a merged PR a fate. A finding is addressed when a later sniff called it fixed and sure, or when GitHub shows the comment as outdated at merge because the code under it changed (a rebase can also outdate a comment, so the sniff is the stronger signal). A reply alone does not count. A finding is wrong when someone with write access gave it a thumbs-down.",
+     "The targets are at least 65% of high findings addressed and under 3% marked wrong. Each month there is also live recall: run the miner from the first lesson on last month's fixed bugs, and check whether Byte had flagged the bug on the PR that introduced it. The rows hold ids, severities and fates only, never paths or text, and the nightly metrics job turns them into dashboards per team."
     ]
    }
   }
  ],
  "lab": {
-  "title": "Route, label and fate on your laptop",
-  "youNeed": [
-   "Node 24 (22.5 or later works for matchesGlob)",
-   "npm"
+  "id": "g2-4",
+  "title": "Route five PRs",
+  "minutes": 25,
+  "needs": [
+   "Node 22.18+ (it runs .ts files directly)"
   ],
-  "worked": [
+  "goal": "Write the route, the risk tier and the review mode as one small module, run it on five PRs, and find the PR that the plan's version sends to the expensive panel by mistake.",
+  "mode": "guided",
+  "guess": {
+   "q": "A Renovate PR changes frontend/package.json (2 lines) and frontend/package-lock.json (4,000 lines). Which effort does reviewRoute choose?",
+   "options": [
+    {
+     "text": "high, because 4,002 lines is far over 400",
+     "correct": false,
+     "why": "The lockfile is left out of the count and out of the kind, so the PR is 2 lines of package.json."
+    },
+    {
+     "text": "low, because after leaving out the lockfile every file is a dependency list",
+     "correct": true,
+     "why": "GENERATED drops the lockfile, and the only file left matches DEPS."
+    },
+    {
+     "text": "medium, because it is not docs or tests",
+     "correct": false,
+     "why": "Dependency-only is the third low-effort kind, next to docs-only and test-only."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "mkdir route-lab && cd route-lab && npm init -y >/dev/null && npm pkg set type=module && npm i -D tsx typescript @types/node && mkdir src test",
-    "see": "added 7 packages, and audited 8 packages in 3s\nfound 0 vulnerabilities"
-   },
-   {
-    "do": "Write three small stubs in place of Byte's files. src/types.ts:\n// Lab stubs for Byte's types: only the fields these files read.\nexport interface PullRequestFile { filename: string; additions: number; deletions: number }\nexport interface ReviewComment { line: number | null; original_line: number | null }\n\nsrc/limits.ts:\nexport const DEFAULT_MODEL = \"claude-opus-5-5\"; // lab stub of Byte's src/limits.ts\n\nsrc/policy.ts:\nimport { matchesGlob } from \"node:path\";\n// Lab stub of Byte's isPathAllowed: true when the path matches any glob.\nexport const isPathAllowed = (path: string, globs: string[]): boolean => globs.some((g) => matchesGlob(path, g));",
-    "see": "(no output; ls src prints limits.ts policy.ts types.ts)"
-   },
-   {
-    "do": "Create src/route.ts from sections 4 and 5, then add section 8's code below it. Create src/risk.ts from sections 6 and 7. Create src/weekly.ts: one line import type { ReviewComment } from \"./types.js\"; then sections 2 and 3.",
-    "see": "(no output; ls src prints limits.ts policy.ts risk.ts route.ts types.ts weekly.ts)"
-   },
-   {
-    "do": "Create test/route.test.ts:\n\nimport test from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { reviewRoute, reviewMode } from \"../src/route.js\";\nimport { riskFor } from \"../src/risk.js\";\n\nconst file = (filename: string, additions: number, deletions = 0) => ({ filename, additions, deletions });\nconst FCP = {\n  high: { paths: [\"cloud/rhinoCloud/rhinoCore/migrations/**\", \".github/workflows/**\"], reason: \"schema change or CI\" },\n  low: { paths: [\"**/*.md\", \"**/*.stories.tsx\", \"**/tests/**\"], reason: \"docs or tests only\" },\n};\n\ntest(\"a docs-only PR is reviewed at low effort\", () => {\n  assert.equal(reviewRoute([file(\"docs/setup.md\", 30)]).effort, \"low\");\n});\ntest(\"a lockfile does not count towards size\", () => {\n  assert.deepEqual(reviewRoute([file(\"frontend/package-lock.json\", 5000), file(\"frontend/src/a.ts\", 10)]),\n    { model: \"claude-opus-5-5\", effort: \"medium\", reason: \"10 changed lines\" });\n});\ntest(\"a migration makes the PR risk:high, and deep mode follows\", () => {\n  const risk = riskFor([file(\"cloud/rhinoCloud/rhinoCore/migrations/0042_add_index.py\", 20)], FCP);\n  assert.deepEqual(risk, { tier: \"high\", reasons: [\"1 file(s): schema change or CI\"] });\n  assert.equal(reviewMode({ risk: risk.tier, changedLines: 20 }).mode, \"deep\");\n});\ntest(\"900 lines of ordinary code raise med to high\", () => {\n  assert.deepEqual(riskFor([file(\"frontend/src/pages/Big.tsx\", 900)], FCP), { tier: \"high\", reasons: [\"900 changed lines\"] });\n});",
+    "say": "Write the three decisions as one module. It is the code from the Understand step with the policy written inline and Node's matchesGlob instead of Byte's helper.",
+    "do": "mkdir -p ~/academy-labs/scratch/route-lab && cd ~/academy-labs/scratch/route-lab\ncat > route.ts <<'EOF'\nimport { matchesGlob } from \"node:path\";\n\nexport type File = { filename: string; additions: number; deletions: number };\nexport type Effort = \"low\" | \"medium\" | \"high\";\nexport type RiskTier = \"low\" | \"med\" | \"high\";\n\nconst MODEL = \"claude-opus-5-5\";\nconst LARGE_PR_LINES = 400;\nconst GENERATED = /(^|\\/)(package-lock\\.json|uv\\.lock|yarn\\.lock)$|_pb2(_grpc)?\\.pyi?$/;\nconst DOCS = /\\.(md|mdx|txt)$|(^|\\/)docs\\//;\nconst TESTS = /(^|\\/)(tests?|e2e|__tests__)\\/|\\.(test|spec)\\.[jt]sx?$|(^|\\/)test_[^/]+\\.py$/;\nconst DEPS = /(^|\\/)(package\\.json|pyproject\\.toml|requirements[^/]*\\.txt)$/;\n\nexport const reviewRoute = (files: File[]) => {\n  const counted = files.filter((f) => !GENERATED.test(f.filename));\n  const lines = counted.reduce((sum, f) => sum + f.additions + f.deletions, 0);\n  const all = (pattern: RegExp) => counted.every((f) => pattern.test(f.filename));\n  if (all(DOCS) || all(TESTS) || all(DEPS)) return { model: MODEL, effort: \"low\" as Effort, reason: \"docs-, test- or dependency-only\" };\n  if (lines > LARGE_PR_LINES) return { model: MODEL, effort: \"high\" as Effort, reason: `${lines} changed lines` };\n  return { model: MODEL, effort: \"medium\" as Effort, reason: `${lines} changed lines` };\n};\n\nconst RISK = {\n  high: { paths: [\"cloud/rhinoCloud/rhinoCore/migrations/**\", \"cloud/rhinoCloud/rhinoCore/permissions.py\", \".github/workflows/**\"], reason: \"migrations, permissions or CI\" },\n  low: { paths: [\"**/*.md\", \"**/*.stories.tsx\", \"**/tests/**\", \"**/*.test.tsx\"], reason: \"docs or tests only\" },\n};\nconst RAISE_ABOVE_LINES = 800;\nconst ORDER: RiskTier[] = [\"low\", \"med\", \"high\"];\nconst matches = (path: string, globs: string[]) => globs.some((g) => matchesGlob(path, g));\n\nexport const riskFor = (files: File[]) => {\n  const reasons: string[] = [];\n  let tier: RiskTier = files.every((f) => matches(f.filename, RISK.low.paths)) ? \"low\" : \"med\";\n  const risky = files.filter((f) => matches(f.filename, RISK.high.paths));\n  if (risky.length > 0) {\n    tier = \"high\";\n    reasons.push(`${risky.length} file(s): ${RISK.high.reason}`);\n  }\n  const lines = files.reduce((sum, f) => sum + f.additions + f.deletions, 0);\n  if (lines > RAISE_ABOVE_LINES && tier !== \"high\") {\n    tier = ORDER[ORDER.indexOf(tier) + 1];\n    reasons.push(`${lines} changed lines`);\n  }\n  return { tier, reasons: reasons.length > 0 ? reasons : [tier === \"low\" ? RISK.low.reason : \"no high-risk paths\"] };\n};\n\nexport const reviewMode = (risk: RiskTier, changedLines: number, asked?: \"deep\") => {\n  if (asked === \"deep\") return { mode: \"deep\", reason: \"asked with @byte-review deep\" };\n  if (risk === \"high\") return { mode: \"deep\", reason: \"risk:high\" };\n  if (changedLines > RAISE_ABOVE_LINES) return { mode: \"deep\", reason: `${changedLines} changed lines` };\n  return { mode: \"standard\", reason: \"single review session\" };\n};\nEOF",
     "see": "(no output)"
    },
    {
-    "do": "Create test/weekly.test.ts:\n\nimport test from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { findingFate } from \"../src/weekly.js\";\n\ntest(\"an outdated comment counts as addressed\", () => {\n  assert.deepEqual(findingFate({ line: null, original_line: 41 }, undefined, 0), { fate: \"addressed\", wrong: false });\n});\ntest(\"a reply alone does not address a finding\", () => {\n  assert.deepEqual(findingFate({ line: 41, original_line: 41 }, undefined, 0), { fate: \"open\", wrong: false });\n});\ntest(\"a sure fulfilled sniff addresses it, and a writer's thumbs-down marks it wrong\", () => {\n  assert.deepEqual(findingFate({ line: 41, original_line: 41 }, { verdict: \"fulfilled\", sure: true }, 1), { fate: \"addressed\", wrong: true });\n});",
-    "see": "(no output)"
+    "say": "Describe five PRs by their changed files and print what Byte would do with each.",
+    "do": "cat > prs.ts <<'EOF'\nimport { reviewRoute, riskFor, reviewMode, type File } from \"./route.ts\";\n\nconst f = (filename: string, additions: number, deletions = 0): File => ({ filename, additions, deletions });\nconst prs: Record<string, File[]> = {\n  \"#2501 README typo\": [f(\"README.md\", 1, 1)],\n  \"#2512 No projects yet card\": [f(\"frontend/src/components/ProjectsTable/ProjectsTable.tsx\", 48, 6), f(\"frontend/src/components/ProjectsTable/ProjectsTable.test.tsx\", 40)],\n  \"#2520 Dataset permission check\": [f(\"cloud/rhinoCloud/rhinoCore/permissions.py\", 22, 8)],\n  \"#2531 New projects page\": [f(\"frontend/src/app/projects/page.tsx\", 620, 40), f(\"frontend/src/app/projects/columns.tsx\", 240)],\n  \"#2540 Bump zod\": [f(\"frontend/package.json\", 1, 1), f(\"frontend/package-lock.json\", 2100, 1900)],\n};\n\nfor (const [name, files] of Object.entries(prs)) {\n  const route = reviewRoute(files);\n  const risk = riskFor(files);\n  const lines = files.reduce((sum, x) => sum + x.additions + x.deletions, 0);\n  const mode = reviewMode(risk.tier, lines);\n  console.log(`${name.padEnd(30)} effort ${route.effort.padEnd(6)} risk:${risk.tier.padEnd(4)} ${mode.mode.padEnd(8)} (${risk.reasons.join(\"; \")})`);\n}\nEOF\nnode prs.ts",
+    "see": "#2501 README typo              effort low    risk:low  standard (docs or tests only)\n#2512 No projects yet card     effort medium risk:med  standard (no high-risk paths)\n#2520 Dataset permission check effort medium risk:high deep     (1 file(s): migrations, permissions or CI)\n#2531 New projects page        effort high   risk:high deep     (900 changed lines)\n#2540 Bump zod                 effort low    risk:high deep     (4002 changed lines)"
    },
    {
-    "do": "node --import tsx --test test/*.test.ts",
-    "see": "✔ a docs-only PR is reviewed at low effort (0.5ms)\n✔ a lockfile does not count towards size (0.5ms)\n✔ a migration makes the PR risk:high, and deep mode follows (1.8ms)\n✔ 900 lines of ordinary code raise med to high (0.5ms)\n✔ an outdated comment counts as addressed (0.6ms)\n...\nℹ tests 7\nℹ pass 7"
-   },
-   {
-    "do": "npx tsc --noEmit --strict --module nodenext --moduleResolution nodenext --target es2023 --types node src/*.ts && echo types ok",
-    "see": "types ok"
+    "say": "Read the table row by row before you go on. Four rows are what we want. One is not: which PR would pay for the five-lens panel without any reason?",
+    "do": "node prs.ts | grep deep",
+    "see": "#2520 Dataset permission check effort medium risk:high deep     (1 file(s): migrations, permissions or CI)\n#2531 New projects page        effort high   risk:high deep     (900 changed lines)\n#2540 Bump zod                 effort low    risk:high deep     (4002 changed lines)"
    }
   ],
-  "faded": "Add a test for a PR of 900 lines that are all Markdown, in docs/guide.md. Predict both answers before you run it. Left to you: the two asserts. reviewRoute must give effort low, because docs-only wins over size. riskFor must give tier med with the reason 900 changed lines, low raised one step.",
-  "alone": "G2-10 asks for one more test: a thumbs-down from a non-collaborator does not count. findingFate only receives a number, so write countWriterThumbsDown(reactions, writers) in src/weekly.ts. reactions is an array of { user: string; content: string }, and writers is a Set of logins. Count reactions with content -1 from logins in writers, and test it with one writer and one outsider.",
-  "done": "Seven tests pass, tsc prints types ok, and your faded test shows effort low with tier med for 900 lines of Markdown."
+  "build": "Write more.ts with two new PRs and predict each row before you run it: a Storybook-only PR (frontend/src/components/ProjectsTable/ProjectsTable.stories.tsx, 120 added lines) and a CI change (.github/workflows/frontend-ci.yml, 6 added and 4 removed). Then print reviewMode(\"low\", 2, \"deep\"). Explain why the Storybook PR is risk:low but still gets medium effort.",
+  "checks": [
+   "prs.ts prints the five rows above, with the README at low effort and risk:low.",
+   "The permission PR is risk:high and deep, with the matched rule as its reason.",
+   "After your fix, Bump zod is risk:med and standard.",
+   "The Storybook PR is effort medium, risk:low, standard; the CI change is risk:high and deep.",
+   "reviewMode with asked deep returns deep for any PR."
+  ],
+  "solution": {
+   "lang": "typescript",
+   "file": "~/academy-labs/scratch/route-lab/more.ts",
+   "text": "import { reviewRoute, riskFor, reviewMode, type File } from \"./route.ts\";\n\nconst f = (filename: string, additions: number, deletions = 0): File => ({ filename, additions, deletions });\nconst prs: Record<string, File[]> = {\n  \"#2550 Stories for the card\": [f(\"frontend/src/components/ProjectsTable/ProjectsTable.stories.tsx\", 120)],\n  \"#2551 CI cache key\": [f(\".github/workflows/frontend-ci.yml\", 6, 4)],\n};\nfor (const [name, files] of Object.entries(prs)) {\n  const lines = files.reduce((sum, x) => sum + x.additions + x.deletions, 0);\n  const risk = riskFor(files);\n  console.log(`${name.padEnd(28)} effort ${reviewRoute(files).effort.padEnd(6)} risk:${risk.tier.padEnd(4)} ${reviewMode(risk.tier, lines).mode}`);\n}\nconsole.log(reviewMode(\"low\", 2, \"deep\"));\n// #2550 Stories for the card   effort medium risk:low  standard\n// #2551 CI cache key           effort medium risk:high deep\n// { mode: 'deep', reason: 'asked with @byte-review deep' }\n// The two lists differ: route's TESTS and DOCS do not include .stories.tsx, the risk policy's low list does."
+  },
+  "fix": "Bump zod, a Renovate PR that changes one line of package.json and 4,000 lines of package-lock.json, is labelled risk:high and sent to deep mode: about $20 of panel review for a version bump. reviewRoute leaves the lockfile out of its count, but riskFor (and the line count passed to reviewMode) do not. Export GENERATED from route.ts, filter it out of the line count in riskFor and in prs.ts, and run node prs.ts again: Bump zod should become risk:med and standard.",
+  "explain": [
+   "Why are lockfiles left out when Byte measures the size of a PR?",
+   "Why do the risk tiers live in Byte's policy and not in a file inside fcp?",
+   "The risk label never changes who may approve. Then what is it for?"
+  ],
+  "done": "Your table shows Bump zod as risk:med and standard, and you can say why each of the other PRs got its effort, tier and mode."
  },
- "quiz": [
+ "check": [
   {
-   "q": "A PR changes 3 Markdown files and frontend/package-lock.json with 4,000 changed lines. Which effort does reviewRoute pick?",
+   "q": "A PR changes three Markdown files and frontend/package-lock.json, 4,000 lines in all. Which effort does the route pick?",
    "options": [
     {
-     "text": "high, because the PR has more than 400 changed lines",
-     "correct": false,
-     "why": "The lockfile matches GENERATED and is dropped before counting."
-    },
-    {
-     "text": "low: the lockfile is left out, and every remaining file is docs",
+     "text": "low, because after leaving out the lockfile every file is documentation",
      "correct": true,
-     "why": "counted holds only the three Markdown files, so all(DOCS) is true."
+     "why": "Generated files never count and never decide the kind, so this is a docs-only PR."
     },
     {
-     "text": "medium, because the files are of mixed kinds",
+     "text": "high, because the PR is over 400 lines",
      "correct": false,
-     "why": "Kinds are checked after generated files are removed; nothing mixed is left."
+     "why": "The 4,000 lines are the lockfile, which is left out of the count."
+    },
+    {
+     "text": "medium, because a lockfile is neither docs nor tests",
+     "correct": false,
+     "why": "The lockfile is filtered out before the kind is checked."
     }
    ]
   },
   {
-   "q": "Why do fcp's risk tiers live in Byte's config/repositories.json and not in a file inside fcp?",
+   "q": "Why do fcp's risk tiers live in Byte's policy, baked into its image, instead of a file in fcp?",
    "options": [
     {
-     "text": "So the risk label can be added to the ruleset as a required check",
+     "text": "Byte cannot read files from the repo it reviews",
      "correct": false,
-     "why": "The check is never added to the ruleset; it only informs the reviewer."
+     "why": "It reads the PR's files all the time. The point is who can change the rules."
     },
     {
-     "text": "Because JSON loads faster than YAML in a GitHub Action",
-     "correct": false,
-     "why": "Speed is not the reason. The question is who can change the rules."
-    },
-    {
-     "text": "Policy is baked into Byte's signed image and never read from the reviewed repo, so a PR cannot lower its own tier",
+     "text": "So that a PR cannot edit the rules and lower its own tier",
      "correct": true,
-     "why": "Any file in fcp is a file a PR to fcp can edit."
+     "why": "A rule file in fcp could be changed in the same PR it judges. Rules from the reviewed repo are untrusted data."
+    },
+    {
+     "text": "Because the tiers change on every release of Byte",
+     "correct": false,
+     "why": "They change rarely, through a reviewed PR to Byte. Where they live is about trust, not speed."
     }
    ]
   },
   {
-   "q": "A Byte comment sits on a line the author later rewrote. At merge, GitHub shows it as outdated. Nobody replied. What fate does it get?",
+   "q": "A PR touches cloud/rhinoCloud/rhinoCore/permissions.py and gets risk:high. What changes for that PR?",
    "options": [
     {
-     "text": "addressed: its line is null because the code under it changed",
+     "text": "It needs two approvals instead of one",
+     "correct": false,
+     "why": "The label never changes the approval rules: one approval, never by the requester, for every PR."
+    },
+    {
+     "text": "Byte's risk check fails until a security reviewer approves",
+     "correct": false,
+     "why": "The check is neutral and not required. It informs; it never blocks."
+    },
+    {
+     "text": "The reviewer sees the label and its reason, and Byte reviews it in deep mode with the panel",
      "correct": true,
-     "why": "Outdated at merge is one of the two addressed signals; a reply is not needed."
-    },
-    {
-     "text": "open, because nobody replied to it",
-     "correct": false,
-     "why": "Replies do not count either way; the code change does."
-    },
-    {
-     "text": "wrong, because the author ignored it",
-     "correct": false,
-     "why": "wrong counts only thumbs-downs from writers."
+     "why": "The tier tells the one reviewer where to look and decides that Byte spends more effort on it."
     }
    ]
   }
  ],
- "recall": [
-  "From g2-3: what does the Wilson upper bound protect against, and what do you do when there are too few pairs?",
-  "From p8-8: what is effort, and why does changing it per message keep the prompt cache warm?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "In RhinoHealth/byte: src/route.ts (reviewRoute, later reviewMode), additions and deletions on PullRequestFile in src/types.ts, a new effort output from gate(), --effort \"$EFFORT\" in review.yml, an optional --effort in cli.ts with CLAUDE_EFFORT as the default, and engines.ts using it. claude-sonnet-5-5 joins SUPPORTED_MODELS for the panel's conventions lens; reviews stay on Opus 5.5. Each route is proved on its BYTE-GOLD dev slice and ships through the gate; Nave reviews it.",
+   "Risk: a risk block per repository in config/repositories.json, src/risk.ts, a risk subcommand that sets one label and a completed neutral Byte risk check run, a reusable risk.yml in Byte and a new caller byte-risk.yml in fcp on opened, reopened, synchronize and ready_for_review (a separate file, because adding opened to byte-review.yml would start a full review on every new PR). The three labels are created once with gh label create; the check is never added to the ruleset. riskFor should leave lockfiles and generated files out of its line count, as reviewRoute does, or every large Renovate PR becomes risk:high and runs the panel. Live metrics: finding fates from the weekly-harvest stage in src/weekly.ts, merged into data/finding-fates.jsonl, and byte_findings_addressed_ratio, byte_findings_wrong_ratio and byte_live_recall in VictoriaMetrics."
+  ],
+  "tickets": [
+   {
+    "key": "G2-11",
+    "why": "The route: model and effort per PR from size and kind, each route proved on BYTE-GOLD."
+   },
+   {
+    "key": "G2-12",
+    "why": "risk:low, med or high on every fcp PR, with a neutral check and the reasons."
+   },
+   {
+    "key": "G2-17",
+    "why": "Deep mode for risk:high, large PRs and @byte-review deep, after measuring cost and quality."
+   },
+   {
+    "key": "G2-10",
+    "why": "Live numbers: addressed rate, wrong rate and monthly live recall."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "finding fate",
-   "plain": "One row per Byte finding on a merged PR: addressed or open, and wrong or not. Ids and enums only."
-  },
-  {
-   "term": "addressed",
-   "plain": "A finding a sure sniff called fulfilled, or whose comment GitHub marked outdated at merge."
-  },
-  {
-   "term": "live recall",
-   "plain": "Each month, the share of shipped bugs that Byte had flagged on the PR that introduced them."
+   "term": "effort",
+   "plain": "The setting that decides how much Claude reasons before answering: low, medium or high."
   },
   {
    "term": "route",
-   "plain": "The model, effort and reason Byte picks for one review from the PR's size and kind."
+   "plain": "The model, effort and reason Byte's gate picks for one review from the PR's files."
   },
   {
    "term": "risk tier",
-   "plain": "risk:low, risk:med or risk:high, set from path rules in Byte's policy and the PR's size."
+   "plain": "risk:low, risk:med or risk:high, from the paths a PR touches and its size."
   },
   {
    "term": "neutral check",
-   "plain": "A completed check run that shows information without passing or failing the PR."
+   "plain": "A check run that shows information and is neither green nor red; it never blocks a merge."
   },
   {
    "term": "deep mode",
-   "plain": "The panel review (five lenses and a skeptic), used for risk:high, big PRs or @byte-review deep."
+   "plain": "Byte's expensive review: five lenses and a skeptic, used only where a miss hurts most."
+  },
+  {
+   "term": "finding fate",
+   "plain": "What happened to one Byte finding on a merged PR: addressed or open, and whether people marked it wrong."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G2-10",
-   "why": "This lesson explained the finding-fate row, the two addressed signals, the writer-only wrong count, and where the numbers go.",
-   "walk": [
-    "In the weekly-harvest stage of src/weekly.ts, add FindingFate and findingFate() (the code above). Run it for each Byte finding comment on PRs merged in the window.",
-    "Count wrong only from write collaborators' thumbs-downs; a reply alone never addresses a finding.",
-    "Write finding-fates.jsonl rows with ids, severity and enums only. Upload it as byte-finding-fates-<runId>, and let the hourly sweep in src/telemetry.ts merge it into data/finding-fates.jsonl.",
-    "Add a 'Live quality' line per team to DASHBOARD.md: HIGH addressed %, wrong % and n.",
-    "Have the G1 nightly job write byte_findings_addressed_ratio{severity,team}, byte_findings_wrong_ratio{team} and byte_live_recall to VictoriaMetrics.",
-    "Monthly live recall: run scripts/gold-mine.ts --since 30d on last month's fixed Bugs. Then run byte gold-score --live on each introducing PR Byte reviewed, with the same filter and judge as BYTE-GOLD.",
-    "Add tests to test/weekly.test.ts: an outdated comment counts, a reply alone does not, a non-collaborator's thumbs-down does not."
-   ]
+   "q": "From memory: the three kinds of PR that get low effort, and the size that keeps high.",
+   "a": "Docs-only, test-only and dependency-only PRs get low; over 400 changed lines (lockfiles and generated files left out) keeps high; everything else is medium."
   },
   {
-   "key": "G2-11",
-   "why": "This lesson explained how reviewRoute sizes a PR, which files never count, and how each route proves itself on BYTE-GOLD.",
-   "walk": [
-    "Add src/route.ts with reviewRoute (the code above).",
-    "Extend PullRequestFile in src/types.ts with additions and deletions. Call reviewRoute in gate() where the model is resolved; a team model in policy still wins.",
-    "Add an effort gate output and pass --effort \"$EFFORT\" in review.yml. Read it in cli.ts as optional with CLAUDE_EFFORT as the default, and use it in engines.ts instead of the constant.",
-    "Add claude-sonnet-5-5 to SUPPORTED_MODELS for the panel's conventions lens; reviews stay on Opus 5.5.",
-    "Prove each route on its BYTE-GOLD dev slice: HIGH recall within 3 points of today's high and no more clean false alarms. A route that loses goes back to high; ship through the G2-09 gate.",
-    "Show model and effort on the dashboard's runs table and the reason in the status comment. Nave reviews the PR."
-   ]
+   "q": "What has to be true before a cheaper route stays in Byte?",
+   "a": "On its BYTE-GOLD dev slice, recall on high bugs within 3 points of high effort, and no more false alarms on clean PRs. Otherwise the route goes back to high."
   },
   {
-   "key": "G2-12",
-   "why": "This lesson explained why tiers live in Byte's policy, how riskFor decides, and why the label is information only.",
-   "walk": [
-    "Add a risk block for fcp to config/repositories.json, drafted with the BE and FE guilds. High is the path list above; low is docs, stories and tests only; med is the rest.",
-    "Add src/risk.ts (the code above) and a risk subcommand in src/cli.ts. It lists the files with the read token and sets one label, removing the other two. Then it creates a completed Byte risk check run with conclusion neutral and the matched rules.",
-    "Add a reusable .github/workflows/risk.yml in byte: App token with issues: write, checks: write and pull-requests: read, worker image by digest, like review.yml.",
-    "Add a new caller fcp/.github/workflows/byte-risk.yml on pull_request opened, reopened, synchronize and ready_for_review for base main. Pin it by SHA; scripts/fleet-sync.sh moves the pin.",
-    "Add the new file to SECURITY.md's list of pull_request workflows that hold the App key.",
-    "Create the three labels in fcp once (gh label create risk:high --color B60205, and so on). Never add the check to the ruleset."
-   ]
-  },
-  {
-   "key": "G2-17",
-   "why": "This lesson explained when the panel runs, what W10 must measure first, and who decides to widen it.",
-   "walk": [
-    "Add reviewMode() to src/route.ts (the code above). Call it in the gate with the tier from riskFor() and the changed lines, and pass a new review_mode output to review.yml.",
-    "Teach the command parser that deep after @byte-review is a mode, not a team.",
-    "In review.ts, call the panel (runLenses() and skeptic(), G2-15 and G2-16) in deep mode and the single session otherwise. Both end in the same ModelReview, publish path and check run.",
-    "In W10, replay the BYTE-GOLD dev split in both modes. Compare HIGH recall, precision, clean false alarms, cost and minutes per PR, per lens.",
-    "Ship deep mode for risk:high only if HIGH recall is not lower and clean false alarms stay at most 0.2 per PR. Widening it is Sean and Nave's call.",
-    "Tag runs mode: deep in data/runs.jsonl and show deep runs, their cost and quota hits on the dashboard. Write the decision in ROADMAP.md."
-   ]
+   "q": "Name the three ways a PR gets deep mode.",
+   "a": "It is risk:high, it has more than 800 changed lines, or someone comments @byte-review deep."
   }
  ],
- "remember": "Size each review to its PR, label risk from rules the PR cannot edit, and prove every route on BYTE-GOLD."
+ "remember": "Let the changed files decide the review: effort from size and kind, a risk label that informs the one reviewer, and the expensive panel only where a missed bug hurts most."
 }

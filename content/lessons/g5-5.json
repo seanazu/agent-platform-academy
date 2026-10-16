@@ -1,611 +1,319 @@
 {
+ "v": 2,
  "id": "g5-5",
  "title": "CI fixers and the false-heal check",
- "minutes": 60,
+ "minutes": 55,
  "youNeed": [
-  "g5-4",
-  "g5-1",
-  "g0-4"
+  "g5-2",
+  "g0-4",
+  "p8-4"
  ],
- "bridge": "A CI fixer is like the teammate who jumps on red main: reproduce the failing job, make the smallest fix, push. Except: it must never make CI green by weakening a test. A mechanical check reads every diff for exactly that before any PR exists.",
- "intro": "Red main blocks everyone. This lesson turns on the first routines: the FE CI fixer, the BE CI fixer and the DevOps pipeline fixer. Each first asks \"is it us?\", reproduces the failing job in a VM, and fixes it inside its paths. The false-heal check rejects any fix that weakens a test.",
- "picture": {
-  "caption": "Reproduce at main's head first; fix only if it is really the code; reject any fix that weakens a test.",
-  "nodes": [
-   {
-    "id": "red",
-    "label": "[FRONTEND] - CI red on main",
-    "kind": "check"
-   },
-   {
-    "id": "jobs",
-    "label": "routines/fe-ci-fixer/jobs.yaml",
-    "kind": "file"
-   },
-   {
-    "id": "vm",
-    "label": "lite VM at main's head",
-    "kind": "machine"
-   },
-   {
-    "id": "alerts",
-    "label": "#ai-agents-alerts",
-    "kind": "service"
-   },
-   {
-    "id": "fixer",
-    "label": "fe-ci-fixer session",
-    "kind": "agent"
-   },
-   {
-    "id": "heal",
-    "label": "false-heal check",
-    "kind": "check"
-   },
-   {
-    "id": "judge",
-    "label": "scope judge, then shipPr",
-    "kind": "check"
-   }
+ "map": "vm",
+ "hook": {
+  "story": [
+   "Tuesday, 10:09. The gather window is over and the CI fixer has its VM. It runs the failing test from main and sees it fail for itself: a refactor merged at 10:02 changed one comparison, and now the empty projects table no longer shows its \"No projects yet\" card. The test that checks the card is red, exactly as it should be.",
+   "The fixer's job is to make CI green, and there are two ways to do that. It can fix the comparison in the component, one line. Or it can change the test: skip it, delete the assertion, or edit the expected text to match what the broken code now returns. Every one of those turns CI green. Only the first one fixes main. The others hide the bug, and the next person to look at a green main has no idea the card is gone."
   ],
-  "steps": [
-   {
-    "from": "red",
-    "to": "jobs",
-    "text": "routineRun looks up how to reproduce the failed job"
-   },
-   {
-    "from": "jobs",
-    "to": "vm",
-    "text": "runs the failed commands at main's head: is it us?"
-   },
-   {
-    "from": "vm",
-    "to": "alerts",
-    "text": "green in the VM: environment or flake; post the evidence and stop"
-   },
-   {
-    "from": "vm",
-    "to": "fixer",
-    "text": "red in the VM: the smallest fix inside frontend/"
-   },
-   {
-    "from": "fixer",
-    "to": "heal",
-    "text": "every diff is read for deleted tests, skips, removed assertions, looser thresholds"
-   },
-   {
-    "from": "heal",
-    "to": "judge",
-    "text": "clean: the scope judge with the charter; any finding rejects the run"
-   }
-  ]
+  "question": "How do we make sure a fixer can never turn CI green by weakening the test that caught the problem?"
  },
- "sections": [
+ "read": [
   {
-   "h": "The FE CI fixer: is it us?",
+   "h": "First, is it us?",
    "p": [
-    "When [FRONTEND] - CI fails on main, one run per root cause starts fe-ci-fixer (lesson g5-2). Its first step is always the same question: is it us? It runs the failed commands at main's head in the VM.",
-    "Green in the VM means the environment or a flake, not the code. The run posts the evidence to #ai-agents-alerts and stops. Red in the VM means a real failure, and the agent makes the smallest fix inside frontend/.",
-    "jobs.yaml maps each frontend CI job to the commands that reproduce it, and names the jobs that are hand-offs. The fix must pass npm run verify (G7) and the reproduced commands."
+    "Before any fix, the CI fixer answers one question: is the failure in our code at all? It runs the failed job's commands at main's newest commit, inside its VM. If they pass there, the code is fine and the problem is the environment, a runner, the package mirror, the QA environment, or a flaky test. The fixer posts its evidence to #ai-agents-alerts and stops, because no code change can fix an environment. If the commands fail in the VM too, the failure is real and reproducible, and the fixer makes the smallest change it can inside its charter's paths.",
+    "Each fixer keeps a small map of how to reproduce every CI job in its VM, and which jobs it must always hand to a person. This lesson is about what happens after the fixer is sure the code is broken, because that is where the dangerous shortcut lives."
    ],
-   "because": "Checking main's head first avoids \"fixing\" code that is not broken, which is the most common way a CI fixer goes wrong.",
    "code": {
     "lang": "yaml",
-    "file": "ai-agents/routines/fe-ci-fixer/jobs.yaml",
-    "text": "# ai-agents/routines/fe-ci-fixer/jobs.yaml: sketch: how each \"[FRONTEND] - CI\" job is reproduced in the VM\nworkflow: \"[FRONTEND] - CI\"\nsetup: cd frontend && npm ci                     # Node 24.15; packages through the Nexus npm proxy (G3)\ncheck_main_first: true                           # failed commands green at main's head → environment or flake\njobs:\n  \"Unit Tests\":\n    vm: lite\n    repro:\n      - .github/scripts/frontend/script-tests/test-playwright-parallelism.sh\n      - cd frontend && npm run check-types\n      - cd frontend && npm run lint\n      - cd frontend && npm run test:unit\n  \"Build\":\n    vm: lite\n    repro: [\"cd frontend && npm run build\", \"cd frontend && npm run build-storybook\"]\n  \"Build E2E app\":\n    vm: full\n    repro: [\"<copy the build steps from .github/workflows/_frontend-build-e2e-app.yml>\"]\n  \"I&T - AWS\":\n    vm: full\n    repro: [\"cd frontend && npx playwright test --project=pr <failed spec>   # against FCP Lab, not QA\"]\n    if_green_in_lab: hand_off                    # passes on Lab, failed on QA → QA env or data, not code\n  \"I&T - GCP\": { same_as: \"I&T - AWS\" }\n  \"Deploy\": { hand_off: \"needs cloud credentials; DevOps\" }\n  \"Publish\": { hand_off: \"image publishing; DevOps\" }",
+    "file": "ai-agents/routines/fe-ci-fixer/jobs.yaml (part)",
+    "text": "workflow: \"[FRONTEND] - CI\"\nsetup: cd frontend && npm ci\ncheck_main_first: true          # failed commands green at main's head: environment or flake\njobs:\n  \"Unit Tests\":\n    vm: lite\n    repro:\n      - cd frontend && npm run check-types\n      - cd frontend && npm run lint\n      - cd frontend && npm run test:unit\n  \"I&T - AWS\":\n    vm: full\n    repro: [\"cd frontend && npx playwright test --project=pr <failed spec>\"]   # against FCP Lab\n    if_green_in_lab: hand_off   # failed on QA, passes on the Lab: the QA environment, not code\n  \"Deploy\": { hand_off: \"needs cloud credentials; DevOps\" }",
     "notes": [
-     {
-      "line": 1,
-      "text": "Data only: routines/ holds charters and job maps; the code lives in the harness."
-     },
      {
       "line": 3,
-      "text": "Install once. Packages come through the Nexus npm proxy, since the VM has no open internet."
-     },
-     {
-      "line": 4,
-      "text": "Run the failed commands at main's head first. Green means environment or flake."
-     },
-     {
-      "line": 6,
-      "text": "The job's exact name in CI. Its repro steps are the same commands the job runs."
-     },
-     {
-      "line": 9,
-      "text": "The script-tests step from frontend CI."
-     },
-     {
-      "line": 16,
-      "text": "Needs a full VM. Copy its build steps from the reusable e2e build workflow."
-     },
-     {
-      "line": 21,
-      "text": "Re-run only the failed spec, against FCP Lab, not the QA environment."
-     },
-     {
-      "line": 22,
-      "text": "Passes on Lab but failed on QA: the QA environment or its data, not code."
-     },
-     {
-      "line": 24,
-      "text": "Needs cloud credentials. The VM has none, so this is always a hand-off to DevOps."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The BE CI fixer, part 1: cloud",
-   "p": [
-    "The BE CI fixer reuses the same flow for [CLOUD] - CI and [CLIENT] - CI. Only the commands, paths and skills change. Its charter allows cloud/**, client/** and sdk/**, with **/migrations/** denied.",
-    "Some failures are always hand-offs. Protoc drift touches the stubs in common/fcp_common/, which is the cloud-client contract and outside BE routine paths. A makemigrations --check failure means a migration, and the pilot has none. Integration tests need the QA environments, which the VM cannot reach."
-   ],
-   "because": "Knowing in advance which failures a routine must hand off keeps it from trying fixes it is not allowed to make.",
-   "code": {
-    "lang": "yaml",
-    "file": "ai-agents/routines/be-ci-fixer/jobs.yaml (part 1 of 2)",
-    "text": "# ai-agents/routines/be-ci-fixer/jobs.yaml: sketch: \"[CLOUD] - CI\" and \"[CLIENT] - CI\" jobs in the VM\ncheck_main_first: true\nworkflows:\n  \"[CLOUD] - CI\":\n    \"Lint\":\n      vm: lite\n      repro:\n        - cd cloud/rhinoCloud && uv sync --frozen --only-group lint --no-install-project\n        - pre-commit run --all-files --show-diff-on-failure\n      hand_off_if: \"the diff is in common/fcp_common/rhinoAgentRpc (protoc drift: the cloud↔client contract)\"\n    \"Unit Tests\":\n      vm: full                                   # postgres, minio and redis come from the compose services\n      repro:\n        - ./scripts/local_run_backend_unit_tests.sh cloud <failed test label>\n        - ./scripts/local_run_backend_unit_tests.sh cloud    # the whole suite before \"done\"\n      hand_off_if: \"makemigrations --dry-run --check fails (no migrations in the pilot)\"\n    \"I&T - AWS\": { hand_off: \"runs on qa-cloud behind cloud_integration_tests_aws; the VM has no QA access\" }\n    \"I&T - GCP\": { hand_off: \"same, behind cloud_integration_tests_gcp\" }\n    \"Publish\": { hand_off: \"edits RhinoHealth/gitops; DevOps\" }",
-    "notes": [
-     {
-      "line": 2,
-      "text": "The same first question as FE: is it us?"
-     },
-     {
-      "line": 4,
-      "text": "Jobs of the cloud CI workflow, by their exact names."
-     },
-     {
-      "line": 8,
-      "text": "Install only the lint tools, from the lockfile, without installing the project."
-     },
-     {
-      "line": 9,
-      "text": "The lint job: black, isort and flake8 through pre-commit."
-     },
-     {
-      "line": 10,
-      "text": "A diff under rhinoAgentRpc is the gRPC contract: hand it to people."
-     },
-     {
-      "line": 12,
-      "text": "Unit tests need postgres, minio and redis from the compose services, so a full VM."
-     },
-     {
-      "line": 14,
-      "text": "First the failed test, then the whole suite before done."
-     },
-     {
-      "line": 16,
-      "text": "A missing migration: no migrations in the pilot, so hand it off."
-     },
-     {
-      "line": 17,
-      "text": "Integration tests run on qa-cloud behind a lock; the VM has no QA access."
-     },
-     {
-      "line": 19,
-      "text": "Publishing edits the gitops repo: DevOps."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The BE CI fixer, part 2: client",
-   "p": [
-    "The client part is the same shape, with client/rhinoOnPrem and its own integration locks. Run the BE part of the red-builds slice (lesson g5-9) 3 times before turning on shadow.",
-    "Both CI fixers use Opus 5.5 at low effort; a failed step re-runs at medium. They run on a lite Spot VM, and on a full VM when the tests need the compose services or FCP Lab."
-   ],
-   "because": "Backend red builds block the same people, so the BE fixer reuses the FE flow and only swaps the commands.",
-   "code": {
-    "lang": "yaml",
-    "file": "ai-agents/routines/be-ci-fixer/jobs.yaml (part 2 of 2)",
-    "text": "  \"[CLIENT] - CI\":\n    \"Lint\":\n      vm: lite\n      repro:\n        - cd client/rhinoOnPrem && uv sync --frozen --only-group lint --no-install-project\n        - pre-commit run --all-files --show-diff-on-failure\n    \"Unit Tests\": { vm: full, repro: [\"./scripts/local_run_backend_unit_tests.sh client <failed test label>\"] }\n    \"I&T - AWS\": { hand_off: \"qa-on-prem behind client_integration_tests_aws\" }\n    \"I&T - GCP\": { hand_off: \"behind client_integration_tests_gcp\" }",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The second workflow under the same workflows key."
+      "text": "Run the failed commands at main's head first. Green there means it is not our code."
      },
      {
       "line": 5,
-      "text": "The client's own uv project and lint group."
-     },
-     {
-      "line": 7,
-      "text": "Client unit tests with fcp's script and the client component."
-     },
-     {
-      "line": 8,
-      "text": "Client integration tests run on qa-on-prem: always a hand-off."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The false-heal check, part 1: the patterns",
-   "p": [
-    "A false heal is a fix that makes CI green by weakening a test. A CI fixer can always do that: delete the test, skip it, remove an assertion, raise a timeout. It is the one failure that must never ship.",
-    "false-heal.ts builds on G0-19's weakened-tests detector (ai-agents/checks/src/weakened-tests.ts): one implementation, with the charter rules added. The patterns cover both stacks, pytest and unittest, Vitest and Playwright.",
-    "For Nova, findings are flags in the PR. For routines, any finding rejects the run with outcome false_heal, and one false heal moves the routine down the trust ladder."
-   ],
-   "because": "A regular expression over the diff catches the mechanical forms of weakening before any model or person has to.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/harness/src/checks/false-heal.ts (part 1 of 2)",
-    "text": "// ai-agents/harness/src/checks/false-heal.ts: sketch; G0's locked-checks detector plus the charter rules\nconst TEST_FILE = /(^|\\/)(tests?|e2e|integration-tests)\\/|(^|\\/)test_[^/]*\\.py$|_test\\.py$|\\.(test|spec)\\.tsx?$/;\nconst SKIP = /@pytest\\.mark\\.(skip|xfail)|@unittest\\.skip|self\\.skipTest\\(|\\b(it|test|describe)\\.(skip|only|fixme)\\(/;\nconst ASSERT = /\\bassert\\b|self\\.assert\\w+\\(|\\bexpect\\(/;\nconst THRESHOLD = /(fail[-_]under|retries|timeout\\w*)\\s*[:=]\\s*([\\d.]+)/i;\nconst RETRY_OR_SLEEP = /time\\.sleep\\(|asyncio\\.sleep\\(|@retry|@flaky|--reruns|waitForTimeout\\(/;\nconst count = (rx: RegExp, lines: string[]): number => lines.filter((line) => rx.test(line)).length;\n\nexport function falseHeals(diff: FileDiff[], never: Set<string>): string[] {\n  const found: string[] = [];\n  for (const f of diff) {\n    const isTest = TEST_FILE.test(f.path);\n    if (f.deleted && isTest) found.push(`${f.path}: test file deleted`);\n    found.push(...f.added.filter((line) => SKIP.test(line)).map((line) => `${f.path}: new skip \\`${line.trim()}\\``));\n    if (isTest) {\n      const removed = count(ASSERT, f.removed), added = count(ASSERT, f.added);\n      if (removed > added) found.push(`${f.path}: ${removed - added} assertion(s) removed`);\n      if (never.has(\"edit_test_assertions\") && removed) found.push(`${f.path}: an existing assertion was changed`);\n    }",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Built on G0's detector, plus the charter rules."
-     },
-     {
-      "line": 2,
-      "text": "A test file: under tests/, test/, e2e/ or integration-tests/, or named test_*.py, *_test.py, *.test.ts(x), *.spec.ts(x)."
-     },
-     {
-      "line": 3,
-      "text": "New skips: pytest skip and xfail, unittest skip, skipTest(), and .skip, .only or .fixme in Vitest and Playwright."
-     },
-     {
-      "line": 4,
-      "text": "An assertion line: assert, self.assert...( or expect(."
-     },
-     {
-      "line": 5,
-      "text": "A threshold with a number: fail-under, retries, timeout. Group 1 is the key, group 2 the value."
-     },
-     {
-      "line": 6,
-      "text": "Sleeps, retry decorators and reruns: the flaky-test fixer's forbidden fixes."
-     },
-     {
-      "line": 7,
-      "text": "How many lines match a pattern."
-     },
-     {
-      "line": 12,
-      "text": "Is this file a test file?"
+      "text": "The job's exact name in frontend CI, and the commands that reproduce it."
      },
      {
       "line": 13,
-      "text": "A deleted test file is always a false heal."
+      "text": "An integration test that fails against the QA environment but passes against FCP Lab, the full product on one machine with fake data, is a hand-off."
      },
      {
       "line": 14,
-      "text": "Any added line with a skip, in any file."
-     },
-     {
-      "line": 17,
-      "text": "Fewer assertions than before in a test file."
-     },
-     {
-      "line": 18,
-      "text": "With this never-rule, even changing one existing assertion is a finding."
+      "text": "The VM holds no cloud credentials, so deploy failures always go to a person."
      }
     ]
    }
   },
   {
-   "h": "The false-heal check, part 2: thresholds and charter rules",
+   "h": "Two ways to turn CI green",
    "p": [
-    "pairedChanges finds the same threshold key on a removed and an added line, with the old and new value. A fail-under that goes down is looser; a retries or timeout value that goes up is looser.",
-    "Two more charter rules. add_retries_or_sleeps is for the flaky-test fixer. add_code is for the dead-code removers, which may only delete; an import line that only loses names is fine.",
-    "The check runs in two places. In the VM, the Stop hook runs it so the agent sees the problem before it says done. Before any PR, it runs on the diff ahead of the scope judge, which gets the list with the charter."
+    "A false heal is a change that turns CI green by weakening the checks instead of fixing the code. It comes in a few shapes, and all of them are easy for an agent that has been told to make CI pass: delete a test file, skip a test with it.skip or @pytest.mark.skip, remove an assertion, change an expected value to match the broken output, or loosen a threshold such as a coverage minimum, a retry count or a timeout. A model does not need bad intent to do this. It needs only a goal, \"make CI green\", and a moment where the shortcut looks reasonable.",
+    "We do not ask the model to promise it will not do this, and we do not rely on a reviewer to spot it in a long diff. A false heal leaves marks in the diff that a short program can find every time: a removed line with an assertion, an added line with .skip(, a number after retries that went up. So the false-heal check is plain code that reads the diff. It is cheap, it never gets tired, and an agent cannot talk it out of its answer."
+   ]
+  },
+  {
+   "h": "Reading the diff",
+   "p": [
+    "The check gets the diff as a list of files, each with its added and removed lines, and the charter's never-list. Every rule is one regular expression and one comparison. Two of them deserve a closer look. Counting assertions catches a removed assertion, but not a changed one: if the fixer rewrites assert.equal(emptyMessage(0), \"No projects yet\") into assert.equal(emptyMessage(0), \"\"), one assertion was removed and one added, so the count is equal. That is why CI fixers carry the never-rule edit_test_assertions in their charter, which turns any removed assertion line into a finding. The threshold rule pairs the same key on a removed and an added line: a fail-under that goes down is looser, and a retries or timeout value that goes up is looser."
    ],
-   "because": "Running the check inside the VM lets the agent restore the test itself; running it again before the PR is the wall.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/harness/src/checks/false-heal.ts (part 2 of 2)",
-    "text": "    for (const [key, oldValue, newValue] of pairedChanges(THRESHOLD, f)) {  // the same key on a removed and an added line\n      const loosened = key.toLowerCase().includes(\"fail\") ? newValue < oldValue : newValue > oldValue;\n      if (loosened) found.push(`${f.path}: ${key} loosened ${oldValue} -> ${newValue}`);\n    }\n    if (never.has(\"add_retries_or_sleeps\")) {\n      found.push(...f.added.filter((line) => RETRY_OR_SLEEP.test(line)).map(() => `${f.path}: retry or sleep added`));\n    }\n    if (never.has(\"add_code\") && !onlyRemovesTokens(f)) {  // dead-code removers may only delete\n      found.push(`${f.path}: new code in a deletions-only routine`);\n    }\n  }\n  return found;  // any finding → outcome false_heal: rejected, and counted on the trust ladder (G5-15)\n}",
+    "file": "ai-agents/harness/src/checks/false-heal.ts",
+    "text": "const TEST_FILE = /(^|\\/)(tests?|e2e|integration-tests)\\/|\\.(test|spec)\\.tsx?$|(^|\\/)test_[^/]*\\.py$/;\nconst SKIP = /\\b(it|test|describe)\\.(skip|only|fixme)\\(|@pytest\\.mark\\.(skip|xfail)|@unittest\\.skip/;\nconst ASSERT = /\\bassert\\b|self\\.assert\\w+\\(|\\bexpect\\(/;\nconst THRESHOLD = /(fail[-_]under|retries|timeout\\w*)\\s*[:=]\\s*([\\d.]+)/i;\n\nexport const falseHeals = (diff: FileDiff[], never: Set<string>): string[] => {\n  const found: string[] = [];\n  for (const f of diff) {\n    const isTest = TEST_FILE.test(f.path);\n    if (f.deleted && isTest) found.push(`${f.path}: test file deleted`);\n    for (const line of f.added.filter((l) => SKIP.test(l))) found.push(`${f.path}: new skip \\`${line.trim()}\\``);\n    if (isTest) {\n      const removed = count(ASSERT, f.removed), added = count(ASSERT, f.added);\n      if (removed > added) found.push(`${f.path}: ${removed - added} assertion(s) removed`);\n      if (never.has(\"edit_test_assertions\") && removed > 0) found.push(`${f.path}: an existing assertion was changed`);\n    }\n    for (const [key, oldValue, newValue] of pairedChanges(THRESHOLD, f)) {\n      const loosened = key.toLowerCase().includes(\"fail\") ? newValue < oldValue : newValue > oldValue;\n      if (loosened) found.push(`${f.path}: ${key} loosened ${oldValue} -> ${newValue}`);\n    }\n  }\n  return found;\n};",
     "notes": [
      {
       "line": 1,
-      "text": "Each threshold key that appears on a removed line and on an added line."
+      "text": "A test file on either stack: under test/, tests/ or e2e/, or named *.test.ts, *.spec.tsx, test_*.py."
      },
      {
       "line": 2,
-      "text": "For fail-under, lower is looser. For retries and timeouts, higher is looser."
+      "text": "New skips in Vitest, Playwright, pytest and unittest. .only counts too, because it silently skips every other test."
      },
      {
       "line": 3,
-      "text": "The finding names the key and both values."
+      "text": "An assertion line: assert, self.assertEqual and friends, or expect(."
      },
      {
-      "line": 5,
-      "text": "Only when the charter forbids it: any added sleep or retry is a finding."
-     },
-     {
-      "line": 8,
-      "text": "A deletions-only routine may shorten lines but never add new code."
-     },
-     {
-      "line": 12,
-      "text": "Any finding gives outcome false_heal: rejected, and counted on the trust ladder."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "wall",
-    "text": "Agents never weaken the checks they are judged by. The false-heal check, G0's weakened-tests check and the scope judge enforce the same rule in three places."
-   }
-  },
-  {
-   "h": "The pipeline fixer, part 1: workflow weakeners",
-   "p": [
-    "DevOps checks are growing (G7), and red pipelines block everyone. The pipeline fixer takes red check workflows in infrastructure, gitops and fcp's .github/. It reproduces the check on a lite VM and proposes a fix with the check's output.",
-    "Its walls: no cloud credentials in the VM, and never tofu or terraform apply or destroy, argocd app sync or workflow_dispatch. G3's guard rails also block these commands. A person applies anything that touches cloud resources.",
-    "Editing .github/workflows/ needs GitHub's workflows permission, which the rhino-ai-agents App does not have. Until Security agrees to a grant for this fixer only, it posts workflow changes as a patch on the ticket. A person applies it."
-   ],
-   "because": "Workflow files can be weakened in ways test regexes never see, like switching a job off. So they get their own rules.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/harness/src/checks/false-heal-workflows.ts (part 1 of 2)",
-    "text": "// ai-agents/harness/src/checks/false-heal-workflows.ts: sketch: extra false-heal rules for workflow files\nimport { parse } from \"yaml\";\n\nconst WEAKENERS: [RegExp, string][] = [\n  [/^\\s*continue-on-error:\\s*true/, \"continue-on-error added\"],\n  [/^\\s*if:\\s*(false|\\$\\{\\{\\s*false\\s*\\}\\})\\s*$/, \"job or step switched off\"],\n  [/\\|\\|\\s*(true|exit 0)\\s*$/, \"failure swallowed with || true\"],\n  [/-check=false|--no-verify|--exit-code[ =]0/, \"check flag turned off\"],\n];\n\nexport function workflowFalseHeals(diff: FileDiff[], requiredChecks: Set<string>): string[] {\n  const found: string[] = [];\n  for (const f of diff) {\n    if (!f.path.startsWith(\".github/workflows/\")) continue;\n    for (const line of f.added) {\n      found.push(...WEAKENERS.filter(([rx]) => rx.test(line)).map(([, why]) => `${f.path}: ${why}`));\n    }\n    const before = jobNames(f.oldText), after = jobNames(f.newText);\n    for (const name of before) {  // required checks come from the ruleset (G0)\n      if (!after.has(name) && requiredChecks.has(name)) found.push(`${f.path}: removed required check '${name}'`);\n    }",
-    "notes": [
-     {
-      "line": 2,
-      "text": "Workflow files are parsed as YAML to compare jobs."
-     },
-     {
-      "line": 5,
-      "text": "A failing step that no longer fails the job."
-     },
-     {
-      "line": 6,
-      "text": "if: false, plain or as ${{ false }}."
-     },
-     {
-      "line": 7,
-      "text": "A command ending in || true or || exit 0 can never fail."
-     },
-     {
-      "line": 8,
-      "text": "Flags that turn a check off, such as --no-verify or -check=false."
+      "line": 4,
+      "text": "A threshold with a number. Group 1 is the key, group 2 the value."
      },
      {
       "line": 11,
-      "text": "Input: the diff and the required check names from G0's ruleset."
+      "text": "A skip is a finding in any file, not only in test files."
      },
      {
       "line": 14,
-      "text": "Only workflow files are checked here."
+      "text": "Fewer assertions than before."
      },
      {
       "line": 15,
-      "text": "Every added line against every weakener."
+      "text": "With this never-rule, touching any existing assertion is a finding, even if the count stays the same."
+     },
+     {
+      "line": 17,
+      "text": "pairedChanges finds the same key on a removed and an added line, with the old and new value."
      },
      {
       "line": 18,
-      "text": "The check names before and after the change."
-     },
-     {
-      "line": 20,
-      "text": "A required check that disappears is a false heal."
+      "text": "For fail-under, lower is looser. For retries and timeouts, higher is looser."
      }
+    ]
+   },
+   "deeper": {
+    "h": "Go deeper: false heals in workflow files",
+    "p": [
+     "The pipeline fixer works on CI workflows themselves, and workflows can be weakened in ways that test-file rules never see. So it gets extra rules: no continue-on-error: true (a failing step that no longer fails the job), no if: false on a job or step, no command ending in || true, no flag that turns a check off such as --no-verify, no required check removed, and no trigger paths narrowed so that a check stops running on some changes. Until Security agrees to a grant for this fixer only, it cannot push workflow changes at all, because our GitHub App has no permission to edit workflow files; it posts its change as a patch for a person to apply."
     ]
    }
   },
   {
-   "h": "The pipeline fixer, part 2: narrowed triggers",
+   "h": "Where the check runs, and what a finding costs",
    "p": [
-    "A subtle weakener: narrowing a workflow's trigger paths, so the check stops running on some changes. If the new path list is a strict subset of the old one, it is a finding.",
-    "Done means the failing check passes in the VM. Add a plan or rendered diff from CI when one exists. Today infrastructure CI only checks formatting, so the PR says plainly that no plan was run. Triggers come from the copies of the trigger Action in infrastructure and gitops."
+    "The check runs in two places. Inside the VM, the harness runs it from the Stop hook, the hook that runs when the agent says it is done. A finding there sends the agent back to work with the reason, so it can restore the test and fix the code instead, which is the cheapest moment to catch it. Then, before any pull request exists, it runs again on the final diff, ahead of the scope judge. That second run is the wall: whatever happened in the session, a weakened test does not leave the VM as a routine's PR.",
+    "For Nova the findings are flags in the PR, because a person asked for that work and may have a reason. For a routine, any finding rejects the run with the outcome false_heal, no PR is opened, and the trust ladder moves the routine one step down. One false heal costs a routine more than ten good fixes earn it, and that is on purpose: a weakened test that ships is worse than a red main, because nobody knows to look."
    ],
-   "because": "A check that no longer runs is as weak as a check that always passes.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/harness/src/checks/false-heal-workflows.ts (part 2 of 2)",
-    "text": "    const oldPaths = triggerPaths(f.oldText), newPaths = triggerPaths(f.newText);\n    if (newPaths.size < oldPaths.size && [...newPaths].every((p) => oldPaths.has(p))) {\n      found.push(`${f.path}: trigger paths narrowed, so the check stops running on some changes`);\n    }\n  }\n  return found;  // merged with falseHeals() (G5-14); any finding rejects the run\n}\n\nfunction jobNames(text: string): Set<string> {  // parsed with the yaml package; a job's check name is name: or its id\n  const jobs: Record<string, { name?: string }> = parse(text)?.jobs ?? {};\n  return new Set(Object.entries(jobs).map(([id, job]) => job.name ?? id));\n}",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The paths: filters of the workflow's triggers, before and after."
-     },
-     {
-      "line": 2,
-      "text": "Fewer paths, and every new path was already there: the trigger was narrowed."
-     },
-     {
-      "line": 3,
-      "text": "The finding says what that means: the check stops running on some changes."
-     },
-     {
-      "line": 6,
-      "text": "These findings join the general ones. Any finding rejects the run."
-     },
-     {
-      "line": 9,
-      "text": "Parse the YAML and list jobs."
-     },
-     {
-      "line": 11,
-      "text": "A job's check name is its name: if set, else its id."
-     }
+   "deeper": {
+    "h": "Go deeper: the backend CI fixer's hand-offs",
+    "p": [
+     "The backend CI fixer reuses the same flow for cloud and client CI, with cloud/, client/ and sdk/ as its paths and migrations denied. Some failures it never tries to fix. Protoc drift touches the gRPC stubs in common/fcp_common/, the contract between cloud and client, which is outside its paths. A failing makemigrations --check means a database migration, and the pilot allows none. Integration tests that need the QA environments cannot run in the VM. All three go to the backend guild with the evidence."
     ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "The G5-25 sketch calls triggerPaths, but no ticket defines it. Write it next to jobNames: parse the workflow YAML and collect the on.<event>.paths lists into a Set. Add a test for it, since the check depends on it."
    }
   }
  ],
  "lab": {
-  "title": "Catch false heals in fixture diffs",
-  "youNeed": [
-   "Node 22 or newer",
-   "npm",
-   "a terminal"
+  "id": "g5-5",
+  "title": "Catch the false heal",
+  "minutes": 30,
+  "needs": [
+   "Node 22.18 or newer (it runs .ts files directly)",
+   "git",
+   "A terminal"
   ],
-  "worked": [
+  "goal": "Break main in a tiny repo, make three fixes that all turn CI green, and write the check that tells the honest one from the two false heals.",
+  "mode": "guided",
+  "guess": {
+   "q": "Your first version of the check counts assertion lines and rejects a diff when it removes more than it adds. The fixer changes assert.equal(emptyMessage(0), \"No projects yet\") into assert.equal(emptyMessage(0), \"\"). Does the counting rule catch it?",
+   "options": [
+    {
+     "text": "Yes, because an assertion line was removed.",
+     "correct": false,
+     "why": "One assertion line was removed, but one was added too, so the count did not go down."
+    },
+    {
+     "text": "No, because the number of assertions stays the same.",
+     "correct": true,
+     "why": "That is the gap. The never-rule edit_test_assertions closes it by rejecting any removed assertion line in a CI fixer's diff."
+    },
+    {
+     "text": "No, because the check only looks at source files.",
+     "correct": false,
+     "why": "The assertion rules look at test files only. The problem here is that the count is unchanged."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "mkdir -p ~/academy/g5-5/src ~/academy/g5-5/test/fixtures && cd ~/academy/g5-5 && npm init -y >/dev/null && npm pkg set type=module && npm install --save-dev typescript@5.9.3 tsx@4.20.3 @types/node@24",
-    "see": "added <n> packages\nfound 0 vulnerabilities"
+    "say": "Make a tiny repo with one function, its tests and a Playwright config, and commit it as a green main.",
+    "do": "mkdir -p ~/academy-labs/g5-5/fcp && cd ~/academy-labs/g5-5/fcp\ngit init -q -b main && git config user.email lab@example.com && git config user.name Lab\nmkdir -p src test\ncat > src/projects.ts <<'EOF'\nexport const emptyMessage = (projectCount: number): string =>\n  projectCount === 0 ? \"No projects yet\" : \"\";\nEOF\ncat > test/projects.test.ts <<'EOF'\nimport { test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { emptyMessage } from \"../src/projects.ts\";\n\ntest(\"shows No projects yet when there are no projects\", () => {\n  assert.equal(emptyMessage(0), \"No projects yet\");\n});\n\ntest(\"shows nothing when there are projects\", () => {\n  assert.equal(emptyMessage(3), \"\");\n});\nEOF\necho 'export default { retries: 0, timeout: 30000 };' > playwright.config.ts\ngit add . && git commit -qm \"main is green\" && node --test 2>&1 | grep -E \"^# (pass|fail)\"",
+    "see": "# pass 2\n# fail 0"
    },
    {
-    "do": "Save src/diff.ts, a small reader for git diff output and the two helpers the sketch uses:\nexport interface FileDiff { path: string; deleted: boolean; added: string[]; removed: string[] }\n\n/** Read a unified diff (git diff output) into one entry per file. Enough for the false-heal check. */\nexport function parseDiff(text: string): FileDiff[] {\n  const files: FileDiff[] = [];\n  let f: FileDiff | undefined;\n  for (const line of text.split(\"\\n\")) {\n    const head = /^diff --git a\\/(\\S+) b\\//.exec(line);\n    if (head) { f = { path: head[1], deleted: false, added: [], removed: [] }; files.push(f); continue; }\n    if (!f || line.startsWith(\"+++\") || line.startsWith(\"---\")) continue;\n    if (line.startsWith(\"deleted file mode\")) f.deleted = true;\n    else if (line.startsWith(\"+\")) f.added.push(line.slice(1));\n    else if (line.startsWith(\"-\")) f.removed.push(line.slice(1));\n  }\n  return files;\n}\n\n/** [key, old, new] for every threshold whose key appears on a removed line and on an added line. */\nexport function pairedChanges(rx: RegExp, f: FileDiff): [string, number, number][] {\n  const values = (lines: string[]) => new Map(lines.map((l) => rx.exec(l)).filter((m) => m !== null).map((m) => [m[1], Number(m[2])]));\n  const before = values(f.removed), after = values(f.added);\n  return [...before].filter(([key]) => after.has(key)).map(([key, old]) => [key, old, after.get(key)!]);\n}\n\n/** True when every added line is a removed line with some names taken out, e.g. a shorter import. */\nexport function onlyRemovesTokens(f: FileDiff): boolean {\n  const words = (l: string) => l.match(/\\w+/g) ?? [];\n  return f.added.every((a) => f.removed.some((r) => words(a).every((w) => words(r).includes(w))));\n}",
-    "see": "src/diff.ts exports FileDiff, parseDiff, pairedChanges and onlyRemovesTokens."
+    "say": "Break main the way the 10:02 refactor did, and reproduce the failure, because \"is it us?\" always comes first.",
+    "do": "cat > src/projects.ts <<'EOF'\nexport const emptyMessage = (projectCount: number): string =>\n  projectCount < 0 ? \"No projects yet\" : \"\";\nEOF\ngit commit -qam \"refactor: simplify the empty state\" && node --test --test-reporter=spec 2>&1 | head -2",
+    "see": "✖ shows No projects yet when there are no projects (1.2ms)\n✔ shows nothing when there are projects (0.0855ms)"
    },
    {
-    "do": "Save both false-heal.ts blocks as src/false-heal.ts. Replace the first comment line with:\nimport { type FileDiff, onlyRemovesTokens, pairedChanges } from \"./diff.js\";",
-    "see": "src/false-heal.ts exports falseHeals."
+    "say": "Make three fixes on three branches: an honest one, a skip, and an edited expectation. Watch all three turn CI green.",
+    "do": "git switch -qc fix/honest && sed -i.bak 's/projectCount < 0/projectCount === 0/' src/projects.ts\ngit commit -qam \"fix: show the empty card again\" && node --test 2>&1 | grep -E \"^# (pass|fail|skipped) [1-9]\"\ngit switch -q main && git switch -qc fix/skip\nsed -i.bak 's/^test(\"shows No projects yet/test.skip(\"shows No projects yet/' test/projects.test.ts\ngit commit -qam \"fix: unblock main\" && node --test 2>&1 | grep -E \"^# (pass|fail|skipped) [1-9]\"\ngit switch -q main && git switch -qc fix/expect\nsed -i.bak 's/emptyMessage(0), \"No projects yet\"/emptyMessage(0), \"\"/' test/projects.test.ts\ngit commit -qam \"test: match the new empty state\" && node --test 2>&1 | grep -E \"^# (pass|fail|skipped) [1-9]\"\ngit switch -q main && rm -f src/*.bak test/*.bak",
+    "see": "# pass 2\n# pass 1\n# skipped 1\n# pass 2"
    },
    {
-    "do": "Create the five fixtures the ticket asks for:\ncat > test/fixtures/honest-fix.diff <<'EOF'\ndiff --git a/frontend/src/components/ProjectsTable.tsx b/frontend/src/components/ProjectsTable.tsx\n--- a/frontend/src/components/ProjectsTable.tsx\n+++ b/frontend/src/components/ProjectsTable.tsx\n@@ -12,7 +12,7 @@\n-\tconst visible = projects.filter((p) => p.name.includes(search))\n+\tconst visible = search ? projects.filter((p) => p.name.includes(search)) : projects\nEOF\n\ncat > test/fixtures/deleted-test.diff <<'EOF'\ndiff --git a/frontend/test/unit/projectsTable.test.tsx b/frontend/test/unit/projectsTable.test.tsx\ndeleted file mode 100644\n--- a/frontend/test/unit/projectsTable.test.tsx\n+++ /dev/null\n@@ -1,5 +0,0 @@\n-it(\"lists every project when the search is empty\", () => {\n-\texpect(screen.getAllByRole(\"row\")).toHaveLength(3)\n-})\nEOF\n\ncat > test/fixtures/it-skip.diff <<'EOF'\ndiff --git a/frontend/test/unit/projectsTable.test.tsx b/frontend/test/unit/projectsTable.test.tsx\n--- a/frontend/test/unit/projectsTable.test.tsx\n+++ b/frontend/test/unit/projectsTable.test.tsx\n@@ -1,3 +1,3 @@\n-it(\"lists every project when the search is empty\", () => {\n+it.skip(\"lists every project when the search is empty\", () => {\nEOF\n\ncat > test/fixtures/fail-under.diff <<'EOF'\ndiff --git a/cloud/rhinoCloud/pyproject.toml b/cloud/rhinoCloud/pyproject.toml\n--- a/cloud/rhinoCloud/pyproject.toml\n+++ b/cloud/rhinoCloud/pyproject.toml\n@@ -40,1 +40,1 @@\n-fail_under = 50\n+fail_under = 40\nEOF\n\ncat > test/fixtures/sleep.diff <<'EOF'\ndiff --git a/cloud/rhinoCloud/rhinoCore/tests/services/test_dataset_service.py b/cloud/rhinoCloud/rhinoCore/tests/services/test_dataset_service.py\n--- a/cloud/rhinoCloud/rhinoCore/tests/services/test_dataset_service.py\n+++ b/cloud/rhinoCloud/rhinoCore/tests/services/test_dataset_service.py\n@@ -30,2 +30,3 @@\n         self.service.start_import(dataset)\n+        time.sleep(2)\n         self.assertEqual(dataset.status, \"imported\")\nEOF",
-    "see": "Five .diff files: an honest fix, a deleted test, an it.skip, a lower fail_under, an added time.sleep."
-   },
-   {
-    "do": "Save test/false-heal.test.ts:\nimport { test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { readFileSync } from \"node:fs\";\nimport { parseDiff } from \"../src/diff.js\";\nimport { falseHeals } from \"../src/false-heal.js\";\n\nconst fixture = (name: string) => parseDiff(readFileSync(new URL(`./fixtures/${name}.diff`, import.meta.url), \"utf8\"));\nconst CI_FIXER = new Set([\"edit_test_assertions\"]);\nconst FLAKY_FIXER = new Set([\"add_retries_or_sleeps\", \"edit_test_assertions\"]);\n\ntest(\"an honest fix has no findings\", () => {\n  assert.deepEqual(falseHeals(fixture(\"honest-fix\"), CI_FIXER), []);\n});\ntest(\"a deleted test file is a false heal\", () => {\n  assert.match(falseHeals(fixture(\"deleted-test\"), CI_FIXER).join(\"\\n\"), /test file deleted/);\n});\ntest(\"a new it.skip is a false heal\", () => {\n  assert.match(falseHeals(fixture(\"it-skip\"), CI_FIXER).join(\"\\n\"), /new skip/);\n});\ntest(\"a lower fail_under is a false heal\", () => {\n  assert.deepEqual(falseHeals(fixture(\"fail-under\"), CI_FIXER), [\"cloud/rhinoCloud/pyproject.toml: fail_under loosened 50 -> 40\"]);\n});\ntest(\"a sleep added by the flaky-test fixer is a false heal\", () => {\n  assert.match(falseHeals(fixture(\"sleep\"), FLAKY_FIXER).join(\"\\n\"), /retry or sleep added/);\n});",
-    "see": "Five tests, one per fixture."
-   },
-   {
-    "do": "node --import tsx --test --test-reporter=spec \"test/**/*.test.ts\"",
-    "see": "✔ an honest fix has no findings\n✔ a deleted test file is a false heal\n✔ a new it.skip is a false heal\n✔ a lower fail_under is a false heal\n✔ a sleep added by the flaky-test fixer is a false heal\nℹ tests 5\nℹ pass 5\nℹ fail 0"
-   },
-   {
-    "do": "Print the findings for the deleted test with the CI fixer's never-list:\nnpx tsx -e 'import {readFileSync} from \"node:fs\"; import {parseDiff} from \"./src/diff.ts\"; import {falseHeals} from \"./src/false-heal.ts\"; console.log(falseHeals(parseDiff(readFileSync(\"test/fixtures/deleted-test.diff\",\"utf8\")), new Set([\"edit_test_assertions\"])))'",
-    "see": "[\n  'frontend/test/unit/projectsTable.test.tsx: test file deleted',\n  'frontend/test/unit/projectsTable.test.tsx: 1 assertion(s) removed',\n  'frontend/test/unit/projectsTable.test.tsx: an existing assertion was changed'\n]"
+    "say": "Write the first version of the check. It reads git diff between main and a branch, and it only knows about deleted test files and new skips.",
+    "do": "cd ~/academy-labs/g5-5\ncat > false-heal.ts <<'EOF'\nimport { execFileSync } from \"node:child_process\";\n\ntype FileDiff = { path: string; deleted: boolean; added: string[]; removed: string[] };\n\nconst TEST_FILE = /(^|\\/)(tests?|e2e)\\/|\\.(test|spec)\\.tsx?$|(^|\\/)test_[^/]*\\.py$/;\nconst SKIP = /\\b(it|test|describe)\\.(skip|only|fixme)\\(|@pytest\\.mark\\.(skip|xfail)/;\nconst ASSERT = /\\bassert\\b|\\bexpect\\(/;\nconst THRESHOLD = /(fail[-_]under|retries|timeout\\w*)\\s*[:=]\\s*([\\d.]+)/i;\n\n// read `git diff` output into one entry per file\nconst parseDiff = (text: string): FileDiff[] => {\n  const files: FileDiff[] = [];\n  let f: FileDiff | undefined;\n  for (const line of text.split(\"\\n\")) {\n    const head = /^diff --git a\\/(\\S+) b\\//.exec(line);\n    if (head) files.push((f = { path: head[1], deleted: false, added: [], removed: [] }));\n    else if (!f || line.startsWith(\"+++\") || line.startsWith(\"---\")) continue;\n    else if (line.startsWith(\"deleted file\")) f.deleted = true;\n    else if (line.startsWith(\"+\")) f.added.push(line.slice(1));\n    else if (line.startsWith(\"-\")) f.removed.push(line.slice(1));\n  }\n  return files;\n};\n\nexport const falseHeals = (diff: FileDiff[], never: Set<string>): string[] => {\n  const found: string[] = [];\n  for (const f of diff) {\n    const isTest = TEST_FILE.test(f.path);\n    if (f.deleted && isTest) found.push(`${f.path}: test file deleted`);\n    for (const line of f.added.filter((l) => SKIP.test(l))) found.push(`${f.path}: new skip \\`${line.trim()}\\``);\n    // your rules for removed assertions, changed assertions and looser thresholds go here\n  }\n  return found;\n};\n\nconst [repo, branch] = process.argv.slice(2);\nconst diff = execFileSync(\"git\", [\"-C\", repo, \"diff\", `main...${branch}`], { encoding: \"utf8\" });\nconst found = falseHeals(parseDiff(diff), new Set([\"edit_test_assertions\"]));\nconsole.log(found.length ? `✘ ${branch}: false heal\\n  ${found.join(\"\\n  \")}` : `✔ ${branch}: no false heal`);\nprocess.exitCode = found.length ? 1 : 0;\nEOF\nfor b in fix/honest fix/skip fix/expect; do node false-heal.ts fcp $b; done",
+    "see": "✔ fix/honest: no false heal\n✘ fix/skip: false heal\n  test/projects.test.ts: new skip `test.skip(\"shows No projects yet when there are no projects\", () => {`\n✔ fix/expect: no false heal"
    }
   ],
-  "faded": "Add a sixth fixture, timeout.diff, that changes frontend/playwright.config.ts from \"\\ttimeout: 240000,\" to \"\\ttimeout: 480000,\". Write its test like the fail_under one. The expected finding is left to you to predict before you run it.",
-  "alone": "Test the add_code rule for a dead-code remover. Write one fixture where an import line only loses a name and an unused function is deleted: no finding. Write a second where a deleted function is replaced by a new one: the finding \"new code in a deletions-only routine\". Use new Set([\"add_code\"]) as the never-list.",
-  "done": "Seven or more tests pass, and for each fixture you can name the regex or rule that caught it."
+  "build": "The edited expectation got through. Add the missing rules where the comment says: in test files, count assertion lines (the ASSERT pattern) on removed and added lines and report when more were removed; when the never-list has edit_test_assertions, report any removed assertion line; and for every THRESHOLD key that appears on both a removed and an added line, report it as loosened when a fail-under value went down or a retries or timeout value went up. Then make a fourth branch, fix/retries, that changes retries: 0 to retries: 2 in playwright.config.ts, and run the check on all four branches.",
+  "checks": [
+   "✔ fix/honest: no false heal",
+   "✘ fix/skip reports the new skip.",
+   "✘ fix/expect reports: test/projects.test.ts: an existing assertion was changed",
+   "✘ fix/retries reports: playwright.config.ts: retries loosened 0 -> 2",
+   "If you remove edit_test_assertions from the never set at the bottom of the file, fix/expect passes again, which shows why CI fixers carry that rule."
+  ],
+  "solution": {
+   "lang": "typescript",
+   "file": "~/academy-labs/g5-5/false-heal.ts",
+   "text": "import { execFileSync } from \"node:child_process\";\n\ntype FileDiff = { path: string; deleted: boolean; added: string[]; removed: string[] };\n\nconst TEST_FILE = /(^|\\/)(tests?|e2e)\\/|\\.(test|spec)\\.tsx?$|(^|\\/)test_[^/]*\\.py$/;\nconst SKIP = /\\b(it|test|describe)\\.(skip|only|fixme)\\(|@pytest\\.mark\\.(skip|xfail)/;\nconst ASSERT = /\\bassert\\b|\\bexpect\\(/;\nconst THRESHOLD = /(fail[-_]under|retries|timeout\\w*)\\s*[:=]\\s*([\\d.]+)/i;\n\n// read `git diff` output into one entry per file\nconst parseDiff = (text: string): FileDiff[] => {\n  const files: FileDiff[] = [];\n  let f: FileDiff | undefined;\n  for (const line of text.split(\"\\n\")) {\n    const head = /^diff --git a\\/(\\S+) b\\//.exec(line);\n    if (head) files.push((f = { path: head[1], deleted: false, added: [], removed: [] }));\n    else if (!f || line.startsWith(\"+++\") || line.startsWith(\"---\")) continue;\n    else if (line.startsWith(\"deleted file\")) f.deleted = true;\n    else if (line.startsWith(\"+\")) f.added.push(line.slice(1));\n    else if (line.startsWith(\"-\")) f.removed.push(line.slice(1));\n  }\n  return files;\n};\n\nconst count = (rx: RegExp, lines: string[]) => lines.filter((l) => rx.test(l)).length;\n\nconst thresholds = (lines: string[]) =>\n  new Map(lines.map((l) => THRESHOLD.exec(l)).filter((m) => m !== null).map((m) => [m[1], Number(m[2])]));\n\nexport const falseHeals = (diff: FileDiff[], never: Set<string>): string[] => {\n  const found: string[] = [];\n  for (const f of diff) {\n    const isTest = TEST_FILE.test(f.path);\n    if (f.deleted && isTest) found.push(`${f.path}: test file deleted`);\n    for (const line of f.added.filter((l) => SKIP.test(l))) found.push(`${f.path}: new skip \\`${line.trim()}\\``);\n    if (isTest) {\n      const removed = count(ASSERT, f.removed), added = count(ASSERT, f.added);\n      if (removed > added) found.push(`${f.path}: ${removed - added} assertion(s) removed`);\n      if (never.has(\"edit_test_assertions\") && removed > 0) found.push(`${f.path}: an existing assertion was changed`);\n    }\n    const before = thresholds(f.removed), after = thresholds(f.added);\n    for (const [key, oldValue] of before) {\n      const newValue = after.get(key);\n      if (newValue === undefined) continue;\n      const loosened = key.toLowerCase().includes(\"fail\") ? newValue < oldValue : newValue > oldValue;\n      if (loosened) found.push(`${f.path}: ${key} loosened ${oldValue} -> ${newValue}`);\n    }\n  }\n  return found;\n};\n\nconst [repo, branch] = process.argv.slice(2);\nconst diff = execFileSync(\"git\", [\"-C\", repo, \"diff\", `main...${branch}`], { encoding: \"utf8\" });\nconst found = falseHeals(parseDiff(diff), new Set([\"edit_test_assertions\"]));\nconsole.log(found.length ? `✘ ${branch}: false heal\\n  ${found.join(\"\\n  \")}` : `✔ ${branch}: no false heal`);\nprocess.exitCode = found.length ? 1 : 0;"
+  },
+  "fix": "A teammate made the check \"smarter\": it now skips files whose path contains /e2e/, because \"end-to-end tests are flaky anyway, the fixer should be allowed to tune them\". The next week a fixer raises a Playwright timeout from 30000 to 120000 in an e2e helper and adds test.fixme to a spec, and both pass the check. Find the line that lets them through and remove it, then explain why a flaky test is a reason for the flaky-test fixer, never for loosening a check.",
+  "explain": [
+   "Why is the false-heal check a short program reading the diff, and not an instruction in the prompt or a question for the scope judge?",
+   "Why does counting assertions miss a changed expectation, and which charter rule closes that gap?",
+   "Why does the check run twice, once in the Stop hook and once before the PR?"
+  ],
+  "done": "The check passes the honest fix and rejects the skip, the edited expectation and the raised retries, each with a reason a person can read."
  },
- "quiz": [
+ "check": [
   {
-   "q": "The fe-ci-fixer runs the failed commands at main's head in the VM, and they pass. What does it do?",
+   "q": "The CI fixer runs the failed unit tests at main's newest commit in its VM, and they pass. What does it do?",
    "options": [
     {
-     "text": "Pushes a no-op commit to re-trigger CI",
+     "text": "Pushes an empty commit so CI runs again",
      "correct": false,
-     "why": "Nova and the routines never re-run or dispatch CI; there is also nothing to fix."
+     "why": "Agents never re-run or dispatch CI. And green in the VM already says the code is not the problem."
     },
     {
-     "text": "Posts the evidence to #ai-agents-alerts and stops: environment or flake",
+     "text": "Makes the most likely fix anyway, to be safe",
+     "correct": false,
+     "why": "That is fixing code that is not broken, the most common way a CI fixer goes wrong."
+    },
+    {
+     "text": "Posts the evidence to #ai-agents-alerts and stops, because the failure is in the environment or a flake",
      "correct": true,
-     "why": "Green in the VM means the code is not the problem."
-    },
-    {
-     "text": "Fixes the most likely file anyway",
-     "correct": false,
-     "why": "That is exactly the fix of code that is not broken that check_main_first prevents."
+     "why": "Is it us? No. A person deals with runners, mirrors and QA environments."
     }
    ]
   },
   {
-   "q": "A fix changes fail_under = 50 to fail_under = 40. What does the false-heal check report for a routine?",
+   "q": "A routine's fix changes fail_under = 50 to fail_under = 40 in a coverage config and turns CI green. What happens?",
    "options": [
     {
-     "text": "Nothing; it is a config file, not a test",
-     "correct": false,
-     "why": "Thresholds are checked in every file, not only tests."
-    },
-    {
-     "text": "fail_under loosened 50 -> 40, and the run is rejected as false_heal",
+     "text": "The check reports fail_under loosened 50 -> 40, the run ends as a false heal, no PR opens, and the routine steps down",
      "correct": true,
-     "why": "For fail-under, lower is looser. For routines any finding rejects the run."
+     "why": "For fail-under, lower is looser. For a routine, any finding rejects the run and counts on the trust ladder."
     },
     {
-     "text": "A flag in the PR, and a person decides",
+     "text": "Nothing, because it is a config file and not a test",
      "correct": false,
-     "why": "That is the behaviour for Nova. For routines it is a rejection."
+     "why": "The threshold rule reads every file. A config that sets how strict the tests are is part of the tests."
+    },
+    {
+     "text": "The PR opens with a flag, and a person decides",
+     "correct": false,
+     "why": "That is how Nova's findings are handled. For routines, a finding rejects the run."
     }
    ]
   },
   {
-   "q": "The pipeline fixer's fix changes .github/workflows/infra-lint.yml. How does it reach the repo today?",
+   "q": "Why does a single false heal cost a routine so much?",
    "options": [
     {
-     "text": "It pushes the change through the broker",
+     "text": "Because false heals are expensive to compute",
      "correct": false,
-     "why": "The rhino-ai-agents App has no workflows permission, so a push to workflow files is refused."
+     "why": "The check is a few regular expressions. The cost is about trust, not compute."
     },
     {
-     "text": "It posts the change as a patch on the ticket for a person to apply",
+     "text": "Because a false heal that ships hides a bug behind a green main, so nobody knows to look, which is worse than a red main",
      "correct": true,
-     "why": "Until Security agrees to a pipeline-fixer-only grant."
+     "why": "A red main is loud and gets fixed. A weakened test is quiet and stays. That is why it is the one failure that must never ship."
     },
     {
-     "text": "It runs gh workflow run to test it first",
+     "text": "Because a false heal means the routine has a bug in its harness",
      "correct": false,
-     "why": "workflow_dispatch is never allowed for agents."
+     "why": "It can happen with a perfectly working harness. It is a shortcut the model took, which is why code checks for it."
     }
    ]
   }
  ],
- "recall": [
-  "From lesson g5-4: which outcomes count against a routine in the circuit breaker?",
-  "From lesson g0-4: what does G0's weakened-tests check look for in a PR?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "The check is harness/src/checks/false-heal.ts in ai-agents, built on G0's weakened-tests detector (checks/src/weakened-tests.ts) so there is one implementation, with the charter rules edit_test_assertions, add_code and add_retries_or_sleeps added. It runs from the Stop hook in the VM and on the final diff before the scope judge; harness/test/false-heal.test.ts covers real diffs (an honest fix, a deleted test, an it.skip, a lowered --fail-under, an added time.sleep).",
+   "The FE CI fixer uses the fe-ci-fixer charter in shadow, with routines/fe-ci-fixer/jobs.yaml, the skills fix-ci, fe-codebase, verify, fcp-lab and pr-story, Opus 5.5 at low effort (medium on a failed step) and a lite Spot VM. Its fix must pass npm run verify and the reproduced commands. The BE CI fixer reuses it with routines/be-ci-fixer/jobs.yaml. The pipeline fixer adds harness/src/checks/false-heal-workflows.ts for workflow files and posts workflow changes as a patch until Security agrees to a workflows grant."
+  ],
+  "tickets": [
+   {
+    "key": "G5-14",
+    "why": "The false-heal check: the patterns, the charter rules, the Stop hook and the run before the scope judge."
+   },
+   {
+    "key": "G5-20",
+    "why": "The FE CI fixer: jobs.yaml, \"is it us?\" first, the smallest fix inside frontend/."
+   },
+   {
+    "key": "G5-22",
+    "why": "The BE CI fixer: the same flow for cloud and client CI, with its hand-offs."
+   },
+   {
+    "key": "G5-25",
+    "why": "The pipeline fixer and the extra false-heal rules for workflow files."
+   }
+  ]
+ },
  "words": [
   {
    "term": "false heal",
-   "plain": "A fix that turns CI green by weakening a test or a check instead of fixing the cause."
+   "plain": "A change that turns CI green by weakening a test or a check instead of fixing the code."
   },
   {
    "term": "is it us?",
-   "plain": "The CI fixer's first step: run the failed commands at main's head in the VM."
+   "plain": "The CI fixer's first step: run the failed commands at main's head in the VM. Green there means the environment, not our code."
   },
   {
-   "term": "jobs.yaml",
-   "plain": "A data file per CI fixer that maps each CI job to the commands that reproduce it, and names hand-offs."
-  },
-  {
-   "term": "hand-off",
-   "plain": "A failure the routine must not fix; it posts the evidence and gives it to a person or team."
-  },
-  {
-   "term": "protoc drift",
-   "plain": "Generated gRPC stubs out of step with the .proto files: the cloud-client contract."
+   "term": "never-list",
+   "plain": "Extra rules in a charter, such as edit_test_assertions, that the false-heal check enforces for that routine."
   },
   {
    "term": "threshold",
-   "plain": "A number a check compares against, such as fail-under, retries or a timeout."
+   "plain": "A number that sets how strict a check is, such as a coverage minimum, a retry count or a timeout."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G5-20",
-   "why": "This lesson walked through jobs.yaml and the is-it-us step.",
-   "walk": [
-    "Use the fe-ci-fixer charter (lesson g5-1), stage shadow.",
-    "Add ai-agents/routines/fe-ci-fixer/jobs.yaml (code above).",
-    "First step always: run the failed commands at main's head. Green means environment or flake: post to #ai-agents-alerts and stop.",
-    "The fix must pass npm run verify and the reproduced commands. The false-heal check and the scope judge run before any PR.",
-    "Tune on 5 cases from the red-builds slice. Then run the FE part of the slice 3 times before shadow."
-   ]
+   "q": "Name four shapes of false heal the check looks for.",
+   "a": "A deleted test file, a new skip (it.skip, test.skip, .only, .fixme, pytest skip or xfail), a removed or changed assertion, and a loosened threshold (fail-under down, retries or timeout up)."
   },
   {
-   "key": "G5-22",
-   "why": "This lesson showed the BE jobs map and its hand-offs.",
-   "walk": [
-    "Add the be-ci-fixer charter, stage shadow: cloud/**, client/**, sdk/**, migrations denied; skills fix-ci, be-codebase, verify, fcp-lab, pr-story.",
-    "Add ai-agents/routines/be-ci-fixer/jobs.yaml (code above).",
-    "Hand off protoc drift, makemigrations --check failures and integration tests that need the QA environments.",
-    "Run the BE part of the red-builds slice 3 times before turning on shadow."
-   ]
+   "q": "Why does a CI fixer's charter carry never: [edit_test_assertions], when the check already counts assertions?",
+   "a": "Counting misses a changed expectation, because one assertion is removed and one added. The never-rule rejects any removed assertion line, so the fixer cannot rewrite what the test expects."
   },
   {
-   "key": "G5-14",
-   "why": "This lesson walked through falseHeals line by line, and the lab ran it on fixture diffs.",
-   "walk": [
-    "Add ai-agents/harness/src/checks/false-heal.ts (code above), built on G0-19's ai-agents/checks/src/weakened-tests.ts.",
-    "For Nova, findings are PR flags; for routines, any finding rejects the run with outcome false_heal.",
-    "Support the charter rules edit_test_assertions, add_code and add_retries_or_sleeps.",
-    "Run it from the Stop hook in the VM, and again on the diff before the scope judge.",
-    "Write harness/test/false-heal.test.ts from real diffs: an honest fix, a deleted test, an it.skip, a lowered --fail-under, an added time.sleep."
-   ]
-  },
-  {
-   "key": "G5-25",
-   "why": "This lesson explained the pipeline fixer's walls and the workflow weakeners.",
-   "walk": [
-    "Add the pipeline-fixer charter, stage shadow: infrastructure and gitops plus .github/** in fcp; never apply, destroy, sync or dispatch.",
-    "Add ai-agents/harness/src/checks/false-heal-workflows.ts (code above) and merge its findings with falseHeals().",
-    "Decide with Security (Ronen) on a workflows grant. Until then, post workflow changes as a patch on the ticket.",
-    "Done: the failing check passes in the VM, plus a CI plan or rendered diff if one exists. Else say no plan ran.",
-    "Use the trigger Action copies in infrastructure and gitops (lesson g5-2)."
-   ]
+   "q": "What is different when the same finding appears in a Nova PR and in a routine's run?",
+   "a": "For Nova it is a flag in the PR for the reviewer. For a routine it rejects the run as false_heal, no PR is opened, and the routine steps down the trust ladder."
   }
  ],
- "remember": "Ask \"is it us?\" first, fix only inside the charter, and reject any fix that makes CI green by weakening a check."
+ "remember": "Ask \"is it us?\" first, then fix the code, never the test: a short program reads every routine's diff and rejects any fix that turns CI green by weakening a check."
 }

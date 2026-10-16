@@ -1,639 +1,313 @@
 {
-  "id": "g1-2",
-  "title": "The nightly metrics job",
-  "minutes": 50,
-  "youNeed": [
-    "g1-1",
-    "p2-5",
-    "p6-4"
+ "v": 2,
+ "id": "g1-2",
+ "title": "The nightly metrics job",
+ "minutes": 50,
+ "youNeed": [
+  "p6-2",
+  "p6-4",
+  "p2-5"
+ ],
+ "map": "telemetry",
+ "hook": {
+  "story": [
+   "It is December, and Nir, one of our leaders, asks the question this whole project exists to answer: since Nova started in October, do pull requests wait less for a review? You open the delivery dashboard. The review-wait line starts on 1 October, the night the metrics job first ran, and it has gone up and down since. Is the line high or low? Nobody can say, because there is nothing before Nova to compare it with.",
+   "You could have started the job in July, but it is too late for that now. The good news is that GitHub never forgot July: every pull request still has its timeline, with the minute it became ready for review and the minute each review arrived."
   ],
-  "bridge": "The nightly metrics job is like a scheduled report job in CI you know. A cron starts it, it calls APIs and it writes numbers somewhere. Except it writes time series with their own timestamps, so one run can fill in 12 weeks of history. And no series ever carries a person's name.",
-  "intro": "Before agents start, we need numbers about how fcp delivers today: review wait, lead time, change failure and red-main time. This lesson builds the job that pulls those facts from GitHub and Jira every night and writes them to VictoriaMetrics. It also backfills the 12 weeks before October, the baseline every later number is compared with.",
-  "picture": {
-    "caption": "Every night at 02:20 one job reads GitHub and Jira, keeps the raw answer, and writes team-level weekly series.",
-    "nodes": [
-      {
-        "id": "runner",
-        "label": "GitHub Actions runner (ubuntu-22.04-2core)",
-        "kind": "machine"
-      },
-      {
-        "id": "job",
-        "label": "delivery-metrics nightly (metrics/dist/cli.js)",
-        "kind": "service"
-      },
-      {
-        "id": "gh",
-        "label": "GitHub GraphQL and REST (read-only App)",
-        "kind": "cloud"
-      },
-      {
-        "id": "jira",
-        "label": "Jira project RH",
-        "kind": "cloud"
-      },
-      {
-        "id": "raw",
-        "label": "raw pull, JSON artifact",
-        "kind": "file"
-      },
-      {
-        "id": "vm",
-        "label": "VictoriaMetrics (integration VMUser)",
-        "kind": "service"
-      },
-      {
-        "id": "grafana",
-        "label": "Grafana delivery-impact",
-        "kind": "service"
-      }
-    ],
-    "steps": [
-      {
-        "from": "runner",
-        "to": "job",
-        "text": "cron '20 2 * * *' starts the job at 02:20 UTC"
-      },
-      {
-        "from": "job",
-        "to": "gh",
-        "text": "asks for last week's PRs, commits, reviews and the unit-test runs on main"
-      },
-      {
-        "from": "job",
-        "to": "jira",
-        "text": "asks for RH tickets updated in the last 13 weeks"
-      },
-      {
-        "from": "job",
-        "to": "raw",
-        "text": "saves the raw answers as a JSON artifact of the run"
-      },
-      {
-        "from": "job",
-        "to": "vm",
-        "text": "computes weekly team numbers and posts Prometheus text with timestamps"
-      },
-      {
-        "from": "grafana",
-        "to": "vm",
-        "text": "reads the delivery_* series (lesson g1-3)"
-      }
+  "question": "How does a job that first runs in October write correct numbers for the weeks of July, August and September?"
+ },
+ "read": [
+  {
+   "h": "The past is still in GitHub",
+   "p": [
+    "Three things are involved: GitHub, which keeps every pull request's history; the metrics job, a small TypeScript program that a GitHub Actions cron starts every night at 02:20; and VictoriaMetrics, the database our dashboards read. The job asks GitHub for a week of pull requests at a time, because GitHub's search returns at most 1000 results per query, and for each one it gets the commits and two kinds of timeline event: the moment a draft became ready for review, and every review with its author.",
+    "From that it computes review wait: the hours from \"ready for review\" (or from opening, if the PR was never a draft) to the first review by a person who is not the author. Each part of that sentence matters. Byte, our review agent, reviews every PR within minutes, and GitHub marks its reviews with the author type Bot. If Byte's review counted, review wait would drop to ten minutes the week Byte started, and the dashboard would celebrate a change nobody felt. A PR with no human review yet gives no number at all, not zero.",
+    "Notice that nothing in these functions depends on today's date. Review wait for a PR from July comes out exactly the same tonight as it would have on a night in July. That is what makes the rest of this lesson possible."
+   ],
+   "code": {
+    "lang": "javascript",
+    "file": "week.mjs (the lab's version of the job's review-wait part)",
+    "text": "const readyAt = (pr) => pr.timeline.find((e) => e.__typename === \"ReadyForReviewEvent\")?.createdAt ?? pr.createdAt;\n\nconst reviewWaitHours = (pr) => {\n  const first = pr.timeline.find((e) => e.__typename === \"PullRequestReview\"\n    && e.author.__typename === \"User\" && e.author.login !== pr.author.login);\n  return first ? hours(readyAt(pr), first.createdAt) : undefined;\n};\n\nconst mondayOf = (iso) => {\n  const d = new Date(iso);\n  d.setUTCHours(0, 0, 0, 0);\n  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));\n  return d.getTime();\n};",
+    "notes": [
+     {
+      "line": 1,
+      "text": "The first ReadyForReviewEvent if the PR started as a draft, otherwise the moment it opened."
+     },
+     {
+      "line": 5,
+      "text": "Bot reviews never count, and neither does the author reviewing their own PR."
+     },
+     {
+      "line": 6,
+      "text": "undefined means \"no human review yet\". The caller leaves the PR out instead of counting it as 0 hours."
+     },
+     {
+      "line": 9,
+      "text": "The Monday 00:00 UTC of the week a time falls in. A PR counts in the week it became ready for review."
+     }
     ]
+   },
+   "deeper": {
+    "h": "Go deeper: the other numbers the job computes",
+    "p": [
+     "Review wait is one of five delivery numbers that have history. Lead time runs from a PR's first commit to its merge. Change failure counts merged PRs that a revert, a hotfix or a Bug fix touched within 14 days. The share of PRs with AI help counts the \"Co-Authored-By: Claude\" trailer in commits or \"Generated with Claude Code\" in the PR body.",
+     "Red-main time is the hours main had a failing required unit-test job, read from the CI runs on main. Only the required unit-test jobs count, because the slower integration tests fail by chance now and then and would paint main red when the code is fine. If the cloud tests are red from 00:00 to 02:00 and the client tests from 01:00 to 03:00, main was red for 3 hours, not 4: the job walks the results in time order and counts the time when any job is red, once.",
+     "Every night the job also stores the raw answers from GitHub and Jira as a JSON file of the Actions run, so a mistake in a formula can be fixed and the numbers recomputed without asking the APIs again."
+    ]
+   }
   },
-  "sections": [
-    {
-      "h": "A cron at 02:20 and three source APIs",
-      "p": [
-        "Open ai-agents/.github/workflows/delivery-metrics.yml, the file this lesson ends with. Its trigger is a cron, '20 2 * * *', so GitHub starts it at 02:20 UTC every night. Four steps run: actions/setup-node (Node 24, npm cache), then `npm ci --workspace metrics --include-workspace-root`. Then `npm run build -w shared -w metrics`, because metrics imports the shared package, and last `node metrics/dist/cli.js nightly`.",
-        "The job runs on ubuntu-22.04-2core, a GitHub-hosted runner, because it only calls public APIs. If G3 or G5 adds an ai-agents runner set by week 3, move it there. The code lives in a new npm workspace, ai-agents/metrics/, written in TypeScript on Node 24 with the global fetch.",
-        "The workspace has four source files and one command. src/github.ts pulls pull requests, src/ci.ts pulls unit-test runs on main, src/jira.ts pulls RH tickets, and src/vm.ts writes the numbers. src/cli.ts is the delivery-metrics command with two subcommands: nightly and backfill --weeks 12.",
-        "Every number we write is a point on a series: a name, a set of labels, a value and a timestamp. A series is the group of points with the same name and labels, for example delivery_merged_prs{team=\"frontend\"}. Ours carry a team label and never a GitHub login; teams under 3 people report as 'other'."
-      ],
-      "callout": {
-        "kind": "wall",
-        "text": "GitHub reads use a separate read-only App (pull requests, contents, actions and checks: read) through actions/create-github-app-token. The rhino-ai-agents key stays with the broker alone, as in lesson p2-4."
-      }
-    },
-    {
-      "h": "github.ts part 1: one GraphQL query",
-      "p": [
-        "GraphQL is GitHub's second API: you POST one query text and name exactly the fields you want back. One request returns PRs, their commits and their review events together, where REST would need three calls per PR. The small helper graphql in src/gh.ts does the POST to https://api.github.com/graphql with the App token.",
-        "This block is lines 2 to 19 of the sketch; we drop only the file-path comment on line 1. Part 2 holds the function that runs the query."
-      ],
-      "because": "We ask GitHub for everything in one query, because all three delivery metrics start from the same PR data.",
-      "code": {
-        "lang": "typescript",
-        "file": "ai-agents/metrics/src/github.ts",
-        "text": "// Pull fcp PRs with the timeline facts the delivery metrics need.\nimport { graphql } from \"./gh.js\"; // fetch POST https://api.github.com/graphql with a read-only App token\nimport type { PrSearch } from \"./types.js\"; // the shape of this query's result\n\nconst QUERY = `\nquery($q: String!, $after: String) {\n  search(query: $q, type: ISSUE, first: 50, after: $after) {\n    pageInfo { hasNextPage endCursor }\n    nodes { ... on PullRequest {\n      number createdAt mergedAt bodyText author { login }\n      commits(first: 100) { nodes { commit { authoredDate message } } }\n      timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT, PULL_REQUEST_REVIEW], first: 50) {\n        nodes { __typename\n          ... on ReadyForReviewEvent { createdAt }\n          ... on PullRequestReview { createdAt state author { login __typename } } } }\n    } }\n  }\n}`;",
-        "notes": [
-          {
-            "line": 1,
-            "text": "What this file is for: the facts about each PR that the metrics in compute.ts need."
-          },
-          {
-            "line": 2,
-            "text": "graphql(query, variables) posts to GitHub's GraphQL endpoint with the read-only App token; it lives in src/gh.ts."
-          },
-          {
-            "line": 3,
-            "text": "PrSearch is the TypeScript shape of the answer, so the code in part 2 is typed."
-          },
-          {
-            "line": 5,
-            "text": "The query text as a template literal; $q and $after are variables filled in per call."
-          },
-          {
-            "line": 7,
-            "text": "search is GitHub's search API: $q is the search text, ISSUE covers issues and PRs, 50 items per page."
-          },
-          {
-            "line": 8,
-            "text": "pageInfo says whether there is another page and gives the cursor to ask for it."
-          },
-          {
-            "line": 10,
-            "text": "Per PR: number, when it opened, when it merged, the body text and the author login (used only to find a team)."
-          },
-          {
-            "line": 11,
-            "text": "Up to 100 commits with their authored date and message; the oldest date is where lead time starts."
-          },
-          {
-            "line": 12,
-            "text": "Two kinds of timeline events only: the moment a draft became ready, and each review."
-          },
-          {
-            "line": 13,
-            "text": "__typename names the kind of each event, so compute.ts can tell them apart."
-          },
-          {
-            "line": 15,
-            "text": "A review carries its state, time and author. The author's __typename says User or Bot, so Byte's reviews never count as a person."
-          }
-        ]
-      }
-    },
-    {
-      "h": "github.ts part 2: walking the pages",
-      "p": [
-        "GitHub search stops at 1000 results, so pullRequests asks for one week at a time. An async generator is a function declared with `async function*`. It yields values one at a time while it still fetches, and the caller reads it with `for await`. A cursor is the bookmark string GitHub gives you to ask for the next page.",
-        "This block is lines 21 to 35 of the sketch, unchanged."
-      ],
-      "because": "We follow the cursor to every page, because one week of fcp PRs can be more than 50.",
-      "code": {
-        "lang": "typescript",
-        "file": "ai-agents/metrics/src/github.ts",
-        "text": "/** One week per query (GitHub search stops at 1000 results). Run again with field = \"merged\". */\nexport async function* pullRequests(repo: string, weekStart: string, weekEnd: string, field: \"created\" | \"merged\" = \"created\") {\n  const q = `repo:${repo} is:pr ${field}:${weekStart}..${weekEnd}`;\n  let after: string | null = null;\n  do {\n    const { search }: PrSearch = await graphql(QUERY, { q, after });\n    for (const { commits, timelineItems, ...pr } of search.nodes) {\n      const done = commits.nodes.map((n) => n.commit);\n      const firstCommitAt = done.map((c) => c.authoredDate).sort()[0] ?? pr.createdAt; // ISO strings sort by time\n      const aiTrailer = pr.bodyText.includes(\"Generated with Claude Code\") || done.some((c) => c.message.includes(\"Co-Authored-By: Claude\"));\n      yield { ...pr, firstCommitAt, aiTrailer, timeline: timelineItems.nodes };\n    }\n    after = search.pageInfo.hasNextPage ? search.pageInfo.endCursor : null;\n  } while (after);\n}",
-        "notes": [
-          {
-            "line": 1,
-            "text": "The week-per-query rule; the job calls this twice, once by created date and once by merged date."
-          },
-          {
-            "line": 2,
-            "text": "The function takes the repo, the week's start and end dates, and which date field to search by."
-          },
-          {
-            "line": 3,
-            "text": "The search text, for example repo:RhinoHealth/fcp is:pr created:2026-09-01..2026-09-07."
-          },
-          {
-            "line": 4,
-            "text": "after is the cursor; null means the first page."
-          },
-          {
-            "line": 6,
-            "text": "One POST; the answer is typed as PrSearch and we take its search part."
-          },
-          {
-            "line": 7,
-            "text": "For each PR we pull commits and timelineItems apart from the rest; ...pr keeps the plain fields."
-          },
-          {
-            "line": 9,
-            "text": "ISO date strings sort as text in time order, so [0] is the oldest commit. A PR with no commits falls back to createdAt."
-          },
-          {
-            "line": 10,
-            "text": "aiTrailer is true when the body says 'Generated with Claude Code' or a commit carries the Co-Authored-By: Claude trailer. This feeds 'share of PRs with AI help'."
-          },
-          {
-            "line": 11,
-            "text": "yield hands one PR to the caller right away, with the two computed fields and the timeline events."
-          },
-          {
-            "line": 13,
-            "text": "If GitHub says there is another page, keep its cursor; otherwise null ends the loop."
-          },
-          {
-            "line": 14,
-            "text": "do...while runs the body at least once, then repeats while a cursor remains."
-          }
-        ]
-      },
-      "callout": {
-        "kind": "tip",
-        "text": "To test this without GitHub, swap src/gh.ts for a stub that returns pages from an array. The lab does exactly that."
-      }
-    },
-    {
-      "h": "ci.ts part 1: only the required jobs count",
-      "p": [
-        "Red-main time is the number of hours fcp's main branch has a failing required check. We read it from the GitHub Actions REST API, not GraphQL, because runs and jobs are REST resources. The helpers rest and restPages in src/gh.ts do the fetch; restPages follows the Link: next header until the last page.",
-        "Only the required unit-test jobs count. The integration-test jobs are flaky and they are G7's problem, so counting them would paint main red for the wrong reason. This block is lines 2 to 22 of the sketch; only the file-path comment is dropped."
-      ],
-      "because": "We read only the three required unit-test jobs, because flaky integration tests would make main look red when the code is fine.",
-      "code": {
-        "lang": "typescript",
-        "file": "ai-agents/metrics/src/ci.ts",
-        "text": "// Hours fcp main stays red, from the required unit-test jobs only (I&T flakiness is G7's problem).\nimport { rest, restPages } from \"./gh.js\"; // small fetch helpers with the read-only App token; restPages follows Link: next\nimport type { Job, WorkflowRun } from \"./types.js\";\nconst REQUIRED: Record<string, string[]> = { // workflow file -> job names (the second one is the name before G0's rename)\n  \"cloud-ci.yml\": [\"Cloud Unit Tests\", \"Unit Tests\"],\n  \"client-ci.yml\": [\"Client Unit Tests\", \"Unit Tests\"],\n  \"frontend-ci.yaml\": [\"Frontend Unit Tests\", \"Unit Tests\"],\n};\nexport type Result = { workflow: string; at: Date; ok: boolean };\nexport async function* mainResults(repo: string, since: string): AsyncGenerator<Result> {\n  for (const [workflow, names] of Object.entries(REQUIRED)) {\n    const query = { branch: \"main\", status: \"completed\", created: `>=${since}` };\n    for await (const run of restPages<WorkflowRun>(`/repos/${repo}/actions/workflows/${workflow}/runs`, query)) {\n      const { jobs } = await rest<{ jobs: Job[] }>(`/repos/${repo}/actions/runs/${run.id}/jobs`);\n      const job = jobs.find((j) => names.includes(j.name));\n      if (job?.completed_at && (job.conclusion === \"success\" || job.conclusion === \"failure\")) {\n        yield { workflow, at: new Date(job.completed_at), ok: job.conclusion === \"success\" };\n      }\n    }\n  }\n}",
-        "notes": [
-          {
-            "line": 4,
-            "text": "REQUIRED maps each workflow file to the job names that count; Record<string, string[]> means string keys to string arrays."
-          },
-          {
-            "line": 5,
-            "text": "Two names per workflow: the new name after G0's rename, and the old name 'Unit Tests' for earlier runs."
-          },
-          {
-            "line": 9,
-            "text": "A Result is one finished job: which workflow, when it finished, and whether it passed."
-          },
-          {
-            "line": 10,
-            "text": "mainResults is an async generator again; since is the date to start from, for example 13 weeks back."
-          },
-          {
-            "line": 12,
-            "text": "The query asks only for completed runs on main created on or after since."
-          },
-          {
-            "line": 13,
-            "text": "restPages lists one workflow file's runs, page by page, from /repos/{repo}/actions/workflows/{file}/runs."
-          },
-          {
-            "line": 14,
-            "text": "Each run has jobs; one more REST call lists them."
-          },
-          {
-            "line": 15,
-            "text": "Find the job whose name is in our list; other jobs in the run are ignored."
-          },
-          {
-            "line": 16,
-            "text": "Keep only success or failure; cancelled or skipped jobs say nothing about main."
-          },
-          {
-            "line": 17,
-            "text": "Yield the result with a real Date, so part 2 can sort and subtract times."
-          }
-        ]
-      }
-    },
-    {
-      "h": "ci.ts part 2: overlapping red windows count once",
-      "p": [
-        "Main is red while any required job's latest result is a failure. If cloud is red from 00:00 to 02:00 and client from 01:00 to 03:00, main was red for 3 hours, not 4. redHours walks the results in time order and keeps one state per workflow. This block is lines 24 to 35 of the sketch."
-      ],
-      "because": "We keep one boolean per workflow and time when any is false, because overlapping red windows must count once.",
-      "code": {
-        "lang": "typescript",
-        "file": "ai-agents/metrics/src/ci.ts",
-        "text": "/** main is red while any required job's latest result is a failure; overlaps count once. */\nexport function redHours(results: Result[]): number {\n  const state = new Map<string, boolean>();\n  let redSince: Date | undefined, total = 0;\n  for (const { workflow, at, ok } of results.toSorted((a, b) => a.at.getTime() - b.at.getTime())) {\n    state.set(workflow, ok);\n    const redNow = [...state.values()].includes(false);\n    if (redNow && !redSince) redSince = at;\n    else if (!redNow && redSince) { total += (at.getTime() - redSince.getTime()) / 3_600_000; redSince = undefined; }\n  }\n  return total;\n}",
-        "notes": [
-          {
-            "line": 2,
-            "text": "A pure function: results in, hours out, so a node:test can check it with a fixture and no network."
-          },
-          {
-            "line": 3,
-            "text": "state remembers the latest result per workflow file: true for green, false for red."
-          },
-          {
-            "line": 4,
-            "text": "redSince is the time main turned red, or undefined while it is green; total adds up the hours."
-          },
-          {
-            "line": 5,
-            "text": "toSorted returns a sorted copy (Node 20 and later), oldest result first, without changing the input."
-          },
-          {
-            "line": 6,
-            "text": "Record this workflow's latest result."
-          },
-          {
-            "line": 7,
-            "text": "Main is red now if any workflow's latest result is false."
-          },
-          {
-            "line": 8,
-            "text": "Green to red: remember when it happened."
-          },
-          {
-            "line": 9,
-            "text": "Red to green: add the window's length in hours (milliseconds divided by 3,600,000) and clear redSince."
-          },
-          {
-            "line": 11,
-            "text": "The answer in hours for the whole window of results you passed in."
-          }
-        ]
-      },
-      "callout": {
-        "kind": "gotcha",
-        "text": "A window still red at the last result is not counted, because nothing closes it. When the nightly job computes a week, pass in the results up to the end of that week. On a red day, check the last state by hand."
-      }
-    },
-    {
-      "h": "compute.ts part 1: three numbers per PR",
-      "p": [
-        "compute.ts turns the pulled data into numbers, weekly and per team. Nothing in it is ever written per person. Each metric is one small function: a PullRequest in, hours out, or undefined when the PR has no such event yet.",
-        "Review wait starts when the PR became ready for review, or when it opened if it was never a draft. It ends at the first review by a person other than the author. Lead time runs from the first commit to the merge.",
-        "A change failed when a revert, hotfix or Bug fix touches its lines within 14 days. G2's golden-set miner finds those fixes. This block is lines 2 to 18 of the sketch; only the file-path comment is dropped."
-      ],
-      "because": "We write one small pure function per metric, because each can be tested on a fixture and read in a minute.",
-      "code": {
-        "lang": "typescript",
-        "file": "ai-agents/metrics/src/compute.ts",
-        "text": "// Weekly, team-level delivery metrics. Nothing here is ever written per person.\nimport { days, hours, median, quantile } from \"./stats.js\"; // ISO timestamps in, numbers out; quantile as Python's statistics\nimport type { Fix, MergedPr, Point, PullRequest } from \"./types.js\";\n\n/** Ready for review (or opened, if never a draft) to the first review by another person. */\nexport function reviewWaitHours(pr: PullRequest): number | undefined {\n  const ready = pr.timeline.find((e) => e.__typename === \"ReadyForReviewEvent\")?.createdAt ?? pr.createdAt;\n  const first = pr.timeline.find((e) => e.__typename === \"PullRequestReview\"\n    && e.author?.__typename === \"User\" && e.author.login !== pr.author.login)?.createdAt;\n  return first ? hours(ready, first) : undefined;\n}\n\nexport const leadTimeHours = (pr: PullRequest) => (pr.mergedAt ? hours(pr.firstCommitAt, pr.mergedAt) : undefined);\n\n/** A revert, hotfix or Bug fix within 14 days on the same lines (G2's miner does the blame). */\nexport const changeFailed = (pr: MergedPr, fixes: Fix[]) =>\n  fixes.some((f) => f.introducedBy === pr.number && days(pr.mergedAt, f.mergedAt) <= 14);",
-        "notes": [
-          {
-            "line": 2,
-            "text": "stats.ts holds the maths: hours and days between two ISO timestamps, median, and quantile like Python's statistics module."
-          },
-          {
-            "line": 3,
-            "text": "The data shapes come from types.ts; MergedPr is a PullRequest whose mergedAt is not null."
-          },
-          {
-            "line": 6,
-            "text": "reviewWaitHours returns a number or undefined, so a PR with no review yet is left out, not counted as 0."
-          },
-          {
-            "line": 7,
-            "text": "The ready time: the ReadyForReviewEvent if there was one, else the moment the PR opened."
-          },
-          {
-            "line": 8,
-            "text": "The first review that is by a User (not a Bot such as Byte) and not by the author."
-          },
-          {
-            "line": 10,
-            "text": "If there was a review, the hours between; otherwise undefined."
-          },
-          {
-            "line": 13,
-            "text": "Lead time: first commit to merge, only for merged PRs."
-          },
-          {
-            "line": 16,
-            "text": "changeFailed takes the PR and the list of fixes from G2's miner."
-          },
-          {
-            "line": 17,
-            "text": "True when a fix says this PR number introduced the bug and the fix merged within 14 days of the PR."
-          }
-        ]
-      }
-    },
-    {
-      "h": "compute.ts part 2: weekly points per team",
-      "p": [
-        "A Point is what vm.ts writes: a series name, its labels, a value and the week's timestamp. weeklyPoints groups the week's PRs by team and yields one Point per number. p50 is the median: half the values are below it.",
-        "p85 is the value that 85% of the values sit below. With it the dashboard shows the slow tail, not only the middle. This block is lines 20 to 35 of the sketch, unchanged. Lead time, red-main hours and the agent metrics follow the same pattern in the real file; the sketch shows three."
-      ],
-      "because": "We emit p50, p85 and counts per team, because weekly numbers for about 25 engineers are noisy and one average misleads.",
-      "code": {
-        "lang": "typescript",
-        "file": "ai-agents/metrics/src/compute.ts",
-        "text": "export function* weeklyPoints(prs: PullRequest[], fixes: Fix[], teamOf: (pr: PullRequest) => string, weekTs: number): Generator<Point> {\n  const byTeam = new Map<string, PullRequest[]>();\n  for (const pr of prs) { // agent PRs count for the requester's team; teams under 3 people map to \"other\"\n    byTeam.set(teamOf(pr), [...(byTeam.get(teamOf(pr)) ?? []), pr]);\n  }\n  for (const [team, items] of byTeam) {\n    const waits = items.map(reviewWaitHours).filter((w) => w !== undefined);\n    if (waits.length >= 2) {\n      yield [\"delivery_review_wait_hours\", { team, q: \"p50\" }, median(waits), weekTs];\n      yield [\"delivery_review_wait_hours\", { team, q: \"p85\" }, quantile(waits, 0.85), weekTs];\n    }\n    const merged = items.filter((p): p is MergedPr => p.mergedAt !== null);\n    yield [\"delivery_merged_prs\", { team }, merged.length, weekTs];\n    yield [\"delivery_failed_changes\", { team }, merged.filter((p) => changeFailed(p, fixes)).length, weekTs];\n  }\n}",
-        "notes": [
-          {
-            "line": 1,
-            "text": "teamOf maps a PR to a team name; the login lookup from teams.ts happens inside it. weekTs is the week's timestamp in milliseconds."
-          },
-          {
-            "line": 2,
-            "text": "A Map from team to that team's PRs for this week."
-          },
-          {
-            "line": 3,
-            "text": "The comment is the rule: an agent PR counts for the requester's team, and a team under 3 people is 'other'."
-          },
-          {
-            "line": 4,
-            "text": "Append the PR to its team's list; the spread copies the old list plus the new PR."
-          },
-          {
-            "line": 7,
-            "text": "All review waits that exist; filter drops the undefined ones."
-          },
-          {
-            "line": 8,
-            "text": "With fewer than 2 values a median says nothing, so the team gets no review-wait point that week."
-          },
-          {
-            "line": 9,
-            "text": "Yield the p50 point: name, the labels team and q, the median, the timestamp."
-          },
-          {
-            "line": 10,
-            "text": "Same series, label q=p85, the 0.85 quantile."
-          },
-          {
-            "line": 12,
-            "text": "merged narrows the type: the (p): p is MergedPr predicate tells TypeScript that mergedAt is set."
-          },
-          {
-            "line": 13,
-            "text": "How many PRs merged this week; the dashboard shows it only next to change failure."
-          },
-          {
-            "line": 14,
-            "text": "How many of those failed within 14 days; the dashboard divides this by merged PRs."
-          }
-        ]
-      }
-    },
-    {
-      "h": "Jira, the writer and the 12-week backfill",
-      "p": [
-        "src/jira.ts uses Jira REST v3 through the small fetch client in shared/src/jira.ts (lesson p9-2). It runs the JQL `project = RH AND updated >= -13w` against rhino-fcp.atlassian.net with a read-only service account token. The token sits in Vault at kvv2 infrastructure/ai-agents/jira-metrics. It keeps the key, the type, status changes, the Nova assignee flag and the PR keys from titles; no names are stored.",
-        "src/vm.ts writes Prometheus text, one line per Point, with a millisecond timestamp at the end of each line. The timestamp is what puts a backfilled point on the right day. It posts to the integration VMUser the way infrastructure's send-workflow-result.yml does. The secret integration-metrics-user comes from Secrets Manager through the GitHubActions OIDC role; confirm with DevOps that this role trusts RhinoHealth/ai-agents.",
-        "Each night the job also stores the raw pull as a JSON artifact of the workflow run. When a metric has a bug, you fix compute.ts and recompute from the artifact without calling the APIs again. Backfill means computing past weeks from history: `delivery-metrics backfill --weeks 12 --until 2026-09-30` writes the 12 weeks before October as delivery_baseline_* series. Check three numbers by hand against GitHub before you trust it.",
-        "A cohort is a group you compare with another: agent PRs against human PRs, or agent-eligible tickets by G4's Jira label. Agent-only metrics start as 'no data', not 0, so charts show no fake drop. Byte's two rates (G2) and G3's stuck loops and clean endings get delivery_* names too, so one dashboard holds all seventeen."
-      ],
-      "callout": {
-        "kind": "wall",
-        "text": "Aggregate before writing: a login is used in memory to find the team and is then dropped. Series carry team, never login."
-      }
-    }
-  ],
-  "lab": {
-    "title": "Test redHours and pullRequests without GitHub",
-    "youNeed": [
-      "Node 24",
-      "npm",
-      "a terminal"
-    ],
-    "worked": [
-      {
-        "do": "mkdir metrics-lab && cd metrics-lab && npm init -y && npm pkg set type=module && npm i -D typescript tsx @types/node",
-        "see": "added 21 packages, and audited 22 packages in 4s\n\nfound 0 vulnerabilities\n(the package count may differ; the current versions are fine)"
-      },
-      {
-        "do": "mkdir src test. Create src/ci.ts with the Result type (line 9 of ci.ts part 1) and the whole redHours function (ci.ts part 2). Nothing else from ci.ts: the lab never calls GitHub.",
-        "see": "A 13-line file that exports Result and redHours."
-      },
-      {
-        "do": "Create test/ci.test.ts:\nimport { test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { redHours, type Result } from \"../src/ci.js\";\n\nconst at = (h: number) => new Date(Date.UTC(2026, 8, 1, h));\ntest(\"two overlapping red windows count once\", () => {\n  const results: Result[] = [\n    { workflow: \"cloud-ci.yml\", at: at(0), ok: false },\n    { workflow: \"client-ci.yml\", at: at(1), ok: false },\n    { workflow: \"cloud-ci.yml\", at: at(2), ok: true },\n    { workflow: \"client-ci.yml\", at: at(3), ok: true },\n  ];\n  assert.equal(redHours(results), 3);\n});",
-        "see": "A test file; the import ends in .js on purpose (ESM resolves the compiled name, tsx maps it to .ts)."
-      },
-      {
-        "do": "node --import tsx --test test/*.test.ts",
-        "see": "✔ two overlapping red windows count once (1.8ms)\nℹ tests 1\nℹ suites 0\nℹ pass 1\nℹ fail 0\n(more ℹ lines follow)"
-      },
-      {
-        "do": "Create the lab's stub src/gh.ts (not the real file; the real one does fetch):\n// Lab stub: the test queues the pages the fake GitHub answers with.\nexport const pages: unknown[] = [];\nexport const calls: unknown[] = [];\nexport const graphql = async <T>(_query: string, variables: unknown): Promise<T> => {\n  calls.push(variables);\n  return pages.shift() as T;\n};\nand the lab's stub src/types.ts:\nexport type PrSearch = { search: { pageInfo: { hasNextPage: boolean; endCursor: string | null }; nodes: any[] } };",
-        "see": "Two small files. The stub records every call's variables and answers from the queue."
-      },
-      {
-        "do": "Create src/github.ts from the two github.ts blocks, part 1 then part 2, in one file.",
-        "see": "A 33-line file that exports pullRequests."
-      },
-      {
-        "do": "Create test/github.test.ts:\nimport { test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { pages, calls } from \"../src/gh.js\";\nimport { pullRequests } from \"../src/github.js\";\n\nconst pr = (number: number, message: string) => ({\n  number, createdAt: \"2026-09-02T10:00:00Z\", mergedAt: null, bodyText: \"\", author: { login: \"someone\" },\n  commits: { nodes: [{ commit: { authoredDate: \"2026-09-01T09:00:00Z\", message } }] },\n  timelineItems: { nodes: [] },\n});\ntest(\"pullRequests follows the cursor to page two\", async () => {\n  pages.push({ search: { pageInfo: { hasNextPage: true, endCursor: \"c1\" }, nodes: [pr(1, \"fix\")] } });\n  pages.push({ search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [pr(2, \"Co-Authored-By: Claude\")] } });\n  const got: { aiTrailer: boolean; firstCommitAt: string }[] = [];\n  for await (const p of pullRequests(\"RhinoHealth/fcp\", \"2026-09-01\", \"2026-09-07\")) got.push(p);\n  assert.equal(got.length, 2);\n  assert.deepEqual(got.map((p) => p.aiTrailer), [false, true]);\n  assert.equal(got[0].firstCommitAt, \"2026-09-01T09:00:00Z\");\n  assert.equal((calls[1] as { after: string }).after, \"c1\");\n});",
-        "see": "A test with two queued pages: page one says hasNextPage true with cursor c1, page two ends the loop."
-      },
-      {
-        "do": "node --import tsx --test test/*.test.ts",
-        "see": "✔ two overlapping red windows count once (1.8ms)\n✔ pullRequests follows the cursor to page two (3.1ms)\nℹ tests 2\nℹ suites 0\nℹ pass 2\nℹ fail 0"
-      },
-      {
-        "do": "Reading step, because the real ci.ts call needs the App token. In the infrastructure repo, open .github/workflows/send-workflow-result.yml. Find how it gets the integration-metrics-user secret and where it posts Prometheus text.",
-        "see": "A step that reads the secret from Secrets Manager with the OIDC role. A curl that posts text lines to the metrics endpoint. Note both for vm.ts."
-      }
-    ],
-    "faded": "Add a second test to test/ci.test.ts: cloud-ci.yml fails at 00:00 and passes at 01:30, nothing else. Build the fixture the same way with Date.UTC and minutes. The expected number in assert.equal is left out: work it out from the times, then run the tests and see pass 3.",
-    "alone": "Write a helper of the reviewWaitHours shape on the lab fixture. readyAt(pr) returns the createdAt of the ReadyForReviewEvent in pr.timeline, or pr.createdAt when there is none. Give the second fake PR a ReadyForReviewEvent at 2026-09-03T08:00:00Z in timelineItems.nodes, and assert readyAt for both PRs in test/github.test.ts.",
-    "done": "node --import tsx --test test/*.test.ts prints pass 4 and fail 0, and the overlap test proves 3 hours, not 4."
+  {
+   "h": "Stamp the week, not the night",
+   "p": [
+    "A long-running service exposes counters and lets the database read them every few seconds, as you saw in the lesson about Prometheus metrics. A nightly job cannot work like that: it lives for two minutes and is gone. So it pushes its results to VictoriaMetrics' import endpoint as lines of Prometheus text, and it puts a timestamp at the end of each line, in milliseconds since 1970. The timestamp says which week the number is about, not when the job ran.",
+    "That single choice makes a backfill free. A backfill means computing numbers for past periods from history and writing them as if they had been written back then. The nightly run computes last week and stamps it with last week's Monday. The backfill runs the same code for each of the twelve weeks before October and stamps each with its own Monday. There is no second program to keep correct.",
+    "The values are finished numbers, a median per team and week, so a dashboard draws them as they are and never wraps them in rate(), which only makes sense for counters that keep growing."
+   ],
+   "code": {
+    "lang": "text",
+    "file": "what the job pushes (one line per team, week and number)",
+    "text": "delivery_review_wait_hours{team=\"frontend\",q=\"p50\"} 12.0 1788134400000\ndelivery_review_wait_hours{team=\"frontend\",q=\"p85\"} 17.6 1788134400000\n\n# sent once, to the database's import endpoint:\nnode week.mjs | curl --data-binary @- http://<victoria-metrics>/api/v1/import/prometheus",
+    "notes": [
+     {
+      "line": 1,
+      "text": "Name, labels, value, timestamp. 1788134400000 is Monday 31 August 2026, 00:00 UTC: the week this median describes."
+     },
+     {
+      "line": 2,
+      "text": "p85 is the value 85 of 100 PRs stayed under. It shows the slow tail that a median hides."
+     }
+    ]
+   },
+   "see": "204\n(204 means \"accepted\". It does not promise that every line was stored, as the lab shows.)",
+   "deeper": {
+    "h": "Go deeper: fixing a week you already wrote",
+    "p": [
+     "If you push the same week again with a corrected value, VictoriaMetrics keeps both samples with the same timestamp, and you should not rely on which one a query returns. To correct the past, delete the series (the admin endpoint /api/v1/admin/tsdb/delete_series) and push the weeks again from the stored raw JSON. That is the reason the job keeps the raw answers: the fix is a recompute, not a patch on top."
+    ]
+   }
   },
-  "quiz": [
-    {
-      "q": "Why does pullRequests search one week at a time?",
-      "options": [
-        {
-          "text": "GitHub search returns at most 1000 results, so a narrow window keeps every PR in reach.",
-          "correct": true,
-          "why": "The comment on the function says it: one week per query, run again by merged date."
-        },
-        {
-          "text": "The App token expires after one hour, so each week needs a fresh token.",
-          "correct": false,
-          "why": "Tokens do expire after an hour, but many weeks fit in that time; the limit is the search cap."
-        },
-        {
-          "text": "VictoriaMetrics accepts only one week of points per write.",
-          "correct": false,
-          "why": "The writer takes any timestamps; backfill writes 12 weeks in one run."
-        }
-      ]
-    },
-    {
-      "q": "cloud-ci.yml is red from 00:00 to 02:00 and client-ci.yml from 01:00 to 03:00. What does redHours return?",
-      "options": [
-        {
-          "text": "4, because each workflow was red for 2 hours.",
-          "correct": false,
-          "why": "Adding the windows counts the shared hour twice; main was red once."
-        },
-        {
-          "text": "3, because main is red while any required job is red.",
-          "correct": true,
-          "why": "One state per workflow: main turned red at 00:00 and green at 03:00."
-        },
-        {
-          "text": "2, the longer of the two windows.",
-          "correct": false,
-          "why": "The windows overlap but neither sits inside the other; the union is 3 hours."
-        }
-      ]
-    },
-    {
-      "q": "A team has two engineers. How does their work appear in the series?",
-      "options": [
-        {
-          "text": "Under their GitHub logins, so the numbers stay exact.",
-          "correct": false,
-          "why": "No series carries a login; that is the wall this job keeps."
-        },
-        {
-          "text": "It is skipped, because two values make no median.",
-          "correct": false,
-          "why": "Only the review-wait median needs 2 values; the PRs still count, under 'other'."
-        },
-        {
-          "text": "Under team='other', together with every other team under 3 people.",
-          "correct": true,
-          "why": "Teams under 3 people report as 'other', so a number never points at one person."
-        }
-      ]
-    }
+  {
+   "h": "Old points and a quiet 204",
+   "p": [
+    "Every time-series database keeps data for a limited time, called the retention period, and drops anything older. VictoriaMetrics' default is one month. That is fine for a service's live counters, but a backfill writes points from three months ago, and a database with the default setting rejects every one of them. The trap is how quietly it happens: the import still answers 204, the job reports success, and the only trace is a warning in the database's own log and a counter called vm_rows_ignored_total.",
+    "So before you trust a backfill, check two things: that the store keeps data for longer than the oldest week you write (our long-term store keeps it for years), and that the points are really there, by asking for them, not by reading the HTTP status."
+   ]
+  },
+  {
+   "h": "Team numbers, a baseline, and no fake zeros",
+   "p": [
+    "The job adds things up before it writes. Every series carries a team, which comes from the same email-to-team table the collector uses, and never a GitHub login. A team with fewer than 3 people is reported as \"other\", because a number about a team of two is really a number about two people. A median needs at least two PRs, so a quiet week writes no point for that team, and next to every median the job writes how many PRs it is based on, because weekly numbers for about 25 engineers jump around.",
+    "The backfill runs once, over the twelve weeks that end on 30 September, and its result is kept as separate series called delivery_baseline_*. That is the baseline: what normal looked like before any agent worked. In December, every delivery chart draws it as a flat reference line, which turns December's question into something you can answer by looking.",
+    "Numbers that only exist once agents work, such as how many agent PRs are merged, start as \"no data\" and not as 0. A chart that shows 0 for September and 60% for October tells a story of sudden improvement that never happened."
+   ]
+  }
+ ],
+ "lab": {
+  "id": "g1-2",
+  "title": "Backfill three weeks of review wait",
+  "minutes": 30,
+  "needs": [
+   "Node 22+",
+   "Docker Desktop running",
+   "curl and jq"
   ],
-  "recall": [
-    "In lesson g1-1, what does the collector swap the person's email for before it exports a series?",
-    "In lesson p2-5, how does code get a token to act as a GitHub App, and how long does that token live?"
-  ],
-  "videos": [],
-  "words": [
+  "goal": "Compute review wait per team and week from pull-request history, push it with each week's own timestamp, and prove the points landed on the right weeks.",
+  "mode": "guided",
+  "guess": {
+   "q": "It is October. You start VictoriaMetrics with its default settings and push three weeks of review wait from the start of September. curl prints 204. What does a query for those weeks return?",
+   "options": [
     {
-      "term": "series",
-      "plain": "The points that share one name and one set of labels over time; ours carry team, never a login."
+     "text": "All three weeks, because 204 means the database accepted the data.",
+     "correct": false,
+     "why": "204 means the request was fine. The database still checks each line and quietly skips the ones it will not keep."
     },
     {
-      "term": "async generator",
-      "plain": "A function declared async function* that yields values one at a time while it still fetches; read it with for await."
+     "text": "Nothing: the default keeps one month, so points older than that are dropped, with a warning only in the database's log.",
+     "correct": true,
+     "why": "The default retention period is one month. Points older than that are counted in vm_rows_ignored_total and never stored."
     },
     {
-      "term": "cursor",
-      "plain": "The bookmark string GitHub returns with a page, which you send back to get the next page."
-    },
-    {
-      "term": "red-main time",
-      "plain": "Hours during which any required unit-test job on main has a failing latest result; overlaps count once."
-    },
-    {
-      "term": "p85",
-      "plain": "The value that 85% of the week's values sit below; shown next to p50, the median."
-    },
-    {
-      "term": "backfill",
-      "plain": "Computing past weeks from history and writing them with their own timestamps, so the baseline exists before agents start."
-    },
-    {
-      "term": "cohort",
-      "plain": "A group you compare with another, such as agent PRs against human PRs."
+     "text": "The three points, but all placed on today's date, because the database stamps them on arrival.",
+     "correct": false,
+     "why": "The timestamp at the end of each line wins. Without one, the database would use the arrival time, which is exactly what a backfill must avoid."
     }
+   ]
+  },
+  "follow": [
+   {
+    "say": "Make a folder, and write the team table and three weeks of pull requests in the shape GitHub's query returns. Byte, as byte-bot, reviews every PR ten minutes after it is ready; people review later.",
+    "do": "mkdir -p ~/academy-labs/g1-2 && cd ~/academy-labs/g1-2\ncat > teams.json <<'EOF'\n{ \"sean\": \"frontend\", \"dana\": \"frontend\", \"lior\": \"frontend\",\n  \"omer\": \"backend\", \"maya\": \"backend\", \"eli\": \"backend\",\n  \"noa\": \"data\", \"ido\": \"data\" }\nEOF\ncat > prs.json <<'EOF'\n[\n{\"number\":2401,\"author\":{\"login\":\"sean\"},\"createdAt\":\"2026-08-31T09:00:00Z\",\"timeline\":[{\"__typename\":\"ReadyForReviewEvent\",\"createdAt\":\"2026-08-31T13:00:00Z\"},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-08-31T13:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-01T09:00:00Z\",\"author\":{\"login\":\"dana\",\"__typename\":\"User\"}}]},\n{\"number\":2402,\"author\":{\"login\":\"dana\"},\"createdAt\":\"2026-09-01T10:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-01T10:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-01T14:00:00Z\",\"author\":{\"login\":\"lior\",\"__typename\":\"User\"}}]},\n{\"number\":2403,\"author\":{\"login\":\"omer\"},\"createdAt\":\"2026-09-02T08:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-02T08:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-02T11:00:00Z\",\"author\":{\"login\":\"maya\",\"__typename\":\"User\"}}]},\n{\"number\":2404,\"author\":{\"login\":\"maya\"},\"createdAt\":\"2026-09-03T15:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-03T15:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-04T10:00:00Z\",\"author\":{\"login\":\"eli\",\"__typename\":\"User\"}}]},\n{\"number\":2405,\"author\":{\"login\":\"noa\"},\"createdAt\":\"2026-09-02T12:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-02T12:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-03T12:00:00Z\",\"author\":{\"login\":\"omer\",\"__typename\":\"User\"}}]},\n{\"number\":2406,\"author\":{\"login\":\"eli\"},\"createdAt\":\"2026-09-04T09:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-04T09:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-04T10:30:00Z\",\"author\":{\"login\":\"omer\",\"__typename\":\"User\"}}]},\n{\"number\":2407,\"author\":{\"login\":\"ido\"},\"createdAt\":\"2026-09-03T10:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-03T10:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-03T16:00:00Z\",\"author\":{\"login\":\"noa\",\"__typename\":\"User\"}}]},\n{\"number\":2410,\"author\":{\"login\":\"lior\"},\"createdAt\":\"2026-09-07T09:00:00Z\",\"timeline\":[{\"__typename\":\"ReadyForReviewEvent\",\"createdAt\":\"2026-09-07T10:00:00Z\"},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-07T10:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-07T16:00:00Z\",\"author\":{\"login\":\"sean\",\"__typename\":\"User\"}}]},\n{\"number\":2411,\"author\":{\"login\":\"sean\"},\"createdAt\":\"2026-09-08T11:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-08T11:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-09T11:00:00Z\",\"author\":{\"login\":\"dana\",\"__typename\":\"User\"}}]},\n{\"number\":2412,\"author\":{\"login\":\"dana\"},\"createdAt\":\"2026-09-09T09:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-09T09:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-09T12:00:00Z\",\"author\":{\"login\":\"sean\",\"__typename\":\"User\"}}]},\n{\"number\":2413,\"author\":{\"login\":\"omer\"},\"createdAt\":\"2026-09-08T14:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-08T14:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-09T09:00:00Z\",\"author\":{\"login\":\"eli\",\"__typename\":\"User\"}}]},\n{\"number\":2414,\"author\":{\"login\":\"noa\"},\"createdAt\":\"2026-09-10T10:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-10T10:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-10T12:00:00Z\",\"author\":{\"login\":\"maya\",\"__typename\":\"User\"}}]},\n{\"number\":2415,\"author\":{\"login\":\"eli\"},\"createdAt\":\"2026-09-10T13:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-10T13:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}}]},\n{\"number\":2416,\"author\":{\"login\":\"ido\"},\"createdAt\":\"2026-09-11T09:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-11T09:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-11T10:00:00Z\",\"author\":{\"login\":\"noa\",\"__typename\":\"User\"}}]},\n{\"number\":2420,\"author\":{\"login\":\"sean\"},\"createdAt\":\"2026-09-14T09:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-14T09:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-14T11:00:00Z\",\"author\":{\"login\":\"lior\",\"__typename\":\"User\"}}]},\n{\"number\":2421,\"author\":{\"login\":\"lior\"},\"createdAt\":\"2026-09-15T10:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-15T10:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-16T10:00:00Z\",\"author\":{\"login\":\"dana\",\"__typename\":\"User\"}}]},\n{\"number\":2422,\"author\":{\"login\":\"maya\"},\"createdAt\":\"2026-09-15T09:00:00Z\",\"timeline\":[{\"__typename\":\"ReadyForReviewEvent\",\"createdAt\":\"2026-09-16T09:00:00Z\"},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-16T09:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-16T13:00:00Z\",\"author\":{\"login\":\"omer\",\"__typename\":\"User\"}}]},\n{\"number\":2423,\"author\":{\"login\":\"omer\"},\"createdAt\":\"2026-09-16T16:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-16T16:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-17T09:00:00Z\",\"author\":{\"login\":\"maya\",\"__typename\":\"User\"}}]},\n{\"number\":2424,\"author\":{\"login\":\"noa\"},\"createdAt\":\"2026-09-17T10:00:00Z\",\"timeline\":[{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-17T10:10:00Z\",\"author\":{\"login\":\"byte-bot\",\"__typename\":\"Bot\"}},{\"__typename\":\"PullRequestReview\",\"createdAt\":\"2026-09-17T15:00:00Z\",\"author\":{\"login\":\"eli\",\"__typename\":\"User\"}}]}\n]\nEOF",
+    "see": "(no output; teams.json and prs.json now exist)"
+   },
+   {
+    "say": "Write the job: review wait per PR, grouped by team and week, one Prometheus line per group with the week's Monday as its timestamp.",
+    "do": "cat > week.mjs <<'EOF'\nimport { readFileSync } from \"node:fs\";\n\nconst prs = JSON.parse(readFileSync(\"prs.json\", \"utf8\"));\nconst teamOf = JSON.parse(readFileSync(\"teams.json\", \"utf8\")); // GitHub login -> team\n\nconst hours = (from, to) => (Date.parse(to) - Date.parse(from)) / 3_600_000;\nconst quantile = (values, q) => {\n  const s = values.toSorted((a, b) => a - b);\n  const i = (s.length - 1) * q, lo = Math.floor(i), hi = Math.ceil(i);\n  return s[lo] + (s[hi] - s[lo]) * (i - lo);\n};\nconst mondayOf = (iso) => {\n  const d = new Date(iso);\n  d.setUTCHours(0, 0, 0, 0);\n  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));\n  return d.getTime();\n};\n\nconst readyAt = (pr) => pr.timeline.find((e) => e.__typename === \"ReadyForReviewEvent\")?.createdAt ?? pr.createdAt;\nconst reviewWaitHours = (pr) => {\n  const first = pr.timeline.find((e) => e.__typename === \"PullRequestReview\"\n    && e.author.__typename === \"User\" && e.author.login !== pr.author.login);\n  return first ? hours(readyAt(pr), first.createdAt) : undefined;\n};\n\nconst groups = new Map(); // \"team|week\" -> the review waits of that team's PRs in that week\nfor (const pr of prs) {\n  const wait = reviewWaitHours(pr);\n  if (wait === undefined) continue;\n  const key = `${teamOf[pr.author.login]}|${mondayOf(readyAt(pr))}`;\n  groups.set(key, [...(groups.get(key) ?? []), wait]);\n}\nfor (const [key, waits] of groups) {\n  const [team, week] = key.split(\"|\");\n  if (waits.length < 2) continue;\n  console.log(`delivery_review_wait_hours{team=\"${team}\",q=\"p50\"} ${quantile(waits, 0.5).toFixed(1)} ${week}`);\n}\nEOF",
+    "see": "(no output; week.mjs now exists)"
+   },
+   {
+    "say": "Run it. Every line ends with a Monday in milliseconds, and some team-weeks are missing because they had fewer than two reviewed PRs.",
+    "do": "node week.mjs",
+    "see": "delivery_review_wait_hours{team=\"frontend\",q=\"p50\"} 12.0 1788134400000\ndelivery_review_wait_hours{team=\"backend\",q=\"p50\"} 3.0 1788134400000\ndelivery_review_wait_hours{team=\"data\",q=\"p50\"} 15.0 1788134400000\ndelivery_review_wait_hours{team=\"frontend\",q=\"p50\"} 6.0 1788739200000\ndelivery_review_wait_hours{team=\"data\",q=\"p50\"} 1.5 1788739200000\ndelivery_review_wait_hours{team=\"frontend\",q=\"p50\"} 13.0 1789344000000\ndelivery_review_wait_hours{team=\"backend\",q=\"p50\"} 10.5 1789344000000"
+   },
+   {
+    "say": "Start VictoriaMetrics with its default settings and push the lines, the way a careless backfill would.",
+    "do": "docker run -d --name vm-g1 -p 8428:8428 victoriametrics/victoria-metrics:v1.154.0 && sleep 3\nnode week.mjs | curl -s -w '%{http_code}\\n' --data-binary @- localhost:8428/api/v1/import/prometheus",
+    "see": "(a long container ID)\n204"
+   },
+   {
+    "say": "Ask the database what it really did, because the 204 only said the request was fine.",
+    "do": "curl -s localhost:8428/metrics | grep small_timestamp\ndocker logs vm-g1 2>&1 | grep -o 'cannot insert row with too small timestamp [0-9]*' | head -1",
+    "see": "vm_rows_ignored_total{reason=\"small_timestamp\"} 7\ncannot insert row with too small timestamp 1788134400000"
+   },
+   {
+    "say": "Start it again with a retention period long enough for history, like our long-term store, and push the same lines.",
+    "do": "docker rm -f vm-g1\ndocker run -d --name vm-g1 -p 8428:8428 victoriametrics/victoria-metrics:v1.154.0 -retentionPeriod=100y && sleep 3\nnode week.mjs | curl -s -w '%{http_code}\\n' --data-binary @- localhost:8428/api/v1/import/prometheus",
+    "see": "vm-g1\n(a long container ID)\n204"
+   },
+   {
+    "say": "Read the three weeks back, one value per week. Backend shows 3 for the week of 7 September although that week wrote nothing: with no new point, the query repeats the last one. That is why counts belong next to medians.",
+    "do": "sleep 5 && curl -s localhost:8428/api/v1/query_range --data-urlencode 'query=delivery_review_wait_hours' --data-urlencode 'start=2026-08-31T00:00:00Z' --data-urlencode 'end=2026-09-14T00:00:00Z' --data-urlencode 'step=7d' | jq -r '.data.result[] | \"\\(.metric.team): \" + (.values | map((.[0]|todate[5:10]) + \" \" + .[1]) | join(\"  \"))'",
+    "see": "backend: 08-31 3  09-07 3  09-14 10.5\ndata: 08-31 15  09-07 1.5  09-14 1.5\nfrontend: 08-31 12  09-07 6  09-14 13"
+   }
+  ],
+  "build": "Change week.mjs in two ways. First, the data team has only two people, so its numbers point at two engineers: compute each team's size from teams.json and report teams with fewer than 3 people as \"other\". Second, a median hides the slow PRs: print a second line for every group with q=\"p85\" and quantile(waits, 0.85). Run node week.mjs again, then clear the old series and push the new lines: curl -s localhost:8428/api/v1/admin/tsdb/delete_series --data-urlencode 'match[]=delivery_review_wait_hours', then the same push and query as before.",
+  "checks": [
+   "With the default settings, vm_rows_ignored_total{reason=\"small_timestamp\"} shows 7, although curl printed 204.",
+   "With -retentionPeriod=100y, the query shows frontend 12, 6 and 13 hours for the weeks of 31 August, 7 September and 14 September.",
+   "After your change, no line says team=\"data\"; the same values appear as team=\"other\".",
+   "After your change, every group has a p85 line that is at least as big as its p50 line (frontend, 31 August: p50 12.0, p85 17.6).",
+   "grep -c byte-bot prs.json prints 19, yet no review wait in your output is under one hour, because Byte's reviews never count."
+  ],
+  "solution": {
+   "lang": "javascript",
+   "file": "week.mjs (the lines that change)",
+   "text": "const teamOf = JSON.parse(readFileSync(\"teams.json\", \"utf8\")); // GitHub login -> team\nconst size = {};\nfor (const team of Object.values(teamOf)) size[team] = (size[team] ?? 0) + 1;\nconst teamFor = (login) => (size[teamOf[login]] >= 3 ? teamOf[login] : \"other\");\n\n// in the loop over prs:\n  const key = `${teamFor(pr.author.login)}|${mondayOf(readyAt(pr))}`;\n\n// in the loop over groups, after the p50 line:\n  console.log(`delivery_review_wait_hours{team=\"${team}\",q=\"p85\"} ${quantile(waits, 0.85).toFixed(1)} ${week}`);"
+  },
+  "fix": "A teammate \"simplified\" the review check, and now the backfill says review wait was 0.2 hours in every week of September, for every team. Make the broken copy with sed 's/e.author.__typename === \"User\" && //' week.mjs > fast.mjs and run node fast.mjs to see it. Find what the change lets in, explain why every number is the same, and repair fast.mjs.",
+  "explain": [
+   "Why can a job that first runs in October write correct numbers for July?",
+   "Why does each line carry the week's Monday as its timestamp, and what would the dashboard show if the lines had no timestamp?",
+   "The push answered 204, yet nothing was stored. What should a backfill check instead of the status code?"
+  ],
+  "done": "The query shows three weeks per team with the right values, no series says data, every group has a p85, and you removed the database with docker rm -f vm-g1."
+ },
+ "check": [
+  {
+   "q": "The metrics job first ran on 1 October. How does the dashboard get review wait for August?",
+   "options": [
+    {
+     "text": "It cannot; history starts when the job starts",
+     "correct": false,
+     "why": "The job's input is GitHub's history, which still holds August. Only the output is new."
+    },
+    {
+     "text": "The backfill runs the same code over August's pull requests and stamps each number with its own week",
+     "correct": true,
+     "why": "Review wait depends only on each PR's timeline, so it comes out the same today. The timestamp puts it on the right week."
+    },
+    {
+     "text": "Grafana estimates the missing weeks from the October trend",
+     "correct": false,
+     "why": "Grafana draws what is stored. It never invents past values, and a guess would be useless as a baseline."
+    }
+   ]
+  },
+  {
+   "q": "Byte reviews every PR about ten minutes after it is ready. What happens to review wait if the job counts Byte's review as the first review?",
+   "options": [
+    {
+     "text": "Nothing; Byte is a reviewer like any other",
+     "correct": false,
+     "why": "Review wait measures how long a person waits for another person. A bot that answers in minutes measures nothing about that."
+    },
+    {
+     "text": "The job crashes, because bots have no login",
+     "correct": false,
+     "why": "Bots have logins. The danger is quieter: the numbers look plausible and are wrong."
+    },
+    {
+     "text": "It drops to about ten minutes for everyone, and the dashboard shows an improvement nobody felt",
+     "correct": true,
+     "why": "That is why the first review must come from an author of type User who is not the PR's author."
+    }
+   ]
+  },
+  {
+   "q": "A team of two engineers merged five PRs last week. How does that week appear?",
+   "options": [
+    {
+     "text": "Under team=\"other\", together with every team under 3 people",
+     "correct": true,
+     "why": "A number about a team of two is a number about two people. Folding small teams into \"other\" keeps every number at team level."
+    },
+    {
+     "text": "Under the team's own name, because five PRs are enough for a median",
+     "correct": false,
+     "why": "The number of PRs decides whether a median exists. The size of the team decides whether it may be shown under its name."
+    },
+    {
+     "text": "Under each engineer's GitHub login, so the numbers are more precise",
+     "correct": false,
+     "why": "No series ever carries a login. That rule holds for every number in the job."
+    }
+   ]
+  }
+ ],
+ "platform": {
+  "p": [
+   "The job lives in the ai-agents repo as the metrics workspace, TypeScript on Node 24: src/github.ts pulls fcp PRs with one GraphQL query per week (searched once by created date and once by merged date), src/jira.ts pulls RH tickets updated in the last 13 weeks with a read-only Jira account, src/ci.ts reads the required unit-test jobs of cloud-ci.yml, client-ci.yml and frontend-ci.yaml on main, and src/compute.ts turns it all into weekly team points. The command is delivery-metrics, with nightly and backfill --weeks 12.",
+   "It runs from .github/workflows/delivery-metrics.yml on cron '20 2 * * *'. GitHub is read with a separate read-only GitHub App, so the rhino-ai-agents key stays with the broker alone. Points are pushed to the integration VMUser the same way infrastructure's send-workflow-result.yml does it, with the password read from Secrets Manager through the GitHubActions OIDC role. The baseline comes from delivery-metrics backfill --weeks 12 --until 2026-09-30, checked by hand against GitHub for three numbers, and stored as delivery_baseline_*. Byte's rates and the runtime's run numbers are copied into the same delivery_* names, so one dashboard holds all of them."
   ],
   "tickets": [
-    {
-      "key": "G1-03",
-      "why": "This lesson showed the GraphQL query, the cursor loop and the workspace the whole nightly job lives in.",
-      "walk": [
-        "Create the workspace ai-agents/metrics/ (package name @rhinohealth/ai-agents-metrics, ESM, strict TypeScript) with src/github.ts from the two blocks above.",
-        "Add src/gh.ts (graphql, rest and restPages over global fetch with the App token) and src/vm.ts (the Prometheus text writer with millisecond timestamps). Add src/teams.ts (login to team from kvv2 infrastructure/ai-agents/teams).",
-        "Add src/cli.ts as the delivery-metrics bin with the subcommands nightly and backfill --weeks 12.",
-        "Create a separate read-only GitHub App (pull requests, contents, actions, checks: read) and mint its token with actions/create-github-app-token. The rhino-ai-agents key stays with the broker.",
-        "Write to the integration VMUser like infrastructure's send-workflow-result.yml (Secrets Manager integration-metrics-user via the GitHubActions OIDC role). Ask DevOps to confirm the role trusts RhinoHealth/ai-agents.",
-        "Add .github/workflows/delivery-metrics.yml on cron '20 2 * * *', runs-on ubuntu-22.04-2core. Steps: setup-node 24 with npm cache, npm ci --workspace metrics --include-workspace-root, npm run build -w shared -w metrics, node metrics/dist/cli.js nightly.",
-        "Aggregate before writing: series carry team, never login; teams under 3 people report as 'other'."
-      ]
-    },
-    {
-      "key": "G1-06",
-      "why": "This lesson explained ci.ts: which jobs count, and how overlapping red windows become one number.",
-      "walk": [
-        "Add src/jira.ts: JQL project = RH AND updated >= -13w through shared/src/jira.ts, with the read-only token from kvv2 infrastructure/ai-agents/jira-metrics. Keep key, type, status changes, the Nova assignee flag and PR keys from titles; no names.",
-        "Add src/ci.ts from the two blocks above. It needs G0's job renames (Cloud, Client and Frontend Unit Tests), so the required jobs have stable names.",
-        "Write test/ci.test.ts for redHours with the overlap fixture from the lab, so the 'count once' rule is locked in.",
-        "Store each day's raw pull as a JSON artifact of the run, so a metric fix can be recomputed without the APIs.",
-        "Wire both collectors into the nightly subcommand in src/cli.ts."
-      ]
-    },
-    {
-      "key": "G1-07",
-      "why": "This lesson walked through compute.ts and the backfill that writes the September baseline.",
-      "walk": [
-        "Add src/stats.ts (hours, days, median, quantile) and src/compute.ts from the two blocks above. Then one function per remaining metric: lead time, red-main hours, share of PRs with AI help.",
-        "Take the fixes list for changeFailed from G2's golden-set miner (revert, hotfix or Bug fix within 14 days, same lines).",
-        "Add cohorts: agent vs human by PR author, and agent-eligible tickets by G4's Jira label. Agent-only metrics write nothing ('no data'), never 0.",
-        "Run delivery-metrics backfill --weeks 12 --until 2026-09-30 once and write the baseline as delivery_baseline_* series.",
-        "Check three numbers by hand against GitHub: one review wait, one lead time and one week's merged count.",
-        "Copy Byte's addressed and wrong-finding rates (G2) and G3's stuck loops and clean endings into delivery_* names. One dashboard then holds all seventeen."
-      ]
-    }
-  ],
-  "remember": "The nightly job writes team-level weekly series from PRs, tickets and CI runs, and December is compared with the 12-week baseline."
+   {
+    "key": "G1-03",
+    "why": "The metrics workspace, the GitHub query one week at a time, the push with timestamps and the nightly workflow."
+   },
+   {
+    "key": "G1-06",
+    "why": "Jira tickets and red-main time from the required unit-test jobs, plus the raw JSON kept for recomputing."
+   },
+   {
+    "key": "G1-07",
+    "why": "The delivery formulas, teams and cohorts, \"no data\" instead of 0, and the 12-week backfill that becomes the baseline."
+   }
+  ]
+ },
+ "words": [
+  {
+   "term": "review wait",
+   "plain": "Hours from \"ready for review\" to the first review by a person who is not the author. Bot reviews do not count."
+  },
+  {
+   "term": "backfill",
+   "plain": "Computing numbers for past periods from history and writing them with the past period's timestamp."
+  },
+  {
+   "term": "baseline",
+   "plain": "What normal looked like before a change: here, the 12 weeks before October."
+  },
+  {
+   "term": "retention period",
+   "plain": "How long a database keeps data. Points older than it are dropped, also when you write them."
+  },
+  {
+   "term": "p85",
+   "plain": "The value that 85 out of 100 items stay under. It shows the slow tail that a median hides."
+  }
+ ],
+ "review": [
+  {
+   "q": "Write the rule for review wait in one sentence, with both of its exceptions.",
+   "a": "From ready for review (or opening, if never a draft) to the first review by a User who is not the author; bot reviews do not count, and a PR with no human review gives no number instead of 0."
+  },
+  {
+   "q": "A backfill answered 204 but the dashboard is empty for those weeks. What do you check first?",
+   "a": "The database's retention period and its ignored-rows counter (vm_rows_ignored_total with reason small_timestamp), then query the weeks directly."
+  },
+  {
+   "q": "Why do numbers that only exist with agents start as \"no data\" and not 0?",
+   "a": "A 0 before October and a real value after it draws a sudden improvement that never happened; no data draws nothing."
+  }
+ ],
+ "remember": "Compute from history and stamp each number with the week it describes, so the backfill and the nightly run are the same code, and check that the past really landed."
 }

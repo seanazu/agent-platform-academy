@@ -1,570 +1,295 @@
 {
+ "v": 2,
  "id": "g3-11",
  "title": "Checkpoints, recovery and outages",
- "minutes": 45,
+ "minutes": 65,
  "youNeed": [
-  "g3-10",
   "g3-9",
-  "p8-6"
+  "g3-10"
  ],
- "bridge": "A checkpoint is like pushing a WIP commit before you close your laptop: the work lives on the remote. Except the harness does it after every passing step, and it saves notes and the session too. And the workflow, not a person, picks the work up on a new machine.",
- "intro": "VMs crash, Spot machines get taken back, and Claude, Slack or Jira have outages. This lesson makes each of those boring. The harness saves code, notes and proof as it goes. The workflow replaces a dead VM from the last checkpoint. An outage becomes a pause.",
- "picture": {
-  "caption": "The VM is only a workbench: code, notes and the session live outside it, so a fresh VM carries on.",
-  "nodes": [
-   {
-    "id": "harness",
-    "label": "nova-worker on VM 1",
-    "kind": "agent"
-   },
-   {
-    "id": "broker",
-    "label": "broker: git proxy and S3",
-    "kind": "service"
-   },
-   {
-    "id": "store",
-    "label": "branch nova/RH-1234 + runs/<run_id>/",
-    "kind": "cloud"
-   },
-   {
-    "id": "wf",
-    "label": "ticketToPr: runWithRecovery",
-    "kind": "service"
-   },
-   {
-    "id": "vm2",
-    "label": "fresh VM 2",
-    "kind": "machine"
-   },
-   {
-    "id": "person",
-    "label": "Requester's thread",
-    "kind": "person"
-   }
+ "map": "vm",
+ "hook": {
+  "story": [
+   "Nova is building RH-1234 on a full VM. Steps 1 to 3 are done and their tests pass: the code was read, the failing tests are written, the empty-state card exists. In the middle of step 4, hiding the card while the table is loading, the VM freezes. The harness's heartbeat, a small \"I'm alive\" message it sends every 30 seconds, stops arriving.",
+   "Two hours of work happened on that machine. If the code, the notes and the conversation lived only on its disk, Nova starts again from zero tomorrow, and Sean answers the same question twice. And if the next VM freezes too, should Nova try a third, a fourth, a tenth time?"
   ],
-  "steps": [
-   {
-    "from": "harness",
-    "to": "broker",
-    "text": "a step's checks pass: commit, push, upload notes and checkpoints/004.json"
-   },
-   {
-    "from": "broker",
-    "to": "store",
-    "text": "the branch and the run folder now hold the latest checkpoint"
-   },
-   {
-    "from": "harness",
-    "to": "wf",
-    "text": "the heartbeat carries the checkpoint sha"
-   },
-   {
-    "from": "wf",
-    "to": "wf",
-    "text": "no heartbeat for 5 minutes: SandboxDead, the dead VM is released"
-   },
-   {
-    "from": "wf",
-    "to": "vm2",
-    "text": "claims a fresh VM of the same size, freshens at the checkpoint sha"
-   },
-   {
-    "from": "vm2",
-    "to": "store",
-    "text": "fetches the branch, downloads the notes, resumes the stored session"
-   },
-   {
-    "from": "wf",
-    "to": "person",
-    "text": "on a second lost VM: stops and says where the branch and notes are"
-   }
-  ]
+  "question": "How do we lose only the unfinished part of step 4 when a VM dies, and when do we stop trying and call a person?"
  },
- "sections": [
+ "read": [
   {
-   "h": "A Spot VM disappears at step 4",
+   "h": "Save outside the machine after every good step",
    "p": [
-    "Nova is fixing a CI failure on a Spot VM. That is a cheaper VM that AWS can take back after a 2-minute warning (lesson p3-4). Steps 1 to 3 passed their checks. In step 4 AWS takes the machine back. What did we lose?",
-    "With checkpoints, almost nothing. A checkpoint is a saved point a run can restart from. The code is on the branch, and the notes and step record are in S3. The session transcript is in the session store (lesson g3-9). Only the unfinished part of step 4 is gone.",
-    "The rule behind it: the VM is a workbench. Code, memory and proof are always saved outside it. Then a crash, a Spot loss or a 72-hour retirement costs a few minutes, not a ticket."
-   ]
-  },
-  {
-   "h": "checkpoint, part 1: commit and push",
-   "p": [
-    "The harness calls checkpoint after every step whose checks pass. Retire and the Spot warning call it too, through the command nova-worker checkpoint. Part 1 saves the code."
+    "The rule behind this lesson is that the VM is only a workbench. Everything worth keeping is saved somewhere else while the run works, so a dead machine costs minutes, not a ticket. The moment to save is a checkpoint: after each step whose checks pass, the harness commits the work and pushes it to the run's branch through the broker. A checkpoint after a good step is a point we can always start again from, because its tests passed.",
+    "Three kinds of things leave the machine. The code goes to the branch nova/RH-1234 as a commit called wip(RH-1234): <step> [skip ci]. The memory goes to the runs bucket: notes.md, the plan, decisions, what is done and what is next in plain words, plus a small record that ties the step to its commit and session. The conversation is already safe, because the session store from the harness lesson mirrors it as it goes. Finally, the heartbeat carries the checkpoint's commit sha, so the orchestrator always knows the latest safe point."
    ],
-   "because": "We push after each passing step, because the remote branch is the one copy of the code no VM failure can touch.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/harness/src/checkpoint.ts (part 1 of 2)",
-    "text": "import { execFile } from \"node:child_process\";\nimport { readFile } from \"node:fs/promises\";\nimport { basename } from \"node:path\";\nimport { promisify } from \"node:util\";\n\nconst exec = promisify(execFile);\nconst git = (...args: string[]) => exec(\"git\", args, { cwd: \"/work/fcp\" }); // argv, never a shell string\n\n/** Save code, memory and proof outside the VM. Called after every step whose checks pass. */\nexport const checkpoint = async (run: Run, step: Step): Promise<Checkpoint> => {\n  await git(\"add\", \"-A\");\n  const staged = await git(\"diff\", \"--cached\", \"--quiet\").then(() => false, () => true); // exit 1: something is staged\n  if (staged) {\n    // [skip ci]: cloud-ci runs on push to any branch and would take the QA locks at every checkpoint.\n    await git(\"commit\", \"-m\", `wip(${run.jiraKey}): ${step.title} [skip ci]`);\n  }\n  await git(\"push\", \"origin\", `HEAD:refs/heads/${run.branch}`); // origin is the broker's git proxy\n  const sha = (await git(\"rev-parse\", \"HEAD\")).stdout.trim();",
+    "file": "ai-agents/harness/src/checkpoint.ts",
+    "text": "const git = (...args: string[]) => exec(\"git\", args, { cwd: \"/work/fcp\" }); // argv, never a shell string\n\nexport const checkpoint = async (run: Run, step: Step): Promise<Checkpoint> => {\n  await git(\"add\", \"-A\");\n  const staged = await git(\"diff\", \"--cached\", \"--quiet\").then(() => false, () => true);\n  if (staged) await git(\"commit\", \"-m\", `wip(${run.jiraKey}): ${step.title} [skip ci]`);\n  await git(\"push\", \"origin\", `HEAD:refs/heads/${run.branch}`); // origin is the broker's git proxy\n  const sha = (await git(\"rev-parse\", \"HEAD\")).stdout.trim();\n\n  await run.broker.upload(\"notes.md\", renderNotes(run, step, sha)); // plan, done, next, questions\n  await run.broker.upload(`checkpoints/${String(step.index).padStart(3, \"0\")}.json`,\n    JSON.stringify({ sha, step: step.index, session_id: run.sessionId, checks: step.checksPassed }));\n  await run.broker.heartbeat({ step: step.index, progress: run.progress(), checkpoint: sha });\n  return { sha, sessionId: run.sessionId };\n};",
     "notes": [
-     {
-      "line": 1,
-      "text": "execFile runs a program with a list of arguments. No shell reads the input, so a branch or title can never inject a command."
-     },
-     {
-      "line": 6,
-      "text": "promisify turns the callback API into one that returns a promise, so we can await it."
-     },
-     {
-      "line": 7,
-      "text": "git(...) runs git in /work/fcp, the same folder on every VM, so a stored session resumes in the right place."
-     },
-     {
-      "line": 10,
-      "text": "checkpoint takes the run and the step that passed, and returns the sha and the session ID."
-     },
-     {
-      "line": 11,
-      "text": "Stage every change, new files included."
-     },
-     {
-      "line": 12,
-      "text": "git diff --cached --quiet exits 0 when nothing is staged and 1 when something is. The .then turns that exit code into a boolean."
-     },
-     {
-      "line": 15,
-      "text": "The commit message: wip(RH-1234): <step title> [skip ci]. The marker stops CI from running on this push."
-     },
-     {
-      "line": 17,
-      "text": "Push to the run's branch, nova/RH-1234. origin is the broker's git proxy, so the VM holds no GitHub token (lesson g3-4)."
-     },
-     {
-      "line": 18,
-      "text": "Read the sha of the commit we pushed. It is the checkpoint's name."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "why",
-    "text": "cloud-ci, client-ci and sdk-ci run on push to any branch and take the QA locks. Without [skip ci], every checkpoint would start a full backend CI. The commit that opens the PR has no marker, so the PR gets its CI."
-   }
-  },
-  {
-   "h": "checkpoint, part 2: notes, the record and proof",
-   "p": [
-    "Part 2 saves the memory and tells the workflow. notes.md is what Nova knows in plain words: the plan, the decisions, what is done, what is next, open questions. The small JSON record ties a step to its sha and session."
-   ],
-   "because": "We save notes next to the code, because a new session without the old transcript still needs the decisions.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/harness/src/checkpoint.ts (part 2 of 2)",
-    "text": "  await run.broker.upload(\"notes.md\", renderNotes(run, step, sha)); // plan, done, next, questions\n  await run.broker.upload(`checkpoints/${String(step.index).padStart(3, \"0\")}.json`, JSON.stringify({\n    sha, step: step.index, session_id: run.sessionId, checks: step.checksPassed,\n  }));\n  await run.broker.heartbeat({ step: step.index, progress: run.progress(), checkpoint: sha });\n  return { sha, sessionId: run.sessionId };\n};\n\n/** Screenshots, traces, lab reports and logs go up as they are made, not at the end. */\nexport const uploadArtifact = async (run: Run, path: string, kind: string): Promise<void> => {\n  await run.broker.upload(`artifacts/${kind}/${basename(path)}`, await readFile(path));\n  run.manifest.add(kind, basename(path)); // the PR step (G4) links what the QA plan asked for\n};",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Upload notes.md to runs/<run_id>/ through the broker. The broker holds the S3 permissions, not the VM."
-     },
-     {
-      "line": 2,
-      "text": "One record per step: checkpoints/004.json for step 4. padStart keeps the files in order."
-     },
-     {
-      "line": 3,
-      "text": "The record: the sha, the step number, the session ID and the checks that passed."
-     },
      {
       "line": 5,
-      "text": "The heartbeat now carries the checkpoint sha. The workflow always knows the latest one."
+      "text": "git diff --quiet exits with 1 when something is staged, so the promise rejects and we know there is something to commit."
      },
      {
       "line": 6,
-      "text": "The caller gets the sha and the session ID back."
-     },
-     {
-      "line": 10,
-      "text": "uploadArtifact runs as each artifact is made: a screenshot, a Playwright trace, a lab report, a command log."
-     },
-     {
-      "line": 11,
-      "text": "Artifacts go to artifacts/<kind>/<file> in the run folder. A VM lost later loses none of them."
-     },
-     {
-      "line": 12,
-      "text": "The manifest lists every artifact. The PR step (G4) links the ones the QA plan asked for."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Resuming on a fresh VM",
-   "p": [
-    "A fresh VM fetches the branch at the checkpoint sha through the broker. It downloads notes.md and the latest record. Then the harness resumes the stored session by its session ID, so the model sees its own earlier conversation.",
-    "If the transcript cannot be used, the harness starts a new session seeded with notes.md. The model loses its exact words but keeps the plan, the decisions and the next step.",
-    "Two things never happen. The harness never force-pushes: the broker refuses a push that moves the branch backwards. And protected-path edits never reach a commit, because the PreToolUse hook refused them earlier (lesson g3-9)."
-   ],
-   "callout": {
-    "kind": "wall",
-    "text": "One fresh VM per run, and a dead VM is never reused. Recovery always takes a new VM from the warm pool and destroys the old one."
-   }
-  },
-  {
-   "h": "runWithRecovery, part 1: claim, freshen, work",
-   "p": [
-    "The workflow side is runWithRecovery. ticketToPr and routineRun call it instead of claiming a VM themselves. Part 1 is the happy path: claim, freshen at the last checkpoint, and run.",
-    "A VM counts as dead when workInSandbox throws SandboxDead. It does that after 5 minutes without a heartbeat, or when the EC2 status check fails or SSM goes offline (lesson g3-8). The heartbeat comes from a timer in nova-worker, not from the model, so slow thinking is never taken for death."
-   ],
-   "because": "We loop until the work returns, because a lost VM is normal and the answer is always a fresh VM.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/workflows/recovery.ts (part 1 of 2)",
-    "text": "import { ActivityFailure, ApplicationFailure, CancellationScope, log } from \"@temporalio/workflow\";\nimport { act } from \"../policies.js\";\n\nconst MAX_LOST_VMS = 2;\n\n/** A VM is only a workbench: if it dies, take a fresh one and carry on from the last checkpoint. */\n// RunContext (shared package) = Handoff + { runId, agent, branch, base }, built when ticketToPr or routineRun starts\nexport const runWithRecovery = async (wf: RunState, t: RunContext, task: Task, size: Size): Promise<RunResult> => {\n  for (;;) {\n    const vm = await act.acquireSandbox({ runId: t.runId, size, agent: t.agent, jiraKey: t.key });\n    try {\n      await act.freshenSandbox(vm, wf.checkpoint?.sha ?? t.base);\n      return await act.workInSandbox(vm, resumeFrom(task, wf.checkpoint));",
-    "notes": [
-     {
-      "line": 1,
-      "text": "ActivityFailure wraps any error thrown by an activity. ApplicationFailure is the error type we throw ourselves, with a type name."
-     },
-     {
-      "line": 4,
-      "text": "At most 2 lost VMs per ticket. The count lives in the workflow state, so plan and build share it."
+      "text": "[skip ci]: backend CI runs on a push to any branch and would take the QA locks at every checkpoint. The commit that opens the PR has no marker."
      },
      {
       "line": 7,
-      "text": "RunContext is the Handoff plus the run ID, the agent, the branch and the base commit."
-     },
-     {
-      "line": 8,
-      "text": "wf is the run's RunState from lesson g3-10. It holds checkpoint and lostVms too."
-     },
-     {
-      "line": 9,
-      "text": "for (;;) loops until a return or a throw. Each pass uses a new VM."
-     },
-     {
-      "line": 10,
-      "text": "Claim a VM of the same size. The run ID tags it, so a retried claim finds it again."
-     },
-     {
-      "line": 12,
-      "text": "Freshen at the last checkpoint sha. Before the first checkpoint, use the base commit."
+      "text": "Never a force push: the broker refuses a push that moves the branch backwards."
      },
      {
       "line": 13,
-      "text": "resumeFrom adds the checkpoint's session ID and notes to the task, so the harness resumes instead of starting over."
+      "text": "The orchestrator learns the latest safe commit from the heartbeat, without asking the VM."
      }
     ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "The G3-27 ticket does not say how wf.checkpoint gets set. The checkpoint sha reaches the broker in the heartbeat (part 2), not the workflow. Decide it in the PR. For example, workInSandbox can return the last heartbeat's checkpoint, or an activity can fetch it after a SandboxDead. Without that, a fresh VM restarts from t.base."
    }
   },
   {
-   "h": "runWithRecovery, part 2: count, release, stop",
+   "h": "A dead VM is replaced, never repaired",
    "p": [
-    "Part 2 handles the failure. Only two error types mean a lost VM: SandboxDead, and LabNotReady when FCP Lab will not start. Anything else is a real error and goes up to the caller."
+    "On the orchestrator side, the activity that follows the harness is workInSandbox. When five minutes pass with no heartbeat, or AWS says the machine failed its status check, it gives up on the VM and throws an error of the type SandboxDead. The heartbeat comes from a timer in nova-worker, not from the model, so a long thinking turn is never mistaken for death.",
+    "runWithRecovery is the loop around a sandbox step. It claims a VM, freshens it at the last checkpoint instead of at main, and resumes from the next step. If the step throws SandboxDead, the finally block destroys that VM, and the loop claims a fresh one from the warm pool. A dead VM is never reused, because nobody knows what state it is in. Any other error is a real failure and goes up to the caller unchanged."
    ],
-   "because": "We stop after the second lost VM, because a ticket that keeps killing machines needs a person, not a third try.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/workflows/recovery.ts (part 2 of 2)",
-    "text": "    } catch (err) {\n      const type = err instanceof ActivityFailure && err.cause instanceof ApplicationFailure ? err.cause.type : undefined;\n      if (type !== \"SandboxDead\" && type !== \"LabNotReady\") throw err;\n      wf.lostVms += 1;\n      log.warn(\"sandbox lost\", { run: t.runId, lost: wf.lostVms });\n      if (wf.lostVms >= MAX_LOST_VMS) {\n        await act.notify(t, \"This ticket lost two VMs in a row, so I stopped. \" +\n          `Branch ${t.branch} and my notes are saved; a person should take a look.`);\n        throw ApplicationFailure.create({ message: \"two lost VMs\", type: \"NeedsPerson\", nonRetryable: true });\n      }\n    } finally {\n      await CancellationScope.nonCancellable(() => act.releaseSandbox(vm)); // the dead VM is destroyed, never reused\n    }\n  }\n};",
+    "file": "ai-agents/orchestrator/src/workflows/recovery.ts",
+    "text": "const MAX_LOST_VMS = 2;\n\nexport const runWithRecovery = async (wf: RunState, t: RunContext, task: Task, size: Size): Promise<RunResult> => {\n  for (;;) {\n    const vm = await act.acquireSandbox({ runId: t.runId, size, agent: t.agent, jiraKey: t.key });\n    try {\n      await act.freshenSandbox(vm, wf.checkpoint?.sha ?? t.base);\n      return await act.workInSandbox(vm, resumeFrom(task, wf.checkpoint));\n    } catch (err) {\n      const type = err instanceof ActivityFailure && err.cause instanceof ApplicationFailure ? err.cause.type : undefined;\n      if (type !== \"SandboxDead\" && type !== \"LabNotReady\") throw err;\n      wf.lostVms += 1;\n      if (wf.lostVms >= MAX_LOST_VMS) {\n        await act.notify(t, \"This ticket lost two VMs in a row, so I stopped. \" +\n          `Branch ${t.branch} and my notes are saved; a person should take a look.`);\n        throw ApplicationFailure.create({ message: \"two lost VMs\", type: \"NeedsPerson\", nonRetryable: true });\n      }\n    } finally {\n      await CancellationScope.nonCancellable(() => act.releaseSandbox(vm)); // the dead VM is destroyed, never reused\n    }\n  }\n};",
     "notes": [
-     {
-      "line": 2,
-      "text": "Unwrap: the ActivityFailure's cause is our ApplicationFailure, and its type is the name we gave it."
-     },
-     {
-      "line": 3,
-      "text": "Any other error is not ours to handle here. Throw it on."
-     },
-     {
-      "line": 4,
-      "text": "Count the lost VM in workflow state."
-     },
-     {
-      "line": 5,
-      "text": "log from @temporalio/workflow is replay-safe: it does not log again when the history replays."
-     },
-     {
-      "line": 6,
-      "text": "The second loss stops the run. For LabNotReady this gives one retry on a fresh VM, as the playbook says."
-     },
      {
       "line": 7,
-      "text": "Tell the requester what happened and where the branch and notes are. notify tries Slack, then Jira."
-     },
-     {
-      "line": 9,
-      "text": "NeedsPerson is in the never-retry list (lesson g3-10), and nonRetryable makes sure. The run ends as needs a person."
-     },
-     {
-      "line": 11,
-      "text": "On every path the VM is released, a dead one included. It is destroyed, never reused."
-     },
-     {
-      "line": 14,
-      "text": "After a lost VM, the loop goes round and claims a fresh one."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "tip",
-    "text": "Test it in the time-skipping environment from lesson g3-10: an activity mock throws ApplicationFailure.create({ type: \"SandboxDead\", nonRetryable: true }) once, then succeeds. Assert two claims, two releases and a result."
-   }
-  },
-  {
-   "h": "notify: Slack first, then Jira",
-   "p": [
-    "Outages are normal. When Nova needs to tell a person something, notify tries the ticket's Slack thread first. If Slack is down, it comments on Jira. A Jira-first message goes the other way round. If both are down, it throws and is retried with back-off: a wait that grows after each failed try."
-   ],
-   "because": "We fall back between Slack and Jira, because people must still hear from Nova when one of the two is down.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/activities/notify.ts",
-    "text": "import { ApplicationFailure } from \"@temporalio/activity\";\n\n/** Reach the requester somewhere. Slack down -> Jira; Jira down -> Slack; both down -> retry later. */\nexport const notify = async (t: Handoff, text: string, prefer: \"slack\" | \"jira\" = \"slack\"): Promise<string> => {\n  const order = prefer === \"slack\" ? [postToThread, commentOnJira] : [commentOnJira, postToThread];\n  const errors: string[] = [];\n  for (const send of order) {\n    try {\n      await send(t, text);\n      return send.name;\n    } catch (err) {\n      if (!(err instanceof ServiceDown)) throw err; // ServiceDown: 5xx, timeouts, or still rate-limited after retries\n      errors.push(`${send.name}: ${err.message}`);\n    }\n  }\n  throw ApplicationFailure.create({ message: \"Slack and Jira are both down\", details: errors, type: \"BothDown\" }); // retried with back-off\n};",
-    "notes": [
-     {
-      "line": 1,
-      "text": "This is activity code, so it imports from @temporalio/activity and may do I/O."
-     },
-     {
-      "line": 4,
-      "text": "prefer picks the first channel. Most messages are Slack-first."
-     },
-     {
-      "line": 5,
-      "text": "The order of the two senders: postToThread and commentOnJira, both through the broker."
-     },
-     {
-      "line": 9,
-      "text": "Send. On success, return which channel worked."
-     },
-     {
-      "line": 12,
-      "text": "ServiceDown means 5xx, a timeout, or still rate-limited after retries. Any other error is a bug, so it is thrown on."
-     },
-     {
-      "line": 13,
-      "text": "Remember why this channel failed, for the error details."
-     },
-     {
-      "line": 16,
-      "text": "Both are down. BothDown is retried with back-off until one channel comes back."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "The sketches call act.notify, and act uses the AWS policy with at most 10 attempts. For a long outage, call notify through peopleApis (no attempt limit, lesson g3-10). Confirm the choice with the G3-29 owner."
-   }
-  },
-  {
-   "h": "Waiting out an outage",
-   "p": [
-    "Claude slow or down: the SDK retries each call itself, CLAUDE_CODE_MAX_RETRIES at its default of 10. If calls still fail for 15 minutes, the harness checkpoints and exits with the state paused_outage. The workflow then parks the VM and waits, with no VM running.",
-    "GitHub down: broker git and API calls fail closed. The harness retries at the next step boundary, and the PR step retries with back-off. Broker or gateway down: nothing can act without them, so tickets pause. The alert from lesson g3-15 tells DevOps, and runs resume when health checks pass."
-   ],
-   "because": "We wait with durable timers, because a paused ticket should cost nothing and resume by itself.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/workflows/outage.ts",
-    "text": "import { proxyActivities, sleep } from \"@temporalio/workflow\";\nconst OUTAGE_BACKOFF = [\"15 minutes\", \"30 minutes\", \"1 hour\"];\nconst { gatewayHealthy } = proxyActivities<typeof activities>({ ...SHORT, retry: HARNESS_STEP });\n\n/** Claude was down for 15 minutes: the harness saved a checkpoint and exited. Park, wait, resume. */\nexport const waitOutOutage = async (t: Handoff, vm: Sandbox): Promise<void> => {\n  await act.notify(t, \"Claude is unavailable, so I saved my work and paused. I'll carry on by myself.\");\n  await act.parkSandbox(vm);\n  for (let attempt = 0; ; attempt++) {\n    await sleep(OUTAGE_BACKOFF[Math.min(attempt, OUTAGE_BACKOFF.length - 1)]!);\n    if (await gatewayHealthy()) return; // the caller wakes the VM and resumes the stored session\n  }\n};",
-    "notes": [
-     {
-      "line": 1,
-      "text": "sleep is a durable timer in workflow code. It survives restarts and deploys."
-     },
-     {
-      "line": 2,
-      "text": "Wait 15 minutes, then 30, then every hour."
-     },
-     {
-      "line": 3,
-      "text": "gatewayHealthy is a short activity with no retry: one quick check per wake-up."
-     },
-     {
-      "line": 7,
-      "text": "One short line in the thread, so people know why Nova is quiet."
+      "text": "The last checkpoint if there is one, otherwise the main commit the plan was made on."
      },
      {
       "line": 8,
-      "text": "Park the VM: stopped, disk kept, no compute cost."
-     },
-     {
-      "line": 10,
-      "text": "Pick the next wait. After the third, every wait is 1 hour."
+      "text": "resumeFrom gives the harness the session id and the notes, so it continues with step 4, not step 1."
      },
      {
       "line": 11,
-      "text": "When the gateway is healthy, return. The caller wakes the VM and resumes the stored session."
+      "text": "LabNotReady (FCP Lab would not start) is treated like a lost VM: one more try on a fresh machine."
      }
+    ]
+   }
+  },
+  {
+   "h": "The second loss calls a person",
+   "p": [
+    "Why stop at two? One frozen VM is bad luck: machines fail, and a fresh one usually works. Two in a row on the same ticket is a pattern. Maybe step 4 starts a test that eats all the memory, maybe the ticket asks for something that crashes FCP Lab. A third VM would most likely die the same way, and the run would turn into an expensive loop that nobody is watching.",
+    "So the second loss ends the run as needing a person, and the message says where the work is: the branch with every checkpoint and the notes in the runs bucket. Nothing is thrown away, and the person who looks starts from step 4, not from zero. This is the same idea you will meet again in the progress watcher: the platform does not limit how long a run may take, but it notices when trying again has stopped making sense."
+   ],
+   "deeper": {
+    "h": "Go deeper: Spot machines and outages",
+    "p": [
+     "Nova runs on normal on-demand machines because it waits for people, but routines such as the CI fixer use cheaper Spot machines, which AWS can take back with a two-minute warning. The harness listens for that warning, runs nova-worker checkpoint and exits as preempted, and the workflow retries the step on a fresh VM from that checkpoint. It is the same recovery as a frozen VM, only with a warning first.",
+     "Outages of the services around the run get the same treatment: wait, do not lose work. The SDK retries a failing model call itself; if Claude is still unavailable after 15 minutes, the harness checkpoints and exits as paused_outage, the workflow parks the VM and tries again after 15 minutes, 30 minutes, then every hour. Messages to people go through notify, which posts in the Slack thread and falls back to a Jira comment when Slack is down, and the other way round. When the broker or the gateway is down nothing can act at all, so tickets simply pause until health checks pass, and an alert tells DevOps."
     ]
    }
   }
  ],
  "lab": {
-  "title": "Trace a dead VM through the code",
-  "youNeed": [
-   "this lesson open",
-   "lesson g3-10's ticketToPr code",
-   "paper or a text file for your answers"
+  "id": "g3-11",
+  "title": "Kill the VM at step 4",
+  "minutes": 35,
+  "needs": [
+   "Node 22+",
+   "git",
+   "The temporal CLI (brew install temporal)",
+   "The course repo at ~/Projects/ai-agents-course (the lab starts from the p7-4 lab's files)",
+   "Three terminal tabs"
   ],
-  "worked": [
+  "goal": "Make a Temporal run survive a VM that freezes at step 4, continuing from the last checkpoint commit on a fresh VM, and stop to call a person when a second VM dies.",
+  "guess": {
+   "q": "A VM freezes during step 4 of 6. Steps 1 to 3 pushed checkpoint commits. With runWithRecovery, where does the fresh VM start?",
+   "options": [
+    {
+     "text": "At step 1 on main, because a fresh VM has nothing on its disk",
+     "correct": false,
+     "why": "The disk is empty, but the branch is not: freshen checks out the last checkpoint commit."
+    },
+    {
+     "text": "At step 4, from the commit pushed after step 3",
+     "correct": true,
+     "why": "Only the unfinished part of step 4 is lost. The code of steps 1 to 3 is on the branch, and the run knows the checkpoint from the heartbeat."
+    },
+    {
+     "text": "In the middle of step 4, exactly where the old VM stopped",
+     "correct": false,
+     "why": "Work after the last checkpoint was never saved outside the dead VM, so step 4 starts again from its beginning."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "Read checkpoint part 1, line 15. Nova is on RH-1234, and step 4 is called \"add tax to cart total\". Write down the commit message.",
-    "see": "wip(RH-1234): add tax to cart total [skip ci]"
+    "say": "Copy the p7-4 lab's files, because they already connect to Temporal and run a worker on the ai-agents-nova queue.",
+    "do": "cp -r ~/Projects/ai-agents-course/labs/p7-4/start ~/academy-labs/g3-11 && cd ~/academy-labs/g3-11\nrm triggers.mjs try-default.mjs start-run.mjs\nsed -i '' \"s/WorkflowType = 'ticketToPr' AND //\" clean.mjs\nnpm install",
+    "see": "added 150 packages, and audited 151 packages in 5s"
    },
    {
-    "do": "Read part 2, line 2. Write the file name of step 4's record and the four fields inside it.",
-    "see": "checkpoints/004.json with sha, step, session_id and checks"
+    "say": "Save the pretend sandbox activities. Each VM is a folder, every good step is a real git commit pushed to origin.git, and the first VM freezes at step 4.",
+    "do": "cat > activities.mjs <<'EOF'\n// Pretend sandbox activities with real git: every \"VM\" is a folder, origin.git plays the broker's git proxy.\nimport { execFile } from 'node:child_process';\nimport { mkdir, rm, writeFile } from 'node:fs/promises';\nimport { promisify } from 'node:util';\nimport { ApplicationFailure, heartbeat, sleep } from '@temporalio/activity';\n\nconst exec = promisify(execFile);\nconst git = (cwd, ...args) => exec('git', args, { cwd }).then((r) => r.stdout.trim()); // argv, never a shell string\nconst now = () => new Date().toTimeString().slice(0, 8);\nconst STEPS = ['read the table code', 'write the failing tests', 'add the empty-state card', 'hide the card while loading', 'handle a filter with no match', 'tidy up'];\nlet vmCount = 0;\nlet deathsLeft = Number(process.env.DEATHS ?? 1); // how many VMs will freeze at step 4\n\nexport const mainHead = async () => git('origin.git', 'rev-parse', 'main');\n\nexport const acquireSandbox = async (ticket) => {\n  const vm = { id: `i-0${String(++vmCount).padStart(3, '0')}`, ticket };\n  console.log(`${now()}  claimed a fresh VM ${vm.id}`);\n  return vm;\n};\n\nexport const freshenSandbox = async (vm, sha) => {\n  await rm(`vms/${vm.id}`, { recursive: true, force: true });\n  await mkdir('vms', { recursive: true });\n  await exec('git', ['clone', '--quiet', 'origin.git', `vms/${vm.id}`]);\n  await git(`vms/${vm.id}`, 'checkout', '--quiet', '-B', `nova/${vm.ticket}`, sha);\n  console.log(`${now()}  ${vm.id} freshened at ${sha.slice(0, 7)}`);\n};\n\nexport const workInSandbox = async (vm, fromStep) => {\n  const dir = `vms/${vm.id}`;\n  let checkpoint;\n  for (let step = fromStep; step <= STEPS.length; step++) {\n    console.log(`${now()}  ${vm.id} step ${step}: ${STEPS[step - 1]} ...`);\n    await sleep(1500);\n    if (step === 4 && deathsLeft > 0) {\n      deathsLeft -= 1;\n      console.log(`${now()}  ${vm.id} froze (no heartbeat), so the activity gives up on it`);\n      throw ApplicationFailure.create({ type: 'SandboxDead', message: `${vm.id} stopped sending heartbeats`, nonRetryable: true, details: [checkpoint] });\n    }\n    await writeFile(`${dir}/step-${step}.txt`, `${STEPS[step - 1]}\\n`);\n    await git(dir, 'add', '-A');\n    await git(dir, '-c', 'user.name=Nova', '-c', 'user.email=nova@example.com', 'commit', '--quiet', '-m', `wip(${vm.ticket}): ${STEPS[step - 1]} [skip ci]`);\n    await git(dir, 'push', '--quiet', 'origin', `HEAD:refs/heads/nova/${vm.ticket}`);\n    checkpoint = { sha: await git(dir, 'rev-parse', 'HEAD'), step };\n    heartbeat(checkpoint); // the heartbeat carries the latest checkpoint\n    console.log(`${now()}  ${vm.id} checkpoint ${checkpoint.sha.slice(0, 7)} after step ${step}`);\n  }\n  return `all ${STEPS.length} steps done on ${vm.id}`;\n};\n\nexport const releaseSandbox = async (vm) => {\n  await rm(`vms/${vm.id}`, { recursive: true, force: true });\n  console.log(`${now()}  ${vm.id} destroyed`);\n};\n\nexport const notify = async (ticket, text) => console.log(`${now()}  Slack thread for ${ticket}: \"${text}\"`);\nEOF",
+    "see": "(no output: the file is saved)"
    },
    {
-    "do": "Read part 2, line 5. After step 4, what does the workflow know that it did not know before?",
-    "see": "The sha of step 4's checkpoint, carried by the heartbeat."
+    "say": "Save the workflow. It runs the build on one VM with no recovery yet, which is what you will improve.",
+    "do": "cat > workflows.mjs <<'EOF'\n// Nova's build for one ticket, cut down to the part this lab needs.\nimport { ActivityFailure, ApplicationFailure, CancellationScope, proxyActivities } from '@temporalio/workflow';\n\nconst act = proxyActivities({ startToCloseTimeout: '7 days', heartbeatTimeout: '2 minutes' });\n\n// Build it: replace this with runWithRecovery. Right now one frozen VM ends the whole run.\nconst runInSandbox = async (state, ticket, base) => {\n  const vm = await act.acquireSandbox(ticket);\n  try {\n    await act.freshenSandbox(vm, base);\n    return await act.workInSandbox(vm, 1);\n  } finally {\n    await CancellationScope.nonCancellable(() => act.releaseSandbox(vm));\n  }\n};\n\nexport async function buildTicket(ticket) {\n  const state = { lostVms: 0, checkpoint: undefined };\n  const base = await act.mainHead();\n  return runInSandbox(state, ticket, base);\n}\nEOF",
+    "see": "(no output)"
    },
    {
-    "do": "AWS takes the VM back in step 5. Its heartbeats stop. Read runWithRecovery part 2, lines 2 to 5. What is type, and what is wf.lostVms now?",
-    "see": "type is \"SandboxDead\"; wf.lostVms is 1, so the stop branch is skipped."
+    "say": "Save a setup script that makes origin.git, the repo that plays the broker's git proxy, and a script that starts the run.",
+    "do": "cat > setup.mjs <<'EOF'\n// Makes origin.git, a bare repo that plays the broker's git proxy, with one commit on main.\nimport { execFileSync } from 'node:child_process';\nimport { mkdirSync, rmSync, writeFileSync } from 'node:fs';\n\nconst run = (cwd, ...args) => execFileSync('git', args, { cwd, stdio: 'pipe' }).toString().trim();\nrmSync('origin.git', { recursive: true, force: true });\nrmSync('vms', { recursive: true, force: true });\nrun('.', 'init', '--quiet', '--bare', '--initial-branch=main', 'origin.git');\nmkdirSync('vms/seed', { recursive: true });\nrun('vms/seed', 'init', '--quiet', '--initial-branch=main');\nwriteFileSync('vms/seed/README.md', '# fcp (pretend)\\n');\nrun('vms/seed', 'add', '-A');\nrun('vms/seed', '-c', 'user.name=Sean', '-c', 'user.email=sean@example.com', 'commit', '--quiet', '-m', 'main before RH-1234');\nrun('vms/seed', 'push', '--quiet', '../../origin.git', 'main');\nrmSync('vms', { recursive: true, force: true });\nconsole.log(`origin.git is ready: main is at ${run('origin.git', 'rev-parse', '--short', 'main')}`);\nEOF\ncat > start.mjs <<'EOF'\n// Starts the build for RH-1234 and waits for its result.\nimport { connect } from './connect.mjs';\n\nconst client = await connect();\nconst handle = await client.workflow.start('buildTicket', { taskQueue: 'ai-agents-nova', workflowId: 'nova:RH-1234', args: ['RH-1234'] });\ntry {\n  console.log(`result: ${await handle.result()}`);\n} catch (err) {\n  console.log(`the run failed: ${err.cause?.cause?.message ?? err.cause?.message ?? err.message}`);\n}\nawait client.connection.close();\nEOF\nnode setup.mjs",
+    "see": "origin.git is ready: main is at 728c00a\n(your commit ids are different on every run)"
    },
    {
-    "do": "Read line 11, then part 1, lines 10 to 13. What happens to the old VM, and where does the new one start?",
-    "see": "The old VM is released (destroyed). A fresh VM of the same size is freshened at step 4's sha and resumes the stored session."
+    "say": "Start Temporal in the first terminal and the worker in the second, and leave both open. The worker's log is where you watch the VMs.",
+    "do": "temporal server start-dev\n# second terminal:\ncd ~/academy-labs/g3-11 && node worker.mjs",
+    "see": "Nova's worker is listening on the ai-agents-nova queue. Leave this terminal open (Ctrl+C stops it)."
    },
    {
-    "do": "The fresh VM dies too. Read part 2, lines 6 to 9. What does the requester read, and how does the run end?",
-    "see": "\"This ticket lost two VMs in a row, so I stopped. Branch nova/RH-1234 and my notes are saved...\" The run ends with NeedsPerson, never retried."
+    "say": "Start the build in the third terminal, because you need to see what one frozen VM does without recovery.",
+    "do": "cd ~/academy-labs/g3-11 && node start.mjs",
+    "see": "the run failed: i-0001 stopped sending heartbeats\n(worker terminal)\n06:18:54  i-0001 checkpoint 399f344 after step 3\n06:18:54  i-0001 step 4: hide the card while loading ...\n06:18:55  i-0001 froze (no heartbeat), so the activity gives up on it\n06:18:55  i-0001 destroyed"
+   },
+   {
+    "say": "Look at the branch, because the work of steps 1 to 3 is still there even though the run failed.",
+    "do": "git -C origin.git log --oneline nova/RH-1234",
+    "see": "399f344 wip(RH-1234): add the empty-state card [skip ci]\nc091698 wip(RH-1234): write the failing tests [skip ci]\n6e5c523 wip(RH-1234): read the table code [skip ci]\n728c00a main before RH-1234"
    }
   ],
-  "faded": "Trace a different failure with the same steps: FCP Lab will not start on the build VM, so freshenSandbox throws LabNotReady. Write down type, lostVms and what happens to the VM after the first failure. The last step is yours: say what happens on the second LabNotReady, and which ticket's playbook rule that matches.",
-  "alone": "Trace a 40-minute Claude outage that starts in step 3. Say when the harness exits and with which state, and what the thread says. Say what happens to the VM, and when waitOutOutage checks the gateway. Then say what the workflow does after the check that finds the gateway healthy.",
-  "done": "From the code alone, you can explain why a dead VM costs at most one unfinished step. And why the second loss stops the run."
+  "build": "Replace runInSandbox in workflows.mjs with runWithRecovery and call it from buildTicket. In a loop: claim a VM, freshen it at state.checkpoint?.sha ?? base, and work from (state.checkpoint?.step ?? 0) + 1. In catch, rethrow anything that is not an ActivityFailure whose cause is an ApplicationFailure of type SandboxDead; otherwise keep the checkpoint the dead VM reported (failure.details[0]), count the lost VM, and on the second loss notify and throw a non-retryable NeedsPerson failure. Release the VM in finally. Restart the worker, run node setup.mjs && node start.mjs, then try two deaths: stop the worker and start it with DEATHS=2 node worker.mjs.",
+  "checks": [
+   "With one death, node start.mjs prints result: all 6 steps done on i-0002.",
+   "The worker log shows i-0002 freshened at the commit of step 3 and starting with step 4, not step 1.",
+   "git -C origin.git log --oneline nova/RH-1234 shows six wip commits, one per step, and no step twice.",
+   "With DEATHS=2, the run fails with two lost VMs and the worker prints the Slack message that names the branch.",
+   "Every claimed VM has a destroyed line in the worker log, the dead ones included."
+  ],
+  "solution": {
+   "lang": "javascript",
+   "file": "~/academy-labs/g3-11/workflows.mjs (runWithRecovery)",
+   "text": "const MAX_LOST_VMS = 2;\n\n// A VM is only a workbench: if it dies, take a fresh one and carry on from the last checkpoint.\nconst runWithRecovery = async (state, ticket, base) => {\n  for (;;) {\n    const vm = await act.acquireSandbox(ticket);\n    try {\n      await act.freshenSandbox(vm, state.checkpoint?.sha ?? base);\n      return await act.workInSandbox(vm, (state.checkpoint?.step ?? 0) + 1);\n    } catch (err) {\n      const failure = err instanceof ActivityFailure && err.cause instanceof ApplicationFailure ? err.cause : undefined;\n      if (failure?.type !== 'SandboxDead') throw err; // anything else is a real failure\n      state.checkpoint = failure.details?.[0] ?? state.checkpoint; // the last checkpoint the dead VM reported\n      state.lostVms += 1;\n      if (state.lostVms >= MAX_LOST_VMS) {\n        await act.notify(ticket, `This ticket lost two VMs in a row, so I stopped. Branch nova/${ticket} and my notes are saved; a person should take a look.`);\n        throw ApplicationFailure.create({ type: 'NeedsPerson', message: 'two lost VMs', nonRetryable: true });\n      }\n    } finally {\n      await CancellationScope.nonCancellable(() => act.releaseSandbox(vm)); // the dead VM is destroyed, never reused\n    }\n  }\n};\n"
+  },
+  "fix": "A teammate thought the checkpoint record \"could be stale\", so they changed freshen to always use base. Make the same change (freshenSandbox(vm, base) and workInSandbox(vm, 1)), restart the worker and run node setup.mjs && node start.mjs. The run still succeeds, but the worker log shows i-0002 starting at step 1, and the branch history now has every early step twice, because the fresh VM redid two hours of work. Put the checkpoint back.",
+  "explain": [
+   "Why does the harness push a checkpoint after each step whose checks pass, and not on a timer?",
+   "Why is a dead VM always destroyed and replaced, never restarted and reused?",
+   "Why does the run stop after the second lost VM instead of trying a third time?"
+  ],
+  "done": "One frozen VM costs only step 4, two frozen VMs end the run with a message that names the branch, and you stopped the worker and the dev server."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Why do checkpoint commits end with [skip ci]?",
+   "q": "Nova's VM froze in step 4. Which of these is lost?",
    "options": [
     {
-     "text": "To hide work-in-progress commits from the reviewer.",
-     "correct": false,
-     "why": "The commits stay in the branch and the PR. The marker only affects CI."
-    },
-    {
-     "text": "Because the broker refuses any push that would start CI.",
-     "correct": false,
-     "why": "The broker refuses moved branches, not CI. The PR's commit starts CI on purpose."
-    },
-    {
-     "text": "Because cloud-ci runs on push to any branch and would take the QA locks at every checkpoint.",
+     "text": "The unfinished part of step 4",
      "correct": true,
-     "why": "That is the ticket's reason. The commit that opens the PR has no marker."
+     "why": "Everything up to the last checkpoint is on the branch and in the runs bucket, and the conversation is in the session store."
+    },
+    {
+     "text": "Steps 1 to 4, because they were done on that VM",
+     "correct": false,
+     "why": "Steps 1 to 3 were pushed as checkpoint commits after their checks passed, so they live outside the VM."
+    },
+    {
+     "text": "The conversation, so the model must read everything again",
+     "correct": false,
+     "why": "The session store mirrored the transcript as it went, so the new VM resumes the same session."
     }
    ]
   },
   {
-   "q": "A ticket loses its second VM. What does runWithRecovery do?",
+   "q": "Why does runWithRecovery freshen the new VM at the checkpoint sha and not at main?",
    "options": [
     {
-     "text": "Claims a third VM: we never limit agents.",
+     "text": "Because main is protected and cannot be checked out on a VM",
      "correct": false,
-     "why": "Guide, don't cage is about time, turns and budget. A ticket that kills VMs needs a person; that is not a work limit."
+     "why": "Any commit can be checked out. The point is which commit holds the work."
     },
     {
-     "text": "Posts what happened and where the branch and notes are, then ends the run with NeedsPerson.",
+     "text": "Because the checkpoint commit holds the steps that already passed, so the run continues instead of starting over",
      "correct": true,
-     "why": "MAX_LOST_VMS is 2; NeedsPerson is never retried."
+     "why": "Freshening at main would throw away every step since the plan."
     },
     {
-     "text": "Retries on a bigger VM size, in case the VM ran out of memory.",
+     "text": "Because the broker refuses to fetch main for an agent",
      "correct": false,
-     "why": "The code claims the same size every time. Choosing a size is the plan's job."
+     "why": "The broker scopes pushes to the run's branch; reading main is normal. The reason is not to lose work."
     }
    ]
   },
   {
-   "q": "Slack is down and Nova wants to say it paused for an outage. What happens?",
+   "q": "A ticket's second VM dies at the same step. What should happen?",
    "options": [
     {
-     "text": "notify catches ServiceDown from Slack and posts a Jira comment instead.",
+     "text": "Claim a third VM, since recovery is automatic",
+     "correct": false,
+     "why": "Two losses in a row on one ticket are a pattern, and a third VM would most likely die the same way."
+    },
+    {
+     "text": "Restart the second VM and try again on it",
+     "correct": false,
+     "why": "A dead VM is never reused, because nobody knows what state it is in."
+    },
+    {
+     "text": "Stop the run, keep the branch and notes, and tell the requester where they are",
      "correct": true,
-     "why": "Slack first, Jira second. Only both down throws BothDown."
-    },
-    {
-     "text": "The message is dropped, because the thread is the only place for updates.",
-     "correct": false,
-     "why": "notify exists to avoid exactly that."
-    },
-    {
-     "text": "The run fails, because notify throws on any error.",
-     "correct": false,
-     "why": "Only non-ServiceDown errors are thrown on. A Slack outage is ServiceDown."
+     "why": "The ticket needs a person, and nothing is lost: the person starts from the last checkpoint."
     }
    ]
   }
  ],
- "recall": [
-  "From lesson g3-10: why does releaseSandbox run inside CancellationScope.nonCancellable?",
-  "From lesson p8-6: where is a session's transcript stored so that a different machine can resume it?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "The checkpoint lives in ai-agents/harness/src/checkpoint.ts and runs after each step whose checks pass, and through nova-worker checkpoint on a Spot warning or before a parked VM is retired at 72 hours. Commits go to nova/RH-1234 through the broker's git proxy; notes.md and checkpoints/<n>.json go to s3://rhino-ai-agents-runs/runs/<run_id>/, and screenshots, traces and logs go to artifacts/ as they are made.",
+   "runWithRecovery in orchestrator/src/workflows/recovery.ts is used by both ticketToPr and routineRun. It counts ai_agents_vm_dead_total and ai_agents_recoveries_total for the alerts (lesson g3-15), and the drills terminate a real VM mid-run to prove it (lesson g3-16). Outages go through notify and waitOutOutage, with the back-off of 15 minutes, 30 minutes, then every hour."
+  ],
+  "tickets": [
+   {
+    "key": "G3-26",
+    "why": "Checkpoints: the wip commit with [skip ci], notes.md, the checkpoint record and artifacts as they are made."
+   },
+   {
+    "key": "G3-27",
+    "why": "Dead-house recovery: SandboxDead after 5 silent minutes, a fresh VM from the last checkpoint, stop at the second loss."
+   },
+   {
+    "key": "G3-39",
+    "why": "Outages: back off, pause after 15 minutes without Claude, resume by itself, Slack and Jira fallback."
+   }
+  ]
+ },
  "words": [
   {
    "term": "checkpoint",
-   "plain": "A saved point a run can restart from: a pushed commit, notes.md and a small record with the sha and session ID."
-  },
-  {
-   "term": "[skip ci]",
-   "plain": "A marker in a commit message that tells CI not to run for that push."
+   "plain": "A saved point after a step whose checks passed: a commit on the run's branch plus notes in the runs bucket."
   },
   {
    "term": "SandboxDead",
-   "plain": "The error type workInSandbox throws when a VM stops heartbeating for 5 minutes or fails its health checks."
+   "plain": "The error workInSandbox throws when a VM stops sending heartbeats for 5 minutes or fails its status check."
   },
   {
-   "term": "LabNotReady",
-   "plain": "The error type freshenSandbox throws when FCP Lab will not start on a VM."
+   "term": "freshen",
+   "plain": "Prepare a VM's checkout at a given commit: main for a new run, the last checkpoint after a recovery."
   },
   {
-   "term": "back-off",
-   "plain": "Waiting longer after each failed try: 5 s, 10 s, 20 s, up to a maximum."
-  },
-  {
-   "term": "ServiceDown",
-   "plain": "Our error for an outside service that answers 5xx, times out, or stays rate-limited after retries."
+   "term": "runWithRecovery",
+   "plain": "The loop that replaces a dead VM with a fresh one from the last checkpoint, and stops after the second loss."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-26",
-   "why": "This lesson explained checkpoint and uploadArtifact line by line, the [skip ci] marker, and how a fresh VM resumes.",
-   "walk": [
-    "Create ai-agents/harness/src/checkpoint.ts with checkpoint and uploadArtifact (code above). git always runs through execFile with an argv.",
-    "Call checkpoint from the step loop after a step's checks pass. Add the nova-worker checkpoint subcommand for retire and the Spot warning.",
-    "Write renderNotes for runs/<run_id>/notes.md: plan, decisions, done, next, open questions. Upload notes and checkpoints/<n>.json through the broker.",
-    "Put the checkpoint sha in the heartbeat, so the workflow always knows the latest one.",
-    "Call uploadArtifact for screenshots, Playwright traces, lab reports and command logs as they are made. Keep a manifest for the PR step (G4).",
-    "Resume path in the harness: fetch the branch at the checkpoint sha, download the notes, resume the stored session. If the transcript is unusable, start a new session seeded with the notes.",
-    "Never force-push: check that the broker refuses a moved branch. Test checkpoint with node:test against a local bare repo as origin."
-   ]
+   "q": "From memory: the three things that leave the VM at a checkpoint, and where each one goes.",
+   "a": "The code as a wip commit on nova/RH-1234 through the broker; notes.md and the checkpoint record in the runs bucket; the checkpoint sha in the heartbeat. The transcript is already in the session store."
   },
   {
-   "key": "G3-27",
-   "why": "This lesson explained runWithRecovery line by line: which errors mean a lost VM, the count, the release, and the stop after two.",
-   "walk": [
-    "Create ai-agents/orchestrator/src/workflows/recovery.ts with runWithRecovery (code above). Add checkpoint and lostVms to RunState in the shared package.",
-    "Make sure workInSandbox (G3-20) throws a non-retryable SandboxDead after 5 silent minutes. It also throws when the EC2 status check fails or SSM goes offline.",
-    "Make freshenSandbox (G3-18) throw LabNotReady with the lab report output when FCP Lab will not start.",
-    "Use runWithRecovery from ticketToPr and routineRun instead of their own claim, freshen and work lines.",
-    "Count ai_agents_vm_dead_total{agent,size} and ai_agents_recoveries_total{result} in the activities, for the alerts in G3-34.",
-    "Test with TestWorkflowEnvironment.createTimeSkipping() and a mock that throws SandboxDead: one loss recovers, two losses end with NeedsPerson. The drill in G3-41 terminates a real VM."
-   ]
+   "q": "Why does the checkpoint commit say [skip ci], and which commit does not?",
+   "a": "Backend CI runs on a push to any branch and would take the QA locks at every checkpoint. The commit that opens the PR has no marker, so the PR gets its CI."
   },
   {
-   "key": "G3-39",
-   "why": "This lesson explained notify's Slack and Jira fallback, waitOutOutage's growing waits, and what each outside outage does to a run.",
-   "walk": [
-    "Create ai-agents/orchestrator/src/activities/notify.ts (code above) with postToThread, commentOnJira and a ServiceDown error for 5xx, timeouts and exhausted rate limits.",
-    "In the harness, keep CLAUDE_CODE_MAX_RETRIES at its default of 10. After 15 minutes of failing calls, checkpoint and exit with paused_outage.",
-    "Create ai-agents/orchestrator/src/workflows/outage.ts with waitOutOutage (code above). When workInSandbox returns paused_outage, call it, then wake the VM and resume the session.",
-    "GitHub down: the broker fails closed; the harness retries at the step boundary; the PR step retries with back-off.",
-    "Broker or gateway down: tickets stay paused until health checks pass, and G3-34's alert tells DevOps.",
-    "Post one short line in the thread for every pause and every resume."
-   ]
+   "q": "A teammate wants MAX_LOST_VMS = 10 \"to be robust\". What do you answer?",
+   "a": "Two losses in a row on one ticket point to a cause in the ticket or the step, so more tries only burn VMs. Stopping keeps the branch and notes, and a person continues from the checkpoint."
   }
  ],
- "remember": "The VM is a workbench: save code, notes and proof after every passing step, so a dead VM costs minutes."
+ "remember": "Save outside the VM after every good step, replace a dead VM from the last checkpoint, and let the second loss call a person."
 }

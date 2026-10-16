@@ -1,533 +1,328 @@
 {
+ "v": 2,
  "id": "g1-1",
  "title": "The collector and the settings that send to it",
- "minutes": 55,
+ "minutes": 50,
  "youNeed": [
   "p6-1",
-  "p5-2",
+  "p5-3",
   "p12-2"
  ],
- "bridge": "The OTel Collector is like a backend-for-frontend in front of an analytics API. Every client posts to one place, and it reshapes the data before forwarding. Except it deletes fields on purpose, so even a misconfigured client cannot store a prompt. And it checks a token before it reads a byte.",
- "intro": "Claude Code and the Agent SDK already export cost, tokens and tool decisions over OpenTelemetry, but today nothing receives them. This lesson deploys the collector that receives them on inf and scrubs content in one place. Every laptop and agent VM gets one address and one token. By the end, cost by team shows in Grafana with no names and no prompts.",
- "picture": {
-  "caption": "One address, one token, one scrub: from a laptop to a team-level number in Grafana.",
-  "nodes": [
-   {
-    "id": "laptop",
-    "label": "Claude Code on a laptop",
-    "kind": "machine"
-   },
-   {
-    "id": "route",
-    "label": "otel.example.com (Envoy + WAF)",
-    "kind": "service"
-   },
-   {
-    "id": "col",
-    "label": "OTel Collector, 2 pods on inf",
-    "kind": "service"
-   },
-   {
-    "id": "vault",
-    "label": "Vault kvv2",
-    "kind": "service"
-   },
-   {
-    "id": "vm",
-    "label": "VictoriaMetrics",
-    "kind": "service"
-   },
-   {
-    "id": "vl",
-    "label": "VictoriaLogs (1 year)",
-    "kind": "service"
-   },
-   {
-    "id": "grafana",
-    "label": "Grafana",
-    "kind": "service"
-   }
+ "map": "telemetry",
+ "hook": {
+  "story": [
+   "The collector from the earlier lesson works: it deletes prompts and emails before anything is stored. Now it runs on inf, our internal Kubernetes cluster, and the first week of numbers looks wrong. The frontend team's cost on the dashboard is about half of what the Anthropic invoice says. The reason is boring. Half the team works from home without the VPN, so their Claude Code tries to send its numbers to an internal address it cannot reach, and quietly gives up. Nova's machines are worse off: they live in a separate AWS account with no route to inf at all, so not a single agent number has arrived.",
+   "The obvious fix is to put the collector on the internet. But then anyone who finds the address can write to it, and a script could send a million fake cost points to the spend dashboard you show leadership. And even with the right address, 25 engineers would each have to type the same eight settings correctly, and keep them correct."
   ],
-  "steps": [
-   {
-    "from": "laptop",
-    "to": "route",
-    "text": "posts OTLP over HTTPS with Authorization: Bearer <ingest token>"
-   },
-   {
-    "from": "route",
-    "to": "col",
-    "text": "the WAF lets only /v1/metrics and /v1/logs through"
-   },
-   {
-    "from": "vault",
-    "to": "col",
-    "text": "an ExternalSecret gives INGEST_TOKEN and USER_SALT; the team map was rendered at apply time"
-   },
-   {
-    "from": "col",
-    "to": "vm",
-    "text": "checks the token, drops prompt and file_path, swaps email for team, writes metrics"
-   },
-   {
-    "from": "col",
-    "to": "vl",
-    "text": "writes events the same way, scrubbed"
-   },
-   {
-    "from": "vm",
-    "to": "grafana",
-    "text": "cost by team appears within a minute; no email anywhere"
-   }
-  ]
+  "question": "How do we let every laptop and every agent send to one public address, without letting strangers write to it, and without asking each person to set it up?"
  },
- "sections": [
+ "read": [
   {
-   "h": "A signal with nowhere to go",
+   "h": "A public door that only accepts writes with a key",
    "p": [
-    "Set CLAUDE_CODE_ENABLE_TELEMETRY=1 and Claude Code starts exporting metrics and events over OTLP (lesson p6-1). OTLP is the OpenTelemetry wire protocol; we use its HTTP form with protobuf bodies. Today those exports have no address to go to, so we lose them.",
-    "This lesson builds the receiving side in three tickets. G1-02 runs an OpenTelemetry Collector on inf-rhinohealth: two pods that take OTLP in, scrub it, and write on. G1-04 gives the collector a public address, otel.example.com. G1-05 points every Claude Code, on laptops and in agent VMs, at that address through managed settings.",
-    "Metrics go to VictoriaMetrics and events go to the long-term VictoriaLogs, kept for 1 year. There is no traces pipeline: inf has no trace store yet."
+    "Three things are involved: the senders (Claude Code on a laptop, or inside an agent's VM), the door (a public address, otel.rhinohealth.com), and the collector behind it. The door is deliberately narrow. Our internet-facing gateway passes only two paths, /v1/metrics and /v1/logs, which are the two paths OTLP (the OpenTelemetry protocol) uses for metrics and events over HTTP. A web application firewall, or WAF, sits in front and inspects each request for attack patterns. If the WAF itself breaks, requests are refused instead of let through unchecked, which people call failing closed.",
+    "The real lock is inside the collector. Every request must carry an ingest token in its Authorization header, the same Bearer header you know from calling any API. The collector checks it with an extension called bearertokenauth. A request without the header, or with the wrong token, gets 401 before any processor runs, so nothing from a stranger reaches the database.",
+    "This token can only write telemetry. It cannot read a dashboard, query a database or call anything else. That matters, because the token will sit on every laptop, and something that sits on 25 laptops will leak one day. If it leaks, the worst anyone can do is write junk, and we change the token in one place."
    ],
-   "callout": {
-    "kind": "wall",
-    "text": "No prompt, command or file path is stored, even from a misconfigured client. The collector scrubs in one place so that holds for everyone."
-   }
-  },
-  {
-   "h": "The collector values, part 1: receive",
-   "p": [
-    "The collector is deployed like n8n (lesson p5-2): a helm_release of the upstream open-telemetry/opentelemetry-collector chart, inside a module, modules/otel-collector. The chart's values come from a Terraform template file, so Terraform can fill in endpoints and the team map. This block is the first half: how the pods receive.",
-    "The ingest token is a shared secret every sender must present. The collector checks it with the bearertokenauth extension, which reads the token from an environment variable."
-   ],
-   "because": "We take the token from the environment rather than from the values file, so the rendered values never contain a secret.",
    "code": {
     "lang": "yaml",
-    "file": "infrastructure/modules/otel-collector/templates/otel_collector_values.yml.tpl (part 1 of 2)",
-    "text": "mode: deployment\nreplicaCount: 2\nimage:\n  repository: otel/opentelemetry-collector-contrib   # contrib: transform processor and bearertokenauth\nextraEnvsFrom:\n  - secretRef: { name: otel-collector }              # ExternalSecret from kvv2 infrastructure/otel-collector\nconfig:\n  extensions:\n    bearertokenauth: { token: \"$${env:INGEST_TOKEN}\" }\n  receivers:\n    otlp:\n      protocols:\n        http: { endpoint: \"0.0.0.0:4318\", auth: { authenticator: bearertokenauth } }\n  processors:\n    memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 20 }",
+    "file": "collector.yaml (the part that checks the token)",
+    "text": "extensions:\n  bearertokenauth:\n    token: ${env:INGEST_TOKEN}\n\nreceivers:\n  otlp:\n    protocols:\n      http:\n        endpoint: 0.0.0.0:4318\n        auth:\n          authenticator: bearertokenauth\n\nservice:\n  extensions: [bearertokenauth]",
     "notes": [
      {
-      "line": 1,
-      "text": "deployment mode: a normal Deployment, not one pod per node. Senders come from outside the cluster."
-     },
-     {
-      "line": 2,
-      "text": "Two replicas, so a restart does not drop telemetry."
-     },
-     {
-      "line": 4,
-      "text": "The contrib image has the transform processor and bearertokenauth; the core image does not."
-     },
-     {
-      "line": 6,
-      "text": "extraEnvsFrom loads a Kubernetes Secret as environment variables. An ExternalSecret fills it from kvv2 infrastructure/otel-collector (lesson p5-3)."
-     },
-     {
-      "line": 9,
-      "text": "Terraform's templatefile reads ${ as its own interpolation. $$ writes a literal ${env:INGEST_TOKEN}, which the collector resolves at start."
-     },
-     {
-      "line": 13,
-      "text": "One receiver: OTLP over HTTP on port 4318, and every request must pass the authenticator first."
-     },
-     {
-      "line": 15,
-      "text": "memory_limiter refuses data when memory passes 80 percent, so a burst cannot crash the pod."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Part 2: scrub, then export",
-   "p": [
-    "The transform processor runs small statements on every record before export. Ours is named transform/scrub. It deletes the content attributes, replaces the person's email with a team name, and keeps a salted hash of the email. With the hash, weekly active users can be counted without names.",
-    "A salted hash is SHA-256 of the email plus a secret string, the salt. The same email always gives the same hash, so you can count distinct people. Nobody can turn the hash back into an email without the salt.",
-    "The team map, work email to team, lives in Vault at infrastructure/ai-agents/teams, and Sean fills it. A vault_kv_secret_v2 data source reads it, and the template's for loop writes one statement per person."
-   ],
-   "because": "We scrub in the collector, not on each client: one wrong env var on one laptop must not store a prompt.",
-   "code": {
-    "lang": "yaml",
-    "file": "infrastructure/modules/otel-collector/templates/otel_collector_values.yml.tpl (part 2 of 2)",
-    "text": "    transform/scrub:\n      error_mode: ignore\n      log_statements:\n        - context: log      # metric_statements repeat this list with context: datapoint\n          statements:\n            - delete_matching_keys(attributes, \"^(prompt|prompt_text|user_system_prompt|full_command|file_path|tool_parameters)$\")\n%{ for email, team in teams ~}\n            - set(attributes[\"team\"], \"${team}\") where attributes[\"user.email\"] == \"${email}\"\n%{ endfor ~}\n            - set(attributes[\"user.hash\"], SHA256(Concat([attributes[\"user.email\"], \"$${env:USER_SALT}\"], \"\"))) where attributes[\"user.email\"] != nil\n            - delete_key(attributes, \"user.email\")\n    batch: {}\n  exporters:\n    otlphttp/metrics: { metrics_endpoint: \"${metrics_endpoint}\" }   # vminsert .../insert/0/opentelemetry/v1/metrics\n    otlphttp/logs: { logs_endpoint: \"${logs_endpoint}\" }            # vlsingle-rhino-logs-longterm:9428\n  service:\n    extensions: [bearertokenauth]\n    pipelines:\n      metrics: { receivers: [otlp], processors: [memory_limiter, transform/scrub, batch], exporters: [otlphttp/metrics] }\n      logs: { receivers: [otlp], processors: [memory_limiter, transform/scrub, batch], exporters: [otlphttp/logs] }",
-    "notes": [
-     {
-      "line": 2,
-      "text": "error_mode: ignore: a statement that fails on one record is skipped for that record; the pipeline goes on."
-     },
-     {
-      "line": 4,
-      "text": "log_statements apply to events. The same list is repeated as metric_statements with context: datapoint, so metrics are scrubbed too."
-     },
-     {
-      "line": 6,
-      "text": "delete_matching_keys removes every attribute whose name matches: prompt, prompt_text, user_system_prompt, full_command, file_path, tool_parameters."
-     },
-     {
-      "line": 7,
-      "text": "%{ for ... ~} is a Terraform template loop over the team map; ~ strips the line break. It is not YAML."
-     },
-     {
-      "line": 8,
-      "text": "Rendered once per person: when user.email equals that email, set team. Terraform fills ${team} and ${email}."
-     },
-     {
-      "line": 10,
-      "text": "user.hash is SHA256 of email plus salt. USER_SALT comes from the environment, so the rendered values hold no secret."
+      "line": 3,
+      "text": "The collector reads the token from an environment variable when it starts, so the file itself holds no secret and can live in git. On inf, a Kubernetes secret filled from Vault provides the variable."
      },
      {
       "line": 11,
-      "text": "Then the email is deleted. After this line no record carries a name."
-     },
-     {
-      "line": 12,
-      "text": "batch groups records before export: fewer, larger requests."
+      "text": "The receiver hands every request to the extension first. Only requests with the right token go on into the pipeline."
      },
      {
       "line": 14,
-      "text": "Metrics go to vminsert's OTLP insert path. Ask DevOps for -opentelemetry.usePrometheusNaming=true on vminsert, so series get names like claude_code_cost_usage_USD_total."
-     },
-     {
-      "line": 15,
-      "text": "Events go to vlsingle-rhino-logs-longterm, the VictoriaLogs kept for 1 year."
-     },
-     {
-      "line": 19,
-      "text": "Each pipeline runs the same three processors in order: limit memory, scrub, batch. There is no traces pipeline."
+      "text": "Defining an extension is not enough: it must also be switched on here. Forget this line and the collector refuses to start, which is the safe way to fail."
      }
     ]
-   }
+   },
+   "see": "no token     → 401 {\"code\":16, \"message\":\"missing or empty authorization header: Authorization\"}\nwrong token  → 401 {\"code\":16, \"message\":\"provided authorization does not match expected scheme or token\"}\nright token  → 200 {\"partialSuccess\":{}}"
   },
   {
-   "h": "Secrets, the unit and the proof",
+   "h": "Settings that arrive by themselves",
    "p": [
-    "Terraform generates ingest_token and user_salt and writes them to kvv2 infrastructure/otel-collector, the way modules/n8n-secrets does. The ExternalSecret from vault-store turns that path into the Kubernetes Secret named otel-collector that the values load.",
-    "The unit lives at multi_tenant/accounts/infrastructure/otel-collector/terragrunt.hcl (lesson p4-2). A person runs plan and apply over VPN; agents never apply.",
-    "Prove the scrub twice. First from a pod with telemetrygen, a small tool that sends fake OTLP data. Then one real claude -p session with OTEL_LOG_USER_PROMPTS=1 set on purpose: the prompt must not show up in VictoriaLogs."
-   ]
-  },
-  {
-   "h": "A public address: otel.example.com (G1-04)",
-   "p": [
-    "Engineers are not always on VPN, and agent VMs have no peering to inf. So the collector gets a public HTTPS route, otel.example.com, behind Envoy's external gateway and the WAF. A WAF, a web application firewall, inspects each request and blocks known attack shapes. Ours is Coraza, and it fails closed like n8n's webhooks: when it cannot decide, it refuses.",
-    "Only two paths are open, /v1/metrics and /v1/logs. The collector checks the bearer token itself, and that token only lets you write telemetry. Test from a laptop off VPN with telemetrygen, with and without the token; without it you expect 401. If the WAF blocks protobuf bodies, add a rule exception for these two paths."
+    "Now the senders. Claude Code already speaks OpenTelemetry; it needs a few environment variables to know that it should send, what to send and where. If each person sets them by hand, some will forget, some will copy an old address, and some will switch prompts on to debug something and leave them on. The numbers then describe whoever happened to set it up right, not the team.",
+    "So the variables arrive through managed settings, the settings file that an organisation pushes to every Claude Code and that a person cannot override. We keep the file in git, next to the other managed settings, so every change is reviewed. The file turns telemetry on, sends metrics and events as OTLP over HTTP to otel.rhinohealth.com, and turns every content flag off, so prompts, answers and tool details never leave the laptop. The collector still deletes them again, because a rule that depends on every laptop being right is not a rule.",
+    "One value is different: the ingest token. The file in git says only \"<set only in the admin console>\" where the token goes, and the real token is typed only into the admin console of claude.ai, which sends the settings to every laptop. A token in git would be a token in every clone of the repo, forever, even after we change it."
    ],
-   "because": "We add the route to the same unit so the collector and its address are planned and applied together.",
-   "code": {
-    "lang": "hcl",
-    "file": "infrastructure/multi_tenant/accounts/infrastructure/otel-collector/terragrunt.hcl (the file-path comment and five blank lines dropped; nothing else)",
-    "text": "include \"root\" {\n  path   = find_in_parent_folders(\"root.hcl\")\n  expose = true\n}\nterraform {\n  source = \"../../../../modules/otel-collector//\" # module from the collector ticket\n}\ninputs = {\n  namespace     = \"otel-collector\"\n  chart_version = \"0.0.0\" # pin the current open-telemetry/opentelemetry-collector chart release\n  vault_kv_mount_path = include.root.locals.vault_kv_mount_path\n  vault_secret_path   = \"infrastructure/otel-collector\"  # ingest_token, user_salt (generated by Terraform)\n  teams_secret_path   = \"infrastructure/ai-agents/teams\" # work email -> team; owner Sean\n  metrics_endpoint = \"http://vminsert-rhino-metrics.${include.root.locals.metrics_namespace}.svc:8480/insert/0/opentelemetry/v1/metrics\"\n  logs_endpoint    = \"http://vlsingle-rhino-logs-longterm.${include.root.locals.logs_namespace}.svc:9428/insert/opentelemetry/v1/logs\"\n  # This ticket: a public OTLP/HTTP route, like n8n's webhook host. Laptops are not always on VPN.\n  external_route = {\n    parent_ref = \"envoy-external\"\n    hostname   = \"otel.example.com\"\n    paths      = [\"/v1/metrics\", \"/v1/logs\"] # no traces store yet\n  }\n  waf_enabled   = true\n  waf_fail_open = false # fail closed, like n8n's webhooks\n}",
-    "notes": [
-     {
-      "line": 1,
-      "text": "include root pulls in the shared root.hcl: remote state, providers, the Vault address. expose = true lets inputs read its locals."
-     },
-     {
-      "line": 6,
-      "text": "The module from G1-02, by relative path, in the old tree's style."
-     },
-     {
-      "line": 10,
-      "text": "Pin the chart release you tested. 0.0.0 is a placeholder to replace."
-     },
-     {
-      "line": 12,
-      "text": "Where Terraform wrote ingest_token and user_salt."
-     },
-     {
-      "line": 13,
-      "text": "Where Sean's team map lives; the module reads it with a vault_kv_secret_v2 data source."
-     },
-     {
-      "line": 14,
-      "text": "vminsert's OTLP metrics insert path, in the metrics namespace from the root locals."
-     },
-     {
-      "line": 15,
-      "text": "The long-term VictoriaLogs insert path on port 9428."
-     },
-     {
-      "line": 18,
-      "text": "envoy-external is the internet-facing gateway, the same parent n8n's webhooks use."
-     },
-     {
-      "line": 20,
-      "text": "Only two paths; a request to any other path never reaches the collector."
-     },
-     {
-      "line": 23,
-      "text": "waf_fail_open = false: if the WAF cannot decide, the request is refused."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The settings that send (G1-05)",
-   "p": [
-    "Server-managed settings are managed settings pushed from claude.ai to every laptop in the org (lesson p12-2 and lesson g0-6). The file 20-telemetry.json sits next to G0's 10-models.json. The people version is pasted into claude.ai with the real ingest token; the token never goes into git.",
-    "Team is not set here, because the file is org-wide and the collector turns the email into a team. Agents get a different copy, baked into the VM image by G3. It has no OTEL_RESOURCE_ATTRIBUTES, because the harness sets them per step, and no token.",
-    "The proposal for G3 is a small OTLP relay inside the LLM gateway. It checks the run token and adds the ingest token, so the VM holds no ingest token. Leave OTEL_LOG_RAW_API_BODIES and the traces exporter unset.",
-    "The check: on a laptop /status lists the managed source. Within a minute claude_code_cost_usage_USD_total appears in Grafana with a team label and no email."
-   ],
-   "because": "We turn telemetry on through managed settings so every laptop sends the same way, with content off at the source.",
    "code": {
     "lang": "json",
-    "file": "ai-agents/settings/managed-settings.d/20-telemetry.json",
-    "text": "{\n  \"$schema\": \"https://json.schemastore.org/claude-code-settings.json\",\n  \"env\": {\n    \"CLAUDE_CODE_ENABLE_TELEMETRY\": \"1\",\n    \"OTEL_METRICS_EXPORTER\": \"otlp\",\n    \"OTEL_LOGS_EXPORTER\": \"otlp\",\n    \"OTEL_EXPORTER_OTLP_PROTOCOL\": \"http/protobuf\",\n    \"OTEL_EXPORTER_OTLP_ENDPOINT\": \"https://otel.example.com\",\n    \"OTEL_EXPORTER_OTLP_HEADERS\": \"Authorization=Bearer <ingest token: set only in the admin console>\",\n    \"OTEL_LOG_USER_PROMPTS\": \"0\",\n    \"OTEL_LOG_ASSISTANT_RESPONSES\": \"0\",\n    \"OTEL_LOG_TOOL_DETAILS\": \"0\",\n    \"OTEL_LOG_TOOL_CONTENT\": \"0\",\n    \"OTEL_METRICS_INCLUDE_ACCOUNT_UUID\": \"false\",\n    \"OTEL_RESOURCE_ATTRIBUTES\": \"department=rnd,source=human\"\n  }\n}",
+    "file": "ai-agents/settings/managed-settings.d/20-telemetry.json (the important lines)",
+    "text": "{\n  \"env\": {\n    \"CLAUDE_CODE_ENABLE_TELEMETRY\": \"1\",\n    \"OTEL_METRICS_EXPORTER\": \"otlp\",\n    \"OTEL_LOGS_EXPORTER\": \"otlp\",\n    \"OTEL_EXPORTER_OTLP_PROTOCOL\": \"http/protobuf\",\n    \"OTEL_EXPORTER_OTLP_ENDPOINT\": \"https://otel.rhinohealth.com\",\n    \"OTEL_EXPORTER_OTLP_HEADERS\": \"Authorization=Bearer <set only in the admin console>\",\n    \"OTEL_LOG_USER_PROMPTS\": \"0\",\n    \"OTEL_LOG_TOOL_DETAILS\": \"0\",\n    \"OTEL_RESOURCE_ATTRIBUTES\": \"department=rnd,source=human\"\n  }\n}",
     "notes": [
      {
-      "line": 4,
-      "text": "The master switch for Claude Code telemetry."
-     },
-     {
-      "line": 5,
-      "text": "Metrics and events both go out as OTLP; the traces exporter stays unset."
+      "line": 3,
+      "text": "The main switch. Without it, nothing else in this block does anything."
      },
      {
       "line": 7,
-      "text": "http/protobuf: the HTTP form of OTLP, the one the collector's receiver and the WAF route accept."
+      "text": "Only the base address. The exporter adds /v1/metrics and /v1/logs itself, which are exactly the two paths the door lets through."
      },
      {
       "line": 8,
-      "text": "The public address from G1-04; the exporter appends /v1/metrics and /v1/logs itself."
+      "text": "Standard OpenTelemetry format: name=value pairs. The exporter turns it into the header Authorization: Bearer <token> on every request."
      },
      {
       "line": 9,
-      "text": "The placeholder is replaced with the real token only in the admin console, never in this file."
+      "text": "Content flags off at the source. The real file switches off two more of them, for assistant answers and tool content."
      },
      {
-      "line": 10,
-      "text": "The four content flags off: no prompts, no assistant text, no tool details, no tool content."
-     },
-     {
-      "line": 14,
-      "text": "No account UUID on metrics; the collector's user.hash is the only per-person key."
-     },
-     {
-      "line": 15,
-      "text": "Resource attributes every laptop sends: department=rnd and source=human. Agents send source per step instead."
+      "line": 11,
+      "text": "Resource attributes are labels attached to everything this process sends. Every person gets the same two, so there is no team here: the file is the same for the whole company."
      }
+    ]
+   },
+   "deeper": {
+    "h": "Go deeper: why these are environment variables",
+    "p": [
+     "None of these names belong to Claude Code. OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS and OTEL_RESOURCE_ATTRIBUTES are defined by the OpenTelemetry specification, and every OpenTelemetry SDK reads them, in Node, Python or Go. That is why a later lesson can tag an agent's numbers by setting one of these variables per session, without changing a line of the agent's code."
     ]
    }
   },
   {
-   "h": "The lab's collector config",
+   "h": "A person becomes a team at the door",
    "p": [
-    "On the laptop you cannot use Terraform's template, so you write the rendered result by hand. It has two fake emails and a fake salt. The debug exporter prints every record to the terminal, so you can watch the scrub work. Note that tool_parameters is missing from the pattern; the faded step adds it."
+    "Claude Code puts the person's work email on every number it sends, so the dashboards could show cost per person. We do not want that: numbers about one person turn a tool for the team into a tool for watching people. So the collector, which already deletes content, also turns each email into a team name and then deletes the email.",
+    "The table of work email to team lives in Vault, and it changes when people join or move. When we deploy the collector, Terraform reads the table and writes one line per person into the collector's configuration. Next to the team, the collector keeps a salted hash of the email, which you met in the earlier lesson: it lets us count how many different people used Claude this week, without being able to say who they were."
    ],
-   "because": "We use the debug exporter instead of otlphttp so the lab needs no VictoriaMetrics, only a terminal.",
    "code": {
     "lang": "yaml",
-    "file": "~/scratch/g1-1/collector.yaml (lab only)",
-    "text": "extensions:\n  bearertokenauth: { token: \"lab-token\" }\nreceivers:\n  otlp:\n    protocols:\n      http: { endpoint: \"0.0.0.0:4318\", auth: { authenticator: bearertokenauth } }\nprocessors:\n  transform/scrub:\n    error_mode: ignore\n    log_statements:\n      - context: log\n        statements:\n          - delete_matching_keys(attributes, \"^(prompt|prompt_text|user_system_prompt|full_command|file_path)$\")\n          - set(attributes[\"team\"], \"fe\") where attributes[\"user.email\"] == \"ada@example.com\"\n          - set(attributes[\"team\"], \"be\") where attributes[\"user.email\"] == \"bob@example.com\"\n          - set(attributes[\"user.hash\"], SHA256(Concat([attributes[\"user.email\"], \"lab-salt\"], \"\"))) where attributes[\"user.email\"] != nil\n          - delete_key(attributes, \"user.email\")\n  batch: {}\nexporters:\n  debug: { verbosity: detailed }\nservice:\n  extensions: [bearertokenauth]\n  pipelines:\n    logs: { receivers: [otlp], processors: [transform/scrub, batch], exporters: [debug] }",
+    "file": "collector.yaml (what the deploy writes from the team table)",
+    "text": "processors:\n  transform/people:\n    error_mode: ignore\n    metric_statements:\n      - context: datapoint\n        statements:\n          - set(attributes[\"team\"], \"frontend\") where attributes[\"user.email\"] == \"sean@rhinohealth.com\"\n          - set(attributes[\"team\"], \"backend\") where attributes[\"user.email\"] == \"dana@rhinohealth.com\"\n          - set(attributes[\"user.hash\"], SHA256(Concat([attributes[\"user.email\"], \"${env:USER_SALT}\"], \"\"))) where attributes[\"user.email\"] != nil\n          - delete_key(attributes, \"user.email\")",
     "notes": [
      {
-      "line": 2,
-      "text": "A hard-coded token is fine only in the lab; the real file reads it from the environment."
+      "line": 5,
+      "text": "A metric arrives as data points, one per combination of labels. The statements run on each data point. Events get the same list with context: log."
      },
      {
-      "line": 13,
-      "text": "The same pattern as the real file, minus tool_parameters, so you can see one attribute slip through."
+      "line": 7,
+      "text": "One line per person, written by the deploy from the table in Vault. The real table has every engineer in it."
      },
      {
-      "line": 14,
-      "text": "This is what the Terraform loop renders: one set() per email in the team map."
+      "line": 9,
+      "text": "The salt comes from the environment, like the token, so the file in git holds no secret."
      },
      {
-      "line": 16,
-      "text": "lab-salt stands in for USER_SALT; the hash is still SHA-256 of email plus salt."
-     },
-     {
-      "line": 20,
-      "text": "The debug exporter prints each record with its attributes; verbosity detailed shows them all."
-     },
-     {
-      "line": 24,
-      "text": "One logs pipeline, no memory_limiter: the lab sends one record at a time."
+      "line": 10,
+      "text": "After this line, no record carries a name."
      }
+    ]
+   },
+   "deeper": {
+    "h": "Go deeper: the agents hold no ingest token",
+    "p": [
+     "An agent's VM reads text that anyone can write, so it holds no long-lived secret, and the ingest token is no exception. The plan is a small relay inside the LLM gateway, the service that already checks each run's short-lived run token for model calls. The VM sends its telemetry to the relay with that run token, the relay checks it and forwards to the collector with the real ingest token. The VM's copy of the settings therefore has no token and no team; the harness, our program that runs Claude Code in the VM, adds the run's own labels to each session."
     ]
    }
   }
  ],
  "lab": {
-  "title": "Run the scrub on your laptop",
-  "youNeed": [
-   "Docker Desktop",
-   "jq",
-   "terragrunt (brew install terragrunt), for the reading step"
+  "id": "g1-1",
+  "title": "A collector that only takes writes with a key",
+  "minutes": 25,
+  "needs": [
+   "Docker Desktop running",
+   "curl"
   ],
-  "worked": [
+  "goal": "Run a collector that refuses every request without the ingest token, and that turns each person's email into a team before anything leaves it.",
+  "mode": "guided",
+  "guess": {
+   "q": "The collector's configuration defines bearertokenauth and uses it in the receiver, but someone forgot to list it under service.extensions. What happens when you start the collector?",
+   "options": [
+    {
+     "text": "It starts and accepts every request, because the check is not switched on.",
+     "correct": false,
+     "why": "That would be the dangerous way to fail. The receiver needs an authenticator it cannot find, so the collector does not start at all."
+    },
+    {
+     "text": "It refuses to start, and says it cannot find the authenticator.",
+     "correct": true,
+     "why": "The receiver asks for bearertokenauth, which was never started. The collector stops with 'authenticator not found', so you notice at once instead of running an open door."
+    },
+    {
+     "text": "It starts, and every request gets 401, even with the right token.",
+     "correct": false,
+     "why": "The collector checks its whole configuration before it opens the port. A missing extension is caught at start, not per request."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "mkdir -p ~/scratch/g1-1 && cd ~/scratch/g1-1, save the lab config above as collector.yaml, then: docker network create otel-lab",
-    "see": "54288722e682374712b4ac01b4a2e3185a59c47cc06e8ab635321bc63e6c2370\n(your id differs)"
+    "say": "Make a folder for the lab and write the collector configuration from Understand, with both parts: the token check and the team table. The debug exporter prints every record instead of storing it, so you can read what would reach the database.",
+    "do": "mkdir -p ~/academy-labs/g1-1 && cd ~/academy-labs/g1-1 && cat > collector.yaml <<'EOF'\nextensions:\n  bearertokenauth:\n    token: ${env:INGEST_TOKEN}\n\nreceivers:\n  otlp:\n    protocols:\n      http:\n        endpoint: 0.0.0.0:4318\n        auth:\n          authenticator: bearertokenauth\n\nprocessors:\n  transform/people:\n    error_mode: ignore\n    metric_statements:\n      - context: datapoint\n        statements:\n          - set(attributes[\"team\"], \"frontend\") where attributes[\"user.email\"] == \"sean@rhinohealth.com\"\n          - set(attributes[\"team\"], \"backend\") where attributes[\"user.email\"] == \"dana@rhinohealth.com\"\n          - set(attributes[\"user.hash\"], SHA256(Concat([attributes[\"user.email\"], \"${env:USER_SALT}\"], \"\"))) where attributes[\"user.email\"] != nil\n          - delete_key(attributes, \"user.email\")\n\nexporters:\n  debug:\n    verbosity: detailed\n\nservice:\n  extensions: [bearertokenauth]\n  pipelines:\n    metrics:\n      receivers: [otlp]\n      processors: [transform/people]\n      exporters: [debug]\nEOF",
+    "see": "(no output; collector.yaml now exists)"
    },
    {
-    "do": "docker run --rm --name otel-lab-collector --network otel-lab -p 4318:4318 -v \"$PWD/collector.yaml:/etc/otelcol-contrib/config.yaml\" otel/opentelemetry-collector-contrib:latest",
-    "see": "info  extensions/extensions.go  Extension started.  {... \"otelcol.component.id\": \"bearertokenauth\"}\ninfo  otlpreceiver  Starting HTTP server  {... \"endpoint\": \"[::]:4318\"}\ninfo  service  Everything is ready. Begin running and processing data."
+    "say": "Write one cost number the way Claude Code sends it: the metric claude_code.cost.usage, 42 cents, with the model and the person's email as labels.",
+    "do": "cat > cost.json <<'EOF'\n{\"resourceMetrics\":[{\"resource\":{\"attributes\":[\n  {\"key\":\"service.name\",\"value\":{\"stringValue\":\"claude-code\"}}]},\n \"scopeMetrics\":[{\"metrics\":[{\"name\":\"claude_code.cost.usage\",\"unit\":\"USD\",\n  \"sum\":{\"aggregationTemporality\":1,\"isMonotonic\":true,\"dataPoints\":[\n   {\"asDouble\":0.42,\"timeUnixNano\":\"1760000000000000000\",\"attributes\":[\n     {\"key\":\"model\",\"value\":{\"stringValue\":\"claude-opus-5-5\"}},\n     {\"key\":\"user.email\",\"value\":{\"stringValue\":\"sean@rhinohealth.com\"}}]}]}}]}]}]}\nEOF",
+    "see": "(no output; cost.json now exists)"
    },
    {
-    "do": "In a second terminal: docker run --rm --network otel-lab ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest logs --otlp-endpoint otel-lab-collector:4318 --otlp-http --otlp-insecure --otlp-header 'Authorization=\"Bearer lab-token\"' --telemetry-attributes 'prompt=\"fix the login bug\"' --telemetry-attributes 'user.email=\"ada@example.com\"' --telemetry-attributes 'tool_parameters=\"rm -rf\"' --logs 1",
-    "see": "INFO  logs/worker.go  logs generated  {\"worker\": 0, \"logs\": 1}\nINFO  logs/logs.go  stopping the exporter  {\"worker\": 0}"
+    "say": "Start the collector. The token and the salt arrive as environment variables, the same way the Kubernetes secret delivers them on inf.",
+    "do": "docker run -d --name otel-door -p 4318:4318 -e INGEST_TOKEN=lab-ingest-token -e USER_SALT=lab-salt -v \"$PWD/collector.yaml:/etc/otelcol-contrib/config.yaml\" otel/opentelemetry-collector-contrib:0.161.0 && sleep 4 && docker logs otel-door 2>&1 | tail -1 | cut -c1-100",
+    "see": "7924d83e2546…\n2026-10-15T23:34:01.893Z\tinfo\tservice@v0.161.0/service.go:256\tEverything is ready. Begin r"
    },
    {
-    "do": "Look at the collector terminal",
-    "see": "LogRecord #0\nBody: Str(the message)\nAttributes:\n     -> app: Str(server)\n     -> user.hash: Str(86bc3dd67bc04cb396a3b33620dfda2bf4889ac48bca123ff0f5fa319d5e514e)\n     -> tool_parameters: Str(rm -rf)\n     -> team: Str(fe)\n(prompt and user.email are gone; tool_parameters is still there, on purpose)"
+    "say": "Be the stranger first: send the number with no token, and then with a wrong one.",
+    "do": "curl -s -w ' -> %{http_code}\\n' -X POST http://localhost:4318/v1/metrics -H 'Content-Type: application/json' --data @cost.json\ncurl -s -w ' -> %{http_code}\\n' -X POST http://localhost:4318/v1/metrics -H 'Content-Type: application/json' -H 'Authorization: Bearer wrong-token' --data @cost.json",
+    "see": "{\"code\":16, \"message\":\"missing or empty authorization header: Authorization\"} -> 401\n{\"code\":16, \"message\":\"provided authorization does not match expected scheme or token\"} -> 401"
    },
    {
-    "do": "Send again with the same command but without the --otlp-header part",
-    "see": "FATAL  logs/worker.go  failed to export batched logs  {\"error\": \"failed to send logs to http://otel-lab-collector:4318/v1/logs: 401 Unauthorized ...\"}"
+    "say": "Now send it like a laptop with the managed settings: the same header that OTEL_EXPORTER_OTLP_HEADERS produces.",
+    "do": "curl -s -w ' -> %{http_code}\\n' -X POST http://localhost:4318/v1/metrics -H 'Content-Type: application/json' -H 'Authorization: Bearer lab-ingest-token' --data @cost.json",
+    "see": "{\"partialSuccess\":{}} -> 200"
    },
    {
-    "do": "mkdir -p settings && save 20-telemetry.json from the lesson as settings/20-telemetry.json, then: jq -r '.env.OTEL_EXPORTER_OTLP_ENDPOINT, .env.OTEL_LOG_USER_PROMPTS' settings/20-telemetry.json",
-    "see": "https://otel.example.com\n0"
-   },
-   {
-    "do": "Reading step: mkdir -p otel-collector and save the terragrunt.hcl block as otel-collector/terragrunt.hcl. Then run: terragrunt hcl format --file otel-collector/terragrunt.hcl && terragrunt hcl format --check --file otel-collector/terragrunt.hcl; echo exit $?",
-    "see": "exit 0\n(the first command realigns the = signs that the dropped blank lines used to separate; --check then passes)"
+    "say": "Read what would reach the database. Look for the email: it should be gone, with a team and a hash in its place.",
+    "do": "sleep 2 && docker logs otel-door 2>&1 | grep -A4 'Data point attributes'",
+    "see": "Data point attributes:\n     -> model: Str(claude-opus-5-5)\n     -> user.hash: Str(59355a6a057cff7f3c6201125189dd5d4a2749c7b6f0b1c3d1acf6daeda67b79)\n     -> team: Str(frontend)\nValue: 0.420000"
    }
   ],
-  "faded": "Add tool_parameters to the delete_matching_keys pattern in collector.yaml. Restart the collector (Ctrl-C, then the same docker run) and send the same telemetrygen command. The step left out is the edit to the pattern itself: write it so it matches the real file's pattern exactly. Then the Attributes block must show only app, user.hash and team.",
-  "alone": "Add a third email, carol@example.com, to team ds in collector.yaml and prove it with one send. Then send a fourth record with an email that is not in the map. Read what happens: no team, a user.hash, and no user.email.",
-  "done": "The collector prints team and user.hash for every mapped email and never prints prompt, user.email or tool_parameters. A send without the token gets 401."
+  "build": "Omer, a new engineer, joins the data team on Monday, and nobody has added him to the table yet. Copy cost.json to omer.json and change the email to omer@rhinohealth.com, then send it: the record arrives with a hash but no team, so every team dashboard silently drops his cost. Fix collector.yaml in two ways. Add a statement that puts omer@rhinohealth.com in the team \"data\". Then add one statement, after all the people and before the hash, that sets team to \"other\" when no team was set (where attributes[\"team\"] == nil), so the next person nobody added still counts somewhere. Restart the collector (docker rm -f otel-door, then the same docker run), send omer.json again, and send one more copy with an email that is in no table.",
+  "checks": [
+   "A request with no token and a request with a wrong token both get 401.",
+   "A request with Bearer lab-ingest-token gets 200.",
+   "The debug output shows team: Str(frontend) and a user.hash for Sean, and no user.email anywhere.",
+   "After your change, omer.json arrives with team: Str(data), and an email that is in no table arrives with team: Str(other).",
+   "grep -c lab-ingest-token collector.yaml prints 0: the token is not in the file."
+  ],
+  "solution": {
+   "lang": "yaml",
+   "file": "collector.yaml (the statements after your change)",
+   "text": "        statements:\n          - set(attributes[\"team\"], \"frontend\") where attributes[\"user.email\"] == \"sean@rhinohealth.com\"\n          - set(attributes[\"team\"], \"backend\") where attributes[\"user.email\"] == \"dana@rhinohealth.com\"\n          - set(attributes[\"team\"], \"data\") where attributes[\"user.email\"] == \"omer@rhinohealth.com\"\n          - set(attributes[\"team\"], \"other\") where attributes[\"team\"] == nil\n          - set(attributes[\"user.hash\"], SHA256(Concat([attributes[\"user.email\"], \"${env:USER_SALT}\"], \"\"))) where attributes[\"user.email\"] != nil\n          - delete_key(attributes, \"user.email\")"
+  },
+  "fix": "A teammate tidied the configuration and the collector on inf stopped starting after the deploy. Run: sed '/^  extensions: \\[bearertokenauth\\]/d' collector.yaml > broken.yaml && docker run --rm -e INGEST_TOKEN=x -e USER_SALT=y -v \"$PWD/broken.yaml:/etc/otelcol-contrib/config.yaml\" otel/opentelemetry-collector-contrib:0.161.0 2>&1 | tail -1. Read the error (it ends with 'authenticator not found'), find what the tidy removed, and explain why failing to start is better than starting without the check. Then try the other classic mistake: start the correct file without -e INGEST_TOKEN and read what the collector says.",
+  "explain": [
+   "Why is it acceptable that the ingest token sits on every laptop, when we never let a GitHub token sit on an agent's VM?",
+   "The managed settings already switch prompts off. Why does the collector still delete them?",
+   "Why does the settings file for people carry no team, and where does the team come from?"
+  ],
+  "done": "Strangers get 401, a laptop with the token gets 200, every record leaves with a team and a hash and no email, and you removed the lab with docker rm -f otel-door."
  },
- "quiz": [
+ "check": [
   {
-   "q": "An engineer sets OTEL_LOG_USER_PROMPTS=1 on their laptop. Where does the prompt end up?",
+   "q": "The ingest token leaks: someone pasted it into a public gist. What can a stranger do with it?",
    "options": [
     {
-     "text": "In VictoriaLogs, because the flag is per laptop and managed settings cannot stop it",
+     "text": "Read every team's cost numbers from the database",
      "correct": false,
-     "why": "The flag changes what the laptop sends, but the collector deletes the prompt attribute before export."
+     "why": "The token opens only the write door, on two paths. Reading goes through Grafana, which has its own login."
     },
     {
-     "text": "In the WAF's request log at the edge",
-     "correct": false,
-     "why": "The WAF inspects request shapes; it does not store telemetry bodies."
-    },
-    {
-     "text": "Nowhere: transform/scrub deletes the prompt attribute before export",
+     "text": "Write fake telemetry, until we change the token in the one place it is set",
      "correct": true,
-     "why": "That is why the scrub lives in the collector and G1-02's last step tests exactly this case."
+     "why": "That is the whole power of this token, on purpose. The damage is junk data, and we fix it by changing the token in Vault and the admin console."
+    },
+    {
+     "text": "Nothing, because the WAF blocks every request that comes from outside the company",
+     "correct": false,
+     "why": "The WAF blocks attack shapes, not people outside. The address is public on purpose, so laptops off the VPN can reach it."
     }
    ]
   },
   {
-   "q": "Why does the values template write $${env:INGEST_TOKEN} with two dollar signs?",
+   "q": "Why does the real ingest token go into the claude.ai admin console and not into 20-telemetry.json in git?",
    "options": [
     {
-     "text": "Because Terraform's templatefile would read ${ as its own interpolation; $$ leaves a literal ${env:...} for the collector",
+     "text": "Because Claude Code cannot read headers from a settings file",
+     "correct": false,
+     "why": "It can: the admin console sends the same kind of settings. The question is where the secret is stored, not how it is read."
+    },
+    {
+     "text": "Because the admin console encrypts the telemetry on the way",
+     "correct": false,
+     "why": "HTTPS protects the data on the way in both cases. The difference is who can see the token at rest."
+    },
+    {
+     "text": "Because a token in git stays in every clone and in the history, even after we change it",
      "correct": true,
-     "why": "The template renders at apply time; the collector resolves env: at start. Two readers, two escapes."
-    },
-    {
-     "text": "Because YAML needs a doubled dollar sign inside quotes",
-     "correct": false,
-     "why": "YAML has no special meaning for $; the doubling is for Terraform."
-    },
-    {
-     "text": "Because the Helm chart double-escapes environment variables",
-     "correct": false,
-     "why": "The chart passes config through; Terraform is the one that interpolates ${...}."
+     "why": "Git never forgets. The file in git holds a fake value, and the real one lives only where it is needed."
     }
    ]
   },
   {
-   "q": "Where does the real ingest token go?",
+   "q": "A teammate proposes putting the team name in each person's own settings, so the collector needs no table. What goes wrong?",
    "options": [
     {
-     "text": "Into 20-telemetry.json in RhinoHealth/ai-agents; the repo is private",
-     "correct": false,
-     "why": "The file in git keeps the placeholder; a token in git is a token in every clone."
-    },
-    {
-     "text": "Into the claude.ai admin console's server-managed settings, and Vault; never git",
+     "text": "Each person can type any team, or none, so the team numbers depend on everyone getting it right",
      "correct": true,
-     "why": "G1-05 says the token is set only in the admin console; Terraform generated it into kvv2."
+     "why": "The same reason we scrub in the collector: a rule that depends on every laptop being right breaks on the first wrong laptop. One table in one place is correct for everyone."
     },
     {
-     "text": "Into each engineer's ~/.claude/settings.json by a script",
+     "text": "Resource attributes cannot hold a team name",
      "correct": false,
-     "why": "That is per laptop and overridable; managed settings reach everyone the same way."
+     "why": "They can hold any name=value pair. The problem is who sets it, not whether it fits."
+    },
+    {
+     "text": "Nothing; it is the same result with less work",
+     "correct": false,
+     "why": "The managed settings are the same file for the whole company, so a per-person value would have to come from each person by hand, which is the problem this lesson removes."
     }
    ]
   }
  ],
- "recall": [
-  "From lesson p6-1: name the three OpenTelemetry signals, and say which one has no store on inf today.",
-  "From lesson p12-2: how does a managed setting reach a laptop, and can the person override it?"
- ],
- "videos": [
-  {
-   "title": "What is OTel? | OTel for Beginners - The JavaScript Journey",
-   "url": "https://www.youtube.com/watch?v=iEEIabOha8U",
-   "channel": "OpenTelemetry",
-   "minutes": 9,
-   "why": "Official OpenTelemetry intro aimed at JavaScript developers."
-  }
- ],
+ "platform": {
+  "p": [
+   "The collector runs on inf-rhinohealth as a Terraform helm_release unit of the upstream OpenTelemetry Collector chart: contrib image, two replicas, a memory limiter, and an ExternalSecret that brings INGEST_TOKEN and USER_SALT from Vault (kvv2 infrastructure/otel-collector, generated by Terraform the way n8n's secrets are). The deploy reads the email-to-team table from infrastructure/ai-agents/teams and renders one set() line per person; in the Terraform template the collector's own ${env:...} is written $${env:...}, so Terraform leaves it alone. The scrub deletes prompt, prompt_text, user_system_prompt, full_command, file_path, tool_parameters and user.email. Metrics go to vminsert with Prometheus naming switched on (so the cost series is claude_code_cost_usage_USD_total), and events go to the long-term VictoriaLogs, kept for a year. There is no traces pipeline yet.",
+   "The public route otel.rhinohealth.com sits behind envoy-external with the Coraza WAF failing closed, on /v1/metrics and /v1/logs only. The people's settings live in ai-agents/settings/managed-settings.d/20-telemetry.json next to 10-models.json, with the real token pasted only into claude.ai's server-managed settings. The VM image gets a copy with no token and no OTEL_RESOURCE_ATTRIBUTES."
+  ],
+  "tickets": [
+   {
+    "key": "G1-02",
+    "why": "The collector on inf: the team table, the salted hash, the scrub, and where metrics and events are stored."
+   },
+   {
+    "key": "G1-04",
+    "why": "The public door: the route, the two paths, the WAF, and the bearer token checked by the collector."
+   },
+   {
+    "key": "G1-05",
+    "why": "The managed settings that switch telemetry on for every person and agent, content off, token only in the admin console."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "collector",
-   "plain": "The OpenTelemetry service that receives telemetry, changes it, and forwards it to a store."
-  },
-  {
-   "term": "OTLP",
-   "plain": "The OpenTelemetry wire protocol; we use its HTTP form with protobuf bodies."
-  },
-  {
    "term": "ingest token",
-   "plain": "The shared secret every sender presents; it only lets you write telemetry."
+   "plain": "The shared key every sender puts in its Authorization header. It can only write telemetry."
   },
   {
-   "term": "transform processor",
-   "plain": "A collector step that runs small statements on every record, here to delete and replace attributes."
+   "term": "bearertokenauth",
+   "plain": "The collector extension that checks the token on every request and answers 401 when it is missing or wrong."
   },
   {
-   "term": "salted hash",
-   "plain": "SHA-256 of a value plus a secret salt: countable, but not reversible without the salt."
+   "term": "managed settings",
+   "plain": "Settings an organisation pushes to every Claude Code; a person cannot override them."
   },
   {
-   "term": "WAF",
-   "plain": "A web application firewall at the edge that inspects requests and blocks known attack shapes."
+   "term": "fail closed",
+   "plain": "When something cannot decide or cannot start safely, it refuses instead of letting everything through."
   },
   {
-   "term": "telemetrygen",
-   "plain": "A small tool that sends fake OTLP data, used to test a collector."
+   "term": "resource attributes",
+   "plain": "Labels a process attaches to everything it sends, set with OTEL_RESOURCE_ATTRIBUTES."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G1-02",
-   "why": "Scrubbing in one collector means no prompt, command or file path is stored, even from a misconfigured client.",
-   "walk": [
-    "Create modules/otel-collector: a helm_release of the upstream open-telemetry/opentelemetry-collector chart (contrib image, deployment mode, 2 replicas) plus an ExternalSecret from vault-store.",
-    "Generate ingest_token and user_salt with Terraform into kvv2 infrastructure/otel-collector, like modules/n8n-secrets. Read the team map from infrastructure/ai-agents/teams with a vault_kv_secret_v2 data source and render it into the values template (code above).",
-    "Drop prompt, prompt_text, user_system_prompt, full_command, file_path, tool_parameters and user.email before export. Keep user.hash, a salted SHA-256.",
-    "Ask DevOps for -opentelemetry.usePrometheusNaming=true on vminsert. Send logs to the long-term VictoriaLogs. No traces pipeline.",
-    "Test from a pod with telemetrygen. Then run one real claude -p session with OTEL_LOG_USER_PROMPTS=1 on purpose: the prompt must not show up in VictoriaLogs."
-   ]
+   "q": "Name the three places in the collector configuration that the token check needs, and what happens if one is missing.",
+   "a": "The extension with its token (from an environment variable), the receiver's auth.authenticator, and service.extensions. Without the service entry or without the token, the collector refuses to start."
   },
   {
-   "key": "G1-04",
-   "why": "Laptops off VPN and agent VMs without peering need one authenticated public address.",
-   "walk": [
-    "Add external_route to the unit (code above): envoy-external, Coraza WAF failing closed like n8n's webhooks, paths /v1/metrics and /v1/logs only.",
-    "Leave the token check to the collector (bearertokenauth). The token only lets you write telemetry and reaches people through G1-05.",
-    "Test from a laptop off VPN with telemetrygen, with and without the token; expect 401 without it.",
-    "Check the WAF does not block protobuf bodies; add a rule exception for the two paths if it does."
-   ]
+   "q": "A new person joins on Monday. What must happen so her cost shows on her team's dashboard, and what does she see if nobody does it?",
+   "a": "Someone adds her work email to the team table in Vault and the collector is deployed again. Until then her numbers arrive with a hash and team \"other\" (or no team at all if nobody added the fallback), never with her email."
   },
   {
-   "key": "G1-05",
-   "why": "Telemetry only helps if everyone sends it the same way, with content off at the source.",
-   "walk": [
-    "Add settings/managed-settings.d/20-telemetry.json next to 10-models.json (code above).",
-    "Paste the people version into claude.ai server-managed settings with the real ingest token. The token never goes into git.",
-    "Leave team unset; the collector turns the email into a team (G1-02).",
-    "Agents: the image's copy has no OTEL_RESOURCE_ATTRIBUTES and no token. Propose to G3 an OTLP relay in the LLM gateway that checks the run token and adds the ingest token.",
-    "Leave OTEL_LOG_RAW_API_BODIES and the traces exporter unset.",
-    "Check: /status lists the managed source. Within a minute claude_code_cost_usage_USD_total appears in Grafana with a team label and no email."
-   ]
+   "q": "Why does an agent's VM not get the ingest token, even though the token can only write?",
+   "a": "The VM reads text anyone can write, so it holds no long-lived secret. It sends to a relay in the gateway with its short-lived run token, and the relay adds the ingest token."
   }
  ],
- "remember": "One address, one token, one scrub: nothing with content is stored, and every number is by team, never by name."
+ "remember": "One public door, one write-only key that lives in the admin console and never in git, and one collector that turns every email into a team before anything is stored."
 }

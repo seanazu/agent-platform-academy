@@ -1,453 +1,291 @@
 {
+ "v": 2,
  "id": "p12-3",
  "title": "Evals",
  "minutes": 50,
  "youNeed": [
-  "p12-1",
-  "p8-5",
-  "p10-6"
+  "p12-1"
  ],
- "bridge": "An eval is like a Playwright suite for an agent or a skill. It has fixed cases and a pass or fail per case, run before a change ships. Except a model answers differently from run to run, so each case runs three times. And some checks are themselves a model, a judge, which must be checked against people first.",
- "intro": "A skill can read well and still make results worse. The only way to know is to run fixed cases with and without it and compare. This lesson writes an eval case, runs claude plugin eval, and reads a score. Then it places our five suites side by side: BYTE-GOLD, TICKET-BENCH, ROUTINE-BENCH, SKILL-EVALS and BRAIN-QA.",
- "picture": {
-  "caption": "One case runs in two arms; graders score each run; the gate compares the arms and stores the numbers.",
-  "nodes": [
-   {
-    "id": "case",
-    "label": "evals/<skill>/<case>/case.yaml",
-    "kind": "file"
-   },
-   {
-    "id": "eval",
-    "label": "claude plugin eval",
-    "kind": "service"
-   },
-   {
-    "id": "with",
-    "label": "arm WITH the plugin (3 runs)",
-    "kind": "agent"
-   },
-   {
-    "id": "without",
-    "label": "arm W/OUT the plugin (3 runs)",
-    "kind": "agent"
-   },
-   {
-    "id": "graders",
-    "label": "graders: regex, tool_used, llm judge",
-    "kind": "check"
-   },
-   {
-    "id": "results",
-    "label": "results.json: scores and delta",
-    "kind": "file"
-   },
-   {
-    "id": "gate",
-    "label": "plugin CI gate and the G1 eval store",
-    "kind": "check"
-   }
+ "map": "evals",
+ "hook": {
+  "story": [
+   "Dana, a teammate, adds a page of good grill questions to plan-and-grill, the planning skill that every engineer and Nova, our ticket-to-PR agent, load before they write code. She tries it on one vague ticket. The plan is excellent: sharp questions, a clear definition of done. She bumps the version and the change reaches everyone.",
+   "Two weeks later someone notices that plans for one-line typo fixes now open with five questions to the requester, and Nova's small tickets sit for a day waiting for answers nobody needed. Her one try showed the good side of the change. Nothing showed the bad side, because nothing else was tried."
   ],
-  "steps": [
-   {
-    "from": "case",
-    "to": "eval",
-    "text": "the case gives a prompt, allowed tools and graders"
-   },
-   {
-    "from": "eval",
-    "to": "with",
-    "text": "runs the prompt in a throwaway workspace with the plugin loaded"
-   },
-   {
-    "from": "eval",
-    "to": "without",
-    "text": "runs the same prompt with no plugin: the baseline"
-   },
-   {
-    "from": "with",
-    "to": "graders",
-    "text": "each run is scored; free graders on every PR, the judge nightly"
-   },
-   {
-    "from": "graders",
-    "to": "results",
-    "text": "scores per arm and the delta WITH minus W/OUT"
-   },
-   {
-    "from": "results",
-    "to": "gate",
-    "text": "fail below 0.8, or when the plugin does worse than no plugin; store the JSON"
-   }
-  ]
+  "question": "How do we know that a change to a skill made results better overall, and not just one lucky answer on one prompt?"
  },
- "sections": [
+ "read": [
   {
-   "h": "One case, one question",
+   "h": "A case: a real request and a few checks",
    "p": [
-    "Start from a real case. The BE guild's be-codebase skill (G8-11) should help when someone changes a proto. A proto is a gRPC message shared by the cloud and the on-prem client. The case asks that question and checks three things about the answer.",
-    "A case lives in its own folder under the plugin's evals/, with a case.yaml. The prompt is what the agent receives. allowed_tools limits what it may use. context.add_dirs gives it a small fixture folder, here a trimmed copy of the protos with no customer data. The sketch's file-path comment is dropped; nothing else.",
-    "max_turns is the eval tool's own ceiling, and its default is 10. Our cases set it high, 200, so a turn cap never decides the score. It is a setting of the eval runner, not a limit on our agents."
+    "An eval is a set of test cases for an agent or a skill, run before a change ships, much like a test suite for code. Each case has two parts. The prompt is a request a real person would type, written the way they would type it, without naming the skill. The graders are checks on what Claude produced, and each one passes or fails. In Claude Code, claude plugin eval runs a plugin's cases from its evals/ folder, one folder per case.",
+    "The case below is the one that would have caught the typo-fix problem: a small, clear ticket should get a plan and no questions. It uses three kinds of grader. tool_used checks which tools Claude called, here that the Skill tool loaded plan-and-grill. regex searches the final reply with a JavaScript regular expression, here for a \"Done means\" line. llm asks a second model, the judge, whether the reply meets written criteria. The first two cost nothing and give the same verdict every time; the judge costs a model call and can vary, so it gets concrete PASS and FAIL conditions.",
+    "The same case can be written as one case.yaml file, as here, or as a prompt.md file with one grader per file in graders/, which is the layout the tool's own init command writes and the one you use in the lab. The fields are the same."
    ],
-   "because": "We write one case per behaviour, so a failing case names exactly which behaviour broke.",
    "code": {
     "lang": "yaml",
-    "file": "claude-plugins/plugins/be-guild/evals/be-codebase/proto-change/case.yaml (G8-11)",
-    "text": "schema_version: \"1.1\"\nname: be-codebase-proto-change\ntags: [nightly, be-codebase] # has an llm grader, so it runs nightly, not on every PR\nexecution:\n  prompt: >\n    In fcp I need the on-prem client to send the cloud a new \"disk_free_bytes\" value with its heartbeat.\n    The messages are in common/fcp_common/rhinoAgentRpc. Tell me what to change and what to watch out for.\n  allowed_tools: [Read, Glob, Grep, Skill]\n  max_turns: 200 # the eval tool's ceiling; a turn cap shouldn't decide the score\n  timeout_seconds: 3600\ncontext:\n  add_dirs: [fixture] # a trimmed copy of the protos and handlers; no customer data\ngraders:\n  - name: skill-fired\n    type: tool_used\n    tool: Skill\n    input_match: '\"skill\"\\s*:\\s*\"(?:[\\w-]+:)?be-codebase\"'\n  - name: names-protoc\n    type: regex\n    pattern: \"make protoc\"\n  - name: back-compat\n    type: llm\n    criteria: >\n      PASS if the answer adds a new field instead of changing existing ones, says clients already installed at\n      customers must keep working, and says to regenerate and commit the _pb2 files. FAIL if it renames or removes a field.",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The case format version claude plugin eval expects."
-     },
-     {
-      "line": 3,
-      "text": "Tags pick when the case runs. This one has an llm grader, so it runs nightly, not on every PR."
-     },
-     {
-      "line": 5,
-      "text": "The prompt, written the way a real engineer would ask it."
-     },
-     {
-      "line": 8,
-      "text": "Read-only tools plus Skill, so the case tests advice, not edits."
-     },
-     {
-      "line": 9,
-      "text": "The runner's turn ceiling, set high so it never decides the score."
-     },
-     {
-      "line": 12,
-      "text": "A trimmed copy of the relevant code, so the case does not need all of fcp."
-     },
-     {
-      "line": 15,
-      "text": "tool_used counts calls to a tool. Here: did the Skill tool load be-codebase?"
-     },
-     {
-      "line": 20,
-      "text": "A regex grader: the answer must mention make protoc. Free and exact."
-     },
-     {
-      "line": 22,
-      "text": "An llm grader: a judge model reads the answer against these criteria. It costs money, so nightly only."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Graders: free first, a judge where needed",
-   "p": [
-    "A grader scores one run. regex checks the answer text with a JavaScript regular expression. tool_used counts calls to a tool and can match its input. llm asks a judge model whether the answer meets written criteria. There are also file_exists, tool_order and baseline graders.",
-    "Prefer free graders. PR runs use only cases tagged pr, which have free graders only. Nightly runs add the judge. A negative case matters as much as a positive one: an unrelated request must not load the skill. G8-19 asks for at least one per skill."
-   ],
-   "because": "We test that a skill stays quiet, because a skill that fires on everything costs context on every task.",
-   "code": {
-    "lang": "yaml",
-    "file": "claude-plugins/plugins/rhino-core/evals/remove-dead-code/stays-quiet-on-feature/case.yaml (G8-19)",
-    "text": "# RhinoHealth/claude-plugins/plugins/rhino-core/evals/remove-dead-code/stays-quiet-on-feature/case.yaml\nschema_version: \"1.1\"\nname: remove-dead-code-stays-quiet-on-feature\ndescription: An unrelated feature request must not load remove-dead-code.\ntags: [pr, remove-dead-code] # free graders only, so it runs on every PR\nexecution:\n  prompt: \"Add a 'Last updated' column to the datasets table in the dashboard, newest first.\"\n  allowed_tools: [Read, Glob, Grep, Skill]\n  max_turns: 200 # the eval tool's ceiling\ngraders:\n  - name: does-not-fire\n    type: tool_used\n    tool: Skill\n    input_match: '\"skill\"\\s*:\\s*\"(?:[\\w-]+:)?remove-dead-code\"'\n    min: 0\n    max: 0\n    arm: both # score it in both arms; a Skill grader is otherwise only an indicator",
-    "notes": [
-     {
-      "line": 5,
-      "text": "Tagged pr: free graders only, so it runs on every PR."
-     },
-     {
-      "line": 7,
-      "text": "A feature request that has nothing to do with removing dead code."
-     },
-     {
-      "line": 12,
-      "text": "tool_used on the Skill tool, matching the skill's name in the call's input."
-     },
-     {
-      "line": 15,
-      "text": "min 0 and max 0: the skill must load zero times."
-     },
-     {
-      "line": 17,
-      "text": "arm: both scores this in both arms. Without it, a Skill grader is only an indicator in a two-arm run."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "Grader patterns are JavaScript regular expressions. (?i) for 'ignore case' throws an error there; write [Ff]ront-?end instead."
-   }
-  },
-  {
-   "h": "Two arms: with and without the plugin",
-   "p": [
-    "When a plugin resolves, claude plugin eval runs every case twice over: once with the plugin (WITH) and once without it (W/OUT). That second arm is the baseline. The delta is WITH minus W/OUT. A skill that makes the delta negative makes the model worse at that task.",
-    "Each case runs 3 times per arm by default. One run can pass by luck; three runs show whether it holds. Each run gets a throwaway workspace and a fresh home folder, so runs cannot see each other.",
-    "In a two-arm run, a tool_used grader on Skill is an indicator by default. It says whether the plugin fired but does not count in the score. arm: both makes it count in both arms."
-   ],
-   "callout": {
-    "kind": "why",
-    "text": "A skill that reads well can still hurt. Comparing against no plugin is the only way to know it helps, before it reaches every laptop and agent."
-   }
-  },
-  {
-   "h": "The gate in plugin CI",
-   "p": [
-    "G8-12 runs each changed plugin's suite in CI. On a PR it runs the pr-tagged cases. Nightly, at cron 23 2 * * *, it runs every case of every plugin, judges included. It fails below 0.8, and it fails when the plugin does worse than no plugin.",
-    "The models are pinned: the agent on claude-opus-5-5 at medium effort, the judge on claude-sonnet-5-5. A model rollout must not look like a plugin regression. The job runs on an ARC runner set inside inf, because the LLM gateway is internal. The runner holds no Anthropic key: ANTHROPIC_BASE_URL points at the gateway, which adds the evals key.",
-    "There is no --max-cost-usd. Cost is reported in the JSON as costUsd and charted in Grafana; a ceiling comes only after 4 weeks of data. Results go to the G1 eval store."
-   ],
-   "because": "We also fail on a negative mean delta, because a skill that lowers results must not ship even if its cases pass.",
-   "code": {
-    "lang": "yaml",
-    "file": "claude-plugins/.github/workflows/plugin-ci.yml (G8-12, lines 15-26)",
-    "text": "      - name: Run the cases with and without the plugin (3 runs each)\n        run: |\n          tags=$([ \"${{ github.event_name }}\" = \"schedule\" ] || echo \"--tag pr\") # PRs: free graders only\n          claude plugin eval \"plugins/${{ matrix.plugin }}\" $tags \\\n            --trust-plugin --no-publish --json results.json \\\n            --model claude-opus-5-5 --judge-model claude-sonnet-5-5 \\\n            --threshold 0.8 --runs 3 -j 4\n      - name: Fail if the plugin makes results worse than no plugin\n        run: |\n          jq -e '.aggregates.meanDelta == null or .aggregates.meanDelta >= 0' results.json \\\n            || { echo \"::error::${{ matrix.plugin }} scores lower with the plugin than without it\"; exit 1; }\n          jq -r '.cases[] | select((.aggregates.delta // 0) < 0) | \"::warning::\\(.name) regressed by \\(.aggregates.delta)\"' results.json",
+    "file": "plugins/rhino-core/evals/plan-and-grill/typo-fix-skips-grill/case.yaml",
+    "text": "schema_version: \"1.1\"\nname: typo-fix-skips-grill\ntags: [nightly]\nexecution:\n  prompt: >\n    RH-1240: the Save button on the dataset page says \"Sumbit\". Plan the fix before we start.\n  allowed_tools: [Read, Glob, Grep, Skill]\n  max_turns: 30\ngraders:\n  - name: skill-fired\n    type: tool_used\n    tool: Skill\n    input_match: '\"skill\"\\s*:\\s*\"(?:[\\w-]+:)?plan-and-grill\"'\n  - name: has-done-line\n    type: regex\n    pattern: \"done means\"\n    flags: i\n  - name: no-questions\n    type: llm\n    criteria: >\n      PASS if the reply gives a plan right away and asks the requester no questions.\n      FAIL if it asks the requester anything before or instead of the plan.",
     "notes": [
      {
       "line": 3,
-      "text": "Nightly runs get no tag filter. PRs add --tag pr, so only free graders run."
-     },
-     {
-      "line": 4,
-      "text": "One plugin per matrix job, by path."
-     },
-     {
-      "line": 5,
-      "text": "--trust-plugin skips the trust prompt. Acceptable here: the pod is single-use and holds only gateway access."
+      "text": "Tags choose when a case runs. This one has a judge, which costs money, so it runs nightly, not on every pull request."
      },
      {
       "line": 6,
-      "text": "Pinned models, so a model change is never mistaken for a plugin change."
+      "text": "A realistic request. It never says \"use plan-and-grill\", because the case also tests whether Claude picks the skill by itself."
      },
      {
       "line": 7,
-      "text": "Fail below 0.8, 3 runs per arm, 4 runs at a time."
-     },
-     {
-      "line": 10,
-      "text": "jq -e fails the step unless the mean delta is missing (one arm) or at least 0."
-     },
-     {
-      "line": 12,
-      "text": "Cases whose own delta is negative become warnings on the run."
-     }
-    ]
-   },
-   "ifInstead": "If instead a local run says 'is not a trusted plugin directory', run it once in a terminal and answer yes. Pass --trust-plugin only in CI."
-  },
-  {
-   "h": "Golden sets and the five suites",
-   "p": [
-    "A golden set is a fixed list of cases with known answers, written or confirmed by people. It must stay fixed between two runs you compare, or the comparison means nothing. And the agent under test must never read it, so golden sets live in restricted repos the agents' tokens never cover.",
-    "We have five suites. BYTE-GOLD scores Byte's reviews on 240 PRs (G2), and TICKET-BENCH runs Nova on about 40 real fcp tickets with hidden tests (G4). ROUTINE-BENCH scores each routine's slice, such as 30 past red builds (G5-10), and SKILL-EVALS is claude plugin eval on every plugin (G8-12). BRAIN-QA asks the brain 60 real questions (G6-17).",
-    "Each suite writes JSON to the G1 eval store, and the G1-11 scoreboard shows them side by side."
-   ],
-   "because": "We write the answer as points a judge can check one by one, so 'correct' means the same thing every night.",
-   "code": {
-    "lang": "yaml",
-    "file": "<restricted golden-set repo>/brain-qa/cases/bq-017.yaml (G6-17)",
-    "text": "# <restricted golden-set repo>/brain-qa/cases/bq-017.yaml: repo name from G1/G4; agents and the bot can't read it\nid: bq-017\nquestion: \"When I change a proto in fcp_common, what do I need to do so old on-prem clients keep working?\"\nasked_in: public # public = close to the original words; private = rewritten as a summary (DATA-SCOPE.md)\nsource_pages: # any of these in the top 5 of `kb search` counts as a retrieval hit\n  - engineering/cloud-client-compatibility.md\n  - engineering/code-run-path.md\nanswer_points: # the judge checks each point; all must be there for \"correct\"\n  - \"Protos live in common/fcp_common/rhinoAgentRpc/ and the generated _pb2 files are committed (make protoc)\"\n  - \"Add new fields instead of renaming or removing old ones, because clients installed at customers still use them\"\n  - \"Cites at least one page as rnd-kb/<path>@<sha>\"\nexpect: answer # answer | not_in_kb (then the right reply is \"I don't know\" plus where to ask)\ntags: [be, cross-tier, protos]\nadded: 2026-11-10",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The repo agents and the bot cannot read. The name comes from G1 and G4."
-     },
-     {
-      "line": 3,
-      "text": "A question people really asked in Slack, close to its original words."
-     },
-     {
-      "line": 5,
-      "text": "Retrieval is a hit when any of these pages is in kb search's top 5."
+      "text": "Read-only tools: the case tests advice, not edits."
      },
      {
       "line": 8,
-      "text": "The answer points. The judge checks each one; all must be there for correct."
+      "text": "The turn cap for one run. The default is 10; set it generously so a cap never decides the score."
      },
      {
-      "line": 11,
-      "text": "Citing the page with its commit SHA is part of a correct answer."
+      "line": 13,
+      "text": "Matches the Skill tool's input, with or without the plugin's name in front: rhino-core:plan-and-grill."
      },
      {
-      "line": 12,
-      "text": "expect: answer. About 6 cases expect not_in_kb, where the right reply is I don't know."
+      "line": 17,
+      "text": "flags: i makes the match ignore case. JavaScript has no inline (?i)."
+     },
+     {
+      "line": 19,
+      "text": "The judge reads the final reply against these conditions and votes three times; two PASS votes pass the grader."
      }
     ]
    }
   },
   {
-   "h": "Reading a score",
+   "h": "Run it several times, with and without",
    "p": [
-    "A pass rate alone lies. Each suite runs every case 3 times. The scoreboard draws the pass rate with its spread, the gap between the best and worst of the three rounds. A change counts only when it moves past that spread. With 15 tasks, one task is 6.7 points, so one task up or down is noise.",
-    "A judge must earn trust before it decides anything. BYTE-GOLD's judge is checked on 50 pairs Sean and Nave labelled by hand and needs 90% agreement. BRAIN-QA's judge is checked first against Shai's labels on 10 answers.",
-    "Every suite also has a leak check. BYTE-GOLD fails if a case's PR number appears under Byte's skills/. BRAIN-QA fails if 8-word runs of a question appear in an rnd-kb page. A model that saw the answers scores perfectly and proves nothing."
+    "Ask Claude the same thing twice and you get two different answers. So one run of a case proves little: it can pass by luck or fail by luck. claude plugin eval runs every case three times by default. A run's score is the share of its graders that passed, weighted if you gave graders weights, and the case's score is the mean of its runs.",
+    "A high score still does not say that the skill helped, because Claude might do just as well without it. So each case is also run the same number of times with no plugin loaded. The two sets of runs are called the with-arm and the without-arm, the report shows both scores as WITH and W/OUT, and Δ (delta) is WITH minus W/OUT: what the plugin added. A Δ near zero means Claude does fine alone. A negative Δ means the skill made results worse, which is exactly what Dana's change did to small tickets.",
+    "One detail keeps the comparison fair. \"The skill was loaded\" can never pass without the plugin, so counting it would push every without-arm score down and make Δ look better than it is. In a two-arm run, a tool_used grader on Skill is therefore shown as an indicator, \"the plugin fired\", and left out of the score in both arms. When the whole point of a case is that the skill stays quiet, you add arm: both to that grader so it counts in both arms."
    ],
-   "callout": {
-    "kind": "wall",
-    "text": "Agents never change the checks they are judged by. Golden sets live where the agent cannot read or write, and a change to an eval is a PR a person approves."
+   "see": "CASE        WITH  W/OUT Δ      RUNS COST    NOTES\nfirst-case  1.00  0.33  +0.67  6    $0.41\n\n1 case(s) · mean Δ +0.67 · 74s · $0.41\n(the summary claude plugin eval prints, from the docs)",
+   "deeper": {
+    "h": "Go deeper: when to trust a difference",
+    "p": [
+     "Small suites are noisy. With 15 cases, one case changing its verdict moves the pass rate by almost 7 points, so a drop of one case means \"run it again\", not \"the change is bad\". That is why every case runs three times, why our scoreboard draws each pass rate with its spread (the gap between the best and worst of three rounds), and why a change counts only when it moves past that spread.",
+     "The command's exit code follows --threshold only: it exits 1 when any case's with-arm score is below it, 1.0 by default. Δ never changes the exit code, so a gate that cares about Δ reads it from the JSON result, aggregates.meanDelta, and fails the job itself."
+    ]
    }
+  },
+  {
+   "h": "Graders you can trust, cases the agent cannot see",
+   "p": [
+    "Prefer free graders. A regex over the reply or a tool_used check costs nothing, gives the same verdict every time, and can run on every pull request. Use a judge only for what a pattern cannot see, such as \"asks no questions\", and write its criteria as concrete PASS and FAIL conditions. A judge can be wrong in ways that look convincing: a small judge model may fail a correct answer because it is formatted differently from what the criteria describe. So before a judge decides anything that matters, compare its verdicts with labels people wrote by hand on the same answers.",
+    "Give each skill at least one negative case, a request it must stay quiet on. A skill whose description fires on everything loads its body into sessions where it does not belong and steers Claude with instructions meant for another task, and only a negative case shows that.",
+    "The cases themselves are a golden set: fixed prompts with answers people confirmed, kept unchanged between the runs you compare. The agent under test must never see them, or it can learn the answers and score perfectly while proving nothing. claude plugin eval already hides the eval folder from the runs it starts; for our larger suites the cases live in a restricted repository the agents' tokens never reach."
+   ]
   }
  ],
  "lab": {
-  "title": "Write two eval cases for the hello plugin",
-  "youNeed": [
-   "the ~/plugin-lab folder from p12-1 and p12-2",
-   "Claude Code 2.1.269 or later, logged in"
+  "id": "p12-3",
+  "title": "Score a skill with and without it, from recorded runs",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "Claude Code 2.1.269 or later (claude --version), for claude plugin eval init",
+   "Node 22+",
+   "No model calls: the runs are recorded fixtures"
   ],
-  "worked": [
+  "goal": "Write an eval case for a small skill, then score six recorded runs with the case's own graders the way claude plugin eval does, and read WITH, W/OUT and Δ.",
+  "guess": {
+   "q": "With the welcome-note skill, 3 runs score 1.00, 1.00 and 0.50. Without it, 3 runs score 0.00, 0.50 and 1.00. What does the summary say?",
+   "options": [
+    {
+     "text": "WITH 0.83, W/OUT 0.50, Δ +0.33: the skill helps on this case",
+     "correct": true,
+     "why": "Each arm's score is the mean of its runs, and Δ is the difference. The best single run without the skill scored 1.00, which is why one run proves nothing."
+    },
+    {
+     "text": "WITH 1.00, W/OUT 1.00: both arms reached a perfect run, so no difference",
+     "correct": false,
+     "why": "The score is the mean over runs, not the best run. A skill that is right only sometimes scores lower."
+    },
+    {
+     "text": "The case fails, because one run with the skill scored 0.50",
+     "correct": false,
+     "why": "The case score is 0.83. Whether that passes depends on the threshold you set; Δ still says the skill helped."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "cd ~/plugin-lab/plugins/hello && claude plugin eval init --bare demo-case",
-    "see": "Created evals/demo-case/prompt.md and evals/demo-case/graders/criteria.md"
+    "say": "Give this terminal its own Claude Code config folder, so the lab touches nothing of yours, and write the small team-notes plugin with its welcome-note skill. Then ask the eval tool for a blank case. It only writes two files; it calls no model.",
+    "do": "mkdir -p ~/academy-labs/p12-3/plugins/team-notes/.claude-plugin ~/academy-labs/p12-3/plugins/team-notes/skills/welcome-note && cd ~/academy-labs/p12-3\nexport CLAUDE_CONFIG_DIR=\"$PWD/.claude-home\"\ncat > plugins/team-notes/.claude-plugin/plugin.json <<'EOF'\n{\n  \"name\": \"team-notes\",\n  \"version\": \"0.2.0\",\n  \"description\": \"Short notes for the team: welcomes and goodbyes\",\n  \"author\": { \"name\": \"Lab\" }\n}\nEOF\ncat > plugins/team-notes/skills/welcome-note/SKILL.md <<'EOF'\n---\nname: welcome-note\ndescription: \"Writes a two-line welcome for a new teammate: hello by first name, the team, and one tip for day one.\"\nwhen_to_use: \"Someone joins the team, or the user asks for a welcome message, an onboarding note or a first-day greeting.\"\n---\n# welcome-note\n\nGoal: a welcome a new teammate can read in ten seconds, so they feel expected on day one.\n\nWrite two lines. The first says hello by first name and names the team. The second gives\none practical tip for the first day, such as where to ask questions. Keep it warm and plain.\nEOF\ncd plugins/team-notes && claude plugin eval init --bare welcome-names-team",
+    "see": "Created evals/welcome-names-team/prompt.md and evals/welcome-names-team/graders/criteria.md"
    },
    {
-    "do": "cat evals/demo-case/prompt.md. This is the other case format, prompt.md plus graders/*.md. We use case.yaml like the tickets, so delete the folder afterwards: rm -r evals/demo-case",
-    "see": "---\nmax_turns: 10\nallowed_tools: [Read, Glob, Grep, Skill]\n---\n\nTODO: describe what the agent should do"
+    "say": "Look at what it wrote: run limits and tools in the prompt's frontmatter, and one judge grader. Replace them with a real request and three free graders: did the skill fire, does the reply name the team, does it give a first-day tip.",
+    "do": "cat evals/welcome-names-team/prompt.md\nrm evals/welcome-names-team/graders/criteria.md\ncat > evals/welcome-names-team/prompt.md <<'EOF'\n---\nmax_turns: 10\nallowed_tools: [Read, Glob, Grep, Skill]\ntags: [pr]\n---\n\nLior joins the frontend team on Monday. Can you write something short I can post in the team channel?\nEOF\ncat > evals/welcome-names-team/graders/skill-fired.md <<'EOF'\n---\ntype: tool_used\ntool: Skill\ninput_match: '\"skill\"\\s*:\\s*\"(?:[\\w-]+:)?welcome-note\"'\n---\nEOF\ncat > evals/welcome-names-team/graders/names-the-team.md <<'EOF'\n---\ntype: regex\npattern: 'front-?end|\\bFE\\b'\nflags: i\n---\nEOF\ncat > evals/welcome-names-team/graders/gives-a-tip.md <<'EOF'\n---\ntype: regex\npattern: 'ask|question|channel|buddy|setup'\nflags: i\n---\nEOF\nfind evals -type f | sort",
+    "see": "---\nmax_turns: 10\nallowed_tools: [Read, Glob, Grep, Skill]\n---\n\nTODO: describe what the agent should do\nevals/welcome-names-team/graders/gives-a-tip.md\nevals/welcome-names-team/graders/names-the-team.md\nevals/welcome-names-team/graders/skill-fired.md\nevals/welcome-names-team/prompt.md"
    },
    {
-    "do": "mkdir -p evals/greet-user/fires-on-welcome and write evals/greet-user/fires-on-welcome/case.yaml:\n\nschema_version: \"1.1\"\nname: greet-user-fires-on-welcome\ndescription: A welcome request loads greet-user and names the team.\ntags: [pr, greet-user]\nexecution:\n  prompt: \"Write a short welcome for Lior, who joins the FE team today.\"\n  allowed_tools: [Read, Glob, Grep, Skill]\ngraders:\n  - name: skill-fired\n    type: tool_used\n    tool: Skill\n    input_match: '\"skill\"\\s*:\\s*\"(?:[\\w-]+:)?greet-user\"'\n    arm: both\n  - name: names-the-team\n    type: regex\n    pattern: \"\\\\bFE\\\\b|[Ff]ront-?end\"",
-    "see": "(no output)"
+    "say": "A real run is claude plugin eval . from this folder: three runs with the plugin and three without, six model calls on your account. Instead, score six recorded runs of this case with a small scorer that follows the documented rules. It reads your grader files, so they are the same checks.",
+    "do": "cd ~/academy-labs/p12-3 && mkdir -p recorded\ncat > score.mjs <<'EOF'\n// Scores recorded runs of one eval case with the case's own grader files, the way claude plugin eval does:\n// a run's score is the weighted share of graders that passed, a case's score is the mean over its runs,\n// and Δ is WITH minus W/OUT. Only the free graders (regex, tool_used) are implemented here.\nimport { readFileSync, readdirSync } from \"node:fs\";\nimport { join } from \"node:path\";\n\nconst [caseDir, recordedFile] = process.argv.slice(2);\n\nconst frontmatter = (text) => Object.fromEntries(text.split(\"---\")[1].trim().split(\"\\n\").map((line) => {\n  const i = line.indexOf(\":\");\n  let value = line.slice(i + 1).trim().replace(/^'(.*)'$/, \"$1\");\n  return [line.slice(0, i).trim(), /^\\d+$/.test(value) ? Number(value) : value];\n}));\n\nconst graders = readdirSync(join(caseDir, \"graders\")).filter((f) => f.endsWith(\".md\"))\n  .map((f) => ({ name: f.replace(/\\.md$/, \"\"), weight: 1, ...frontmatter(readFileSync(join(caseDir, \"graders\", f), \"utf8\")) }));\n\nconst passes = (g, run) => {\n  if (g.type === \"regex\") return new RegExp(g.pattern, g.flags ?? \"\").test(run.lastMessage);\n  if (g.type === \"tool_used\") {\n    const match = g.input_match ? new RegExp(g.input_match) : null;\n    const n = run.toolCalls.filter((c) => c.tool === g.tool && (!match || match.test(JSON.stringify(c.input)))).length;\n    return n >= (g.min ?? 1) && n <= (g.max ?? Infinity);\n  }\n  throw new Error(`${g.name}: the lab scorer only runs regex and tool_used graders`);\n};\n\n// In a two-arm run, \"the skill fired\" can never pass without the plugin, so it is shown but not scored.\nconst indicator = (g) => g.arm === \"with-only\" || (g.type === \"tool_used\" && g.tool === \"Skill\" && g.arm !== \"both\");\nconst scored = graders.some((g) => !indicator(g)) ? graders.filter((g) => !indicator(g)) : graders;\nconst total = scored.reduce((sum, g) => sum + g.weight, 0);\nconst runScore = (run) => scored.filter((g) => passes(g, run)).reduce((sum, g) => sum + g.weight, 0) / total;\nconst mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;\n\nconst { arms } = JSON.parse(readFileSync(recordedFile, \"utf8\"));\nconsole.log(`scored: ${scored.map((g) => g.name).join(\", \")}   indicator: ${graders.filter((g) => !scored.includes(g)).map((g) => g.name).join(\", \") || \"none\"}`);\nconst score = {};\nfor (const [arm, runs] of Object.entries(arms)) {\n  score[arm] = mean(runs.map(runScore));\n  const fired = graders.filter((g) => !scored.includes(g)).map((g) => `  ${g.name} ${runs.filter((r) => passes(g, r)).length}/${runs.length}`).join(\"\");\n  console.log(`${arm.padEnd(8)} ${runs.map((r) => runScore(r).toFixed(2)).join(\"  \")}   mean ${score[arm].toFixed(2)}${fired}`);\n}\nconst delta = score.with - score.without;\nconsole.log(`WITH ${score.with.toFixed(2)}  W/OUT ${score.without.toFixed(2)}  Δ ${delta >= 0 ? \"+\" : \"\"}${delta.toFixed(2)}`);\nEOF\ncat > recorded/welcome-names-team.json <<'EOF'\n{\n  \"case\": \"welcome-names-team\",\n  \"arms\": {\n    \"with\": [\n      { \"toolCalls\": [{ \"tool\": \"Skill\", \"input\": { \"skill\": \"team-notes:welcome-note\" } }],\n        \"lastMessage\": \"Welcome, Lior! Great to have you on the frontend team.\\nTip for day one: ask anything in #fe-help, no question is too small.\" },\n      { \"toolCalls\": [{ \"tool\": \"Skill\", \"input\": { \"skill\": \"team-notes:welcome-note\" } }],\n        \"lastMessage\": \"Hi Lior, welcome to the FE team!\\nFirst-day tip: your setup buddy is waiting in #fe-help whenever you get stuck.\" },\n      { \"toolCalls\": [{ \"tool\": \"Skill\", \"input\": { \"skill\": \"team-notes:welcome-note\" } }],\n        \"lastMessage\": \"Welcome aboard, Lior! We are happy you are joining the frontend team on Monday.\" }\n    ],\n    \"without\": [\n      { \"toolCalls\": [],\n        \"lastMessage\": \"Hey everyone, please welcome Lior, who starts on Monday! Lior, we are excited to work with you.\" },\n      { \"toolCalls\": [],\n        \"lastMessage\": \"Welcome Lior to the frontend team! Looking forward to building great things together.\" },\n      { \"toolCalls\": [],\n        \"lastMessage\": \"Please join me in welcoming Lior, our new frontend engineer! Lior, if you have questions, just ask in this channel.\" }\n    ]\n  }\n}\nEOF\nnode score.mjs plugins/team-notes/evals/welcome-names-team recorded/welcome-names-team.json",
+    "see": "scored: gives-a-tip, names-the-team   indicator: skill-fired\nwith     1.00  1.00  0.50   mean 0.83  skill-fired 3/3\nwithout  0.00  0.50  1.00   mean 0.50  skill-fired 0/3\nWITH 0.83  W/OUT 0.50  Δ +0.33"
    },
    {
-    "do": "claude plugin eval . --runs 1 --no-publish --json results.json. Answer yes when it asks you to trust the folder.",
-    "see": "Ablation: defaulting to with-without (...) each case also runs a no-plugin baseline arm (2x runs) and reports Δ\nWrote results.json\nReport: .../evals/results/<time>/report.html"
-   },
-   {
-    "do": "jq '.aggregates, .costUsd' results.json, then open the report.html it named.",
-    "see": "{ \"casesTotal\": 1, \"casesPassed\": 1, \"overallScore\": 1, ... }\n<the cost in dollars>\n(numbers vary from run to run)"
-   },
-   {
-    "do": "Break the skill on purpose: change its description to 'Use when the user asks about tax forms.' and bump the version. Run step 4 again.",
-    "see": "The skill-fired grader fails in the WITH arm, so the case fails. Put the description back afterwards."
+    "say": "Read the third with-arm run, the one that scored 0.50, and the third without-arm run, which scored 1.00. Then explain the result in one sentence: what did the skill add, and why would one run of each have told you nothing?",
+    "do": "jq -r '.arms.with[2].lastMessage, .arms.without[2].lastMessage' recorded/welcome-names-team.json",
+    "see": "Welcome aboard, Lior! We are happy you are joining the frontend team on Monday.\nPlease join me in welcoming Lior, our new frontend engineer! Lior, if you have questions, just ask in this channel."
    }
   ],
-  "faded": "Add a negative case, evals/greet-user/stays-quiet-on-goodbye/case.yaml. Its prompt is 'Write a goodbye note for Dana, who leaves on Friday.' Copy the shape of G8-19's case from section 2. Left to you: the grader block that requires greet-user to load zero times, scored in both arms.",
-  "alone": "Write a BRAIN-QA style golden case for a question your team really asks, in the shape of bq-017. Give the question, one or two source pages, three answer points and expect. Then write a free regex grader for one point as a hello eval case. Say in a comment which points only a judge could check.",
-  "done": "The eval run writes results.json and a report, and the broken description makes skill-fired fail. Your negative case has min 0, max 0 and arm: both."
+  "build": "Write a negative case, plugins/team-notes/evals/stays-quiet-on-goodbye/, the shape of Dana's missing case: the prompt asks for a short goodbye post for Dana, who leaves the team on Friday. Give it two graders: does-not-fire, a tool_used grader on Skill whose input_match names welcome-note, with min 0, max 0 and arm: both; and says-goodbye, a regex that finds goodbye, farewell, last day or miss you, ignoring case. Save these recorded runs as recorded/stays-quiet-on-goodbye.json and score them with node score.mjs plugins/team-notes/evals/stays-quiet-on-goodbye recorded/stays-quiet-on-goodbye.json. You should see WITH 0.83, W/OUT 1.00 and Δ -0.17. Say what our plugin CI would do with this result and why.\n\n{\n  \"case\": \"stays-quiet-on-goodbye\",\n  \"arms\": {\n    \"with\": [\n      { \"toolCalls\": [],\n        \"lastMessage\": \"Friday is Dana's last day with us. Thank you for every review and every laugh, Dana. We will miss you!\" },\n      { \"toolCalls\": [{ \"tool\": \"Skill\", \"input\": { \"skill\": \"team-notes:welcome-note\" } }],\n        \"lastMessage\": \"Goodbye and good luck, Dana! Thank you for everything you built with us.\" },\n      { \"toolCalls\": [],\n        \"lastMessage\": \"A farewell to Dana, who leaves on Friday: thank you for three great years on the team.\" }\n    ],\n    \"without\": [\n      { \"toolCalls\": [],\n        \"lastMessage\": \"Friday is Dana's last day. Dana, thank you for everything, and keep in touch!\" },\n      { \"toolCalls\": [],\n        \"lastMessage\": \"Goodbye, Dana! The team will not be the same without you.\" },\n      { \"toolCalls\": [],\n        \"lastMessage\": \"Please join me in a farewell to Dana, who leaves us on Friday.\" }\n    ]\n  }\n}",
+  "checks": [
+   "claude plugin eval init --bare wrote prompt.md and graders/criteria.md, and you replaced them with your prompt and three graders",
+   "The scorer reports skill-fired as an indicator, 3/3 with the plugin and 0/3 without",
+   "WITH 0.83, W/OUT 0.50 and Δ +0.33 for welcome-names-team",
+   "Your negative case scores does-not-fire in both arms and gives Δ -0.17",
+   "You can explain why the gate fails a plugin with a negative mean Δ even if every case is above the threshold"
+  ],
+  "solution": {
+   "lang": "markdown",
+   "file": "the negative case's files",
+   "text": "# plugins/team-notes/evals/stays-quiet-on-goodbye/prompt.md\n---\nmax_turns: 10\nallowed_tools: [Read, Glob, Grep, Skill]\ntags: [pr]\n---\n\nDana leaves the team on Friday. Can you write a short goodbye I can post in the team channel?\n\n# plugins/team-notes/evals/stays-quiet-on-goodbye/graders/does-not-fire.md\n---\ntype: tool_used\ntool: Skill\ninput_match: '\"skill\"\\s*:\\s*\"(?:[\\w-]+:)?welcome-note\"'\nmin: 0\nmax: 0\narm: both\n---\n\n# plugins/team-notes/evals/stays-quiet-on-goodbye/graders/says-goodbye.md\n---\ntype: regex\npattern: 'goodbye|farewell|last day|miss you'\nflags: i\n---"
+  },
+  "fix": "A teammate copied a grader from a Python project and wrote pattern: '(?i)goodbye|farewell|last day|miss you' without a flags line. Make the same change to says-goodbye.md and run the scorer: it stops with SyntaxError: Invalid regular expression … Invalid group. claude plugin eval uses JavaScript regular expressions too and does not support inline (?i). Fix the grader so it still ignores case, and run the scorer again.",
+  "explain": [
+   "Why does every case run several times, and why with and without the plugin?",
+   "Why is a tool_used grader on Skill only an indicator in a two-arm run, and when do you add arm: both?",
+   "Which of your graders would you trust to run on every pull request, and which kind would you keep for a nightly run?"
+  ],
+  "done": "You wrote a positive and a negative eval case, scored recorded runs of both, and can read WITH, W/OUT and Δ, including a negative Δ."
  },
- "quiz": [
+ "check": [
   {
-   "q": "A skill's cases all pass, but results.json shows aggregates.meanDelta of -0.15. What does the G8-12 gate do?",
+   "q": "After a change to plan-and-grill, its suite shows every case above the 0.8 threshold, but the mean Δ is -0.12. Should the change ship?",
    "options": [
     {
-     "text": "Passes, because every case is above 0.8",
+     "text": "Yes: every case passes the threshold",
      "correct": false,
-     "why": "The gate has two parts; the second compares against no plugin."
+     "why": "The threshold only says the results are good. Δ says they were better without the skill, so the skill now gets in the way."
     },
     {
-     "text": "Fails: the plugin makes results worse than no plugin at all",
+     "text": "No: on these tasks Claude does better without the skill than with it",
      "correct": true,
-     "why": "jq -e fails the step when meanDelta is below 0."
+     "why": "A negative Δ means the skill makes results worse. Our gate fails the job on a negative mean Δ even when every case passes."
     },
     {
-     "text": "Warns, because a delta is only advice",
+     "text": "Yes, if the change also made the skill shorter",
      "correct": false,
-     "why": "A negative mean delta fails the job; only per-case deltas are warnings."
+     "why": "Shorter is good only when results hold. Here they got worse."
     }
    ]
   },
   {
-   "q": "Why does a pr-tagged case use only regex and tool_used graders?",
+   "q": "Why does a case run three times in each arm instead of once?",
    "options": [
     {
-     "text": "Because llm graders cannot run in GitHub Actions",
+     "text": "Because the first run warms up the model's cache",
      "correct": false,
-     "why": "They run nightly in the same workflow."
+     "why": "Runs are separate and isolated. The reason is that the answers differ from run to run."
     },
     {
-     "text": "Because free graders are cheap and exact, so every PR can run them; the judge runs nightly",
+     "text": "Because the tool cannot grade a single run",
+     "correct": false,
+     "why": "It can; --runs 1 works for quick tries. It just tells you little."
+    },
+    {
+     "text": "Because a model answers differently each time, so one run can pass or fail by luck; the mean of several runs is a steadier score",
      "correct": true,
-     "why": "G8-11: an llm grader moves the case to the nightly tag."
-    },
-    {
-     "text": "Because the judge model is not pinned",
-     "correct": false,
-     "why": "It is pinned to claude-sonnet-5-5 in G8-12."
+     "why": "In the lab the best run without the skill scored 1.00. Only the means showed that the skill helped."
     }
    ]
   },
   {
-   "q": "Why must BRAIN-QA's golden set never be added to rnd-kb?",
+   "q": "Your case checks that welcome-note loaded, with a tool_used grader on Skill and no arm setting. In a two-arm run, how does that grader count?",
    "options": [
     {
-     "text": "Because the brain bot could then read the answers, and a perfect score would prove nothing",
+     "text": "It is shown as \"the plugin fired\" but left out of both arms' scores",
      "correct": true,
-     "why": "The leak check fails if a question's 8-word runs appear in any rnd-kb page."
+     "why": "It can never pass without the plugin, so counting it would make Δ look bigger than what the skill really adds."
     },
     {
-     "text": "Because rnd-kb only accepts Markdown",
+     "text": "It counts in both arms, like every other grader",
      "correct": false,
-     "why": "Format is not the reason; leaking the answers is."
+     "why": "Only with arm: both. By default a Skill grader is an indicator in a two-arm run."
     },
     {
-     "text": "Because golden sets are too large for git",
+     "text": "It counts in the with-arm only",
      "correct": false,
-     "why": "60 YAML files are small; the reason is who can read them."
+     "why": "That would also inflate Δ. It is excluded from the score in both arms."
     }
    ]
   }
  ],
- "recall": [
-  "From p12-1: which frontmatter field decides whether the model loads a skill?",
-  "From p10-6: what is the difference between pass@1 and pass^3?"
- ],
- "videos": [
-  {
-   "title": "The Most Important Skill for AI Engineers: Evals Explained",
-   "url": "https://www.youtube.com/watch?v=MltkRz94SWA",
-   "channel": "Aish Reganti",
-   "minutes": 18,
-   "why": "What an eval is, golden sets and judges, explained plainly."
-  },
-  {
-   "title": "Making Agent Evals Isn't As Hard As You Think!",
-   "url": "https://www.youtube.com/watch?v=h_DP7ChJUpY",
-   "channel": "Adam Lucek",
-   "minutes": 25,
-   "why": "Agent-specific evals: unit, integration, online and benchmark, citing Anthropic's guide."
-  }
- ],
+ "platform": {
+  "p": [
+   "Every shared skill lives in a plugin in RhinoHealth/claude-plugins, and every skill comes with 3 to 10 eval cases in case.yaml form, at least one of them negative. Plugin CI runs claude plugin eval on each changed plugin. On a pull request it runs only the cases tagged pr, which use free graders; a nightly run at 02:23 runs every case of every plugin, judges included. The agent model is pinned to Opus 5.5 at medium effort and the judge to Sonnet 5.5, so a model rollout is never mistaken for a plugin regression, with --threshold 0.8 and --runs 3. A jq step fails the job when aggregates.meanDelta is below 0 and turns each case's negative Δ into a warning. The job runs on runners inside our cluster that reach the model only through the LLM gateway, so no Anthropic key sits on the runner; cost is reported and charted, with no ceiling until there are four weeks of data.",
+   "Skill evals are one of five suites. BYTE-GOLD scores Byte's reviews on past pull requests with known bugs, TICKET-BENCH runs Nova on 40 past fcp tickets with hidden tests, ROUTINE-BENCH scores each routine on past red builds and bugs, and BRAIN-QA asks the brain 60 real questions. Every suite runs each case three times, writes JSON to the eval results store, checks its judge against people's labels first, and keeps its golden set in a restricted repository with a leak check. The eval scoreboard in Grafana shows them side by side with their spread."
+  ],
+  "tickets": [
+   {
+    "key": "G8-12",
+    "why": "The eval gate in plugin CI: pinned models, pr-tagged cases on pull requests, all cases nightly, 0.8 and the negative-Δ check."
+   },
+   {
+    "key": "G8-11",
+    "why": "be-codebase's cases show the case.yaml shape, free graders on pull requests and a judge nightly."
+   },
+   {
+    "key": "G8-19",
+    "why": "Every task skill gets a negative case with min 0, max 0 and arm: both."
+   },
+   {
+    "key": "G1-08",
+    "why": "The eval results store: one JSON per run, turned into pass-rate, spread and cost series."
+   },
+   {
+    "key": "G6-17",
+    "why": "BRAIN-QA's golden set: real questions, source pages and answer points, kept where the bot cannot read them."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "eval",
-   "plain": "A fixed set of cases for an agent or a skill, each with graders, run before a change ships."
+   "term": "eval case",
+   "plain": "A realistic prompt plus graders, kept fixed so runs can be compared over time."
   },
   {
    "term": "grader",
-   "plain": "One check on a run: regex on the answer, tool_used on the calls, or an llm judge with criteria."
+   "plain": "One pass-or-fail check on a run: a regex on the reply, which tools were called, or a judge with criteria."
   },
   {
    "term": "arm",
-   "plain": "One side of the comparison: WITH the plugin or W/OUT it. The delta is WITH minus W/OUT."
+   "plain": "One side of the comparison: the runs with the plugin loaded, or the runs without it."
   },
   {
-   "term": "golden set",
-   "plain": "Fixed cases with known answers confirmed by people, kept where the agent under test cannot read them."
+   "term": "Δ (delta)",
+   "plain": "The with-plugin score minus the without-plugin score: what the plugin added. Negative means it made things worse."
   },
   {
    "term": "judge",
-   "plain": "A model that grades an answer against written criteria; it is checked against people's labels first."
+   "plain": "A second model that grades a reply against written PASS and FAIL conditions; checked against people's labels before it is trusted."
   },
   {
-   "term": "spread",
-   "plain": "The gap between the best and worst of three rounds; a change counts only when it moves past it."
-  },
-  {
-   "term": "leak check",
-   "plain": "A check that the agent under test never saw the golden answers."
+   "term": "golden set",
+   "plain": "Fixed cases with answers people confirmed, kept where the agent under test cannot read them."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G8-12",
-   "why": "The eval gate: claude plugin eval in plugin CI with pinned models, a 0.8 bar and the with-without comparison."
+   "q": "Write a negative case for a skill of your own: the prompt, and the grader that proves the skill stayed quiet.",
+   "a": "A realistic unrelated request, and a tool_used grader on Skill with input_match naming the skill, min 0, max 0 and arm: both."
   },
   {
-   "key": "G8-11",
-   "why": "be-codebase's cases show the case.yaml shape, free graders on PRs and an llm grader nightly."
+   "q": "A case scores 1.00 with and 1.00 without the plugin. What do you do?",
+   "a": "Nothing is wrong, but the case does not show the skill's value: make the prompt test what the skill adds, or consider cutting that part of the skill."
   },
   {
-   "key": "G5-10",
-   "why": "ROUTINE-BENCH uses the same ideas: one case format, three runs, a score per routine slice."
-  },
-  {
-   "key": "G6-17",
-   "why": "BRAIN-QA's golden set: real questions, source pages and answer points, kept where the bot cannot read."
+   "q": "Why do our pull-request runs use only regex and tool_used graders?",
+   "a": "They are free and give the same verdict every time, so every pull request can run them. Judges cost model calls and vary, so they run nightly."
   }
  ],
- "remember": "Run every case three times, with and without the change, and trust a score only past its spread."
+ "remember": "Run each case several times with and without the skill, check results with free graders first, and trust the difference, not one good answer."
 }

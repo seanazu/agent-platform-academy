@@ -1,784 +1,335 @@
 {
+ "v": 2,
  "id": "g2-2",
  "title": "Sealed replay and scoring",
- "minutes": 60,
+ "minutes": 55,
  "youNeed": [
   "g2-1",
-  "p1-8",
-  "p11-2"
+  "p11-2",
+  "p4-5"
  ],
- "bridge": "A sealed replay is like a Playwright test with a mocked API. Byte asks its usual questions, and a fake answers from a fixed file. Except the fake is Byte's real broker with no token, and the checkout has no history and no route out. So Byte cannot peek at what happened after the PR.",
- "intro": "BYTE-GOLD only means something if Byte reviews each old PR the way it would have back then. This lesson packs a case and replays it through the real worker image on a sealed network. A judge then scores the findings. Then it makes that score a required check in RhinoHealth/byte.",
- "picture": {
-  "caption": "One case goes from byte-gold to a number the gate can compare.",
-  "nodes": [
-   {
-    "id": "case",
-    "label": "cases/<id>/case.json (+ planted.patch)",
-    "kind": "file"
-   },
-   {
-    "id": "packer",
-    "label": "byte gold-pack",
-    "kind": "service"
-   },
-   {
-    "id": "pack",
-    "label": "pack: pr.json, diff.patch, tree.tar",
-    "kind": "file"
-   },
-   {
-    "id": "broker",
-    "label": "replay broker (no token)",
-    "kind": "service"
-   },
-   {
-    "id": "worker",
-    "label": "Byte worker: review",
-    "kind": "agent"
-   },
-   {
-    "id": "squid",
-    "label": "squid: api.anthropic.com only",
-    "kind": "service"
-   },
-   {
-    "id": "scorer",
-    "label": "byte gold-score + judge",
-    "kind": "service"
-   },
-   {
-    "id": "gate",
-    "label": "BYTE-GOLD required check",
-    "kind": "check"
-   }
+ "map": "evals",
+ "hook": {
+  "story": [
+   "BYTE-GOLD is ready: 240 old PRs with their answers. You replay Byte on all of them, and the first number is wonderful: Byte caught 94% of the high bugs. Then you open the log of one case. Byte was reviewing PR #1874 from last spring, and the checkout still had fcp's full history. One of its first commands was git log on the file it was reading, and the newest commit there was the fix: Dataset check uses the dataset's workgroup. Byte did not find the bug. It read the answer.",
+   "This is not a strange accident. When people locked down the environment of a well-known coding benchmark, so that agents could no longer fetch the real fix from git history or the web, scores dropped noticeably. A test that lets the student see the future measures nothing."
   ],
-  "steps": [
-   {
-    "from": "case",
-    "to": "packer",
-    "text": "gold-pack fetches the two SHAs and the PR metadata with a read-only token"
-   },
-   {
-    "from": "packer",
-    "to": "pack",
-    "text": "writes input/pr.json, diff.patch and tree.tar (no .git)"
-   },
-   {
-    "from": "pack",
-    "to": "broker",
-    "text": "broker --replay /input serves Byte's gh reads from the pack"
-   },
-   {
-    "from": "worker",
-    "to": "broker",
-    "text": "asks for the diff and the files, exactly as in production"
-   },
-   {
-    "from": "worker",
-    "to": "squid",
-    "text": "the only way out: HTTPS to api.anthropic.com"
-   },
-   {
-    "from": "broker",
-    "to": "scorer",
-    "text": "publication.json holds the recorded review"
-   },
-   {
-    "from": "scorer",
-    "to": "gate",
-    "text": "recall by severity and clean alarms, compared with the main baseline"
-   }
-  ]
+  "question": "How do we let Byte review an old PR exactly as it was then, with no way to see what happened after?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Open one case and pack it",
+   "h": "Three ways the future leaks in",
    "p": [
-    "Take `cases/real-0042` from lesson g2-1 and run `byte gold-pack --case cases/real-0042 --fcp ~/src/fcp --out packs/real-0042`. A pack is a folder with everything Byte needs to review that PR and nothing else. It has three files under `input/`.",
-    "`pr.json` holds the title, the body unless `blankBody` is set, the files with additions and deletions, the refs and SHAs. They come from `gh api repos/RhinoHealth/fcp/pulls/<n>` and `/files`. It also holds `reviewArgs`: the flags Byte's gate would pass for fcp, so the replay runs the same way as production.",
-    "`diff.patch` is `git diff <base>...<head>`, with `planted.patch` appended for a planted case. `tree.tar` is `git archive <head>` with the patch applied: the files at the head commit and no `.git` folder. A shallow fetch of the two SHAs is enough; nobody needs the full history.",
-    "Why so careful? SWE-bench agents were caught reading future git history and finding the fix. A tree with no `.git` and a broker with no token close that path. The code lives in `src/gold.ts` as `goldPack()`, wired into `src/cli.ts` in the same `argsToMap` and `required` style as the other subcommands."
-   ],
-   "callout": {
-    "kind": "why",
-    "text": "Byte must review the old PR as it would have back then. Anything that happened after the merge, the fix, the comments, the revert, is a leak."
-   }
+    "When Byte reviews an old PR in a normal setup, the future can reach it in three ways. The first is the git history: a clone of fcp contains every later commit, including the fix and its message. The second is the GitHub token: with a live token, Byte can read the PR's later comments, the linked fix PR, even a revert. A live token is also dangerous the other way round, because a replay would post new review comments on a PR that was merged a year ago. The third is the network: from the internet, the fix is one search away.",
+    "So a replay is sealed: we close all three doors, and we do it without changing Byte. The score should describe the Byte we really ship, so the replay runs the same worker image, the same model and the same flags as a live review. Only what Byte can reach is different. It is like an exam room: the student is the same person, but the phone and the notes stay outside. Unlike an exam room, one door stays open, to the Claude API, because Byte cannot think without it."
+   ]
   },
   {
-   "h": "The replay broker, part 1: a session with no token",
+   "h": "The pack: the PR as it was",
    "p": [
-    "In production Byte's worker never calls GitHub itself. It asks the broker, which holds the token and answers only reads about the one PR (Byte's `src/broker.ts`). A replay broker is the same `BrokerSession` class, but its answers come from the pack. The worker runs unchanged and cannot tell the difference.",
-    "The sketch is 33 lines, so it comes in two blocks; nothing is removed between them. First, give `BrokerSessionOptions` in `src/broker.ts` an optional `api` next to the existing `executeRead` injection. Then `src/gold-broker.ts` builds a session with both injected."
+    "A pack is a folder holding everything Byte needs to review one old PR, and nothing else. It has three files. diff.patch is what the PR changed. tree.tar holds the files at the PR's head commit, made with git archive, which writes the files but not the .git folder, so there is no history to read. pr.json holds the PR's title and body, its file list with line counts, its SHAs, and the flags Byte's gate would pass for fcp.",
+    "For a planted case, the packer applies planted.patch on the head before it writes the tree, and adds it to the diff, so Byte sees the bug as if the author had written it. If the PR's body was edited later and mentions the bug (blankBody in the case file), the body is left out."
    ],
-   "because": "Byte's worker only ever talks to a broker, so a broker that answers from the pack lets the worker run unchanged.",
-   "code": {
-    "lang": "typescript",
-    "file": "src/gold-broker.ts (RhinoHealth/byte), lines 1-18",
-    "text": "import { readFile, writeFile } from \"node:fs/promises\";\nimport { join } from \"node:path\";\nimport { BrokerSession, type BrokerCommandResult } from \"./broker.js\";\n\n// `byte broker --replay /input`: Byte's usual gh reads, answered from a sealed\n// pack. No token, no network. Every replay is a first review, so the review\n// and comment listings are empty; anything the pack can't answer is refused.\nexport async function replaySession(inputDir: string, outputDir: string, capability: string): Promise<BrokerSession> {\n  const pr = JSON.parse(await readFile(join(inputDir, \"pr.json\"), \"utf8\")) as ReplayPr;\n  const diff = await readFile(join(inputDir, \"diff.patch\"), \"utf8\");\n  const ok = (stdout: string): BrokerCommandResult => ({ exitCode: 0, stdout, stderr: \"\" });\n  const published: unknown[] = [];\n  return new BrokerSession({\n    repository: pr.repository,\n    prNumber: pr.number,\n    headSha: pr.headSha,\n    token: \"\", // nothing to leak: both GitHub paths below are injected\n    forbiddenSecrets: [capability],",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Promise-based file reads and writes from Node; no extra library."
-     },
-     {
-      "line": 3,
-      "text": "The real, security-reviewed BrokerSession and the result type its reads return. We reuse it, we do not copy it."
-     },
-     {
-      "line": 5,
-      "text": "The command that starts it: `byte broker --replay /input`. No token, no network; the review and comment listings are empty."
-     },
-     {
-      "line": 8,
-      "text": "One function: where the pack is, where to write results, and the capability, the per-run bearer the worker must present."
-     },
-     {
-      "line": 9,
-      "text": "pr.json parsed into a ReplayPr, a small type you declare in this file for the pack's shape."
-     },
-     {
-      "line": 10,
-      "text": "The diff as one string, read once. Every `gh pr diff` call gets this exact text."
-     },
-     {
-      "line": 11,
-      "text": "A helper that wraps text as a successful command result: exit code 0, the text on stdout, nothing on stderr."
-     },
-     {
-      "line": 12,
-      "text": "A list of everything Byte tries to publish. It grows as the review runs."
-     },
-     {
-      "line": 13,
-      "text": "A real BrokerSession; everything below is its options."
-     },
-     {
-      "line": 14,
-      "text": "The session is hard-scoped to one repository, PR number and head SHA, as in production. Reads about anything else are refused."
-     },
-     {
-      "line": 17,
-      "text": "An empty token. There is nothing to leak, because both GitHub paths, reads and writes, are injected below."
-     },
-     {
-      "line": 18,
-      "text": "The secret guard list: the capability must never appear in anything the broker passes on."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The replay broker, part 2: reads and publications",
-   "p": [
-    "The second block, lines 19 to 33, injects the two GitHub paths. `executeRead` gets the `gh` argument list the worker sent and returns a result. `api` receives what Byte would post as a review and records it instead.",
-    "`pick`, `jsonFields`, `recordingApi` and `ReplayPr` are small helpers the sketch assumes in this file; you write them. `jsonFields` reads the `--json` field list out of a `gh pr view` call, `pick` keeps only those fields. `/v1/head` always says unchanged, so the head-SHA re-check before writes passes.",
-    "Tests go in `test/gold-broker.test.ts`, run with `node --test` via tsx. They check that `gh pr diff` returns the pack's patch and that an unknown endpoint is refused. They also check that a publication lands in the file and that nothing touches the network."
-   ],
-   "because": "Every replay is a first review, so earlier reviews and comments must come back empty, and unknown reads are refused.",
-   "code": {
-    "lang": "typescript",
-    "file": "src/gold-broker.ts (RhinoHealth/byte), lines 19-33",
-    "text": "    executeRead: async (args) => {\n      if (args[0] === \"pr\" && args[1] === \"diff\") return ok(diff);\n      if (args[0] === \"pr\" && args[1] === \"view\") return ok(JSON.stringify(pick(pr.view, jsonFields(args))));\n      if (args[0] === \"api\" && /\\/pulls\\/\\d+\\/files/.test(args[1] ?? \"\")) return ok(JSON.stringify(pr.files));\n      if (args[0] === \"api\" && /\\/(pulls|issues)\\/\\d+\\/(reviews|comments)/.test(args[1] ?? \"\")) return ok(\"[]\");\n      return { exitCode: 1, stdout: \"\", stderr: \"not in the replay pack\" };\n    },\n    // New optional injection in BrokerSessionOptions: publications are recorded, never posted.\n    api: recordingApi(async (review) => {\n      published.push(review);\n      await writeFile(join(outputDir, \"publication.json\"), `${JSON.stringify(published, null, 2)}\\n`);\n      return { id: published.length };\n    }),\n  });\n}",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The injected read: `args` is the gh argument list, for example [\"pr\", \"diff\", \"12\"]."
-     },
-     {
-      "line": 2,
-      "text": "`gh pr diff` gets the pack's diff. In production this is the one read Byte makes on every review."
-     },
-     {
-      "line": 3,
-      "text": "`gh pr view --json title,body,...` gets only the fields it asked for, from the pack's view object."
-     },
-     {
-      "line": 4,
-      "text": "`gh api repos/.../pulls/<n>/files` gets the files list with additions and deletions."
-     },
-     {
-      "line": 5,
-      "text": "Reviews and comments listings return `[]`. Every replay is a first review; later comments would be a leak."
-     },
-     {
-      "line": 6,
-      "text": "Anything else: exit code 1 and a reason. The broker's audit records refused reads, which the smoke test checks."
-     },
-     {
-      "line": 9,
-      "text": "The new injection: a recording API. It receives each review Byte would post."
-     },
-     {
-      "line": 10,
-      "text": "Keep it in memory, so the file always holds every publication of the run."
-     },
-     {
-      "line": 11,
-      "text": "Write `publication.json` into the output folder. gold-score reads this file later."
-     },
-     {
-      "line": 12,
-      "text": "Return an id like GitHub would, so the worker's code path stays the same."
-     }
-    ]
-   },
-   "ifInstead": "If instead the worker logs `not in the replay pack` for a production read, answer it from the pack in executeRead. Never give the broker a token."
-  },
-  {
-   "h": "gold-replay.sh, part 1: one run, sealed",
-   "p": [
-    "`scripts/gold-replay.sh <pack> <image> <out>` replays one pack through the real Byte worker image. It reuses review.yml's container pattern. A per-run network, a capability from `openssl rand -hex 32`, and `--cap-drop ALL --read-only --security-opt no-new-privileges` on every container.",
-    "The script is 29 lines, so it comes in two blocks; nothing is removed between them. Part 1 is setup: names, the capability, a temp folder for the tree, and a trap that cleans up whatever happens."
-   ],
-   "because": "Each replay gets its own network, capability and temp tree, so two runs never share anything and the trap always cleans up.",
    "code": {
     "lang": "bash",
-    "file": "scripts/gold-replay.sh (RhinoHealth/byte), lines 1-12",
-    "text": "#!/usr/bin/env bash\n# scripts/gold-replay.sh <pack> <worker image> <out>: one BYTE-GOLD case, sealed.\n# The worker sees the tree (no .git), the replay broker (no token) and one host\n# out. The answer key is never mounted anywhere. SQUID_IMAGE is digest-pinned.\nset -euo pipefail\npack=\"$1\"; image=\"$2\"; out=\"$3\"\nid=\"$(jq -r .id \"$pack/input/pr.json\")\"\nnet=\"gold-$id-$$\"; cap=\"$(openssl rand -hex 32)\"; tree=\"$(mktemp -d)\"\nmapfile -t review_args < <(jq -r '.reviewArgs[]' \"$pack/input/pr.json\") # what the gate would pass for fcp\ntrap 'docker rm -f \"gb-$id\" \"ge-$id\" >/dev/null 2>&1 || true; docker network rm \"$net\" >/dev/null 2>&1 || true; rm -rf \"$tree\"' EXIT\ntar -xf \"$pack/input/tree.tar\" -C \"$tree\"\nmkdir -p \"$out/$id\"",
+    "file": "what the packer does for one case (byte gold-pack)",
+    "text": "# one case: the introducing PR's base and head, from a shallow fetch of fcp\ngit diff \"$base...$head\" > pack/input/diff.patch     # what the PR changed\ngit archive \"$head\" -o pack/input/tree.tar           # the files at head, and no .git folder\ngh api \"repos/RhinoHealth/fcp/pulls/$pr\" > pr.raw.json\n# pr.json keeps: title, body (left out when blankBody is true), files with\n# additions and deletions, base and head SHAs, and reviewArgs: the flags the\n# gate would pass for fcp, so the replay runs the way production runs",
     "notes": [
      {
-      "line": 2,
-      "text": "What the script does, in one line. The three arguments: the pack folder, the worker image, the output folder."
+      "line": 3,
+      "text": "git archive exports the files of one commit. The .git folder, and with it every later commit, never enters the pack."
      },
      {
       "line": 4,
-      "text": "The rule of the script: no answer key is ever mounted. The squid image is pinned by digest, like every third-party image."
-     },
-     {
-      "line": 5,
-      "text": "Stop on any error, on an unset variable, and on a failure inside a pipe. Standard for every bash script in Byte."
-     },
-     {
-      "line": 7,
-      "text": "The case id, read from pr.json with jq. It names the containers and the output folder."
-     },
-     {
-      "line": 8,
-      "text": "A network name unique to this run, a fresh capability, and a temp folder for the tree. `$$` is the shell's process id."
-     },
-     {
-      "line": 9,
-      "text": "mapfile reads the reviewArgs array from pr.json into a bash array, one flag per element. These are the flags the gate would pass for fcp."
-     },
-     {
-      "line": 10,
-      "text": "The trap runs on exit, success or failure: remove both containers, remove the network, delete the temp tree."
-     },
-     {
-      "line": 11,
-      "text": "Unpack tree.tar into the temp folder. This is the checkout the worker will see: files only, no .git."
-     },
-     {
-      "line": 12,
-      "text": "One output folder per case: publication.json, claude-result.json and run-manifest.json land here."
+      "text": "The PR's metadata comes from GitHub when the pack is built, by a token that never enters a container."
      }
     ]
    }
   },
   {
-   "h": "gold-replay.sh, part 2: three containers",
+   "h": "A broker that answers from the pack",
    "p": [
-    "Part 2, lines 13 to 29, starts three containers on one internal network. An internal Docker network has no route out: a container on it cannot reach the internet or the laptop's other networks. The lab shows this with one curl.",
-    "The only exception is squid, the egress proxy from lesson p4-5. It sits on the internal network and on the default bridge, so it can reach out. Its config allows one host: `api.anthropic.com`. `config/gold-squid.conf` reuses the allow-list lines from infrastructure's `modules/squid-proxy` template, without the basic auth.",
-    "Never mount byte-gold or the answers. Replays talk to Claude directly, like live Byte reviews; Byte does not use the gateway.",
-    "Smoke-test 5 packs on byte-runner-set and check three things. Squid's log shows only api.anthropic.com. The broker's audit shows no refused reads. The manifest has the same shape as a live review's."
+    "Byte's worker never calls GitHub itself; it asks the broker, which holds the token. That design is what makes sealing easy. For a replay we start the same broker class with an empty token and two injected functions. Reads are answered from the pack: the diff, the PR view, the file list. The lists of earlier reviews and comments are always empty, because every replay is a first review, and anything the pack cannot answer is refused. Writes are recorded in publication.json instead of being posted.",
+    "The worker cannot tell the difference. It sends the same gh commands as in a live review and gets answers in the same shape, so the review runs exactly as it would on a new PR."
    ],
-   "because": "The worker may reach only the broker and Claude, so one internal network plus one proxy is the whole sandbox.",
    "code": {
-    "lang": "bash",
-    "file": "scripts/gold-replay.sh (RhinoHealth/byte), lines 13-29",
-    "text": "\ndocker network create --internal \"$net\" >/dev/null # no route out\ndocker run -d --name \"ge-$id\" --network \"$net\" --read-only --tmpfs /var/spool/squid --tmpfs /var/run \\\n  -v \"$PWD/config/gold-squid.conf:/etc/squid/squid.conf:ro\" \"$SQUID_IMAGE\" >/dev/null # allows api.anthropic.com only\ndocker network connect bridge \"ge-$id\" # the one container with a way out\ndocker run -d --name \"gb-$id\" --network \"$net\" --cap-drop ALL --read-only --security-opt no-new-privileges \\\n  -e BYTE_BROKER_CAPABILITY=\"$cap\" -v \"$pack/input:/input:ro\" -v \"$out/$id:/output\" \\\n  \"$image\" broker --replay /input >/dev/null\n# (wait for the broker's /health as review.yml does)\n\ndocker run --rm --network \"$net\" --user \"$(id -u):$(id -g)\" --cap-drop ALL --read-only \\\n  --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m -e HOME=/tmp/byte-home \\\n  -e HTTPS_PROXY=\"http://ge-$id:3128\" -e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 -e CLAUDE_CODE_OAUTH_TOKEN \\\n  -e BYTE_BROKER_URL=\"http://gb-$id:8080\" -e BYTE_BROKER_CAPABILITY=\"$cap\" \\\n  -v \"$tree:/workspace:ro\" -v \"$out/$id:/output\" -w /workspace \\\n  \"$image\" review \"${review_args[@]}\" --check-id 0 --output-directory /output \\\n  > \"$out/$id/runner-result.json\" 2> \"$out/$id/runner-stderr.log\"",
+    "lang": "typescript",
+    "file": "src/gold-broker.ts (RhinoHealth/byte), the replay session",
+    "text": "return new BrokerSession({\n  repository: pr.repository,\n  prNumber: pr.number,\n  headSha: pr.headSha,\n  token: \"\", // nothing to leak: both GitHub paths below are injected\n  forbiddenSecrets: [capability],\n  executeRead: async (args) => {\n    if (args[0] === \"pr\" && args[1] === \"diff\") return ok(diff);\n    if (args[0] === \"pr\" && args[1] === \"view\") return ok(JSON.stringify(pick(pr.view, jsonFields(args))));\n    if (args[0] === \"api\" && /\\/pulls\\/\\d+\\/files/.test(args[1] ?? \"\")) return ok(JSON.stringify(pr.files));\n    if (args[0] === \"api\" && /\\/(pulls|issues)\\/\\d+\\/(reviews|comments)/.test(args[1] ?? \"\")) return ok(\"[]\");\n    return { exitCode: 1, stdout: \"\", stderr: \"not in the replay pack\" };\n  },\n  // publications are recorded, never posted\n  api: recordingApi(async (review) => {\n    published.push(review);\n    await writeFile(join(outputDir, \"publication.json\"), `${JSON.stringify(published, null, 2)}\\n`);\n    return { id: published.length };\n  }),\n});",
     "notes": [
      {
-      "line": 2,
-      "text": "`--internal`: Docker gives this network no route out. Nothing on it can reach the internet by itself."
-     },
-     {
-      "line": 3,
-      "text": "The squid container, read-only, with tmpfs for its spool and run folders because it must write somewhere."
-     },
-     {
-      "line": 4,
-      "text": "Its config is mounted read-only from the repo. SQUID_IMAGE is the digest-pinned image, passed in the environment."
-     },
-     {
       "line": 5,
-      "text": "The one line that gives a way out: squid also joins the default bridge network. Only squid, never the worker."
-     },
-     {
-      "line": 6,
-      "text": "The replay broker: capabilities dropped, read-only, no privilege escalation. The same flags review.yml uses."
-     },
-     {
-      "line": 7,
-      "text": "It gets the capability, the pack's input folder read-only, and the output folder. No BYTE_BROKER_TOKEN at all."
-     },
-     {
-      "line": 8,
-      "text": "`broker --replay /input` starts the session from part 1 of the broker."
-     },
-     {
-      "line": 9,
-      "text": "Wait for GET /health before starting the worker, the way review.yml does."
+      "text": "No token at all. Even a bug in this file cannot leak one or reach GitHub."
      },
      {
       "line": 11,
-      "text": "The worker runs as your user id, with capabilities dropped and a read-only root file system."
+      "text": "Earlier reviews and comments: always none. Real ones could quote the bug or the fix."
      },
      {
       "line": 12,
-      "text": "A small tmpfs for /tmp with noexec, and HOME inside it. Claude Code gets a writable home that disappears after the run."
-     },
-     {
-      "line": 13,
-      "text": "HTTPS_PROXY points at squid on port 3128. CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC stops Claude Code's non-essential calls, such as update checks, which squid would refuse anyway."
-     },
-     {
-      "line": 14,
-      "text": "The broker URL and the capability, the same two variables the production worker gets."
+      "text": "Anything else is refused, so a new kind of read shows up as a failure instead of a silent leak."
      },
      {
       "line": 15,
-      "text": "The unpacked tree mounted read-only at /workspace, the output folder, and the working directory set to the tree."
-     },
-     {
-      "line": 16,
-      "text": "`review` with the pack's reviewArgs, a check id of 0 because there is no GitHub check run, and the output folder."
-     },
-     {
-      "line": 17,
-      "text": "The worker's JSON result and its stderr, kept per case next to publication.json."
+      "text": "Byte's review lands in a file for scoring. Nothing is ever posted on the old PR."
      }
     ]
-   },
-   "callout": {
-    "kind": "wall",
-    "text": "One fresh network and tree per run. The answer key is never mounted. The only host out is api.anthropic.com, and only squid can reach it."
    }
   },
   {
-   "h": "Scoring, part 1: the window and the judge",
+   "h": "One door out",
    "p": [
-    "`byte gold-score --cases <byte-gold> --results <dir> --output <file>` reads every case and its `publication.json`, and matches Byte's findings to the golden comments. Matching has two stages. First a filter in code. A finding can only match a golden comment on the same path, within 10 lines of its range.",
-    "Only those pairs go to the judge. The judge is a small Claude call: `claude -p --model claude-haiku-5-5 --effort low`, with no tools and JSON out. It answers one question: does this finding describe this defect? It reuses the session flags and token handling of `weekly-analyze`. This is the Uber and Martian method: a model matches comments, code keeps it cheap and strict.",
-    "Before the gate trusts the judge, Sean and Nave label 50 pairs by hand and compare. Below 90% agreement, switch the judge to Sonnet 5.5 at medium effort and check again. The sketch is 33 lines, so it comes in two blocks; nothing is removed between them."
+    "The last door is the network. The replay script creates a Docker network with the internal flag, which means containers on it can talk to each other but have no route to anything outside. The broker and the worker live only there. The one exception is a Squid proxy, the same kind of allow-list proxy our VMs use: it is connected to the internal network and to Docker's normal bridge network, and its allow-list has a single host, api.anthropic.com. The worker reaches Claude through it, and nothing else.",
+    "The answer key is never mounted into any container, and every container runs with the same hardening flags as a live review: no Linux capabilities, a read-only file system, no privilege escalation. A trap at the end of the script removes the containers and the network, whatever happens."
    ],
-   "because": "A location filter in code keeps the judge cheap and strict: only findings near a golden comment are ever asked about.",
    "code": {
-    "lang": "typescript",
-    "file": "src/gold-score.ts (RhinoHealth/byte), lines 1-14",
-    "text": "import type { ModelFinding } from \"./review.js\";\n\nexport interface GoldenComment { path: string; startLine: number; endLine: number; severity: \"high\" | \"medium\" | \"low\"; defect: string }\nexport interface GoldCase { id: string; kind: \"real\" | \"clean\" | \"planted\"; team: string; split: \"dev\" | \"holdout\"; golden: GoldenComment[] }\nexport type Judge = (finding: ModelFinding, golden: GoldenComment) => Promise<boolean>;\n\n// Routing table: Haiku 5.5 low for yes/no checks. Calibrated on 50 hand-labelled\n// pairs first; below 90% agreement, switch to Sonnet 5.5 medium.\nexport const JUDGE = { model: \"claude-haiku-5-5\", effort: \"low\" } as const;\nconst LINE_WINDOW = 10;\n\nconst near = (f: ModelFinding, g: GoldenComment): boolean =>\n  f.path === g.path && f.line >= g.startLine - LINE_WINDOW && f.line <= g.endLine + LINE_WINDOW;\n",
+    "lang": "bash",
+    "file": "scripts/gold-replay.sh (RhinoHealth/byte), the three containers",
+    "text": "docker network create --internal \"$net\"     # nothing on it has a route out\n\n# squid: on the internal network AND the default bridge, allows api.anthropic.com only\ndocker run -d --name \"ge-$id\" --network \"$net\" --read-only --tmpfs /var/spool/squid --tmpfs /var/run \\\n  -v \"$PWD/config/gold-squid.conf:/etc/squid/squid.conf:ro\" \"$SQUID_IMAGE\"\ndocker network connect bridge \"ge-$id\"\n\n# the replay broker: the pack, read-only, and no token\ndocker run -d --name \"gb-$id\" --network \"$net\" --cap-drop ALL --read-only --security-opt no-new-privileges \\\n  -e BYTE_BROKER_CAPABILITY=\"$cap\" -v \"$pack/input:/input:ro\" -v \"$out/$id:/output\" \\\n  \"$image\" broker --replay /input\n\n# the real worker image, reviewing the tree with no .git\ndocker run --rm --network \"$net\" --cap-drop ALL --read-only --security-opt no-new-privileges \\\n  -e HTTPS_PROXY=\"http://ge-$id:3128\" -e BYTE_BROKER_URL=\"http://gb-$id:8080\" -e BYTE_BROKER_CAPABILITY=\"$cap\" \\\n  -v \"$tree:/workspace:ro\" -v \"$out/$id:/output\" -w /workspace \\\n  \"$image\" review \"${review_args[@]}\" --check-id 0 --output-directory /output",
     "notes": [
      {
       "line": 1,
-      "text": "Byte's finding type from review.ts: path, line, severity and body. Only the type is imported."
+      "text": "--internal: no route out. A container here cannot reach the internet or your laptop's other networks."
      },
      {
-      "line": 3,
-      "text": "A golden comment, the same shape as the `golden` entries in case.json from lesson g2-1."
-     },
-     {
-      "line": 4,
-      "text": "A case with its split: `dev` cases run on every gated PR, `holdout` cases once a month."
-     },
-     {
-      "line": 5,
-      "text": "The judge is a function type that returns a Promise of true or false. Tests pass a fake; production passes the Claude call."
-     },
-     {
-      "line": 7,
-      "text": "The model choice and its condition, written next to the code so nobody forgets the calibration step."
-     },
-     {
-      "line": 9,
-      "text": "Haiku 5.5 at low effort for a yes/no question. Cheap, and the filter already removed the hard cases."
+      "line": 6,
+      "text": "The only container on both networks, so the only way out, and it allows one host."
      },
      {
       "line": 10,
-      "text": "The window: 10 lines above the golden start line and 10 below its end line."
-     },
-     {
-      "line": 12,
-      "text": "`near` is the filter: same path, and the finding's line inside the widened range. Nothing else reaches the judge."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Scoring, part 2: scoreCase",
-   "p": [
-    "Part 2, lines 15 to 33, scores one case. Recall is the share of golden bugs Byte caught. Precision is the share of Byte's findings that matched a golden bug, counted over real and planted cases. A false alarm is a high or medium finding on a clean case.",
-    "The scorecard reports per split, team and kind. It has recall for high, medium and low golden bugs, precision, and high or medium findings per clean PR. It also has the API-equivalent cost and minutes per review, from `claude-result.json`. Numbers only, like `data/runs.jsonl`: no path, code or finding text. The JSON goes to the G1 eval store and a markdown table to the job summary."
-   ],
-   "because": "Only numbers leave this function, so the scorecard can be stored and shown without ever carrying a golden comment out of byte-gold.",
-   "code": {
-    "lang": "typescript",
-    "file": "src/gold-score.ts (RhinoHealth/byte), lines 15-33",
-    "text": "// Only numbers leave this function: no path, code or finding text.\nexport async function scoreCase(c: GoldCase, findings: ModelFinding[], judge: Judge) {\n  const matched = new Set<ModelFinding>();\n  const golden: Array<{ severity: GoldenComment[\"severity\"]; caught: boolean }> = [];\n  for (const g of c.golden) {\n    let caught = false;\n    for (const f of findings.filter((x) => !matched.has(x) && near(x, g))) {\n      if (await judge(f, g)) { matched.add(f); caught = true; break; }\n    }\n    golden.push({ severity: g.severity, caught });\n  }\n  const alarms = findings.filter((f) => f.severity !== \"low\").length; // unrecognised ranks as high\n  return {\n    id: c.id, kind: c.kind, team: c.team, split: c.split, golden,\n    findings: findings.length,\n    matchedFindings: matched.size,\n    cleanAlarms: c.kind === \"clean\" ? alarms : null, // pass bar: mean <= 0.2 per clean PR\n  };\n}",
-    "notes": [
-     {
-      "line": 2,
-      "text": "One case, Byte's findings from its publication.json, and a judge. Async because the judge is a model call."
-     },
-     {
-      "line": 3,
-      "text": "Findings already matched, so one finding can never count for two golden comments."
-     },
-     {
-      "line": 4,
-      "text": "The per-golden result: its severity and whether it was caught. Recall by severity comes from this list."
-     },
-     {
-      "line": 5,
-      "text": "Walk the golden comments one by one."
-     },
-     {
-      "line": 7,
-      "text": "Only unmatched findings that pass `near` are candidates for this golden comment."
-     },
-     {
-      "line": 8,
-      "text": "Ask the judge. On the first yes, mark the finding, count the bug as caught, and stop looking."
-     },
-     {
-      "line": 10,
-      "text": "Record the outcome for this golden comment, caught or not."
-     },
-     {
-      "line": 12,
-      "text": "Alarms are findings that are not low. A missing severity ranks as high, the same rule Byte uses when posting."
-     },
-     {
-      "line": 14,
-      "text": "Ids and enums from the case, then the per-golden list."
-     },
-     {
-      "line": 16,
-      "text": "How many findings matched. Precision across cases is matched over total findings."
-     },
-     {
-      "line": 17,
-      "text": "Only clean cases report alarms. The pass bar is a mean of at most 0.2 per clean PR; real and planted cases get null here."
-     }
-    ]
-   }
-  },
-  {
-   "h": "gold.yml, part 1: when the gate runs",
-   "p": [
-    "Today every Byte change ships on review alone, and a merge to main repins the whole fleet within minutes. `.github/workflows/gold.yml` makes quality measurable before that. It is the gate from the picture. A required check on byte's main replays the dev split and fails when quality drops.",
-    "The sketch is 34 lines, so it comes in two blocks; nothing is removed between them. Part 1 says when the job runs and under what rules. Splits are assigned once in byte-gold by a stable hash of the case id, two thirds dev and one third holdout. The hash is stratified, which means balanced, by kind, team and severity. Only Sean and Nave see per-case holdout results."
-   ],
-   "because": "Only changes that can move Byte's quality should pay for a replay, and the merged result must become the new baseline.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/gold.yml (RhinoHealth/byte), lines 1-19",
-    "text": "name: BYTE-GOLD\non:\n  pull_request:\n    paths: [\"skills/**\", \"src/engines.ts\", \"src/limits.ts\", \"src/review.ts\", \"src/panel.ts\", \"config/repositories.json\", \"Dockerfile\"]\n  push: # the merged result becomes the baseline row in data/gold-runs.jsonl\n    branches: [main]\n    paths: [\"skills/**\", \"src/engines.ts\", \"src/limits.ts\", \"src/review.ts\", \"src/panel.ts\", \"config/repositories.json\", \"Dockerfile\"]\n  schedule:\n    - cron: \"0 19 1 * *\" # holdout split, monthly, in the evening\npermissions:\n  contents: read\nconcurrency:\n  group: byte-gold-${{ github.event.pull_request.number || github.ref }}\n  cancel-in-progress: true # only a PR's newest head is worth scoring\njobs:\n  gold:\n    # Byte's own fix PRs are opened by the App: model-written code never runs next to the answer key.\n    if: github.event_name != 'pull_request' || github.event.pull_request.user.type != 'Bot'\n    runs-on: byte-runner-set",
-    "notes": [
-     {
-      "line": 3,
-      "text": "On pull requests, but only when the listed paths change."
-     },
-     {
-      "line": 4,
-      "text": "The paths that can move quality: playbooks, the engine, limits, review, the panel, policy, and the Dockerfile because it pins Claude Code."
-     },
-     {
-      "line": 5,
-      "text": "The same paths on main. The merged result becomes the baseline row in data/gold-runs.jsonl on the telemetry branch."
-     },
-     {
-      "line": 9,
-      "text": "The first of each month at 19:00 UTC, the holdout split. Evening, so it does not compete with live reviews for quota."
-     },
-     {
-      "line": 11,
-      "text": "The job's own GITHUB_TOKEN can only read. The fcp read token and the byte-gold key come from the steps in part 2."
-     },
-     {
-      "line": 13,
-      "text": "One run per PR at a time, keyed by PR number, or by ref on main and schedule."
-     },
-     {
-      "line": 14,
-      "text": "A new push cancels the running replay: only a PR's newest head is worth scoring."
-     },
-     {
-      "line": 18,
-      "text": "Skip PRs opened by a Bot. Byte's own fix PRs are opened by the App, and model-written code must never run next to the answer key."
-     },
-     {
-      "line": 19,
-      "text": "byte-runner-set: the same single-use runners as live reviews, so the score describes what ships."
-     }
-    ]
-   }
-  },
-  {
-   "h": "gold.yml, part 2: the steps and the pass bar",
-   "p": [
-    "Part 2, lines 20 to 34, is the job's steps. `scripts/gold-run.sh` does the work in order: leak check, pack, replay, score, pass bar. The leak check fails first if any case's PR number, head SHA or Jira key appears under `skills/`. The weekly loop writes MEMORY.md from live findings, so it could copy a case in by accident.",
-    "Packs are cached by case id and built with the read-only App token; the token never enters a container. Replays run 4 at a time against the image built from the PR. Scope follows the change: a PR under `skills/<team>/` replays only that team's cases, so the weekly MEMORY.md PRs stay cheap. Engine, limits, review, panel, policy or Dockerfile changes replay every dev case.",
-    "The pass bar has two parts. HIGH recall at most 3 points below the latest main row in `data/gold-runs.jsonl`. And at most 0.2 high or medium findings per clean PR.",
-    "Run main 3 times first to measure noise. If runs differ by more than 3 points, re-run only the cases that flipped. Replays share Byte's Claude quota with live reviews; if live reviews start hitting 429s, move runs to the evening."
-   ],
-   "because": "The PR's own image is scored against byte-gold, so a prompt or playbook change must earn its place before it ships.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/gold.yml (RhinoHealth/byte), lines 20-34",
-    "text": "    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with: { persist-credentials: false }\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        # decide: a read-only deploy key or a small read-only App for byte-gold\n        with: { repository: RhinoHealth/byte-gold, path: gold, ssh-key: \"${{ secrets.BYTE_GOLD_DEPLOY_KEY }}\", persist-credentials: false }\n      - id: fcp-token # packs fetch two SHAs per case; contents and PRs read only\n        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3\n        with: { client-id: \"${{ secrets.BYTE_GITHUB_APP_ID }}\", private-key: \"${{ secrets.BYTE_GITHUB_APP_PRIVATE_KEY }}\", owner: RhinoHealth, repositories: fcp, permission-contents: read, permission-pull-requests: read }\n      - run: docker build -t \"byte-worker:gold-$GITHUB_SHA\" . # local only: never pushed, never repinned\n      - env:\n          GH_TOKEN: ${{ steps.fcp-token.outputs.token }}\n          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.BYTE_CLAUDE_CODE_OAUTH_TOKEN }}\n          SPLIT: ${{ github.event_name == 'schedule' && 'holdout' || 'dev' }}\n        run: scripts/gold-run.sh \"$SPLIT\" \"byte-worker:gold-$GITHUB_SHA\" gold # leak check, pack, replay, score, pass bar",
-    "notes": [
-     {
-      "line": 2,
-      "text": "Check out byte at the PR head, pinned by SHA with the version in a comment, as every action in Byte is."
-     },
-     {
-      "line": 3,
-      "text": "No credentials left in the checkout, so nothing later in the job can push with them."
-     },
-     {
-      "line": 4,
-      "text": "A second checkout: byte-gold into the `gold` folder. The answer key arrives here, and only here."
-     },
-     {
-      "line": 5,
-      "text": "An open decision for DevOps: a read-only deploy key, or a small read-only GitHub App for byte-gold."
-     },
-     {
-      "line": 7,
-      "text": "Mint a GitHub App token for fcp only, so gold-pack can fetch two SHAs per case."
-     },
-     {
-      "line": 9,
-      "text": "Contents and pull requests, read only. The packs need nothing else."
-     },
-     {
-      "line": 10,
-      "text": "Build the worker image from the PR, tagged with the commit SHA. Local only: never pushed, so the fleet is never repinned by this job."
-     },
-     {
-      "line": 12,
-      "text": "GH_TOKEN is the fcp read token for gold-pack. It is used on the runner and never passed to a container."
-     },
-     {
-      "line": 13,
-      "text": "The Claude token the worker needs, the same secret live reviews use."
-     },
-     {
-      "line": 14,
-      "text": "The split: holdout on the monthly schedule, dev on every PR and main push."
+      "text": "The pack is mounted read-only. The byte-gold repo, with the answers, is mounted nowhere."
      },
      {
       "line": 15,
-      "text": "The whole pipeline in one script, so the lab, the smoke test and CI run exactly the same steps."
+      "text": "The tree from tree.tar, read-only, with no .git folder."
      }
     ]
-   },
-   "callout": {
-    "kind": "wall",
-    "text": "Agents never change the checks they are judged by. The Bot guard keeps Byte's own PRs out of this job. The paths list means a prompt change cannot skip the gate."
+   }
+  },
+  {
+   "h": "From replays to a score, and a gate",
+   "p": [
+    "Each sealed replay leaves a publication.json with Byte's findings. Scoring compares them with the golden comments in two steps. Code first keeps only pairs that could match: same file, and a finding line within 10 lines of the golden range. Then a small, cheap model call, a judge, answers one yes-or-no question per pair: does this finding describe this defect? From the matches come the numbers: recall for high, medium and low bugs, precision (how many of Byte's findings matched a real or planted bug), and false alarms per clean PR.",
+    "Those numbers become a gate: a required check in Byte's repo that replays the cases whenever a PR changes Byte's prompts, playbooks, model or effort. The change fails if recall on high bugs drops more than 3 points below the last main run, or if clean PRs get more than 0.2 false alarms each. From now on, a rule or a cheaper setting stays in Byte only if BYTE-GOLD says it still catches the bugs."
+   ],
+   "deeper": {
+    "h": "Go deeper: trusting the judge, and keeping the test fair",
+    "p": [
+     "The judge is Haiku 5.5 at low effort with no tools. Before the gate trusts it, two people label 50 finding-and-golden pairs by hand; if the judge agrees with them less than 90% of the time, it moves to Sonnet 5.5 at medium. The scorecard holds numbers only, never a path or code, like Byte's other telemetry.",
+     "The cases are split once, by a stable hash of the case id, into a dev split (two thirds) that every PR replays and a holdout split (one third) that runs once a month. Nobody tunes Byte against the holdout, so it shows whether the dev numbers were overfitted. A PR that only changes one team's playbook replays only that team's cases, to keep cost down. Before anything runs, a leak check fails the job if a case's PR number, head SHA or Jira key appears in Byte's playbooks, because the weekly loop writes lessons from live reviews into them. Main is replayed three times first to measure noise, because two runs of the same model never give exactly the same answers."
+    ]
    }
   }
  ],
  "lab": {
-  "title": "Pack, score and seal on your laptop",
-  "youNeed": [
-   "The gold-lab repo from lesson g2-1",
-   "Node 24 and npm",
-   "Docker Desktop",
-   "jq"
+  "id": "g2-2",
+  "title": "Close the three doors",
+  "minutes": 30,
+  "needs": [
+   "The gold-lab repo from the g2-1 lab",
+   "Docker running",
+   "git and tar"
   ],
-  "worked": [
+  "goal": "See the future leak in a normal clone, then build a pack with no history and a Docker network whose only way out is a one-host proxy.",
+  "mode": "guided",
+  "guess": {
+   "q": "You unpack tree.tar into a folder and run git log there. What happens?",
+   "options": [
+    {
+     "text": "It shows the PR's own commits only",
+     "correct": false,
+     "why": "git archive copies files, not commits. There is no history of any kind in the tree."
+    },
+    {
+     "text": "It fails with not a git repository, as long as the folder is not inside another git repo",
+     "correct": true,
+     "why": "No .git folder, no history. But git also searches parent folders, which is why the tree must live outside any clone; the Fix step shows that trap."
+    },
+    {
+     "text": "It shows the full fcp history",
+     "correct": false,
+     "why": "That would be true for a clone. An archive is only the files of one commit."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "cd gold-lab && mkdir -p pack/input && git diff \"$(git rev-list --max-parents=0 HEAD)...$(git log --format=%h --grep='(#12)')\" > pack/input/diff.patch && git archive \"$(git log --format=%h --grep='(#12)')\" -o pack/input/tree.tar && tar -tf pack/input/tree.tar",
-    "see": ".gitignore\npackage-lock.json\npackage.json\nsrc/\nsrc/greet.ts"
+    "say": "First see the leak. Check out PR #12's head in the full clone, the way a careless replay would, and ask git about the file.",
+    "do": "cd ~/academy-labs/scratch/gold-lab && git switch -q --detach \":/RH-1207\" && git log --oneline -1\ngit log --oneline --all -- src/paging.ts | head -1\ngit switch -q main",
+    "see": "fcb91e8 [FE] RH-1207: Projects table pages through every project (#12)\nfc403bc [FE] RH-1301: Every page shows 25 projects, not 26 (#15)"
    },
    {
-    "do": "git log --format=%H --grep='(#12)' to get the head SHA. Write pack/input/pr.json by hand. Contents: { \"id\": \"real-0001\", \"repository\": \"lab/gold-lab\", \"number\": 12, \"headSha\": \"<the full SHA>\", \"reviewArgs\": [\"--repository\", \"lab/gold-lab\", \"--pr\", \"12\", \"--engine\", \"claude\"], \"view\": { \"title\": \"Shout the greeting\", \"body\": \"\" }, \"files\": [{ \"filename\": \"src/greet.ts\", \"additions\": 1, \"deletions\": 1 }] } Then: jq -r '.reviewArgs[]' pack/input/pr.json",
-    "see": "--repository\nlab/gold-lab\n--pr\n12\n--engine\nclaude"
+    "say": "Build a pack for PR #12 outside the clone: the diff against its base, and the files at its head with no .git.",
+    "do": "base=$(git log --format=%H --grep='(#11)'); head=$(git log --format=%H --grep='(#12)')\npack=~/academy-labs/scratch/pack-real-0001 && mkdir -p $pack/input $pack/tree\ngit diff \"$base...$head\" > $pack/input/diff.patch\ngit archive \"$head\" -o $pack/input/tree.tar && tar -xf $pack/input/tree.tar -C $pack/tree\nls -a $pack/tree && git -C $pack/tree log --oneline",
+    "see": ".\n..\nsrc\nfatal: not a git repository (or any of the parent directories): .git"
    },
    {
-    "do": "Write the lab's stub src/review.ts, not Byte's real file. One line: export interface ModelFinding { path: string; line: number; severity: \"high\" | \"medium\" | \"low\" | null; body: string }. Copy the two gold-score.ts blocks above, in order, into src/gold-score.ts. Then: ls src",
-    "see": "gold-score.ts\ngreet.ts\nreview.ts"
+    "say": "Mount the tree read-only into a container with no network at all, the way the worker sees /workspace, and try again.",
+    "do": "docker run --rm --network none -v \"$pack/tree:/workspace:ro\" alpine/git:2.47.2 -C /workspace log --oneline",
+    "see": "fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set)."
    },
    {
-    "do": "mkdir test and write test/gold-score.test.ts with node:test and node:assert/strict. A fake judge: async (f, g) => f.body.includes(\"upper-cases\") && g.defect.includes(\"upper-cases\"). A real case: golden comment on src/greet.ts lines 2 to 2, severity high, defect \"The greeting upper-cases the whole name.\" Three tests. First: a high finding on src/greet.ts line 5, body \"upper-cases every name\". Expect golden [{ severity: \"high\", caught: true }], matchedFindings 1 and cleanAlarms null. Second: the same finding on src/other.ts gives caught false. Third: a clean case with one medium and one low finding gives cleanAlarms 1.",
-    "see": "(no output yet; the file exists)"
+    "say": "Now the network. Create an internal network and try to reach the internet from it.",
+    "do": "docker network create --internal gold-sealed\ndocker run --rm --network gold-sealed curlimages/curl:8.11.1 -sS --max-time 5 https://example.com -o /dev/null; echo \"exit $?\"",
+    "see": "curl: (28) Resolving timed out after 5003 milliseconds\nexit 28"
    },
    {
-    "do": "node --import tsx --test test/*.test.ts",
-    "see": "# tests 3\n# suites 0\n# pass 3\n# fail 0"
+    "say": "Open one door: a Squid proxy on both networks that allows a single host. In Byte that host is api.anthropic.com; here it is example.com.",
+    "do": "cd ~/academy-labs/scratch && mkdir -p seal && cd seal && cat > squid.conf <<'EOF'\nhttp_port 3128\ndns_nameservers 1.1.1.1\nacl allowed dstdomain example.com\nhttp_access allow CONNECT allowed\nhttp_access deny all\nEOF\ndocker run -d --name gold-proxy --network gold-sealed -v \"$PWD/squid.conf:/etc/squid/squid.conf:ro\" ubuntu/squid:latest\ndocker network connect bridge gold-proxy",
+    "see": "(a container ID; no other output)"
    },
    {
-    "do": "docker network create --internal sealed-lab && docker run --rm --network sealed-lab curlimages/curl:8.11.1 -sS --max-time 5 https://example.com; echo \"exit $?\"",
-    "see": "curl: (28) Resolving timed out after 5002 milliseconds\nexit 28"
-   },
-   {
-    "do": "docker run --rm curlimages/curl:8.11.1 -sS -o /dev/null -w '%{http_code}\\n' https://example.com && docker network rm sealed-lab",
-    "see": "200\nsealed-lab"
-   },
-   {
-    "do": "Reading step: in the two gold-replay.sh blocks, find the three docker run lines and the one `docker network connect bridge` line. Name which container is on both networks. The script needs the Byte image and Claude quota, so it runs only on byte-runner-set.",
-    "see": "ge-<id>, the squid container, is the only one on both networks."
+    "say": "Try the allowed host and a forbidden one through the proxy, then read Squid's log, which is the evidence a smoke test checks.",
+    "do": "for u in https://example.com https://github.com; do docker run --rm --network gold-sealed curlimages/curl:8.11.1 -sS --max-time 10 -x http://gold-proxy:3128 -o /dev/null -w \"$u %{http_code}\\n\" $u; done\ndocker exec gold-proxy tail -2 /var/log/squid/access.log",
+    "see": "https://example.com 200\ncurl: (56) CONNECT tunnel failed, response 403\nhttps://github.com 000\n... TCP_TUNNEL/200 5415 CONNECT example.com:443 - HIER_DIRECT/172.66.147.243 -\n... TCP_DENIED/403 3392 CONNECT github.com:443 - HIER_NONE/- text/html"
    }
   ],
-  "faded": "Same test file, one more test for the LINE_WINDOW boundary. The golden range is 2 to 2 and the window is 10. So a finding at line 12 must count as caught, and one at line 13 must not. The step left out: the two assert lines. Write them from the `near` definition and run the tests again.",
-  "alone": "Score a clean case. Build clean-0001 with kind clean and an empty golden list. Add a findings fixture with two high, one medium and three low findings. Write a test that expects cleanAlarms 3 and matchedFindings 0. In one comment, explain why a mean of 3 fails the 0.2 bar.",
-  "done": "All tests pass, curl from the internal network fails, and curl from the default network returns 200."
+  "build": "Pack the planted case from the g2-1 lab, cases/planted-0001, whose head is PR #11. The tree must hold the files at #11's head with planted.patch applied, and diff.patch must hold #11's change followed by the planted patch (#11 is the first commit, so use git show --format= on it instead of a base...head diff). Check that the tree's src/paging.ts contains rows.slice(1, PAGE_SIZE) and that diff.patch has two diff --git lines. Then clean up: docker rm -f gold-proxy and docker network rm gold-sealed.",
+  "checks": [
+   "In the full clone, git log --all shows the fix commit (#15) while you are on PR #12's head.",
+   "git log in the unpacked tree fails with not a git repository.",
+   "curl from the internal network without the proxy times out.",
+   "Through the proxy, example.com answers 200 and github.com is refused with 403, and Squid's log shows both.",
+   "Your planted pack's tree contains the planted bug, and its diff.patch has two diff --git lines."
+  ],
+  "solution": {
+   "lang": "bash",
+   "file": "~/academy-labs/scratch/gold-lab",
+   "text": "head=$(git log --format=%H --grep='(#11)')\np=~/academy-labs/scratch/pack-planted-0001 && mkdir -p $p/input $p/tree\ngit archive \"$head\" | tar -x -C $p/tree\n(cd $p/tree && git apply ~/academy-labs/scratch/gold-lab/cases/planted-0001/planted.patch)\n{ git show --format= \"$head\"; cat cases/planted-0001/planted.patch; } > $p/input/diff.patch\ntar -cf $p/input/tree.tar -C $p/tree .\ngrep slice $p/tree/src/paging.ts        # rows.slice(1, PAGE_SIZE)\ngrep -c '^diff --git' $p/input/diff.patch   # 2\ndocker rm -f gold-proxy && docker network rm gold-sealed"
+  },
+  "fix": "A teammate's packer unpacks the tree into gold-lab/pack/tree, inside the clone, \"to keep things together\". Try it: mkdir -p pack/tree && tar -xf ~/academy-labs/scratch/pack-real-0001/input/tree.tar -C pack/tree && git -C pack/tree log --oneline | head -1. The fix commit appears again. Explain why (git looks for a .git folder in every parent folder) and repair it, then delete pack/.",
+  "explain": [
+   "Name the three ways the future can reach Byte during a replay, and what closes each one.",
+   "Why does the replay run Byte's real worker image instead of a simpler test version?",
+   "Why does the replay broker answer the lists of earlier reviews and comments with an empty list?"
+  ],
+  "done": "Your pack has no history, the internal network has one way out to one host, you packed the planted case, and you removed the proxy and the network."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Why does the replay broker answer the reviews and comments listings with []?",
+   "q": "Why is the tree in a pack made with git archive instead of a clone checked out at the PR's head?",
    "options": [
     {
-     "text": "GitHub rate-limits those endpoints, so the pack leaves them out",
+     "text": "git archive is faster for big repos",
      "correct": false,
-     "why": "The pack never calls them at all; rate limits are not the reason."
+     "why": "Speed is a side effect. The reason is what the archive leaves out."
     },
     {
-     "text": "Every replay is a first review, so Byte must not see later comments",
+     "text": "A clone carries every later commit, including the fix, and git archive writes the files without any history",
      "correct": true,
-     "why": "Comments written after the merge, including the fix discussion, would leak the answer."
+     "why": "With no .git folder, git log has nothing to show, so the fix cannot be read."
     },
     {
-     "text": "The pack would be too big with the comment history",
+     "text": "The worker cannot read files from a clone",
      "correct": false,
-     "why": "Size is not the problem; the history is the leak."
+     "why": "It can read any files. That is exactly the problem with a clone."
     }
    ]
   },
   {
-   "q": "Which container in gold-replay.sh has a route out of the internal network?",
+   "q": "In a replay, Byte's worker asks the broker for the PR's earlier review comments. What does it get?",
    "options": [
     {
-     "text": "squid, which also joins the bridge network and allows only api.anthropic.com",
+     "text": "The comments that were really posted on the PR, read with a live token",
+     "correct": false,
+     "why": "There is no token, and real comments could describe the bug or link the fix."
+    },
+    {
+     "text": "An error that stops the replay",
+     "correct": false,
+     "why": "This read is expected in every review, so the replay broker answers it, just with nothing."
+    },
+    {
+     "text": "An empty list, because every replay is a first review",
      "correct": true,
-     "why": "That one `docker network connect bridge` line is the whole way out, and squid's allow-list has one host."
-    },
-    {
-     "text": "The worker, because it must reach Claude",
-     "correct": false,
-     "why": "The worker reaches Claude through HTTPS_PROXY pointing at squid; it has no route of its own."
-    },
-    {
-     "text": "The broker, because it must reach GitHub",
-     "correct": false,
-     "why": "The replay broker has no token and answers everything from the pack."
+     "why": "Byte reviews the PR as if it had just been opened, with nothing that came later."
     }
    ]
   },
   {
-   "q": "A PR changes only skills/be/MEMORY.md. What does the gate replay?",
+   "q": "Which container in a sealed replay can reach anything outside the internal network?",
    "options": [
     {
-     "text": "Every dev case, because any playbook change can move quality",
-     "correct": false,
-     "why": "That would make the weekly MEMORY.md PRs expensive; scope follows the change."
-    },
-    {
-     "text": "Nothing, because MEMORY.md is data, not code",
-     "correct": false,
-     "why": "skills/** is in the paths list; a playbook is part of the prompt."
-    },
-    {
-     "text": "Only the BE team's dev cases, after the leak check",
+     "text": "Only the Squid proxy, and it allows api.anthropic.com alone",
      "correct": true,
-     "why": "A PR under skills/<team>/ replays that team's cases; engine or policy changes replay every dev case."
+     "why": "It is the one container on both networks. The worker reaches Claude through it and nothing else."
+    },
+    {
+     "text": "The broker, because it must talk to GitHub",
+     "correct": false,
+     "why": "The replay broker answers from the pack. It has no token and no route out."
+    },
+    {
+     "text": "The worker, because the model runs there",
+     "correct": false,
+     "why": "The worker only reaches the broker and the proxy. Its calls to Claude go through Squid."
     }
    ]
   }
  ],
- "recall": [
-  "From lesson g2-1: what does a golden comment contain, and what must never be in it?",
-  "From lesson p11-2: what is a capability, and why is one minted per run instead of reused?"
- ],
- "videos": [
-  {
-   "title": "The Most Important Skill for AI Engineers: Evals Explained",
-   "url": "https://www.youtube.com/watch?v=MltkRz94SWA",
-   "channel": "Aish Reganti",
-   "minutes": 18,
-   "why": "What an eval is, golden sets and judges, explained plainly."
-  }
- ],
+ "platform": {
+  "p": [
+   "In RhinoHealth/byte: byte gold-pack (src/gold.ts) writes input/pr.json, diff.patch and tree.tar from a shallow fetch of the two SHAs; src/gold-broker.ts and byte broker --replay serve the pack with BYTE_BROKER_CAPABILITY and no BYTE_BROKER_TOKEN, which needs a new optional api injection in BrokerSessionOptions; scripts/gold-replay.sh reuses review.yml's container pattern with a per-run --internal network and a digest-pinned Squid allowing only api.anthropic.com (config/gold-squid.conf, from infrastructure's squid-proxy template without basic auth). Replays talk to Claude directly, as live Byte does; Byte does not use our gateway.",
+   "Scoring is byte gold-score (src/gold-score.ts) with a Haiku 5.5 judge, calibrated by Sean and Nave on 50 hand-labelled pairs. The gate is .github/workflows/gold.yml on byte-runner-set: it runs on PRs touching skills/**, src/engines.ts, src/limits.ts, src/review.ts, src/panel.ts, config/repositories.json or the Dockerfile, refreshes the baseline in data/gold-runs.jsonl on main, runs the holdout monthly, skips PRs opened by bots, and becomes a required check on byte's main."
+  ],
+  "tickets": [
+   {
+    "key": "G2-04",
+    "why": "The packer and the replay broker: no history, no token, publications recorded."
+   },
+   {
+    "key": "G2-06",
+    "why": "gold-replay.sh: the internal network, Squid with one host, the hardening flags, the smoke test on 5 packs."
+   },
+   {
+    "key": "G2-08",
+    "why": "Scoring: the line window, the judge and its calibration, the scorecard."
+   },
+   {
+    "key": "G2-09",
+    "why": "The gate in Byte's repo: splits, scope by change, the leak check and the pass bar."
+   }
+  ]
+ },
  "words": [
   {
+   "term": "sealed replay",
+   "plain": "Running Byte on an old PR so that it can see the PR as it was, and nothing that happened later."
+  },
+  {
    "term": "pack",
-   "plain": "A folder with pr.json, diff.patch and tree.tar: everything Byte needs to review one old PR, and nothing after it."
+   "plain": "A folder with one PR's diff, its files at head (no .git) and its metadata: all Byte needs, nothing more."
   },
   {
    "term": "replay broker",
-   "plain": "Byte's real BrokerSession started with no token, answering gh reads from the pack and recording the review to a file."
+   "plain": "Byte's normal broker with no token, answering reads from the pack and recording what Byte would post."
   },
   {
    "term": "internal network",
-   "plain": "A Docker network created with --internal: containers on it have no route out."
+   "plain": "A Docker network whose containers can reach each other but have no route out."
   },
   {
    "term": "judge",
-   "plain": "A small Claude call that answers one yes/no question: does this finding describe this defect?"
+   "plain": "A small model call that answers yes or no: does this finding describe this golden defect?"
   },
   {
-   "term": "recall",
-   "plain": "The share of golden bugs Byte caught, reported per severity."
-  },
-  {
-   "term": "split",
-   "plain": "Which group a case is in: dev runs on every gated PR, holdout once a month."
-  },
-  {
-   "term": "pass bar",
-   "plain": "HIGH recall at most 3 points below the latest main row, and at most 0.2 high or medium findings per clean PR."
+   "term": "gate",
+   "plain": "A required check that replays BYTE-GOLD and fails a change to Byte when quality drops."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G2-04",
-   "why": "This lesson showed what a pack holds, and how a BrokerSession with injected reads and writes replays it with no token.",
-   "walk": [
-    "Add src/gold.ts with goldPack() and wire `gold-pack` into src/cli.ts in the same argsToMap and required style as the other subcommands.",
-    "gold-pack --case <dir> --fcp <clone> --out <pack> writes input/pr.json (with reviewArgs), input/diff.patch (plus planted.patch) and input/tree.tar. The tar comes from `git archive <head>` with no .git; a shallow fetch of the two SHAs is enough.",
-    "Give BrokerSessionOptions in src/broker.ts an optional `api`, next to the existing executeRead injection.",
-    "Add src/gold-broker.ts with replaySession() from the two blocks above; `broker --replay /input` starts it with BYTE_BROKER_CAPABILITY and no BYTE_BROKER_TOKEN.",
-    "Write test/gold-broker.test.ts: gh pr diff returns the pack's patch, an unknown endpoint is refused, a publication lands in the file. Nothing touches the network."
-   ]
+   "q": "From memory: the three files in a pack, and what each one leaves out on purpose.",
+   "a": "diff.patch (the PR's change, plus planted.patch for a planted case), tree.tar (files at head, no .git, so no later history), pr.json (title, files, SHAs, review flags; the body is left out when blankBody is set)."
   },
   {
-   "key": "G2-06",
-   "why": "This lesson showed the three containers, the internal network and the one proxy that make a replay sealed.",
-   "walk": [
-    "Add scripts/gold-replay.sh <pack> <image> <out> from the two blocks above, reusing review.yml's container pattern and flags.",
-    "Create the network with --internal and start the replay broker on it with the pack's input/ mounted read-only.",
-    "Add config/gold-squid.conf from infrastructure's modules/squid-proxy template without basic auth, allowing only api.anthropic.com. Run squid digest-pinned on the internal network and the default bridge.",
-    "Unpack tree.tar into a temp dir, mount it at /workspace:ro, and run the worker's review with HTTPS_PROXY, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 and the pack's reviewArgs.",
-    "Keep publication.json, claude-result.json and run-manifest.json per case; never mount byte-gold; the trap removes containers and network.",
-    "Smoke-test 5 packs on byte-runner-set: squid's log shows only api.anthropic.com and the broker's audit shows no refused reads. The manifest matches a live review's shape."
-   ]
+   "q": "A replay's Squid log shows a refused request to github.com. Is that a problem?",
+   "a": "The seal worked, because the request was refused. But it means something in Byte tried to reach GitHub directly, which a smoke test should explain, since all GitHub reads should go to the replay broker."
   },
   {
-   "key": "G2-08",
-   "why": "This lesson explained the 10-line filter, the judge and the numbers-only scorecard.",
-   "walk": [
-    "Add src/gold-score.ts from the two blocks above and wire `gold-score --cases <byte-gold> --results <dir> --output <file>` into src/cli.ts.",
-    "Judge each near pair with `claude -p --model claude-haiku-5-5 --effort low`, no tools, JSON out, reusing weekly-analyze's session flags and token handling.",
-    "Calibrate with Sean and Nave on 50 hand-labelled pairs. Below 90% agreement, switch the judge to Sonnet 5.5 at medium and check again.",
-    "Report per split, team and kind: recall by severity, precision, high or medium findings per clean PR, cost and minutes from claude-result.json.",
-    "Write numbers only: the scorecard JSON to the G1 eval store and a markdown table to the job summary."
-   ]
-  },
-  {
-   "key": "G2-09",
-   "why": "This lesson showed the gate's triggers, the Bot guard, the leak check, the scoping and the pass bar.",
-   "walk": [
-    "Assign splits once in byte-gold by a stable hash of the case id, two thirds dev and one third holdout. Stratify by kind, team and severity.",
-    "Add .github/workflows/gold.yml from the two blocks above: PRs and main pushes on the listed paths, plus the monthly holdout schedule.",
-    "Write scripts/gold-run.sh: leak check under skills/, then pack with the read-only App token, cached by case id and never inside a container. Then replay 4 at a time and score with `byte gold-score`.",
-    "Scope by change: skills/<team>/ replays that team's cases; engine, limits, review, panel, policy or Dockerfile changes replay every dev case.",
-    "Pass bar: HIGH recall at most 3 points below the latest main row in data/gold-runs.jsonl. Also at most 0.2 high or medium findings per clean PR. Run main 3 times first to measure noise.",
-    "Make BYTE-GOLD a required check on byte's main; if live reviews start hitting 429s, move replays to the evening."
-   ]
+   "q": "Someone wants to make the replay faster by giving the worker a normal clone instead of tree.tar. What do you answer?",
+   "a": "A clone contains the fix and every later commit, so Byte can read the answer with git log, and recall stops meaning anything."
   }
  ],
- "remember": "Seal the replay (no history, no token, one host out) and the score becomes a number the gate can hold."
+ "remember": "A replay measures Byte only if it is sealed: the files with no history, a broker with no token, and one door out to Claude."
 }

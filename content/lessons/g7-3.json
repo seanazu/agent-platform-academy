@@ -1,671 +1,323 @@
 {
+ "v": 2,
  "id": "g7-3",
  "title": "Builders and ported tests",
  "minutes": 55,
  "youNeed": [
-  "g7-2",
-  "p10-3"
+  "p10-3",
+  "g7-2"
  ],
- "bridge": "A builder is like a Playwright page object that sets up state through the real UI instead of writing to the database. Except: here the \"UI\" is the cloud's API called in-process. Each builder returns the ids a test needs, after the serializers and permission checks ran for real.",
- "intro": "With the fakes in place, tests need data: sites, projects, schemas, datasets and code objects. This lesson builds that data through the API with the integration tests' own client. Then it ports 15 cloud-only tests off shared QA. It stays Python: the tests run inside fcp's Django backend.",
- "picture": {
-  "caption": "A ported test keeps its own calls; only the transport and the data source change.",
-  "nodes": [
-   {
-    "id": "test",
-    "label": "Ported test (api_client, builder)",
-    "kind": "check"
-   },
-   {
-    "id": "wrap",
-    "label": "RhinoAPITestWrapper (unchanged calls)",
-    "kind": "service"
-   },
-   {
-    "id": "inproc",
-    "label": "InProcessRhinoAPI._send()",
-    "kind": "service"
-   },
-   {
-    "id": "api",
-    "label": "Cloud API in-process (DRF APIClient)",
-    "kind": "service"
-   },
-   {
-    "id": "fake",
-    "label": "FakeOnPremClient and the other fakes",
-    "kind": "service"
-   },
-   {
-    "id": "qa",
-    "label": "QA original, marked nightly",
-    "kind": "file"
-   }
+ "map": "github",
+ "hook": {
+  "story": [
+   "You pick the first integration test to move off shared QA and into the new API layer: a permission test that checks what a collaborating workgroup may do in a project. It is short and it never needs an on-prem client, so it should be easy. Then you read its first lines. The collaborator is a workgroup with a fixed ID, 65e46694-0951-4634-a839-634af42a8177, which someone created by hand on QA years ago. In the new layer every run starts from an empty, freshly migrated database, and that workgroup does not exist.",
+   "The quick fix is a few lines of factory code that write a workgroup row straight into the database. It would make the test green, but it would also skip everything the product does when a workgroup is really created: the serializer's checks, the permissions and the rows that come with it. The test would then check the API's rules against data that the API itself could never have made."
   ],
-  "steps": [
-   {
-    "from": "test",
-    "to": "wrap",
-    "text": "calls create_project(), add_collaborator() as on QA"
-   },
-   {
-    "from": "wrap",
-    "to": "inproc",
-    "text": "make_call() reaches the new _send() seam"
-   },
-   {
-    "from": "inproc",
-    "to": "api",
-    "text": "APIClient.generic() runs the request with a real JWT"
-   },
-   {
-    "from": "api",
-    "to": "fake",
-    "text": "an import schedules a task; the builder finishes it with complete_task()"
-   },
-   {
-    "from": "qa",
-    "to": "test",
-    "text": "the QA copy runs nightly for 2 green weeks, then is deleted"
-   }
-  ]
+  "question": "How does a test in the new layer get the users, workgroups and projects it needs, made the way the product makes them, without any fixed IDs from QA?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Data through the API, not through factories",
+   "h": "A shared environment remembers every run",
    "p": [
-    "factory_boy writes rows straight into the database. That is fine for a model test, but it skips the serializers, the permission checks and the import status changes. An endpoint test that starts from factory rows can pass while the real flow fails. So tests_api builds its data the way the UI and the SDK do: through the API.",
-    "The integration tests already have a client for that. rhinoCore/integration-tests/integration_test_utils/common.py defines RhinoAPI, whose make_call() sends HTTP with requests.request. rhino_api_wrapper.py wraps it as RhinoAPITestWrapper with methods like create_project(). If tests_api reuses that wrapper, ported tests keep their own calls almost unchanged.",
-    "To reuse it, G7-06 first adds a seam to RhinoAPI. The two requests.request(...) calls in make_call, including the page fetches, move into one _send() method. Runs against QA behave exactly as before. A subclass can now override _send()."
+    "Tests on QA lean on what QA already contains: a workgroup created by hand, a user with a known password, an offline client with an ID like cafecafe-…-000000000004. That works as long as nobody deletes those rows and nobody else's test changes them. QA also keeps whatever each run created, so the second run of a test starts in a different world than the first. You will see it in the lab: the same script against the same server answers 201 the first time and 500 the second, because the user it creates already exists, and the project list grows by one on every run.",
+    "The API layer gives each test a fresh database, so a test can no longer find its world; it has to build it. That rule, every test builds what it needs and nothing is shared, also makes the tests independent of each other and of the order they run in, which pytest-xdist needs anyway."
    ],
-   "callout": {
-    "kind": "wall",
-    "text": "Fake data only. Names and emails come from Faker, passwords are generated per test, and import outputs are fake rows. Never copy rows from QA or prod; PHI never enters a test."
-   }
+   "see": "$ uv run python qa_style.py     # first run against a running server\nsite: 201\ncreated project 1\n$ uv run python qa_style.py     # the same script again\nsite: 500\ncreated project 2\nprojects: [{'id': 1, …}, {'id': 2, …}]"
   },
   {
-   "h": "InProcessRhinoAPI, part 1: a real token (G7-06)",
+   "h": "Builders go through the front door",
    "p": [
-    "The new class lives in tests_api/api.py. It subclasses RhinoAPI and swaps the transport: DRF's APIClient instead of the network (lesson p10-3). Authentication stays real: the token comes from the auth/obtain_token endpoint, so the login path is tested too."
+    "There are two ways to create test data. A factory, for example with the factory_boy library, writes rows straight into the database: fast and simple, and fine for a unit test of one model. But it skips the serializer, the permission checks and every field the API fills in by itself. In the lab, the API sets a project's workgroup and creator from the logged-in user, so a project written by a factory has no creator, and the database refuses it; give it one by hand and the factory happily stores a project with a blank name, which the API would refuse with 400.",
+    "A builder creates the same data through the API, the way the UI and the SDK do. It is a small function with a clear name, such as builder.site() or builder.project(site), that calls the real endpoints, fills every value the test does not care about with fake data from the Faker library, and returns what the test needs, usually IDs and a logged-in client. The data then exists only because the API agreed to create it. In fcp, builder.site() posts to the test-data endpoint the cloud already has for QA and returns a fresh workgroup with its own user; only the first Rhino admin that bootstraps everything comes from a factory."
    ],
-   "because": "We fetch a real JWT instead of force_authenticate, because a ported test should prove that login and permissions work, not skip them.",
    "code": {
     "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/api.py (part 1 of 2)",
-    "text": "import json\nfrom urllib.parse import urlencode\n\nfrom rest_framework.test import APIClient\n\nfrom integration_test_utils.common import RhinoAPI\nfrom integration_test_utils.rhino_api_wrapper import RhinoAPITestWrapper\n\n\nclass InProcessRhinoAPI(RhinoAPI):\n    \"\"\"The integration tests' RhinoAPI with the HTTP call swapped for DRF's APIClient: same auth (a real JWT from\n    auth/obtain_token), same error handling and pagination, but no network and no shared QA.\"\"\"\n\n    def __init__(self, user_username: str, user_password: str, api_version: str = \"v2\"):\n        super().__init__(api_version=api_version, user_username=user_username, user_password=user_password)\n        self.api_base_url = \"/api/\"\n        self.client = APIClient()\n\n    def _request_jwt_token(self) -> str:\n        credentials = {\"email\": self.user_username, \"password\": self.user_password}\n        return self.client.post(f\"{self.api_base_versioned_url}auth/obtain_token\", credentials).json()[\"access\"]",
+    "file": "tests/conftest.py (the lab; fcp's builders live in tests_api/builders.py)",
+    "text": "@dataclass\nclass Site:\n    api: InProcessAPI  # logged in as the site's first user\n    workgroup: str\n    email: str\n\n\nclass Builder:\n    def site(self) -> Site:\n        \"\"\"A fresh workgroup and user, made through the API's test-data endpoint. Fake data only.\"\"\"\n        workgroup, email, password = f\"wg-{fake.unique.slug()}\", fake.unique.email(), fake.password(length=16)\n        response = APIClient().post(\"/api/test-data/site/\", {\"workgroup\": workgroup, \"email\": email, \"password\": password}, format=\"json\")\n        assert response.status_code == 201, response.json()\n        return Site(InProcessAPI(email, password), workgroup, email)",
     "notes": [
      {
-      "line": 1,
-      "text": "To encode a JSON body by hand for APIClient.generic()."
+      "line": 3,
+      "text": "What a test needs about one site: a client logged in as its user, and the names it was given."
      },
      {
-      "line": 2,
-      "text": "To turn query parameters into a query string."
+      "line": 11,
+      "text": "Fake data only: a unique workgroup and email for every call, so two sites never collide."
      },
      {
-      "line": 4,
-      "text": "DRF's in-process test client: no server, no network."
-     },
-     {
-      "line": 6,
-      "text": "The integration tests' client. pythonpath in tests_api/pytest.ini includes ../rhinoCore/integration-tests, so this import works."
-     },
-     {
-      "line": 7,
-      "text": "The wrapper with the high-level calls (create_project and friends)."
-     },
-     {
-      "line": 10,
-      "text": "Same behaviour as RhinoAPI (errors, pagination, token cache), different transport."
+      "line": 12,
+      "text": "Through the API's own test-data endpoint, with its serializer and checks."
      },
      {
       "line": 14,
-      "text": "Takes the user's email and password, like the parent."
+      "text": "The test gets a client already able to log in as the new user."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The same calls, a different transport",
+   "p": [
+    "fcp's integration tests already have a client for the API: a class, RhinoAPI, that logs in, sends each request with the requests library and raises a clear error on a bad status, plus a wrapper with one method per action, such as create_project(). Ported tests should keep those calls, so the only thing that changes is how a request travels. The trick is a seam inside the client. All its network traffic goes through one method, _send, and a subclass for the API layer overrides only that method: instead of an HTTP request to QA, it hands the same method, URL, headers and body to DRF's APIClient, which runs them inside the test process.",
+    "Everything else in the client stays real, including the login. The in-process client gets its token from the real token endpoint with the user's real password, so authentication is tested on every call, and the wrapper's error handling works as before. In fcp, the first change is to move the two requests.request(...) calls in the integration tests' client into one _send method, which changes nothing for the runs against QA, and only then to add the in-process subclass."
+   ],
+   "code": {
+    "lang": "python",
+    "file": "tests/inprocess.py (the lab; fcp's is tests_api/api.py)",
+    "text": "\"\"\"The same RhinoAPI, with the network swapped for DRF's APIClient: same calls, same login, no server.\"\"\"\nimport json\n\nfrom rest_framework.test import APIClient\n\nfrom api import RhinoAPI\n\n\nclass InProcessAPI(RhinoAPI):\n    def __init__(self, email: str, password: str):\n        super().__init__(\"/api/\", email, password)\n        self.client = APIClient()\n\n    def _send(self, method, url, headers, json_body):\n        meta = {\"HTTP_\" + name.upper().replace(\"-\", \"_\"): value for name, value in headers.items()}\n        body = json.dumps(json_body) if json_body is not None else \"\"\n        return self.client.generic(method, url, body, content_type=\"application/json\", **meta)",
+    "notes": [
+     {
+      "line": 9,
+      "text": "A subclass of the client the QA tests use, so every method they call still exists."
+     },
+     {
+      "line": 11,
+      "text": "A path instead of a host: requests stay inside Django."
+     },
+     {
+      "line": 14,
+      "text": "The only override. RhinoAPI calls _send for the login and for every request."
      },
      {
       "line": 15,
-      "text": "Let the parent set version, user and trace id."
-     },
-     {
-      "line": 16,
-      "text": "A path, not a host. api_base_versioned_url is a property built from it, so every URL becomes /api/v2/..."
-     },
-     {
-      "line": 17,
-      "text": "One in-process client per user."
-     },
-     {
-      "line": 19,
-      "text": "Override the parent's token request, which uses requests.post."
-     },
-     {
-      "line": 20,
-      "text": "The same form fields the parent sends."
-     },
-     {
-      "line": 21,
-      "text": "Post them to the real endpoint and return the access token from the JSON."
+      "text": "Django's test client reads headers as META keys: Authorization becomes HTTP_AUTHORIZATION."
      }
     ]
    }
   },
   {
-   "h": "InProcessRhinoAPI, part 2: the _send() seam",
+   "h": "Porting a test: move it, don't copy it",
    "p": [
-    "_send() receives what make_call would have given requests.request and replays it through APIClient.generic(). Django's test client takes headers as META keys: Authorization becomes HTTP_AUTHORIZATION, X-Trace-Id becomes HTTP_X_TRACE_ID.",
-    "Two fixtures complete the ticket. builder.site() posts test/create_test_data with TestDataCreator's \"custom\" scenario: a workgroup, a user with a $var password and a user_role. It returns a Site with a logged-in wrapper.",
-    "api_client is a wrapper on the in-process transport for the site's workgroup. It has the same name as the integration fixture, so ported tests keep working. Only the bootstrap Rhino admin comes from RhinoAdminTestFactory."
+    "With builders and the in-process client, a ported test reads almost like the original. Its own calls stay, and each fixed ID from QA becomes a builder call, so the collaborating workgroup from the story becomes a fresh builder.site(). The test asserts on what a caller sees, the status code, the error text, the fields and the number of rows, and never on which internal functions ran, so it survives a refactoring.",
+    "Moving is a process, not a copy. The original stays on QA for a while, marked to run only in the nightly run, and is deleted once the port has been green in CI for two weeks. Not every test can move: a test that needs a real indexing machine or a search cluster stays on QA, and a port may check that the work was queued without running it."
    ],
-   "because": "We convert headers to META keys and encode the body ourselves, because APIClient.generic() takes raw Django request parts, not requests-style arguments.",
    "code": {
     "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/api.py (part 2 of 2)",
-    "text": "    def _send(self, method, url, headers=None, data=None, params=None, json_body=None, timeout=None):\n        # New seam: RhinoAPI.make_call (and its page fetches) call _send() instead of requests.request().\n        meta = {\"HTTP_\" + name.upper().replace(\"-\", \"_\"): value for name, value in (headers or {}).items() if value}\n        body = json.dumps(json_body) if json_body is not None else (data or \"\")  # multipart uploads: check per endpoint\n        return self.client.generic(\n            method, url, body, content_type=\"application/json\", QUERY_STRING=urlencode(params or {}), **meta\n        )\n\n\ndef in_process_wrapper(email: str, password: str, workgroup_uid: str) -> RhinoAPITestWrapper:  # for `api_client`\n    wrapper = RhinoAPITestWrapper(user_username=email, user_password=password, workgroup_uid=workgroup_uid)\n    wrapper.api = InProcessRhinoAPI(email, password)\n    return wrapper",
+    "file": "tests/test_project_visibility.py (the lab)",
+    "text": "\"\"\"Ported from the QA suite. There, the other site was a hard-coded workgroup that had to exist on QA:\nOTHER_WORKGROUP = \"65e46694-0951-4634-a839-634af42a8177\". Here each test builds its own sites.\"\"\"\n\n\ndef test_a_site_sees_only_its_own_projects(builder):\n    mine, other = builder.site(), builder.site()\n    mine.api.create_project(\"Lung CT\")\n    assert [p[\"name\"] for p in mine.api.list_projects()] == [\"Lung CT\"]\n    assert other.api.list_projects() == []\n\n\ndef test_the_api_records_who_created_a_project(builder):\n    site = builder.site()\n    site.api.create_project(\"Lung CT\")\n    [project] = site.api.list_projects()\n    assert (project[\"workgroup\"], project[\"created_by\"]) == (site.workgroup, site.email)",
     "notes": [
-     {
-      "line": 1,
-      "text": "The new seam. make_call (and its page fetches) call it instead of requests.request()."
-     },
-     {
-      "line": 3,
-      "text": "Each header becomes HTTP_<NAME> with dashes turned into underscores; empty values are skipped."
-     },
-     {
-      "line": 4,
-      "text": "A JSON body is encoded here; otherwise the raw data. Multipart uploads need a check per endpoint."
-     },
-     {
-      "line": 5,
-      "text": "Run any HTTP method through the whole Django stack in-process."
-     },
      {
       "line": 6,
-      "text": "The query parameters, encoded, plus the headers as META entries."
-     },
-     {
-      "line": 10,
-      "text": "A factory function the api_client fixture uses."
-     },
-     {
-      "line": 11,
-      "text": "The normal wrapper, logged in as this user, with this workgroup as default."
-     },
-     {
-      "line": 12,
-      "text": "Swap its transport for the in-process one. Every wrapper method now runs without a network."
-     },
-     {
-      "line": 13,
-      "text": "The test gets the same object type as on QA."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Builders, part 1: the Site record (G7-08)",
-   "p": [
-    "G7-08 adds builders for the next layer of data: data schemas, datasets and code objects. Most cloud-only scenarios need a project with a schema, a dataset and a code object. Building them through the API catches what factories skip: serializer validation, permission checks and import status changes.",
-    "The file starts with a dataclass (lesson p10-1) that holds everything a test needs about one site."
-   ],
-   "because": "We return a small Site record, because every later builder needs the site's logged-in client and its workgroup.",
-   "code": {
-    "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/builders.py (part 1 of 2)",
-    "text": "from dataclasses import dataclass\nfrom pathlib import Path\n\nfrom faker import Faker\n\nfrom fcp_common.rhinoTaskServices.task_common import TaskStatus, TaskType\nfrom rhinoCloud.rhinoCore.models.dataset import Dataset\n\nfrom integration_test_utils.rhino_api_wrapper import RhinoAPITestWrapper\n\nSCHEMA_CSVS = Path(__file__).parents[1] / \"rhinoCore\" / \"integration-tests\" / \"pytest_fixtures\"\nfake = Faker()\n\n\n@dataclass\nclass Site:\n    api: RhinoAPITestWrapper  # logged in as the site's user, on the in-process transport (see builder.site())\n    workgroup_uid: str\n    email: str\n    password: str  # generated per test; fake",
-    "notes": [
-     {
-      "line": 1,
-      "text": "A dataclass writes the constructor and equality for a record."
-     },
-     {
-      "line": 4,
-      "text": "Faker makes fake names, emails and phrases."
-     },
-     {
-      "line": 6,
-      "text": "Shared enums from fcp_common: the task's state and its kind (DATASET_IMPORT and others)."
-     },
-     {
-      "line": 7,
-      "text": "The model, only to read its ImportStatusTypes enum."
-     },
-     {
-      "line": 11,
-      "text": "The schema CSVs the integration tests already use, for example \"Pneumonia Input Schema.csv\"."
-     },
-     {
-      "line": 12,
-      "text": "One Faker for the module. pytest-randomly reseeds it, so values repeat with the same seed."
-     },
-     {
-      "line": 16,
-      "text": "The record a builder returns."
-     },
-     {
-      "line": 17,
-      "text": "A wrapper logged in as the site's user, on the in-process transport."
-     },
-     {
-      "line": 18,
-      "text": "The site's workgroup id."
-     },
-     {
-      "line": 20,
-      "text": "Generated per test. It is fake, so it may appear in a test."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Builders, part 2: schema and dataset",
-   "p": [
-    "data_schema() calls the wrapper's create_schema with a CSV. dataset() is the interesting one. It imports through POST datasets/ as the UI does, then lets the fake client answer the import task.",
-    "It needs a new parameter. RhinoAPITestWrapper.create_dataset hard-codes \"sync\": True today; add a sync parameter. A sync import polls the database in the request thread while it waits, so the fake could never answer. code_object() (not shown) posts to code_objects/ with TestDataCreator's python_code config. The helpers pneumonia(site) and python_code(site, project_uid) return small dataclasses of uids."
-   ],
-   "because": "We import with sync=False and finish the task from the test, because the fake answers only when the test calls complete_task().",
-   "code": {
-    "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/builders.py (part 2 of 2)",
-    "text": "def data_schema(site: Site, project_uid: str, csv_name: str = \"Pneumonia Input Schema.csv\") -> str:\n    return site.api.create_schema(project_uid, SCHEMA_CSVS / csv_name)\n\n\ndef dataset(site: Site, project_uid: str, schema_uid: str, onprem_client, import_output: dict) -> str:\n    \"\"\"Import through POST datasets/ like the UI does; the fake client \"runs\" the import task.\n    sync=False on purpose: a sync import polls the DB in this thread while waiting, so the fake could never answer.\"\"\"\n    created = site.api.create_dataset(fake.catch_phrase(), project_uid, schema_uid, \"/rhino_data/fake.csv\", sync=False)\n    task = next(t for t in reversed(onprem_client.scheduled) if t.task_type == TaskType.DATASET_IMPORT)\n    onprem_client.complete_task(task.task_uid, TaskStatus.COMPLETED, import_output)  # fake rows, made with Faker\n    status = site.api.api.make_call(\"GET\", f\"datasets/{created['uid']}/\")[\"data\"][\"import_status\"]\n    assert status == Dataset.ImportStatusTypes.COMPLETE, status\n    return created[\"uid\"]",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Create a schema in a project from one of the CSVs; returns its uid."
-     },
-     {
-      "line": 5,
-      "text": "Takes the site, the project, the schema, the onprem_client fixture and a fake import output."
-     },
-     {
-      "line": 7,
-      "text": "The docstring keeps the reason next to the code."
-     },
-     {
-      "line": 8,
-      "text": "A fake name, a fake path, and sync=False (the new parameter)."
+      "text": "Two fresh sites instead of one site plus a fixed workgroup from QA."
      },
      {
       "line": 9,
-      "text": "The newest scheduled task of type DATASET_IMPORT, from the fake's record."
-     },
-     {
-      "line": 10,
-      "text": "The fake client reports success with fake rows; the production handler runs."
-     },
-     {
-      "line": 11,
-      "text": "Read the dataset back through the API, as a user would."
-     },
-     {
-      "line": 12,
-      "text": "The import must be COMPLETE. The assert message shows the actual status when it is not."
-     },
-     {
-      "line": 13,
-      "text": "The test gets the dataset's uid."
+      "text": "The other site sees nothing: the API's own filtering, checked from the outside."
      }
     ]
    },
-   "callout": {
-    "kind": "tip",
-    "text": "Copy the shape of import_output from the dataset-handler tests in rhinoTaskServices/tests, and fill it with Faker rows made in the test."
-   }
-  },
-  {
-   "h": "Porting, part 1: same calls, no QA (G7-18)",
-   "p": [
-    "G7-18 moves 8 tests that only need the cloud: permission/test_project_permission.py (4), test_client_offline_validation.py (2), test_tensorboard.py::test_get_or_create_tensorboard_no_logs_returns_guidance and test_runtime_file.py::test_cross_workgroup_access. They wait in the QA queue today although they never need a real client.",
-    "Move, don't copy. The QA original gets @pytest.mark.nightly, which per-push QA runs skip. Once the port has been green in CI for 2 weeks, delete the original. Assert on what the caller sees (status codes, error text, fields, row counts), never on which internal calls happened."
-   ],
-   "because": "We keep the original calls line for line, so a reviewer can compare the port and the QA test at a glance.",
-   "code": {
-    "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/test_project_permissions.py (part 1 of 2)",
-    "text": "\"\"\"Ported from rhinoCore/integration-tests/permission/test_project_permission.py: the same calls, run in-process\nagainst the fakes instead of qa-cloud. The QA original is marked nightly until this has been green for 2 weeks.\"\"\"\n\nfrom rhinoCloud.rhinoCore.services.permission_service import remove_rhino_admin_from_permissions\nfrom rhinoCloud.rhinoCore.services.project_permission.permission_constants import ActionTypes, PermissionPersona\n\n\ndef test_project_permission_endpoint(api_client):\n    project_uid = api_client.create_project(permissions=None)\n    expected = remove_rhino_admin_from_permissions(ActionTypes().get_project_default_dict())\n    assert api_client.get_project_permissions(project_uid) == expected",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The docstring says where the test came from and when the QA original goes away."
-     },
-     {
-      "line": 4,
-      "text": "A production helper that removes the Rhino admin entries from a permission dict."
-     },
-     {
-      "line": 5,
-      "text": "The permission actions and the personas (roles) that may perform them."
-     },
-     {
-      "line": 8,
-      "text": "The test asks for api_client; the fixture name matches the integration suite."
-     },
-     {
-      "line": 9,
-      "text": "The same call as on QA, now in-process."
-     },
-     {
-      "line": 10,
-      "text": "The default project permissions without the admin entries."
-     },
-     {
-      "line": 11,
-      "text": "Compare what the endpoint returns with the expected dict."
-     }
+   "deeper": {
+    "h": "Go deeper: datasets need the fake client",
+    "p": [
+     "Most real scenarios need more than a project: a data schema, a dataset and a code object. A dataset is imported by the site's on-prem client, so its builder uses the fake from the previous lesson. It creates the dataset through POST datasets/ like the UI, finds the import task the fake recorded, and calls complete_task with a successful status and fake rows made with Faker, which runs the cloud's real response handler. Then it checks through the API that the import finished.",
+     "One detail matters: the import must be started asynchronously. A synchronous import makes the request wait in the test's own thread for the client's answer, and since the test is the one that delivers the answer, it would wait forever. So the wrapper's create_dataset gets a sync parameter that the builder sets to false."
     ]
-   }
-  },
-  {
-   "h": "Porting, part 2: a builder replaces a QA id",
-   "p": [
-    "The second test needed a second workgroup. On QA it used the hard-coded collaborator workgroup 65e46694-0951-4634-a839-634af42a8177. In tests_api, builder.site() makes a fresh one.",
-    "The same goes for the pre-seeded offline workgroup cafecafe-cafe-cafe-cafe-000000000004. Find how the cloud decides a client is offline (RH-5356). Then build that state with the fake's offline_agents or a builder.",
-    "The runtime-file test uses the in-memory object store. The TensorBoard test uses the fake's empty GetTensorBoardLogsMetadata."
-   ],
-   "because": "We build the collaborator with builder.site(), because a hard-coded QA id ties the test to one shared environment.",
-   "code": {
-    "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/test_project_permissions.py (part 2 of 2)",
-    "text": "def test_project_collab_permission_endpoint(api_client, builder):\n    collaborator = builder.site()  # was the hard-coded QA workgroup 65e46694-0951-4634-a839-634af42a8177\n    project_uid = api_client.create_project(permissions=None)\n    api_client.add_collaborator(project_uid, collaborator.workgroup_uid)\n    permissions = api_client.get_site_permissions(project_uid)[collaborator.workgroup_uid][\"permissions\"]\n    assert permissions == remove_rhino_admin_from_permissions(ActionTypes().get_site_default_dict())\n\n    custom = ActionTypes().get_site_default_dict()\n    custom[ActionTypes.SHARE_SECURE_ACCESS_LIST.name] = [\n        PermissionPersona.RHINO_ADMIN.name,\n        PermissionPersona.COLLABORATOR_MEMBER.name,\n    ]\n    project_uid = api_client.create_project(permissions=None)\n    api_client.add_collaborator(project_uid, collaborator.workgroup_uid, permissions=custom)\n    permissions = api_client.get_site_permissions(project_uid)[collaborator.workgroup_uid][\"permissions\"]\n    assert permissions[ActionTypes.SHARE_SECURE_ACCESS_LIST.name] == [PermissionPersona.COLLABORATOR_MEMBER.name]",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Asks for api_client and builder."
-     },
-     {
-      "line": 2,
-      "text": "A fresh site replaces the hard-coded QA workgroup."
-     },
-     {
-      "line": 4,
-      "text": "Invite the collaborator with default permissions."
-     },
-     {
-      "line": 5,
-      "text": "Read that site's permissions through the API."
-     },
-     {
-      "line": 6,
-      "text": "They must equal the site defaults without the admin entries."
-     },
-     {
-      "line": 8,
-      "text": "Now a custom set: start from the defaults."
-     },
-     {
-      "line": 9,
-      "text": "Allow sharing the secure access list to the admin and collaborator members."
-     },
-     {
-      "line": 14,
-      "text": "Invite with the custom permissions on a second project."
-     },
-     {
-      "line": 16,
-      "text": "The admin persona is removed from what users see, so only COLLABORATOR_MEMBER remains."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Porting vocabularies, part 1 (G7-27)",
-   "p": [
-    "G7-27 ports the next 7 tests, bringing the total to 15. Six are custom-vocabulary parsing tests from test_semantic_mapping.py: test_custom_vocabulary and its five variants. Their helper assert_vocabulary_terms moves to tests_api/helpers.py. The seventh is test_vocabulary.py::test_large_vocabulary_upload."
-   ],
-   "because": "We move the shared assert helper into tests_api/helpers.py, because six ported tests use it and none should import from the QA suite.",
-   "code": {
-    "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/test_custom_vocabularies.py (part 1 of 2)",
-    "text": "\"\"\"Ported from rhinoCore/integration-tests/test_semantic_mapping.py and test_vocabulary.py (custom vocabularies).\"\"\"\n\nfrom helpers import assert_vocabulary_terms  # moved from test_semantic_mapping.py into tests_api/helpers.py\n\nSTART_INDEXING = \"rhinoCloud.rhinoCore.celery_tasks.vocabulary_indexing.start_indexing\"\n\n\ndef test_custom_vocabulary_no_identifier(api_client):\n    project_uid = api_client.create_project()\n    vocabulary_uid = api_client.create_vocabulary(\n        project_uid=project_uid,\n        name=\"test_custom_vocabulary_no_identifier\",\n        terms=\"\\n\".join(f\"test_term_name{i}\" for i in range(1, 5)),\n        type=\"custom\",\n    )\n    expected = [{\"term_display_name\": f\"test_term_name{i}\", \"term_identifier\": None} for i in range(1, 5)]\n    assert_vocabulary_terms(api_client, vocabulary_uid, expected)",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The docstring names the two QA files these tests came from."
-     },
-     {
-      "line": 3,
-      "text": "The moved helper. tests_api is on the pythonpath, so helpers is importable by name."
-     },
-     {
-      "line": 5,
-      "text": "The full task name of the indexing task; Celery registers tasks by import path."
-     },
-     {
-      "line": 8,
-      "text": "One of the six variants: terms with a display name and no identifier."
-     },
-     {
-      "line": 10,
-      "text": "Create a custom vocabulary in a fresh project through the API."
-     },
-     {
-      "line": 13,
-      "text": "Four lines: test_term_name1 to test_term_name4."
-     },
-     {
-      "line": 16,
-      "text": "Each term must come back with its display name and a None identifier."
-     },
-     {
-      "line": 17,
-      "text": "The helper reads the terms through the API and compares them."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Porting vocabularies, part 2: queued, not drained",
-   "p": [
-    "The large upload is a multipart upload: the file goes up in parts, which land in the in-memory object store. index_large_vocabulary then queues a Celery chain that starts an indexing VM and OpenSearch. The API layer runs neither, so the test checks the chain was queued and stops there.",
-    "test_very_large_vocabulary_upload and the full-flow vocabulary tests stay on the QA nightly, because they need real indexing. After the port, time the whole layer. If it is over 3 minutes locally, look at the 10 slowest tests (--durations=10) before adding more."
-   ],
-   "because": "We assert on task_queue.sent and never drain, because draining would try to start a VM the API layer does not have.",
-   "code": {
-    "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/test_custom_vocabularies.py (part 2 of 2)",
-    "text": "def test_large_vocabulary_upload(api_client, task_queue, object_store):\n    project_uid = api_client.create_project()\n    vocabulary_uid = upload_large_vocabulary(api_client, project_uid)  # same helper and file as the QA test\n    assert api_client.get_vocabulary(vocabulary_uid)[\"status\"]  # check: the status the upload sets before indexing\n    # index_large_vocabulary queues a Celery chain that starts an indexing VM. Check it was queued, but do not drain\n    # it: the API layer runs no VM and no OpenSearch. The QA nightly keeps the full indexing flow.\n    assert START_INDEXING in [task.name for task in task_queue.sent]",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Asks for the two fakes it needs: the task queue and the object store."
-     },
-     {
-      "line": 3,
-      "text": "The QA test's upload steps, moved into tests_api/helpers.py. The sketch leaves out that import; add it."
-     },
-     {
-      "line": 4,
-      "text": "The vocabulary exists and has a status. Check which status the upload sets before indexing."
-     },
-     {
-      "line": 5,
-      "text": "Why we stop here: no VM and no OpenSearch in the API layer."
-     },
-     {
-      "line": 7,
-      "text": "The indexing task was sent. Check whether it is the chain's first task or sits inside the chain option."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "The G7-27 sketch calls upload_large_vocabulary, but it is not imported and no function with that name exists in fcp. Find the real upload steps in the QA test and write the helper yourself. Or import the real one by its real name. Do not copy the sketch as it is."
    }
   }
  ],
  "lab": {
-  "title": "Find what the port changes, in the integration tests",
-  "youNeed": [
-   "Your fcp checkout (~/Projects/fcp)",
-   "A terminal"
+  "id": "g7-3",
+  "title": "Builders through the API, and one client for HTTP and in-process",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "uv",
+   "Two terminal tabs (one runs a server for a few minutes)"
   ],
-  "worked": [
+  "goal": "See how a shared server remembers every run, then make tests build their own sites through the API, using the same client class in-process instead of over HTTP.",
+  "guess": {
+   "q": "A builder creates a project by writing Project.objects.create(name=..., workgroup=...) straight into the database. The API normally sets created_by from the logged-in user. What happens in a test that uses it?",
+   "options": [
+    {
+     "text": "It works, because the database fills created_by in by itself.",
+     "correct": false,
+     "why": "Nothing fills it. It is the API's perform_create that sets the creator, and a factory never runs it."
+    },
+    {
+     "text": "The insert fails with NOT NULL constraint failed on created_by, because the factory skipped the code that sets it.",
+     "correct": true,
+     "why": "The row is missing everything the API would add. Here the database notices; for a check that lives only in the serializer, nothing would."
+    },
+    {
+     "text": "The API refuses the request with 400.",
+     "correct": false,
+     "why": "There is no request. That is the point: the factory never goes through the API."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "cd ~/Projects/fcp/cloud/rhinoCloud/rhinoCore/integration-tests && grep -n \"requests.request\" integration_test_utils/common.py",
-    "see": "173:        response = requests.request(method, url, headers=headers, data=data, params=params, json=json, timeout=timeout)\n176:            response = requests.request(\n(line numbers may differ on your branch)"
+    "say": "Make the project: Django, DRF and requests for the app and its client, pytest, pytest-django and Faker for the tests.",
+    "do": "mkdir -p ~/academy-labs/g7-3 && cd ~/academy-labs/g7-3 && uv init --bare --python 3.13 && uv add \"django>=5.2,<5.3\" \"djangorestframework>=3.17,<3.18\" requests && uv add --dev pytest pytest-django faker && uv run django-admin startproject mysite . && uv run python manage.py startapp projects",
+    "see": " + django==5.2.18\n + djangorestframework==3.17.2\n + requests==2.34.2\n …\n + faker==40.43.0\n + pytest-django==4.14.0"
    },
    {
-    "do": "sed -n '/def api_base_versioned_url/,+2p' integration_test_utils/common.py",
-    "see": "    def api_base_versioned_url(self):\n        return f\"{self.api_base_url}{self.api_version}/\""
+    "say": "Write the API: token login, a test-data endpoint that creates a workgroup with its first user, and a projects endpoint that fills in the workgroup and the creator from the logged-in user.",
+    "do": "cat >> mysite/settings.py <<'EOF'\n\nINSTALLED_APPS += [\"rest_framework\", \"rest_framework.authtoken\", \"projects\"]\nREST_FRAMEWORK = {\n    \"DEFAULT_AUTHENTICATION_CLASSES\": [\"rest_framework.authentication.TokenAuthentication\"],\n    \"DEFAULT_PERMISSION_CLASSES\": [\"rest_framework.permissions.IsAuthenticated\"],\n}\nEOF\ncat > projects/models.py <<'EOF'\nfrom django.conf import settings\nfrom django.db import models\n\n\nclass Member(models.Model):\n    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)\n    workgroup = models.CharField(max_length=60)\n\n\nclass Project(models.Model):\n    name = models.CharField(max_length=120)\n    workgroup = models.CharField(max_length=60)\n    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)\nEOF\ncat > projects/views.py <<'EOF'\nfrom django.contrib.auth.models import User\nfrom rest_framework import serializers, status, viewsets\nfrom rest_framework.permissions import AllowAny\nfrom rest_framework.response import Response\nfrom rest_framework.views import APIView\n\nfrom .models import Member, Project\n\n\nclass ProjectSerializer(serializers.ModelSerializer):\n    created_by = serializers.SlugRelatedField(slug_field=\"email\", read_only=True)\n\n    class Meta:\n        model = Project\n        fields = [\"id\", \"name\", \"workgroup\", \"created_by\"]\n        read_only_fields = [\"workgroup\"]\n\n\nclass ProjectViewSet(viewsets.ModelViewSet):\n    serializer_class = ProjectSerializer\n\n    def get_queryset(self):\n        return Project.objects.filter(workgroup=self.request.user.member.workgroup).order_by(\"id\")\n\n    def perform_create(self, serializer):  # the API decides the workgroup and the creator, never the caller\n        serializer.save(workgroup=self.request.user.member.workgroup, created_by=self.request.user)\n\n\nclass SiteSerializer(serializers.Serializer):\n    workgroup = serializers.SlugField()\n    email = serializers.EmailField()\n    password = serializers.CharField(min_length=12)\n\n\nclass TestSiteView(APIView):\n    \"\"\"Test data only: a workgroup and its first user, like fcp's test-data endpoint.\"\"\"\n\n    permission_classes = [AllowAny]\n\n    def post(self, request):\n        site = SiteSerializer(data=request.data)\n        site.is_valid(raise_exception=True)\n        email, workgroup = site.validated_data[\"email\"], site.validated_data[\"workgroup\"]\n        user = User.objects.create_user(username=email, email=email, password=site.validated_data[\"password\"])\n        Member.objects.create(user=user, workgroup=workgroup)\n        return Response({\"workgroup\": workgroup, \"email\": email}, status=status.HTTP_201_CREATED)\nEOF\ncat > mysite/urls.py <<'EOF'\nfrom django.urls import path\nfrom rest_framework.authtoken.views import obtain_auth_token\nfrom rest_framework.routers import DefaultRouter\n\nfrom projects.views import ProjectViewSet, TestSiteView\n\nrouter = DefaultRouter()\nrouter.register(\"api/projects\", ProjectViewSet, basename=\"project\")\nurlpatterns = [\n    path(\"api/token/\", obtain_auth_token),\n    path(\"api/test-data/site/\", TestSiteView.as_view()),\n    *router.urls,\n]\nEOF\nuv run python manage.py makemigrations projects && uv run python manage.py migrate -v 0",
+    "see": "Migrations for 'projects':\n  projects/migrations/0001_initial.py\n    + Create model Member\n    + Create model Project"
    },
    {
-    "do": "grep -n '\"sync\": True' integration_test_utils/rhino_api_wrapper.py | head -1",
-    "see": "137:                    \"sync\": True,\n(the hard-coded value inside create_dataset that G7-08 turns into a parameter)"
+    "say": "Write the client the QA tests would use. All its network traffic goes through one method, _send. Then a small script that does what a QA test does: create a site, log in, make a project.",
+    "do": "cat > api.py <<'EOF'\n\"\"\"The test client the integration tests use against QA: real HTTP, a real login, one method per call.\"\"\"\nimport requests\n\n\nclass ApiError(Exception):\n    pass\n\n\nclass RhinoAPI:\n    def __init__(self, base_url: str, email: str, password: str):\n        self.base_url, self.email, self.password = base_url, email, password\n        self._token = None\n\n    def _send(self, method, url, headers, json_body):  # the seam: the only line that touches the network\n        return requests.request(method, url, headers=headers, json=json_body, timeout=30)\n\n    def _request_token(self):\n        response = self._send(\"POST\", f\"{self.base_url}token/\", {}, {\"username\": self.email, \"password\": self.password})\n        return response.json()[\"token\"]\n\n    def make_call(self, method, path, json_body=None):\n        self._token = self._token or self._request_token()\n        response = self._send(method, f\"{self.base_url}{path}\", {\"Authorization\": f\"Token {self._token}\"}, json_body)\n        if response.status_code >= 400:\n            raise ApiError(f\"{method} {path}: {response.status_code} {response.json()}\")\n        return response.json()\n\n    def create_project(self, name: str) -> int:\n        return self.make_call(\"POST\", \"projects/\", {\"name\": name})[\"id\"]\n\n    def list_projects(self) -> list[dict]:\n        return self.make_call(\"GET\", \"projects/\")\nEOF\ncat > qa_style.py <<'EOF'\n\"\"\"What an integration test does on QA: real HTTP to a running server.\"\"\"\nimport sys\n\nimport requests\n\nfrom api import RhinoAPI\n\nbase = sys.argv[1] if len(sys.argv) > 1 else \"http://localhost:8000/api/\"\nsite = {\"workgroup\": \"lab-a\", \"email\": \"dana@example.com\", \"password\": \"a-long-fake-password\"}\nprint(\"site:\", requests.post(f\"{base}test-data/site/\", json=site, timeout=30).status_code)\napi = RhinoAPI(base, site[\"email\"], site[\"password\"])\nprint(\"created project\", api.create_project(\"Lung CT\"))\nprint(\"projects:\", api.list_projects())\nEOF",
+    "see": "(no output)"
    },
    {
-    "do": "grep -rn \"65e46694\\|cafecafe\" . | grep -v \"^Binary\"",
-    "see": "./integration_test_utils/common.py:40:COLLABORATING_WORKGROUP_UID = \"65e46694-...\"\n./permission/test_project_permission.py:27:    collab_workgroup = \"65e46694-...\"\n./test_client_offline_validation.py:10:_OFFLINE_WORKGROUP_UID = \"cafecafe-...\"\n./nvflare/test_nvflare.py:82:_OFFLINE_WORKGROUP_UID = \"cafecafe-...\""
+    "say": "In a second terminal, start the server and leave it running; it plays the shared QA environment.",
+    "do": "cd ~/academy-labs/g7-3 && uv run python manage.py runserver 8000",
+    "see": "Starting development server at http://127.0.0.1:8000/\nQuit the server with CONTROL-C."
    },
    {
-    "do": "grep -n \"^def test_\" permission/test_project_permission.py",
-    "see": "9:def test_project_permission_endpoint(api_client):\n25:def test_project_collb_permission_endpoint(api_client):\n46:def test_project_post_site_permission_endpoint(api_client):\n77:def test_project_update_approved_code_list_endpoint(api_client):"
+    "say": "Back in the first terminal, run the script twice and compare the two runs.",
+    "do": "uv run python qa_style.py; uv run python qa_style.py",
+    "see": "site: 201\ncreated project 1\nprojects: [{'id': 1, 'name': 'Lung CT', 'workgroup': 'lab-a', 'created_by': 'dana@example.com'}]\nsite: 500\ncreated project 2\nprojects: [{'id': 1, …}, {'id': 2, 'name': 'Lung CT', 'workgroup': 'lab-a', 'created_by': 'dana@example.com'}]"
    },
    {
-    "do": "ls pytest_fixtures | grep Pneumonia",
-    "see": "Pneumonia Input Schema With BMI.csv\nPneumonia Input Schema roc.csv\nPneumonia Input Schema.csv"
+    "say": "Stop the server with Ctrl+C. Now the in-process client: the same RhinoAPI with _send swapped for DRF's APIClient. Then the builder, and a test ported from the QA style.",
+    "do": "printf '\\n[tool.pytest.ini_options]\\nDJANGO_SETTINGS_MODULE = \"mysite.settings\"\\npythonpath = [\".\"]\\n' >> pyproject.toml && mkdir -p tests && cat > tests/inprocess.py <<'EOF'\n\"\"\"The same RhinoAPI, with the network swapped for DRF's APIClient: same calls, same login, no server.\"\"\"\nimport json\n\nfrom rest_framework.test import APIClient\n\nfrom api import RhinoAPI\n\n\nclass InProcessAPI(RhinoAPI):\n    def __init__(self, email: str, password: str):\n        super().__init__(\"/api/\", email, password)\n        self.client = APIClient()\n\n    def _send(self, method, url, headers, json_body):\n        meta = {\"HTTP_\" + name.upper().replace(\"-\", \"_\"): value for name, value in headers.items()}\n        body = json.dumps(json_body) if json_body is not None else \"\"\n        return self.client.generic(method, url, body, content_type=\"application/json\", **meta)\nEOF\ncat > tests/conftest.py <<'EOF'\nfrom dataclasses import dataclass\n\nimport pytest\nfrom faker import Faker\nfrom rest_framework.test import APIClient\n\nfrom inprocess import InProcessAPI\n\nfake = Faker()\n\n\n@dataclass\nclass Site:\n    api: InProcessAPI  # logged in as the site's first user\n    workgroup: str\n    email: str\n\n\nclass Builder:\n    def site(self) -> Site:\n        \"\"\"A fresh workgroup and user, made through the API's test-data endpoint. Fake data only.\"\"\"\n        workgroup, email, password = f\"wg-{fake.unique.slug()}\", fake.unique.email(), fake.password(length=16)\n        response = APIClient().post(\"/api/test-data/site/\", {\"workgroup\": workgroup, \"email\": email, \"password\": password}, format=\"json\")\n        assert response.status_code == 201, response.json()\n        return Site(InProcessAPI(email, password), workgroup, email)\n\n\n@pytest.fixture\ndef builder(db):\n    return Builder()\nEOF\ncat > tests/test_project_visibility.py <<'EOF'\n\"\"\"Ported from the QA suite. There, the other site was a hard-coded workgroup that had to exist on QA:\nOTHER_WORKGROUP = \"65e46694-0951-4634-a839-634af42a8177\". Here each test builds its own sites.\"\"\"\n\n\ndef test_a_site_sees_only_its_own_projects(builder):\n    mine, other = builder.site(), builder.site()\n    mine.api.create_project(\"Lung CT\")\n    assert [p[\"name\"] for p in mine.api.list_projects()] == [\"Lung CT\"]\n    assert other.api.list_projects() == []\n\n\ndef test_the_api_records_who_created_a_project(builder):\n    site = builder.site()\n    site.api.create_project(\"Lung CT\")\n    [project] = site.api.list_projects()\n    assert (project[\"workgroup\"], project[\"created_by\"]) == (site.workgroup, site.email)\nEOF\nuv run pytest -q; uv run pytest -q",
+    "see": "..                                                                       [100%]\n2 passed in 0.68s\n..                                                                       [100%]\n2 passed in 0.68s"
    }
   ],
-  "faded": "List the six custom-vocabulary tests G7-27 ports. The file is test_semantic_mapping.py; the grep pattern is left to you. You should find six names that start with test_custom_vocabulary.",
-  "alone": "Open test_client_offline_validation.py. Write down which QA id it depends on and which fixture gives it an offline client. Then say how you would build that state with FakeOnPremClient.offline_agents or a builder.",
-  "done": "You can point at the two requests.request calls, the hard-coded sync value, the QA ids, and the 8 tests G7-18 moves."
+  "build": "Add a project builder and port two more tests. In tests/conftest.py, give Builder a method project(site, name=None) that creates the project through site.api.create_project, with a Faker catch_phrase when no name is given, and returns the ID. Then write tests/test_project_access.py with two tests: another site that asks for GET projects/<id>/ of my project gets an ApiError with 404, and a project named \" \" (a single space) is refused with an ApiError with 400. Use pytest.raises(ApiError, match=\"404\") and match=\"400\".",
+  "checks": [
+   "uv run pytest -q prints 4 passed, and passes again on a second run.",
+   "No test file contains a fixed workgroup, email or ID: every site comes from builder.site().",
+   "builder.project calls the API (create_project), not Project.objects.",
+   "The 404 test proves the other site cannot even see that the project exists.",
+   "The blank-name test fails if you make builder.project write the row directly (see Fix it)."
+  ],
+  "solution": {
+   "lang": "python",
+   "file": "tests/conftest.py (the new method) and tests/test_project_access.py",
+   "text": "# tests/conftest.py, inside class Builder\n    def project(self, site: Site, name: str | None = None) -> int:\n        \"\"\"A project made by the site's own user, through POST projects/.\"\"\"\n        return site.api.create_project(name or fake.catch_phrase())\n\n\n# tests/test_project_access.py\nimport pytest\n\nfrom api import ApiError\n\n\ndef test_another_site_cannot_open_my_project(builder):\n    mine, other = builder.site(), builder.site()\n    project_id = builder.project(mine)\n    with pytest.raises(ApiError, match=\"404\"):\n        other.api.make_call(\"GET\", f\"projects/{project_id}/\")\n\n\ndef test_a_project_needs_a_name(builder):\n    with pytest.raises(ApiError, match=\"400\"):\n        builder.project(builder.site(), name=\" \")"
+  },
+  "fix": "A teammate wants faster tests and changes builder.project to write the row directly: return Project.objects.create(name=name or fake.catch_phrase(), workgroup=site.workgroup).id. Make that change and run the tests: two fail with NOT NULL constraint failed: projects_project.created_by_id. They \"fix\" it by adding created_by=User.objects.get(email=site.email), and now test_a_project_needs_a_name fails with DID NOT RAISE ApiError, because the factory stored a project with a blank name. Explain what each failure tells you, and put the API call back.",
+  "explain": [
+   "Why does the same script answer 201 and then 500 against the running server, and why can't that happen in the API layer?",
+   "What does a builder check that a factory skips? Give two examples from the lab.",
+   "Which single method did InProcessAPI override, and why is the login still real?"
+  ],
+  "done": "Four tests pass in-process with no fixed IDs, and you can say why the builder goes through the API instead of writing rows."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Why does InProcessRhinoAPI fetch a real JWT instead of calling force_authenticate?",
+   "q": "A ported test needs a second workgroup. On QA it used a fixed ID created by hand years ago. What should the ported test do?",
    "options": [
     {
-     "text": "Because APIClient cannot authenticate without a token.",
+     "text": "Insert a workgroup row with that same fixed ID in a fixture, so the rest of the test stays unchanged.",
      "correct": false,
-     "why": "force_authenticate works fine in unit tests; this is a choice."
+     "why": "It keeps the test tied to a made-up ID and skips everything the product does when a workgroup is created."
     },
     {
-     "text": "Because the ported tests should prove the login path works, not skip it.",
+     "text": "Call builder.site() and use the workgroup it returns.",
      "correct": true,
-     "why": "The token comes from auth/obtain_token, so authentication is part of every test."
+     "why": "A fresh site made through the API: no shared state, no fixed ID, and the creation path is tested too."
     },
     {
-     "text": "Because the QA environment requires it.",
+     "text": "Stay on QA, because the API layer cannot have two workgroups.",
      "correct": false,
-     "why": "No QA is involved; everything runs in-process."
+     "why": "It can have as many as the test builds. A test only needs QA when it needs a real client or real infrastructure."
     }
    ]
   },
   {
-   "q": "The dataset builder imports with sync=False. What would happen with sync=True?",
+   "q": "Why do builders create data through the API instead of with factories that write rows?",
    "options": [
     {
-     "text": "The request thread would poll the database for the result, and the fake could never answer in time.",
+     "text": "Because API calls are faster than database inserts.",
+     "correct": false,
+     "why": "They are slower. We pay a little speed for data that the product could really contain."
+    },
+    {
+     "text": "Because factories cannot create related rows.",
+     "correct": false,
+     "why": "factory_boy handles related rows well. The issue is what factories skip, not what they can build."
+    },
+    {
+     "text": "Because the API runs the serializer, the permission checks and the fields it fills in itself, so tests only ever see data the product could really create.",
      "correct": true,
-     "why": "The fake answers only when the test calls complete_task(), which cannot happen while the request waits."
-    },
-    {
-     "text": "The import would complete faster.",
-     "correct": false,
-     "why": "Nothing completes it except complete_task()."
-    },
-    {
-     "text": "The serializer would reject the request.",
-     "correct": false,
-     "why": "sync=True is valid on QA; the problem is waiting in-process."
+     "why": "A test that starts from impossible data can pass while the real flow fails."
     }
    ]
   },
   {
-   "q": "A ported test has been green in CI for one week. What happens to the QA original?",
+   "q": "The in-process client overrides only _send. What does that buy a ported test?",
    "options": [
     {
-     "text": "Delete it now; the port works.",
-     "correct": false,
-     "why": "The rule is two green weeks first."
-    },
-    {
-     "text": "Keep it running on every push as a backup.",
-     "correct": false,
-     "why": "It is marked nightly, so per-push QA runs skip it."
-    },
-    {
-     "text": "It stays, marked @pytest.mark.nightly, until the port has been green for 2 weeks.",
+     "text": "Its calls, such as create_project(), stay exactly as they were, and the login, error handling and pagination remain the real client's code.",
      "correct": true,
-     "why": "Move, don't copy: the original is deleted after two green weeks."
+     "why": "Only the transport changes. Everything a QA test relied on still runs."
+    },
+    {
+     "text": "It no longer needs to log in, which makes it faster.",
+     "correct": false,
+     "why": "It still logs in through the real token endpoint with a real password; that is a feature, not a cost."
+    },
+    {
+     "text": "It can now reach QA and the test database at the same time.",
+     "correct": false,
+     "why": "It talks only to Django inside the test process. QA is not involved at all."
     }
    ]
   }
  ],
- "recall": [
-  "From g7-2: what does FakeOnPremClient.complete_task() call, and on which thread?",
-  "From p10-3: what is the difference between a factory row and data created through a serializer?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "In rhinoCore/integration-tests/integration_test_utils/common.py, RhinoAPI.make_call (including its page fetches) moves its requests.request calls into one _send() method. tests_api/api.py adds InProcessRhinoAPI, which overrides _send and _request_jwt_token with DRF's APIClient and still gets a real JWT from auth/obtain_token. tests_api/builders.py adds the builder fixture: builder.site() posts test/create_test_data with TestDataCreator's custom scenario, builder.project(), data_schema() with the CSVs in pytest_fixtures/, dataset() with sync=False and FakeOnPremClient.complete_task, code_object() and the pneumonia and python_code scenario helpers. api_client keeps the name of the integration fixture, so ported tests run almost unchanged.",
+   "The first port moves 8 cloud-only tests (permission/test_project_permission.py, test_client_offline_validation.py, a TensorBoard test and a runtime-file test), replacing the QA IDs 65e46694-… and cafecafe-…-000000000004 with builders and the fake's offline_agents. The second moves the six custom-vocabulary tests and the large vocabulary upload, which checks that the indexing chain was queued in the task-queue fake without draining it; the very large upload and the full indexing flow stay on the QA nightly. Originals get @pytest.mark.nightly and are deleted after two green weeks. Known gap: the vocabulary sketch calls upload_large_vocabulary, which does not exist in fcp."
+  ],
+  "tickets": [
+   {
+    "key": "G7-06",
+    "why": "The _send seam, InProcessRhinoAPI, builder.site(), builder.project() and the api_client fixture."
+   },
+   {
+    "key": "G7-08",
+    "why": "Builders for schemas, datasets (through the fake client) and code objects, plus the scenario helpers."
+   },
+   {
+    "key": "G7-18",
+    "why": "Port the first 8 cloud-only integration tests: move, don't copy."
+   },
+   {
+    "key": "G7-27",
+    "why": "Port the 7 vocabulary tests, bringing the total to 15."
+   }
+  ]
+ },
  "words": [
   {
    "term": "builder",
-   "plain": "A test helper that creates data through the API and returns the ids a test needs."
+   "plain": "A small test helper that creates data through the API and returns what the test needs, such as IDs and a logged-in client."
+  },
+  {
+   "term": "factory",
+   "plain": "A helper (for example factory_boy) that writes rows straight into the database, skipping the API."
   },
   {
    "term": "transport",
-   "plain": "The part of a client that sends the request; here requests over HTTP or APIClient in-process."
+   "plain": "How a request travels: over HTTP to a server, or in-process through Django's test client."
   },
   {
-   "term": "META key",
-   "plain": "How Django's test client takes a header: HTTP_ plus the name in capitals with underscores."
+   "term": "porting a test",
+   "plain": "Moving a test from QA to the API layer: same calls, builders instead of fixed IDs, then deleting the original."
   },
   {
-   "term": "TestDataCreator",
-   "plain": "The cloud's test-data endpoint (test/create_test_data) that builds named scenarios such as custom, pneumonia and python_code."
-  },
-  {
-   "term": "port (a test)",
-   "plain": "Move a test to another suite with the same calls, then delete the original after two green weeks."
-  },
-  {
-   "term": "multipart upload",
-   "plain": "Uploading a big file in parts that the store joins; here the parts land in the in-memory store."
+   "term": "Faker",
+   "plain": "A library that makes realistic fake names, emails and phrases, so tests never use real data."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G7-06",
-   "why": "This lesson walked through InProcessRhinoAPI, the new _send() seam and the builder and api_client fixtures.",
-   "walk": [
-    "In integration_test_utils/common.py, move the requests.request calls in RhinoAPI.make_call (and the page fetches) into one _send() method; QA runs behave as before.",
-    "Add tests_api/api.py from the two blocks above.",
-    "Add tests_api/builders.py with a builder fixture: builder.site() posts test/create_test_data with scenario custom; builder.project(site) calls create_project.",
-    "Add the api_client fixture: a RhinoAPITestWrapper on the in-process transport with the site's workgroup as default.",
-    "Write builder tests: a site's user lists its own workgroup; a new project shows for that user, not another site's."
-   ]
+   "q": "List three things a QA test may rely on that a test in the API layer must build itself.",
+   "a": "Workgroups or users created by hand with fixed IDs, known passwords, and rows left over from earlier runs (or a pre-seeded offline client)."
   },
   {
-   "key": "G7-08",
-   "why": "This lesson walked through the Site record and the schema and dataset builders, and why the import runs with sync=False.",
-   "walk": [
-    "Add a sync parameter to RhinoAPITestWrapper.create_dataset (it hard-codes True today).",
-    "Add data_schema() and dataset() from the two blocks above; copy import_output's shape from the dataset-handler tests in rhinoTaskServices/tests.",
-    "Add code_object(): post to code_objects/ with TestDataCreator's python_code config (generic-python-runner image, the BMI one-liner).",
-    "Add the scenario helpers pneumonia(site) and python_code(site, project_uid) returning small dataclasses of uids.",
-    "Use Faker for every import row; no PHI and no copies of real data."
-   ]
+   "q": "Sketch the in-process client from memory: what does it subclass, what does it override, and how does a header reach Django?",
+   "a": "It subclasses the QA client (RhinoAPI), overrides only _send, and passes headers as META keys, for example Authorization as HTTP_AUTHORIZATION, to APIClient.generic."
   },
   {
-   "key": "G7-18",
-   "why": "This lesson ported the permission tests line by line and explained the move-don't-copy rule.",
-   "walk": [
-    "Port the 4 tests in permission/test_project_permission.py into tests_api/test_project_permissions.py, replacing QA ids with builder.site().",
-    "Port the 2 tests in test_client_offline_validation.py. Find how the cloud decides a client is offline (RH-5356); build it with offline_agents or a builder.",
-    "Port test_tensorboard.py::test_get_or_create_tensorboard_no_logs_returns_guidance (empty GetTensorBoardLogsMetadata) and test_runtime_file.py::test_cross_workgroup_access (object store).",
-    "Mark each QA original @pytest.mark.nightly; delete it after the port has been green in CI for 2 weeks.",
-    "Assert on status codes, error text, fields and row counts only."
-   ]
-  },
-  {
-   "key": "G7-27",
-   "why": "This lesson ported the vocabulary tests and explained why the large upload checks the queued chain without draining it.",
-   "walk": [
-    "Port test_custom_vocabulary and its five variants; move assert_vocabulary_terms to tests_api/helpers.py.",
-    "Port test_large_vocabulary_upload with task_queue and object_store; move its upload steps into a helper and import it.",
-    "Assert the indexing chain was queued in task_queue.sent; do not drain it.",
-    "Keep test_very_large_vocabulary_upload and the full-flow tests on the QA nightly; mark the originals nightly and delete them after 2 green weeks.",
-    "Time the layer; if it is over 3 minutes locally, read --durations=10 before adding more."
-   ]
+   "q": "What are the steps for moving a QA test to the API layer?",
+   "a": "Copy its calls, replace fixed IDs with builders, assert on what the caller sees, mark the QA original nightly, and delete it after two green weeks in CI."
   }
  ],
- "remember": "Build test data through the API with the integration client on an in-process transport, and port tests with their own calls."
+ "remember": "Let every test build its own world through the API's front door, and swap only the transport so ported tests keep their calls."
 }
