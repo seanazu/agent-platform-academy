@@ -1,458 +1,317 @@
 {
+ "v": 2,
  "id": "g3-1",
  "title": "The repo: ai-agents on npm workspaces",
  "minutes": 40,
  "youNeed": [
   "p1-1",
-  "p1-8",
-  "p2-4"
+  "p1-5",
+  "p1-6"
  ],
- "bridge": "The ai-agents repo is like fcp's frontend folder with its package.json and CI. Except it is one npm workspace: six packages, one lockfile, one CI, one ruleset. And the harness does not ship as a package at all, but as one bundled file.",
- "intro": "Every service in G3 lives in one private repo, RhinoHealth/ai-agents. This lesson builds that repo: the workspaces, the CI, the Docker images, the harness release and the ruleset on main. Get this right once, and every later ticket has a home and the same walls.",
- "picture": {
-  "caption": "One repo, three outputs: a green CI, five images in inf ECR, and one harness tarball that the sandbox image unpacks.",
-  "nodes": [
-   {
-    "id": "pr",
-    "label": "a PR to main",
-    "kind": "file"
-   },
-   {
-    "id": "ci",
-    "label": "ci.yml: lint, test, evals",
-    "kind": "check"
-   },
-   {
-    "id": "ruleset",
-    "label": "ruleset on main",
-    "kind": "check"
-   },
-   {
-    "id": "images",
-    "label": "images.yml",
-    "kind": "service"
-   },
-   {
-    "id": "ecr",
-    "label": "inf ECR",
-    "kind": "cloud"
-   },
-   {
-    "id": "release",
-    "label": "release-harness.yml",
-    "kind": "service"
-   },
-   {
-    "id": "tgz",
-    "label": "ai-agents-harness-<version>.tgz",
-    "kind": "file"
-   },
-   {
-    "id": "packer",
-    "label": "Packer image (lesson g3-5)",
-    "kind": "machine"
-   }
+ "map": "broker",
+ "hook": {
+  "story": [
+   "A run starts for RH-1234. The orchestrator, the Temporal worker that starts and drives every agent run, opens the run's scope in the broker, the service that holds our GitHub, Jira and Slack keys and makes those calls for the run. The scope is a small JSON object: which repo the run may push to, which branch, and which Slack thread it may post in. Last week someone renamed one field in the orchestrator's copy of that object, slackThreadTs became threadTs, because the shorter name read better. The orchestrator's tests passed. The broker has its own copy of the type, which still says slackThreadTs, and its tests passed too.",
+   "So CI was green and the change was deployed. Now every run sends a scope that the broker reads as \"no Slack thread\", and Nova, our ticket-to-PR agent, cannot post its plan anywhere. Nothing crashed, nothing was red, and the first person to notice is you, wondering why Slack is so quiet."
   ],
-  "steps": [
-   {
-    "from": "pr",
-    "to": "ci",
-    "text": "every PR runs the three jobs"
-   },
-   {
-    "from": "ci",
-    "to": "ruleset",
-    "text": "the ruleset requires lint, test and evals, plus one approval"
-   },
-   {
-    "from": "ruleset",
-    "to": "images",
-    "text": "after the merge, main builds five Docker images"
-   },
-   {
-    "from": "images",
-    "to": "ecr",
-    "text": "pushed to inf ECR, tags immutable"
-   },
-   {
-    "from": "ruleset",
-    "to": "release",
-    "text": "a release bundles harness/ with esbuild"
-   },
-   {
-    "from": "release",
-    "to": "tgz",
-    "text": "one file, nova-worker.mjs, plus workflows, prompts and settings"
-   },
-   {
-    "from": "tgz",
-    "to": "packer",
-    "text": "the nightly image unpacks it; nothing to install on the VM"
-   }
-  ]
+  "question": "How do several services in one repo share one definition, so that changing it breaks the build instead of production?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Why one repo, and why TypeScript",
+   "h": "Two copies drift apart",
    "p": [
-    "G3 builds five programs: the LLM gateway, the broker, the Temporal orchestrator, the Slack app and nova-worker. They share types, config, a Jira client and a GitHub client. One repo with npm workspaces gives them one lockfile, one CI and one set of rules.",
-    "The platform is TypeScript on Node 24, like Byte, and Byte's broker becomes the base of ours. The language the platform is written in is not the language the agents work in. Nova fixes Django code and React code equally well.",
-    "One folder stays Python: evals/. Harbor, our benchmark runner, is Python, so its adapters are too. It is a small uv project beside the TypeScript workspaces, as in lesson p10-1."
+    "The bug in the story has nothing to do with Slack. Two services talk to each other through a shape of data, and each one kept its own description of that shape. A test can only check a service against its own copy, so each test proved that the service agreed with itself. The disagreement lived exactly in the place no test looked: between the two copies.",
+    "The fix is to keep one description and let both services import it. In our platform repo, ai-agents, that description lives in a package called shared. It holds the zod schemas for the objects that travel between services, and the broker and the orchestrator both import RunScope from it. A zod schema is both a runtime check and a TypeScript type, so one file answers two questions: what does the compiler allow, and what does the receiver accept?"
    ],
-   "callout": {
-    "kind": "why",
-    "text": "A workspace is an npm feature. One root package.json lists folders, each folder is its own package, and npm links them together in one node_modules. You already use the idea in a monorepo; here it is npm's built-in version."
-   }
-  },
-  {
-   "h": "The root package.json",
-   "p": [
-    "Start from the real file. This is the root of the repo, and the only package.json with a lockfile next to it."
-   ],
-   "because": "We write the root first because every script, every test glob and every CI job hangs off it.",
-   "code": {
-    "lang": "json",
-    "file": "ai-agents/package.json",
-    "text": "{\n  \"name\": \"@rhinohealth/ai-agents\",\n  \"version\": \"0.1.0\",\n  \"private\": true,\n  \"description\": \"AI agent platform: LLM gateway, broker, Temporal orchestrator, nova-worker harness, Slack app.\",\n  \"type\": \"module\",\n  \"workspaces\": [\"shared\", \"gateway\", \"broker\", \"orchestrator\", \"harness\", \"slack-app\"],\n  \"scripts\": {\n    \"build\": \"npm run build --workspaces --if-present\",\n    \"lint\": \"eslint .\",\n    \"typecheck\": \"npm run typecheck --workspaces --if-present\",\n    \"test\": \"node --import tsx --test \\\"*/test/**/*.test.ts\\\"\",\n    \"check\": \"npm run lint && npm run typecheck && npm test && npm run build\"\n  },\n  \"engines\": {\n    \"node\": \">=24\"\n  },\n  \"devDependencies\": {\n    \"@types/node\": \"24.12.2\",\n    \"eslint\": \"10.8.0\",\n    \"tsx\": \"4.20.3\",\n    \"typescript\": \"5.9.3\",\n    \"typescript-eslint\": \"8.65.0\"\n  }\n}",
-    "notes": [
-     {
-      "line": 2,
-      "text": "The root package. It is private, so nobody can npm publish it by mistake."
-     },
-     {
-      "line": 6,
-      "text": "\"type\": \"module\" means every .js file is an ES module: import, not require. The SDK and Temporal both work this way."
-     },
-     {
-      "line": 7,
-      "text": "The workspaces. Each name is a folder with its own package.json. checks/, metrics/ and drills/ are added by later tickets."
-     },
-     {
-      "line": 8,
-      "text": "--workspaces runs the script in every package; --if-present skips packages that do not define it."
-     },
-     {
-      "line": 10,
-      "text": "ESLint runs once, from the root, with one eslint.config.js (typescript-eslint, like Byte)."
-     },
-     {
-      "line": 12,
-      "text": "node:test is Node's own test runner. --import tsx lets it run .ts files with no build step. The glob finds test/ in every workspace."
-     },
-     {
-      "line": 13,
-      "text": "check is what CI runs, in this order. Run it locally before you push."
-     },
-     {
-      "line": 16,
-      "text": "Node 24, because fcp's frontend needs >=24.15 and the harness runs on the same Node inside the VM."
-     },
-     {
-      "line": 18,
-      "text": "Exact versions, no ^ or ~. Byte does this too: a lockfile change is then the only way a version moves."
-     },
-     {
-      "line": 22,
-      "text": "TypeScript 5.9, the same line as Byte. typescript-eslint does not support TypeScript 7 yet."
-     }
-    ]
-   },
-   "see": "$ npm run check\n> eslint .\n> npm run typecheck --workspaces --if-present\n> node --import tsx --test \"*/test/**/*.test.ts\"\nℹ tests 12\nℹ pass 12\nℹ fail 0",
-   "ifInstead": "If instead npm says \"Unsupported engine\", your shell is on an older Node. Run `nvm use 24` and check that `node -v` prints v24.x."
-  },
-  {
-   "h": "Inside a workspace",
-   "p": [
-    "Every TypeScript workspace has the same shape: <pkg>/package.json named @rhinohealth/ai-agents-<pkg>, src/*.ts in kebab-case (ticket-to-pr.ts, git-proxy.ts), and test/*.test.ts. A file name is the kebab-case of the thing inside it.",
-    "tsconfig.base.json at the root sets strict, target ES2023, module and moduleResolution NodeNext, and verbatimModuleSyntax. Each workspace extends it. NodeNext means imports inside the repo end in .js even when the source is .ts; TypeScript resolves them.",
-    "The shared workspace holds the zod schemas and types every service uses: Task, RunScope, Plan, Charter, Handoff. Other workspaces depend on it by name, and npm links the folder, so there is nothing to publish."
-   ],
-   "because": "We give shared/ a real package name because the broker and the orchestrator must agree on the same Handoff shape. A linked package is the one way to share types without copying.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/shared/src/schemas.ts",
-    "text": "import { z } from \"zod\";\n\n/** What starts a Nova run (G4-04). The workflow ID is built from key. */\nexport const Handoff = z.object({\n  key: z.string().regex(/^[A-Z]+-\\d+$/), // RH-1234\n  requester: z.string(), // the Jira accountId of the person who assigned the ticket\n  drill: z.boolean().optional(), // drill tickets use minute-scale timers (G3-38)\n});\nexport type Handoff = z.infer<typeof Handoff>;",
-    "notes": [
-     {
-      "line": 1,
-      "text": "zod 4 is the SDK's peer dependency, so it is already in the lockfile."
-     },
-     {
-      "line": 4,
-      "text": "A zod schema is both a runtime check and a TypeScript type (lesson p1-5)."
-     },
-     {
-      "line": 5,
-      "text": "The regex refuses lower-case or missing numbers before anything else runs."
-     },
-     {
-      "line": 9,
-      "text": "z.infer gives the type for free. Every workspace imports this one Handoff."
-     }
-    ]
-   }
-  },
-  {
-   "h": "CI: three jobs on every PR",
-   "p": [
-    "ci.yml runs on pull_request and on push to main, on fcp-runner-set, our self-hosted runners from lesson p2-1. It has three jobs: lint, test and evals. The ruleset requires all three, so their names matter."
-   ],
-   "because": "We split lint, test and evals into three jobs because a required check is a job name. We want to see which one is red.",
-   "code": {
-    "lang": "yaml",
-    "file": "ai-agents/.github/workflows/ci.yml",
-    "text": "name: CI\non:\n  pull_request:\n  push:\n    branches: [main]\njobs:\n  lint:\n    runs-on: fcp-runner-set\n    steps:\n      - uses: actions/checkout@<sha> # v5\n      - uses: actions/setup-node@<sha> # v5\n        with: { node-version: 24, cache: npm }\n      - run: npm ci\n      - run: npm run lint\n      - run: npm run typecheck\n  test:\n    runs-on: fcp-runner-set\n    steps:\n      - uses: actions/checkout@<sha> # v5\n      - uses: actions/setup-node@<sha> # v5\n        with: { node-version: 24, cache: npm }\n      - run: npm ci\n      - run: npm test\n      - run: npm run build",
-    "notes": [
-     {
-      "line": 2,
-      "text": "pull_request for every PR and push to main for the merge commit, like fcp's frontend-ci."
-     },
-     {
-      "line": 8,
-      "text": "fcp-runner-set is the self-hosted runner group. Ask DevOps to let the new repo use it."
-     },
-     {
-      "line": 10,
-      "text": "Every action pinned by commit SHA, with the version as a comment (lesson p2-2)."
-     },
-     {
-      "line": 12,
-      "text": "cache: npm keeps node_modules downloads between runs, keyed on package-lock.json."
-     },
-     {
-      "line": 13,
-      "text": "npm ci installs exactly the lockfile. npm install could change it."
-     },
-     {
-      "line": 24,
-      "text": "build runs tsc in every workspace, so a type error in dist/ also fails the PR."
-     }
-    ]
-   },
-   "see": "The third job, evals, uses astral-sh/setup-uv, then `uv sync --frozen --project evals`, `pre-commit run --all-files` and `uv run --project evals pytest`. Its Python style is fcp's: black and isort at 120 columns, flake8 with select=F."
-  },
-  {
-   "h": "Images and the harness release",
-   "p": [
-    "images.yml runs on main only. It builds the orchestrator, broker, gateway, slack-app and checks images and pushes them to inf ECR. Each Dockerfile follows Byte's: FROM node:24-bookworm-slim pinned by digest, npm ci --ignore-scripts, a non-root user 10001 (lesson p1-8).",
-    "DevOps adds the ECR repositories in multi_tenant/accounts/infrastructure/artifacts/artifacts.hcl with tags_immutability_enabled = true. Immutable tags mean a pushed image can never be replaced under the same tag.",
-    "The harness is different. It runs inside every sandbox VM, so we do not want npm install there. release-harness.yml bundles harness/ with esbuild into one file, nova-worker.mjs. The shared package and every dependency are inside it. A two-line banner sits on top: the #!/usr/bin/env node shebang, then the createRequire line (lesson p1-7).",
-    "Because it is bundled, the harness imports the Agent SDK from @anthropic-ai/claude-agent-sdk/core, the SDK's entry for bundled apps. The names are the same as the root entry. It runs the image's pinned claude binary through pathToClaudeCodeExecutable, so the SDK's own binary is not needed."
-   ],
-   "because": "We attach a tarball to a GitHub release because Packer can download a release asset with a short-lived token. A tarball needs nothing installed to unpack.",
-   "code": {
-    "lang": "yaml",
-    "file": "ai-agents/.github/workflows/release-harness.yml",
-    "text": "  release:\n    runs-on: fcp-runner-set\n    permissions: { contents: write } # to attach the asset\n    steps:\n      - uses: actions/checkout@<sha> # v5\n      - uses: actions/setup-node@<sha> # v5\n        with: { node-version: 24, cache: npm }\n      - run: npm ci\n      - run: |\n          npx esbuild harness/src/main.ts --bundle --platform=node --format=esm \\\n            --banner:js=$'#!/usr/bin/env node\\nimport { createRequire } from \"node:module\"; const require = createRequire(import.meta.url);' \\\n            --outfile=dist/harness/nova-worker.mjs\n      - run: cp -r harness/workflows harness/prompts dist/harness/ && mkdir -p dist/harness/settings &&\n               cp settings/protected-paths.yaml dist/harness/settings/\n      - run: tar -czf ai-agents-harness-${{ github.ref_name }}.tgz -C dist harness\n      - run: gh release upload \"${{ github.ref_name }}\" ai-agents-harness-${{ github.ref_name }}.tgz\n        env: { GH_TOKEN: \"${{ github.token }}\" }",
+    "file": "shared/src/index.ts",
+    "text": "import { z } from \"zod\";\n\nexport const RunScope = z.object({\n  runId: z.string(),\n  repo: z.string(),\n  branch: z.string(),\n  slackThreadTs: z.string().nullable(),\n});\nexport type RunScope = z.infer<typeof RunScope>;",
     "notes": [
      {
       "line": 3,
-      "text": "The job needs contents: write only to upload the asset. Nothing else."
+      "text": "The runtime check. The broker calls RunScope.parse on every scope it receives."
+     },
+     {
+      "line": 7,
+      "text": "null means the run has no Slack thread, which is a real case, so it is part of the shape."
      },
      {
       "line": 9,
-      "text": "run: | starts a multi-line shell script. GitHub runs it with bash on Linux runners."
-     },
-     {
-      "line": 10,
-      "text": "esbuild bundles main.ts and everything it imports into one ESM file for Node."
-     },
-     {
-      "line": 11,
-      "text": "The two-line banner from lesson p1-7. $'...' is bash quoting that turns \\n into a real new line. Line 1 is the shebang, so /usr/local/bin/nova-worker (a link to this file, lesson g3-5) runs directly. Line 2 gives the bundle a real require for CommonJS packages such as yaml."
-     },
-     {
-      "line": 13,
-      "text": "workflows/ (Workflow tool scripts), prompts/ and protected-paths.yaml ride along; the hooks read them."
-     },
-     {
-      "line": 15,
-      "text": "The tag name is the version: ai-agents-harness-v0.3.0.tgz."
-     },
-     {
-      "line": 16,
-      "text": "gh release upload attaches the file to the release with the job's own token."
+      "text": "The TypeScript type, made from the schema. Same name, so one import gives you both."
      }
     ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "The G3-01 ticket sketch puts only the shebang in the banner. That bundle builds, then fails on the VM with: Dynamic require of \"process\" is not supported. The cause is the yaml package, which is CommonJS. Always use the two-line banner above, shebang first. Before you tag a release, run the bundle once on your laptop, as in lesson p1-7."
    }
   },
   {
-   "h": "The ruleset on main",
+   "h": "Workspaces: import a folder by its name",
    "p": [
-    "A ruleset is GitHub's rule list for a branch (lesson p2-4). On main: a PR is required, with exactly one approval. A new push dismisses stale approvals. The required checks are lint, test and evals. No force push, no delete.",
-    "The rhino-ai-agents GitHub App gets no bypass. That is the wall: an agent can open a PR here, but it cannot merge one. There is no CODEOWNERS file, on purpose; the one approval is the independent approval from G0.",
-    "Finish with a short AGENTS.md (what lives where, how to run tests) and a CLAUDE.md that only says @AGENTS.md, exactly like frontend/."
+    "How does the broker import a package that is not on the npm registry? With npm workspaces. The root package.json lists folders, and each folder is a package with its own package.json and its own name, here @rhinohealth/ai-agents-shared. One npm install at the root creates a link in node_modules for each workspace, pointing at its folder. So the broker writes an ordinary package import, Node and TypeScript follow the link, and nothing is ever published.",
+    "The link is a symbolic link, not a copy. When you edit shared/src/index.ts, every service that imports it sees the new file immediately, which is exactly what makes a change to it visible everywhere at once."
    ],
-   "callout": {
-    "kind": "wall",
-    "text": "Exactly one approval, and never from the requester of the agent's PR. Agents never merge. The ruleset enforces it; no prompt can change it."
+   "code": {
+    "lang": "json",
+    "file": "shared/package.json",
+    "text": "{\n  \"name\": \"@rhinohealth/ai-agents-shared\",\n  \"version\": \"0.1.0\",\n  \"type\": \"module\",\n  \"exports\": { \".\": { \"types\": \"./src/index.ts\", \"default\": \"./dist/index.js\" } },\n  \"scripts\": { \"build\": \"tsc -p tsconfig.json\", \"typecheck\": \"tsc -p tsconfig.json --noEmit\" }\n}",
+    "notes": [
+     {
+      "line": 2,
+      "text": "The name other workspaces import. A service lists it in its dependencies as \"@rhinohealth/ai-agents-shared\": \"0.1.0\"."
+     },
+     {
+      "line": 5,
+      "text": "The compiler reads the source file, so a typecheck needs no build first. Running code uses the built file in dist/."
+     }
+    ]
+   },
+   "see": "$ ls -l node_modules/@rhinohealth/\nai-agents-broker -> ../../broker\nai-agents-orchestrator -> ../../orchestrator\nai-agents-shared -> ../../shared"
+  },
+  {
+   "h": "The root checks every workspace",
+   "p": [
+    "Sharing one schema only helps if a change to it is checked against every package that uses it. That is the job of the scripts in the root package.json. npm run typecheck --workspaces runs the typecheck script of every workspace, in the order the workspaces are listed, and --if-present skips a package that has no such script. npm also keeps going after a failure, so one run shows every package the change broke.",
+    "Replay the story with the shared schema. The rename now happens in shared, because there is no other copy to rename. The same pull request runs the root typecheck, and it fails twice: in the broker, which reads slackThreadTs, and in the orchestrator, which writes it. The author has to fix both in the same pull request, and the broken pair never reaches main."
+   ],
+   "code": {
+    "lang": "json",
+    "file": "package.json (the root, shortened)",
+    "text": "{\n  \"name\": \"@rhinohealth/ai-agents\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"workspaces\": [\"shared\", \"broker\", \"orchestrator\"],\n  \"scripts\": {\n    \"typecheck\": \"npm run typecheck --workspaces --if-present\",\n    \"pretest\": \"npm run build --workspace shared\",\n    \"test\": \"node --import tsx --test --test-reporter=spec \\\"*/test/**/*.test.ts\\\"\"\n  }\n}",
+    "notes": [
+     {
+      "line": 5,
+      "text": "shared comes first, so its scripts run before the packages that use it."
+     },
+     {
+      "line": 7,
+      "text": "Every workspace's typecheck, one after another."
+     },
+     {
+      "line": 8,
+      "text": "npm runs pretest by itself before test. Tests import shared's built file, so it is built first."
+     },
+     {
+      "line": 9,
+      "text": "One test run for the whole repo: tsx runs the .ts test files, and the glob finds test/ in every workspace."
+     }
+    ]
+   },
+   "see": "> @rhinohealth/ai-agents-broker@0.1.0 typecheck\nsrc/scopes.ts(4,60): error TS2339: Property 'slackThreadTs' does not exist on type '{ runId: string; repo: string; branch: string; threadTs: string | null; }'.\n> @rhinohealth/ai-agents-orchestrator@0.1.0 typecheck\nsrc/open-run.ts(7,3): error TS2353: Object literal may only specify known properties, and 'slackThreadTs' does not exist in type '{ ... threadTs: string | null; }'.",
+   "deeper": {
+    "h": "Go deeper: why the broker still parses",
+    "p": [
+     "If both services import the same type, why does the broker also call RunScope.parse? Because types disappear when TypeScript is compiled. The scope arrives at the broker as JSON over HTTP, and at that moment it is just bytes. The two services are also deployed one at a time, so for a few minutes a new orchestrator can talk to an old broker. parse turns any mismatch into a clear 400 error that names the field, instead of a quiet undefined that looks like \"no thread\"."
+    ]
+   }
+  },
+  {
+   "h": "What leaves the repo",
+   "p": [
+    "The repo holds every service of the platform: the LLM gateway (our only door to Claude), the broker, the orchestrator, the harness (our program that runs the Claude session inside the agent's VM), the Slack app and shared. Code leaves the repo in only two ways, and both are built from main after the checks pass. The services become Docker images that run on our internal cluster. The harness becomes one bundled file, because the VM should install nothing at run time.",
+    "Both outputs inherit the same contract: the shared package is compiled into each image and bundled into the harness file, so every piece of one release was checked against the same schema."
+   ],
+   "deeper": {
+    "h": "Go deeper: CI, the release and the rules on main",
+    "p": [
+     "CI runs on every pull request and on every push to main, with three jobs: lint (npm ci, lint, typecheck), test (npm ci, test, build) and evals, a small Python project for our benchmark runner. The jobs are separate because a required check is a job name, and you want to see which one is red.",
+     "The harness release bundles harness/ with esbuild into one file, nova-worker.mjs, with a two-line banner: the #!/usr/bin/env node line, then a line that creates require, because some packages, such as yaml, still call require inside an ES module bundle (the bundling lesson shows the error you get without it). The release attaches a tarball with that file plus its prompts and settings.",
+     "Main has a ruleset: a pull request with exactly one approval, stale approvals dismissed on a new push, the three checks required, no force push and no deletion. Our agents' GitHub App gets no bypass, so an agent can open a pull request in this repo but never merge one, even here, where the walls themselves are written."
+    ]
    }
   }
  ],
  "lab": {
-  "title": "Build a two-workspace ai-agents skeleton and run its tests",
-  "youNeed": [
-   "Node 24 (nvm use 24)",
-   "npm 10",
-   "an empty folder"
+  "id": "g3-1",
+  "title": "One schema, three services",
+  "minutes": 25,
+  "mode": "guided",
+  "needs": [
+   "Node 22 or newer (the platform uses 24; 22 works for this lab)",
+   "About 30 MB of disk for TypeScript, tsx and zod",
+   "Internet for npm install"
   ],
-  "worked": [
+  "goal": "Build a small copy of the ai-agents workspace where the broker and the orchestrator share one schema, then rename a field and watch one root command point at every place that must change.",
+  "guess": {
+   "q": "The broker and the orchestrator both import RunScope from the shared workspace. You rename slackThreadTs to threadTs in shared and run npm run typecheck at the root. What do you expect?",
+   "options": [
+    {
+     "text": "It passes, because shared itself still compiles.",
+     "correct": false,
+     "why": "shared does compile. But the root runs the typecheck of every workspace, and the other two still use the old name."
+    },
+    {
+     "text": "It fails in the broker and in the orchestrator, each at the line that uses the old name.",
+     "correct": true,
+     "why": "Both import the one type through the workspace link, so both see the rename at once. npm keeps going after the first failure, so you get both errors."
+    },
+    {
+     "text": "It fails only in the first workspace and stops there.",
+     "correct": false,
+     "why": "npm runs the script in every workspace and reports each failure, which is what you want from a contract check."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "mkdir -p ws/shared/src ws/broker/src ws/broker/test && cd ws",
-    "see": "(no output; you are now inside ws/)"
+    "say": "Create the root of the repo: the workspace list, the root scripts and one shared compiler setting.",
+    "do": "mkdir -p ~/academy-labs/g3-1 && cd ~/academy-labs/g3-1\ncat > package.json <<'EOF'\n{\n  \"name\": \"@rhinohealth/ai-agents\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"workspaces\": [\"shared\", \"broker\", \"orchestrator\"],\n  \"scripts\": {\n    \"typecheck\": \"npm run typecheck --workspaces --if-present\",\n    \"pretest\": \"npm run build --workspace shared\",\n    \"test\": \"node --import tsx --test --test-reporter=spec \\\"*/test/**/*.test.ts\\\"\"\n  }\n}\nEOF\ncat > tsconfig.base.json <<'EOF'\n{ \"compilerOptions\": { \"strict\": true, \"target\": \"ES2023\", \"module\": \"NodeNext\", \"moduleResolution\": \"NodeNext\",\n  \"verbatimModuleSyntax\": true, \"declaration\": true, \"skipLibCheck\": true, \"types\": [\"node\"] } }\nEOF\nfor pkg in shared broker orchestrator; do\n  mkdir -p $pkg/src $pkg/test\n  echo '{ \"extends\": \"../tsconfig.base.json\", \"compilerOptions\": { \"rootDir\": \"src\", \"outDir\": \"dist\" }, \"include\": [\"src\"] }' > $pkg/tsconfig.json\ndone",
+    "see": "(no output: three folders, each with a tsconfig.json)"
    },
    {
-    "do": "Write package.json at the root: \"type\": \"module\", \"workspaces\": [\"shared\", \"broker\"], scripts test = node --import tsx --test \"*/test/**/*.test.ts\", typecheck = npm run typecheck --workspaces --if-present, engines node >=24.",
-    "see": "(a file; copy the root package.json from the section above and keep only two workspaces)"
-   },
-   {
-    "do": "Write tsconfig.base.json with strict, target ES2023, module and moduleResolution NodeNext, verbatimModuleSyntax, types [\"node\"].",
-    "see": "(a file)"
-   },
-   {
-    "do": "Write shared/package.json (name @rhinohealth/ai-agents-shared, main ./src/index.ts, script typecheck tsc -p tsconfig.json --noEmit) and shared/src/index.ts with the Handoff zod schema from this lesson.",
+    "say": "Write the shared package: its package.json from Understand and the RunScope schema.",
+    "do": "Save shared/package.json and shared/src/index.ts exactly as shown in Understand.",
     "see": "(two files)"
    },
    {
-    "do": "Write broker/package.json (name @rhinohealth/ai-agents-broker, dependency \"@rhinohealth/ai-agents-shared\": \"0.1.0\"), broker/src/health.ts exporting health() => ({ ok: true, service: \"broker\" }), and broker/test/health.test.ts with two node:test tests: health() and Handoff.safeParse({ key: \"rh-1\", requester: \"sean\" }).success === false.",
-    "see": "(three files)"
+    "say": "Write the two services. Both depend on shared by name, and each has one small test.",
+    "do": "for pkg in broker orchestrator; do\ncat > $pkg/package.json <<EOF\n{ \"name\": \"@rhinohealth/ai-agents-$pkg\", \"version\": \"0.1.0\", \"type\": \"module\",\n  \"dependencies\": { \"@rhinohealth/ai-agents-shared\": \"0.1.0\" },\n  \"scripts\": { \"build\": \"tsc -p tsconfig.json\", \"typecheck\": \"tsc -p tsconfig.json --noEmit\" } }\nEOF\ndone\ncat > broker/src/scopes.ts <<'EOF'\nimport { RunScope } from \"@rhinohealth/ai-agents-shared\";\n\nexport const openScope = (body: unknown): RunScope => RunScope.parse(body);\nexport const canPost = (scope: RunScope): boolean => scope.slackThreadTs !== null;\nEOF\ncat > orchestrator/src/open-run.ts <<'EOF'\nimport type { RunScope } from \"@rhinohealth/ai-agents-shared\";\n\nexport const scopeFor = (ticket: string, threadTs: string): RunScope => ({\n  runId: `run-${ticket}`,\n  repo: \"RhinoHealth/fcp\",\n  branch: `nova/${ticket}`,\n  slackThreadTs: threadTs,\n});\nEOF\ncat > broker/test/scopes.test.ts <<'EOF'\nimport { test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { canPost, openScope } from \"../src/scopes.js\";\n\ntest(\"a run with a Slack thread may post in it\", () => {\n  const scope = openScope({ runId: \"run-1\", repo: \"RhinoHealth/fcp\", branch: \"nova/RH-1234\", slackThreadTs: \"1760.42\" });\n  assert.equal(canPost(scope), true);\n});\nEOF\ncat > orchestrator/test/open-run.test.ts <<'EOF'\nimport { test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { RunScope } from \"@rhinohealth/ai-agents-shared\";\nimport { scopeFor } from \"../src/open-run.js\";\n\ntest(\"the scope the orchestrator sends is one the broker accepts\", () => {\n  assert.doesNotThrow(() => RunScope.parse(scopeFor(\"RH-1234\", \"1760.42\")));\n});\nEOF",
+    "see": "(no output: four new files)"
    },
    {
-    "do": "npm install --save-exact --save-dev tsx@4.20.3 typescript@5.9.3 @types/node@24.12.2 && npm install --save-exact -w shared zod@4",
-    "see": "added 30 packages, and audited 33 packages\nfound 0 vulnerabilities"
+    "say": "Install once at the root, with exact versions, and look at what npm did with the three folders.",
+    "do": "npm install --save-exact --save-dev tsx@4.20.3 typescript@5.9.3 @types/node@24.12.2\nnpm install --save-exact --workspace shared zod@4.6.7\nls -l node_modules/@rhinohealth/",
+    "see": "found 0 vulnerabilities\nai-agents-broker -> ../../broker\nai-agents-orchestrator -> ../../orchestrator\nai-agents-shared -> ../../shared"
    },
    {
-    "do": "ls -la node_modules/@rhinohealth/",
-    "see": "ai-agents-broker -> ../../broker\nai-agents-shared -> ../../shared"
+    "say": "Run the root checks while everything agrees.",
+    "do": "npm run typecheck && npm test",
+    "see": "> @rhinohealth/ai-agents-shared@0.1.0 typecheck\n> @rhinohealth/ai-agents-broker@0.1.0 typecheck\n> @rhinohealth/ai-agents-orchestrator@0.1.0 typecheck\n✔ a run with a Slack thread may post in it (1.06ms)\n✔ the scope the orchestrator sends is one the broker accepts (1.01ms)\nℹ pass 2\nℹ fail 0"
    },
    {
-    "do": "npm test",
-    "see": "✔ health answers without auth (0.571375ms)\n✔ the shared Handoff schema rejects a bad key (0.712458ms)\nℹ tests 2\nℹ pass 2\nℹ fail 0"
-   },
-   {
-    "do": "npm run typecheck",
-    "see": "> @rhinohealth/ai-agents-shared@0.1.0 typecheck\n> tsc -p tsconfig.json --noEmit\n> @rhinohealth/ai-agents-broker@0.1.0 typecheck\n> tsc -p tsconfig.json --noEmit"
+    "say": "Now make the rename from the story, but in the one place it can happen, and run the same command.",
+    "do": "sed -i.bak 's/slackThreadTs: z/threadTs: z/' shared/src/index.ts\nnpm run typecheck 2>&1 | grep 'error TS'",
+    "see": "src/scopes.ts(4,60): error TS2339: Property 'slackThreadTs' does not exist on type '{ runId: string; repo: string; branch: string; threadTs: string | null; }'.\nsrc/open-run.ts(7,3): error TS2353: Object literal may only specify known properties, and 'slackThreadTs' does not exist in type '{ runId: string; repo: string; branch: string; threadTs: string | null; }'."
    }
   ],
-  "faded": "Add a third workspace, slack-app, with one test that imports Handoff from the shared package and parses a valid key. Add it to the root workspaces list and run npm install again. The last step is yours: make npm test show 3 passing tests, and say why node_modules/@rhinohealth/ now has three links.",
-  "alone": "Add a check script to the root that runs typecheck, then test, in that order, and make one test fail on purpose. Run npm run check and confirm it stops at the failing test with exit code 1 (echo $?). Then fix the test and run it again.",
-  "done": "npm test prints pass 3 and fail 0, and node_modules/@rhinohealth/ shows three symlinks into your workspaces."
+  "build": "Undo the rename (mv shared/src/index.ts.bak shared/src/index.ts). Add a fourth workspace, slack-app, the way you added the broker: a package.json named @rhinohealth/ai-agents-slack-app that depends on shared, a function threadLink(scope) that returns a Slack link built from scope.slackThreadTs or null, and one test. Add slack-app to the root workspaces list (npm pkg set 'workspaces[3]=slack-app') and run npm install again. Then rename the field in shared once more and count the errors.",
+  "checks": [
+   "node_modules/@rhinohealth/ has one link per workspace, and each one points at a folder, not a copy.",
+   "npm run typecheck prints a typecheck line for every workspace, shared first.",
+   "With the field renamed in shared, the typecheck fails in the broker and in the orchestrator at the lines that use the old name.",
+   "After you add slack-app, npm test shows 3 passing tests, and the rename makes slack-app fail too.",
+   "Nothing in your workspace was published or downloaded under the @rhinohealth name: npm ls @rhinohealth/ai-agents-shared shows it as a link (->)."
+  ],
+  "solution": {
+   "lang": "typescript",
+   "file": "slack-app/src/thread-link.ts (plus a package.json and tsconfig.json like the broker's)",
+   "text": "import type { RunScope } from \"@rhinohealth/ai-agents-shared\";\n\nexport const threadLink = (scope: RunScope): string | null =>\n  scope.slackThreadTs ? `https://rhino.slack.com/archives/C0NOVA/p${scope.slackThreadTs.replace(\".\", \"\")}` : null;\n\n// slack-app/test/thread-link.test.ts\n// test(\"a run without a thread has no link\", () => {\n//   assert.equal(threadLink({ runId: \"run-1\", repo: \"RhinoHealth/fcp\", branch: \"nova/RH-1234\", slackThreadTs: null }), null);\n// });\n// With the rename: two more TS2339 errors, both in src/thread-link.ts."
+  },
+  "fix": "A teammate wanted the orchestrator to build without the shared package, so they pasted a copy of RunScope into orchestrator/src/open-run.ts and deleted the import. Recreate it: replace the import line with a local type RunScope = { runId: string; repo: string; branch: string; slackThreadTs: string | null }. Rename the field in shared and fix the broker. Now the typecheck is green, but npm test fails with invalid_type on threadTs. Find why the typecheck could not warn you, delete the copy, import the type from shared again, and let the typecheck show you the line to change.",
+  "explain": [
+   "Why did both services pass their own tests in the story, even though they could not talk to each other?",
+   "What does npm install put in node_modules for a workspace, and why does that make a change in shared visible to every service at once?",
+   "If both services import the same type, why does the broker still call RunScope.parse on what it receives?"
+  ],
+  "done": "A rename in shared makes the root typecheck fail in every workspace that uses the field, and npm test passes again once you fix them all."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Why does the harness ship as one bundled file instead of a package in ECR?",
+   "q": "The broker and the orchestrator each keep their own copy of the RunScope type. Someone renames a field in the orchestrator's copy only. What happens?",
    "options": [
     {
-     "text": "Because the VM has no Docker",
+     "text": "The broker's typecheck fails, because the types no longer match",
      "correct": false,
-     "why": "The image has Docker; FCP Lab needs it. The reason is about installing, not containers."
+     "why": "The broker checks against its own copy, which did not change. Nothing connects the two copies, so nothing fails."
     },
     {
-     "text": "Because nothing should be installed on a VM at run time; Packer unpacks a tarball once a night",
+     "text": "Both typechecks and both test suites pass, and the mismatch shows up only when the services talk in production",
      "correct": true,
-     "why": "A bundled file needs no npm install and no network. The nightly image bakes it in."
+     "why": "Each service agrees with its own copy. The disagreement is between the copies, where no test looks."
     },
     {
-     "text": "Because esbuild is faster than tsc",
+     "text": "npm install refuses to install two types with the same name",
      "correct": false,
-     "why": "Speed is not the point; a single file with every dependency inside is."
+     "why": "npm knows nothing about TypeScript types. Two copies are just two files."
     }
    ]
   },
   {
-   "q": "The ruleset on main requires checks named lint, test and evals. What makes a check requirable?",
+   "q": "Why does the root typecheck use --workspaces instead of checking only the package you changed?",
    "options": [
     {
-     "text": "The workflow file name",
-     "correct": false,
-     "why": "GitHub matches required checks by job name, not by file."
-    },
-    {
-     "text": "The job name in the workflow",
+     "text": "Because a change to shared can break any package that imports it, so every consumer must be checked in the same run",
      "correct": true,
-     "why": "A required status check is a job name. That is why fcp had to rename its 'Unit Tests' jobs (G0-02)."
+     "why": "The point of a shared contract is that one change is checked against everyone who depends on it, before merge."
     },
     {
-     "text": "A label on the PR",
+     "text": "Because npm cannot run a script in one workspace",
      "correct": false,
-     "why": "Labels do not gate merges; required checks and approvals do."
+     "why": "It can, with --workspace <name>. The pretest script does exactly that for shared."
+    },
+    {
+     "text": "Because it is faster than one typecheck per package",
+     "correct": false,
+     "why": "It runs one typecheck per package anyway. The reason is coverage, not speed."
     }
    ]
   },
   {
-   "q": "Which import does the bundled harness use for the Agent SDK?",
+   "q": "Both services import RunScope from shared. Why does the broker still call RunScope.parse on every scope it receives?",
    "options": [
     {
-     "text": "@anthropic-ai/claude-agent-sdk",
+     "text": "Because zod needs parse to create the TypeScript type",
      "correct": false,
-     "why": "The root entry expects the SDK's own files next to it; a bundle moves them. Use the entry made for bundles."
+     "why": "z.infer creates the type at compile time. parse is a separate check that runs on real data."
     },
     {
-     "text": "@anthropic-ai/claude-agent-sdk/core, the entry for bundled apps, with the same names",
+     "text": "Because parse makes the typecheck faster",
+     "correct": false,
+     "why": "parse runs when the program runs, not when it compiles."
+    },
+    {
+     "text": "Because types vanish at run time: the scope arrives as JSON, and a sender from another release could still send the old shape",
      "correct": true,
-     "why": "The /core entry is documented for bundled apps. Everything the harness uses is exported there too."
-    },
-    {
-     "text": "@anthropic-ai/claude-code",
-     "correct": false,
-     "why": "That is the CLI package. The harness runs the pinned claude binary through pathToClaudeCodeExecutable instead."
+     "why": "During a deploy an old orchestrator can talk to a new broker. parse turns that into a clear error that names the field."
     }
    ]
   }
  ],
- "recall": [
-  "From p1-7: what does esbuild's --banner:js option add to the output file, and why does the harness need it?",
-  "From p2-4: what is the difference between a GitHub App's installation token and a personal access token?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "The platform repo is RhinoHealth/ai-agents: TypeScript on Node 24, ES modules, npm workspaces shared, gateway, broker, orchestrator, harness and slack-app (checks, metrics and drills come later), each named @rhinohealth/ai-agents-<pkg>, with src/*.ts in kebab-case and test/*.test.ts, and an evals/ folder that is a small Python project managed with uv. The zod schemas that travel between services, such as RunScope, Task, Plan and Charter, live in shared/src/schemas.ts. Byte's style applies: ESLint with typescript-eslint, node:test through tsx, exact pins, few runtime dependencies.",
+   "ci.yml runs lint, test and evals on fcp-runner-set. images.yml builds the orchestrator, broker, gateway, slack-app and checks images from node:24-bookworm-slim pinned by digest, non-root user 10001, into inf ECR with immutable tags. release-harness.yml bundles nova-worker.mjs with the two-line banner and attaches ai-agents-harness-<version>.tgz, which the sandbox image unpacks. Main's ruleset: one approval, stale approvals dismissed, lint, test and evals required, no force push or delete, no bypass for rhino-ai-agents, no CODEOWNERS. A short AGENTS.md and a CLAUDE.md that only says @AGENTS.md finish the repo."
+  ],
+  "tickets": [
+   {
+    "key": "G3-01",
+    "why": "Creates the repo: workspaces, the shared package, CI, the images, the harness release and the ruleset on main."
+   },
+   {
+    "key": "G3-07",
+    "why": "The broker's RunScope is the first contract in shared, read by the orchestrator and the broker."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "workspace",
-   "plain": "An npm feature where one root package.json lists folders, each a package, all sharing one lockfile and one node_modules."
+   "term": "npm workspace",
+   "plain": "A folder with its own package.json, listed in the root package.json and linked into node_modules by its name."
   },
   {
-   "term": "lockfile",
-   "plain": "package-lock.json: the exact version of every package installed, so every machine installs the same thing."
+   "term": "shared package",
+   "plain": "The workspace that holds the schemas and types every service imports, so there is only one copy."
   },
   {
-   "term": "ruleset",
-   "plain": "GitHub's list of rules for a branch: required PR, approvals, required checks, no force push."
+   "term": "contract",
+   "plain": "The shape of data two services agree on. If it lives in one place, a change to it is checked everywhere."
   },
   {
-   "term": "required check",
-   "plain": "A CI job name that must be green before a PR can merge."
+   "term": "symbolic link",
+   "plain": "A file that points at another folder. Workspaces use it, so edits are seen at once, with nothing copied or published."
   },
   {
-   "term": "bundle",
-   "plain": "One JavaScript file that contains a program and every library it imports, made by esbuild."
-  },
-  {
-   "term": "ECR",
-   "plain": "AWS's Docker image registry. inf ECR is the one our cluster pulls from."
-  },
-  {
-   "term": "immutable tag",
-   "plain": "An ECR setting: once an image is pushed under a tag, no other image can take that tag."
+   "term": "runtime check",
+   "plain": "A check that runs on real data while the program runs, like RunScope.parse, unlike a type, which is gone after compiling."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-01",
-   "why": "This lesson showed what this ticket creates. That is the workspace layout, the three CI jobs, the image build, the harness bundle and the ruleset.",
-   "walk": [
-    "Create the private repo RhinoHealth/ai-agents. Add the root package.json (code above), package-lock.json, tsconfig.base.json, eslint.config.js like Byte's, AGENTS.md and a CLAUDE.md that says @AGENTS.md.",
-    "Create shared/, gateway/, broker/, orchestrator/, harness/ and slack-app/, each with package.json named @rhinohealth/ai-agents-<pkg>, src/ in kebab-case and test/. Put the zod schemas in shared/src/schemas.ts.",
-    "Create evals/ as a uv project (evals/pyproject.toml, Python 3.13) with fcp's black, isort and flake8 settings through pre-commit.",
-    "Add .github/workflows/ci.yml with jobs lint, test and evals (code above) on fcp-runner-set. Ask DevOps to allow the repo on the runner group.",
-    "Add images.yml (on main: five images from node:24-bookworm-slim by digest, npm ci --ignore-scripts, user 10001, pushed to inf ECR). Ask DevOps to add ai-agents-orchestrator, ai-agents-broker, ai-agents-slack-app and ai-agents-checks to artifacts.hcl with tags_immutability_enabled = true.",
-    "Add release-harness.yml (code above). It bundles nova-worker.mjs with the two-line banner (shebang, then createRequire). It packs a tarball with workflows/, prompts/ and settings/protected-paths.yaml and attaches it to the release. The ticket sketch has only the shebang line; fix that in the PR.",
-    "Create the ruleset on main: PR required, 1 approval, dismiss stale approvals, and required checks lint, test, evals. Also no force push, no delete, no bypass for rhino-ai-agents, and no CODEOWNERS."
-   ]
+   "q": "Write the root scripts typecheck, pretest and test from memory, and say why pretest exists.",
+   "a": "typecheck: npm run typecheck --workspaces --if-present. pretest: npm run build --workspace shared. test: node --import tsx --test \"*/test/**/*.test.ts\". Tests import shared's built file, so shared must be built before they run."
+  },
+  {
+   "q": "A teammate wants to copy RunScope into the Slack app \"to keep it independent\". What do you answer?",
+   "a": "A copy cannot fail when the original changes, so the drift reaches production, as in the story. Import it from shared; the workspace link costs nothing and nothing is published."
   }
  ],
- "remember": "One repo, one lockfile, one CI, one ruleset. Every agent service lives in ai-agents, and the harness leaves it as one bundled file."
+ "remember": "Keep every shape that travels between services in one shared workspace, and let one root command check every service that uses it, so a change breaks the build instead of production."
 }

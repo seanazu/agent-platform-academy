@@ -1,481 +1,289 @@
 {
+ "v": 2,
  "id": "g3-8",
  "title": "Sandbox activities: claim, run, park, release",
- "minutes": 55,
+ "minutes": 45,
  "youNeed": [
   "p7-2",
-  "p1-6",
-  "g3-7"
+  "p3-5",
+  "p3-4"
  ],
- "bridge": "An activity is like an API call from inside a React component: the workflow asks, the activity does the I/O. Except Temporal retries it, so it must be safe to run twice. And a long one must send heartbeats, or Temporal decides it is dead.",
- "intro": "The workflow decides what happens to a run; activities do it. This lesson writes the activities that drive one VM through its life. They claim it, bring it to the right commit and run the harness. They park it while a person thinks, and destroy it at the end.",
- "picture": {
-  "caption": "One run, one VM: claimed, freshened, worked, maybe parked and woken, and always released.",
-  "nodes": [
-   {
-    "id": "wf",
-    "label": "ticketToPr workflow",
-    "kind": "service"
-   },
-   {
-    "id": "acquire",
-    "label": "acquireSandbox + freshenSandbox",
-    "kind": "service"
-   },
-   {
-    "id": "vm",
-    "label": "sandbox VM",
-    "kind": "machine"
-   },
-   {
-    "id": "work",
-    "label": "workInSandbox",
-    "kind": "service"
-   },
-   {
-    "id": "broker",
-    "label": "broker internal API (heartbeats)",
-    "kind": "service"
-   },
-   {
-    "id": "park",
-    "label": "parkSandbox / wakeSandbox / retireSandbox",
-    "kind": "service"
-   },
-   {
-    "id": "release",
-    "label": "releaseSandbox",
-    "kind": "service"
-   }
+ "map": "vm-pool",
+ "hook": {
+  "story": [
+   "The run for RH-1234 asks for a lite VM. The orchestrator, the Temporal worker that does the outside work of every run, finds a warm one, detaches it from its pool and tags it as this run's. One second later, before it can report back, its pod is restarted during a routine deploy.",
+   "Temporal, the workflow engine that records every step of the run, sees that the step never finished, so after a short wait it runs the same step again on another worker. That is exactly what Temporal is for. But the step is \"take a VM from the pool\", and if it simply runs again, it takes a second VM. The first one is now tagged for a run that will never use it, and it costs money until something notices."
   ],
-  "steps": [
-   {
-    "from": "wf",
-    "to": "acquire",
-    "text": "claim a full VM for the build and bring it to the exact commit"
-   },
-   {
-    "from": "acquire",
-    "to": "vm",
-    "text": "detach, tag run-id and lease, write the task and capability over SSM"
-   },
-   {
-    "from": "work",
-    "to": "vm",
-    "text": "start nova-worker as a systemd unit over SSM, once"
-   },
-   {
-    "from": "work",
-    "to": "broker",
-    "text": "every 30 s read the last heartbeat; renew the lease every 5 minutes"
-   },
-   {
-    "from": "wf",
-    "to": "park",
-    "text": "needs_answer and 10 idle minutes: stop the VM, keep the disk"
-   },
-   {
-    "from": "wf",
-    "to": "release",
-    "text": "always, in finally: revoke the scope and terminate the VM"
-   }
-  ]
+  "question": "How do we write the steps that claim, run and release a VM, so that running any of them twice does no harm?"
  },
- "sections": [
+ "read": [
   {
-   "h": "A VM's life in seven activities",
+   "h": "Temporal will run your step again",
    "p": [
-    "Workflow code must be deterministic: no network, no AWS calls, no Date.now() for logic (lesson p7-2). So everything that touches a VM is an activity: a plain async function that may use any Node API.",
-    "G3-18 writes two: acquireSandbox takes a VM of the right size, and freshenSandbox brings it to the exact commit. G3-20 writes the rest: workInSandbox, parkSandbox, wakeSandbox, retireSandbox and releaseSandbox. Routines use the same activities (G5-08's routineRun).",
-    "Plan small, build big. ticketToPr claims a lite VM for the plan and a full VM for the build (G3-24). Each claim is a fresh VM."
+    "In Temporal, the steps that touch the outside world are activities: plain async functions that the workflow calls, and that may use the AWS SDK, the network and the clock. The life of a sandbox VM is a handful of them. acquireSandbox takes a VM of the right size from its warm pool. freshenSandbox brings it to the run's commit. workInSandbox starts the harness, our program that runs the Claude session on the VM, and follows it. parkSandbox stops a VM that is waiting for a person, and wakeSandbox starts it again. releaseSandbox ends it.",
+    "Temporal records each activity's result once it finishes. If a worker dies first, Temporal cannot know how far the function got, so it retries the activity from the start. The side effect may already have happened: the VM detached, the harness started, the instance terminated. So the rule for every one of these activities is the same: it must be idempotent, which means that running it twice has the same effect as running it once."
    ]
   },
   {
-   "h": "Claim, part 1: safe to retry",
+   "h": "Claim: look for your own VM first",
    "p": [
-    "Temporal retries a failed activity. If acquireSandbox crashed right after it tagged a VM, a blind retry would claim a second one and leak the first. So the first thing it does is look for a VM already tagged with this run."
+    "The claim makes itself safe to repeat with one question at the start: is there already a VM tagged with this run's ID? If there is, a previous attempt got that far, and the activity returns that VM instead of taking another. Only if there is none does it raise the group's desired capacity by one, wait for a new VM to be in service, detach it so the group forgets it, and tag it with the run ID, the agent, the ticket and a lease, the time until which the run promises to look after it.",
+    "Two runs can also reach for the same new VM at the same moment. Detaching is the referee: AWS lets only one detach succeed, so the loser's call fails, and it moves on to the next VM. The lab shows the first case with real AWS calls against LocalStack, a program that answers AWS API calls on your laptop."
    ],
-   "because": "We look for this run's VM before claiming, because an activity that runs twice must not take two VMs.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/activities/sandbox.ts (part 1 of 2)",
-    "text": "// ai-agents/orchestrator/src/activities/sandbox.ts: sketch. Activities may use Node APIs; workflow code may not.\nimport { heartbeat } from \"@temporalio/activity\";\nimport { AutoScalingClient, AutoScalingServiceException, DetachInstancesCommand, SetDesiredCapacityCommand } from \"@aws-sdk/client-auto-scaling\";\nimport { CreateTagsCommand, EC2Client } from \"@aws-sdk/client-ec2\";\nimport { setTimeout as sleep } from \"node:timers/promises\";\n\nconst asg = new AutoScalingClient({});\nconst ec2 = new EC2Client({});\n/** Take a warm VM of the right size, detach it, and tag it as this run's. Temporal owns it after this. */\nexport const acquireSandbox = async (req: ClaimRequest): Promise<Sandbox> => {\n  const existing = await findInstance({ \"ai-agents:run-id\": req.runId }); // safe to retry\n  if (existing) return existing;\n  const group = `ai-agents-sandbox-${req.size}${req.spot ? \"-spot\" : \"\"}`;\n  const before = await inServiceIds(group);\n  await asg.send(new SetDesiredCapacityCommand({ AutoScalingGroupName: group, DesiredCapacity: (await desired(group)) + 1, HonorCooldown: false }));",
+    "file": "orchestrator/src/activities/sandbox.ts (shortened)",
+    "text": "export const acquireSandbox = async (req: ClaimRequest): Promise<Sandbox> => {\n  const existing = await findInstance({ \"ai-agents:run-id\": req.runId });\n  if (existing) return existing;\n  const group = `ai-agents-sandbox-${req.size}${req.spot ? \"-spot\" : \"\"}`;\n  const before = await inServiceIds(group);\n  await raiseDesiredByOne(group);\n  for (;;) {\n    heartbeat(\"waiting for a warm VM\");\n    for (const id of (await inServiceIds(group)).filter((i) => !before.includes(i))) {\n      try {\n        await detach(group, id);\n      } catch (err) {\n        if (err instanceof AutoScalingServiceException) continue;\n        throw err;\n      }\n      await tagAsRun(id, req);\n      return { instanceId: id, size: req.size, spot: req.spot, runId: req.runId };\n    }\n    await sleep(5_000);\n  }\n};",
     "notes": [
      {
-      "line": 1,
-      "text": "The rule that makes this an activity: it calls AWS, which workflow code may not."
-     },
-     {
       "line": 2,
-      "text": "heartbeat tells Temporal 'still working'. Only activities can call it."
+      "text": "The idempotency check. A retry after a crash finds the VM the first attempt already took."
      },
      {
-      "line": 7,
-      "text": "Clients with no settings: on inf they pick up IRSA credentials for ai-agents-orchestrator (lesson g3-3)."
+      "line": 8,
+      "text": "Waiting for a VM can take a minute; the heartbeat tells Temporal this worker is still alive."
      },
      {
       "line": 11,
-      "text": "Search EC2 for an instance tagged ai-agents:run-id = this run. Found: return it. This is what makes a retry safe."
+      "text": "Detach with \"decrement desired capacity\": the group forgets the VM, and Temporal owns it from here."
      },
      {
       "line": 13,
-      "text": "The group name: ai-agents-sandbox-full, or ai-agents-sandbox-full-spot for retryable routines."
-     },
-     {
-      "line": 14,
-      "text": "Remember which VMs are already in service, so we take only the one our claim adds."
-     },
-     {
-      "line": 15,
-      "text": "Raise desired by 1. HonorCooldown: false, so the group acts at once. A warm VM starts."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "On a retry, findInstance finds this run's VM. It must also read the VM's size and Spot from its tags (ai-agents:size and the Spot tag). The G3-18 sketch does not, so a retried claim can return a Sandbox with the wrong size."
-   }
-  },
-  {
-   "h": "Claim, part 2: detach, tag, return",
-   "p": [
-    "Now the activity waits for a new InService VM, takes it out of the group and tags it. If the pool is empty, the group builds a VM from scratch. That is a cold start, and we count it as a metric."
-   ],
-   "because": "We detach before tagging, because the detach is the step only one claim can win, so it decides who owns the VM.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/activities/sandbox.ts (part 2 of 2)",
-    "text": "  for (;;) {\n    heartbeat(\"waiting for a warm VM\");\n    for (const instanceId of (await inServiceIds(group)).filter((id) => !before.includes(id))) {\n      try { // two claims may race for one VM: the loser's detach fails and it tries the next\n        await asg.send(new DetachInstancesCommand({ InstanceIds: [instanceId], AutoScalingGroupName: group, ShouldDecrementDesiredCapacity: true }));\n      } catch (err) {\n        if (err instanceof AutoScalingServiceException) continue;\n        throw err;\n      }\n      await ec2.send(new CreateTagsCommand({ Resources: [instanceId], Tags: [\n        { Key: \"ai-agents:run-id\", Value: req.runId },\n        { Key: \"ai-agents:agent\", Value: req.agent },\n        { Key: \"ai-agents:jira\", Value: req.jiraKey ?? \"-\" },\n        { Key: \"ai-agents:lease-until\", Value: leaseUntil({ hours: 2 }) }, // renewed while the run lives\n      ] }));\n      return { instanceId, size: req.size, spot: req.spot, runId: req.runId };\n    }\n    await sleep(5_000);\n  }\n};",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Wait with no deadline. The activity's own timeouts and heartbeats cover a group that never delivers."
-     },
-     {
-      "line": 2,
-      "text": "Heartbeat on every loop, so Temporal knows the claim is alive while the VM starts."
-     },
-     {
-      "line": 3,
-      "text": "Only VMs that were not in service before our claim."
-     },
-     {
-      "line": 5,
-      "text": "Detach and lower desired, so the group does not replace the VM in service. The pool refills on its own."
-     },
-     {
-      "line": 7,
-      "text": "Two claims can race for the same new VM. The loser's detach fails with an AWS error, and it tries the next VM."
-     },
-     {
-      "line": 8,
-      "text": "Any other error is real and goes to Temporal's retry."
-     },
-     {
-      "line": 10,
-      "text": "Tag it: the run, the agent and the Jira key, so people and the sweeper can see whose VM it is."
-     },
-     {
-      "line": 14,
-      "text": "The lease: now plus 2 hours. workInSandbox renews it while the run lives (part 4)."
+      "text": "Another claim won this VM. Try the next one."
      },
      {
       "line": 16,
-      "text": "The Sandbox value goes back to the workflow, which passes it to every later activity."
-     },
-     {
-      "line": 18,
-      "text": "No new VM yet: wait 5 seconds and look again."
+      "text": "Run ID, agent, ticket and a lease of two hours, renewed while the run lives."
      }
     ]
    },
-   "callout": {
-    "kind": "tip",
-    "text": "After the claim, the same activity opens the run's broker scope (POST /internal/runs) and mints the gateway run token (HMAC-signed, G0-13). Over SSM it writes the task, the capability and the token to /run/nova/, mode 0600, owner agent. Neither is a key to an outside service, and both die with the run."
+   "see": "$ CRASH=1 ./acquire.sh run-7f3a\nworker died after tagging i-52b9d909d01556c40\n$ ./acquire.sh run-7f3a        # Temporal's retry\nalready claimed for run-7f3a: i-52b9d909d01556c40"
+  },
+  {
+   "h": "Run: start once, then re-attach",
+   "p": [
+    "workInSandbox has the same problem in another form. It starts the harness over SSM, AWS's way of sending a command to a machine that accepts no connections, as a systemd unit named after the run, because a run can last longer than any SSM command may. Then it follows the run: every 30 seconds it reads the harness's last heartbeat from the broker, the service that holds our keys and also receives those heartbeats, reports its own heartbeat to Temporal, and renews the VM's lease every five minutes. It returns when the harness says done, needs an answer, preempted or failed.",
+    "A retry of workInSandbox must not start a second harness on the same VM. So it first asks systemd whether the run's unit is already active, and only starts it if not; otherwise it simply begins following again. The harness never noticed that the worker watching it was replaced. If the harness itself goes silent for five minutes, the activity fails with SandboxDead, a failure Temporal does not retry, because the workflow must decide what happens next."
+   ],
+   "deeper": {
+    "h": "Go deeper: park, wake and retire",
+    "p": [
+     "A VM that waits for a person should not cost 42 cents an hour. After 10 idle minutes the workflow calls parkSandbox: stop the instance, keep its disk, and set the lease to 73 hours from now. wakeSandbox starts it again when the answer comes, waits about a minute for SSM to be online and freshens it if main moved. After 72 hours stopped, retireSandbox starts it once more, pushes a final checkpoint and terminates it; the next answer continues on a fresh VM. Each of these is safe to repeat too: stopping a stopped VM or tagging a tagged one changes nothing.",
+     "On a Spot VM, a small timer on the machine writes a file when AWS announces it will take the machine back. The harness checkpoints and exits as preempted, and the workflow retries the step on a fresh VM from the same group."
+    ]
    }
   },
   {
-   "h": "Freshen: redo only what changed",
+   "h": "Release: \"already gone\" is success",
    "p": [
-    "The warm VM was baked last night. freshenSandbox(vm, sha) brings it to the exact commit. As agent, it runs git fetch origin <sha> through the broker and checks it out. It compares lockfile hashes with /etc/ai-agent-sandbox/manifest.json and reinstalls only what changed: npm ci in frontend/, uv sync in cloud/ and client/.",
-    "On full and wide it runs lab refresh sandbox --accept-branch, adding --rebuild or --migrate only when the lab asks. Then lab status sandbox --json must say ready. This also proves main itself is healthy, so a later failure belongs to the change, not to main.",
-    "If FCP Lab will not start, the activity throws an ApplicationFailure of type LabNotReady. The workflow retries once on a fresh VM, then reports in Slack with the lab report output (the playbook)."
-   ]
-  },
-  {
-   "h": "Run, part 1: start once, then follow",
-   "p": [
-    "SSM commands time out after at most 48 hours, and runs have no time limit. So workInSandbox does not run nova-worker inside an SSM command. It uses SSM only to start a systemd unit: systemd-run --uid agent --unit nova-<run> /usr/local/bin/nova-worker run /run/nova/task.json. The unit lives as long as the VM does.",
-    "Then it follows the run through the broker, where the harness sends a heartbeat every 30 seconds (lesson g3-9). On a retry, ensureHarnessRunning finds the unit already running and re-attaches instead of starting a second one."
+    "releaseSandbox runs in the workflow's finally block, so it runs however the run ends: done, failed, stopped by a person or cancelled. It revokes the run's scope in the broker, so the capability on the VM stops working everywhere, then terminates the instance. Both calls are already idempotent except for one answer: when the VM no longer exists, AWS says InvalidInstanceID.NotFound. For a release that is exactly the state we wanted, so the activity treats that one error as success and throws every other error again."
    ],
-   "because": "We follow the harness through its heartbeats, because the orchestrator can restart without ending the run.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/activities/run.ts (part 1 of 2)",
-    "text": "// ai-agents/orchestrator/src/activities/run.ts: sketch\nimport { ApplicationFailure, heartbeat } from \"@temporalio/activity\";\nimport { EC2Client, StopInstancesCommand, TerminateInstancesCommand } from \"@aws-sdk/client-ec2\";\nimport { setTimeout as sleep } from \"node:timers/promises\";\nconst ec2 = new EC2Client({});\n\n/** Start the harness if needed, then follow it. Returns when the run ends, asks, or dies. */\nexport const workInSandbox = async (vm: Sandbox, task: Task): Promise<RunOutcome> => {\n  await ensureHarnessRunning(vm, task); // systemd-run ... nova-worker run over SSM; a retry re-attaches instead of starting twice\n  let lastLease = 0;\n  for (;;) {\n    const beat = await brokerInternal.get<Heartbeat>(`/internal/runs/${task.runId}/heartbeat`);\n    heartbeat({ step: beat.step, progress: beat.progress }); // Temporal: we're alive\n    if ([\"done\", \"needs_answer\", \"preempted\", \"failed\"].includes(beat.state)) return toOutcome(beat);\n    // No \"I'm alive\" for 5 minutes: the VM or the harness is gone.\n    if (beat.age_s > 300) throw ApplicationFailure.create({ message: \"no heartbeat for 5 minutes\", type: \"SandboxDead\", nonRetryable: true });\n    if (performance.now() - lastLease > 300_000) {\n      await tag(vm, { \"ai-agents:lease-until\": leaseUntil({ hours: 2 }) }); // the sweeper leaves live runs alone\n      lastLease = performance.now();\n    }\n    await sleep(30_000);\n  }\n};",
+    "file": "orchestrator/src/activities/run.ts (shortened)",
+    "text": "export const releaseSandbox = async (vm: Sandbox): Promise<void> => {\n  await brokerInternal.delete(`/internal/runs/${vm.runId}`);\n  await ec2.send(new TerminateInstancesCommand({ InstanceIds: [vm.instanceId] })).catch((err: Error) => {\n    if (err.name !== \"InvalidInstanceID.NotFound\") throw err;\n  });\n};",
     "notes": [
      {
       "line": 2,
-      "text": "ApplicationFailure lets us name a failure type the workflow can handle."
-     },
-     {
-      "line": 8,
-      "text": "Input: the claimed VM and the task. Output: how the run stopped."
-     },
-     {
-      "line": 9,
-      "text": "Start the systemd unit over SSM (SendCommand with AWS-RunShellScript), or re-attach if it is already running."
-     },
-     {
-      "line": 12,
-      "text": "Read the harness's last heartbeat from the broker's internal port. The VM is never called directly."
-     },
-     {
-      "line": 13,
-      "text": "Pass the step and progress on to Temporal. This is the activity's own heartbeat."
-     },
-     {
-      "line": 14,
-      "text": "Four ways a run stops: done, needs_answer (a question), preempted (Spot), failed. The workflow decides what next."
-     },
-     {
-      "line": 16,
-      "text": "No heartbeat for 5 minutes: the VM or harness is gone. Non-retryable SandboxDead, which recovery handles (G3-27)."
-     },
-     {
-      "line": 17,
-      "text": "Every 5 minutes, push the lease 2 hours ahead, so the sweeper leaves a live run alone."
-     },
-     {
-      "line": 21,
-      "text": "Look again in 30 seconds."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "wall",
-    "text": "No time limit cuts a run. The workflow gives this activity startToCloseTimeout \"7 days\" because the SDK requires one. When it passes, the retry re-attaches to the harness still running on the VM. Liveness comes from heartbeats, not from a clock."
-   }
-  },
-  {
-   "h": "Run, part 2: park and release",
-   "p": [
-    "When the run asks a person a question and nobody answers for 10 minutes, the workflow parks the VM. Stopped, it costs about $0.01 an hour instead of $0.42 for a full VM. wakeSandbox starts it again on the answer, waits until SSM is online (about a minute), and freshens again if main moved.",
-    "A VM parked for 72 hours is retired. retireSandbox starts it and runs nova-worker checkpoint, which pushes the branch and uploads notes. Then it terminates the VM. The next answer resumes on a fresh VM.",
-    "Spot ends a run differently. spot-watch writes /run/nova/preempt, and the harness checkpoints and exits with state preempted. workInSandbox returns preempted, and the workflow retries the step on a fresh VM from the same Spot group."
-   ],
-   "because": "We revoke the broker scope before terminating, because the capability must stop working even if the terminate call fails.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/orchestrator/src/activities/run.ts (part 2 of 2)",
-    "text": "/** Waiting on a person: stop the VM and keep its disk (about $0.01/h instead of $0.42/h for full). */\nexport const parkSandbox = async (vm: Sandbox): Promise<void> => {\n  await ec2.send(new StopInstancesCommand({ InstanceIds: [vm.instanceId] }));\n  await tag(vm, { \"ai-agents:state\": \"parked\", \"ai-agents:lease-until\": leaseUntil({ hours: 73 }) });\n};\n\nexport const releaseSandbox = async (vm: Sandbox): Promise<void> => { // end of the run: no reuse, ever\n  await brokerInternal.delete(`/internal/runs/${vm.runId}`); // the capability stops working\n  await ec2.send(new TerminateInstancesCommand({ InstanceIds: [vm.instanceId] })).catch((err: Error) => {\n    if (err.name !== \"InvalidInstanceID.NotFound\") throw err; // a VM that is already gone is fine\n  });\n};",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The cost note: a stopped VM pays only for its disk."
-     },
-     {
-      "line": 3,
-      "text": "Stop, not terminate: the disk keeps the checkout, caches and FCP Lab state."
+      "text": "Revoke first: deleting a scope that is already gone is fine too."
      },
      {
       "line": 4,
-      "text": "Mark it parked. The lease becomes now plus 73 hours, past the 72-hour retire, so the sweeper does not race the workflow."
-     },
-     {
-      "line": 7,
-      "text": "release is the end of every run, success or not. The workflow calls it from finally."
-     },
-     {
-      "line": 8,
-      "text": "Revoke the scope first: from now on the capability gets 401."
-     },
-     {
-      "line": 9,
-      "text": "Terminate. A VM is never reused."
-     },
-     {
-      "line": 10,
-      "text": "Already gone (the sweeper, a Spot reclaim, a person) is fine. Any other error is thrown and retried."
+      "text": "Gone is what we wanted. Anything else, such as a missing permission, must still fail loudly."
      }
     ]
-   }
-  },
-  {
-   "h": "Testing activities without AWS",
-   "p": [
-    "aws-sdk-client-mock replaces the send method of an AWS client class with a fake you program: 'when DescribeAutoScalingGroups is sent, answer this'. It records every command, so a test can assert what was sent. No credentials, no network.",
-    "heartbeat only works inside an activity context. MockActivityEnvironment from @temporalio/testing runs a function as if Temporal had started it, so heartbeat works and is recorded. The lab uses both."
-   ]
+   },
+   "see": "$ ./release.sh i-52b9d909d01556c40\ni-52b9d909d01556c40 -> shutting-down\n$ ./release.sh i-0000000000000dead\ni-0000000000000dead is already gone: nothing to do"
   }
  ],
  "lab": {
-  "title": "Test acquireSandbox with aws-sdk-client-mock",
-  "youNeed": [
-   "Node 24 (node -v prints v24.x)",
-   "About 350 MB of disk for node_modules (@temporalio/testing brings a native library)",
-   "No AWS account: every AWS call is mocked"
+  "id": "g3-8",
+  "title": "A claim that survives a crash",
+  "minutes": 25,
+  "mode": "guided",
+  "needs": [
+   "Docker running",
+   "AWS CLI v2 and the LocalStack image from the p3-1 lab (localstack/localstack:4.9)",
+   "No AWS account: every call goes to LocalStack on your laptop"
   ],
-  "worked": [
+  "goal": "Claim a warm VM in a way that a retry after a crash returns the same VM, show what a claim without that check does, and release a VM twice without an error.",
+  "guess": {
+   "q": "The claim tags a VM with run-7f3a and then the worker dies before it returns. Temporal runs the claim again. With no check at the start, what happens?",
+   "options": [
+    {
+     "text": "Temporal remembers the VM from the first attempt and passes it in.",
+     "correct": false,
+     "why": "Temporal only records results of activities that finished. The first attempt never returned, so Temporal knows nothing about the VM."
+    },
+    {
+     "text": "The retry takes a second VM, and the first one stays tagged for a run that will never use it.",
+     "correct": true,
+     "why": "Without looking for its own VM first, the retry cannot know the first attempt got that far."
+    },
+    {
+     "text": "AWS refuses to tag a second VM with the same run ID.",
+     "correct": false,
+     "why": "Tags are not unique in AWS. Any number of machines can carry the same tag."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "mkdir -p ~/academy/activity-lab/src ~/academy/activity-lab/test && cd ~/academy/activity-lab && npm init -y >/dev/null && npm pkg set type=module",
-    "see": "(no output)"
+    "say": "Start LocalStack and point the AWS CLI at it in this terminal, then create two warm lite VMs.",
+    "do": "docker run --rm -d --name localstack -p 4566:4566 localstack/localstack:4.9 && sleep 15\nexport AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:4566\naws ec2 run-instances --image-id ami-ff0fea8310f3 --count 2 --instance-type m8i.xlarge \\\n  --tag-specifications 'ResourceType=instance,Tags=[{Key=ai-agents:managed,Value=true},{Key=ai-agents:pool,Value=lite}]' \\\n  --query 'Instances[].InstanceId' --output text",
+    "see": "i-52b9d909d01556c40\ti-5c90c99cb2f3321aa\n(your IDs are different)"
    },
    {
-    "do": "npm i --save-exact -D tsx@4.20.3 typescript@5.9.3 @types/node@24.12.2 @temporalio/activity@1.24.0 @temporalio/testing@1.24.0 @aws-sdk/client-auto-scaling@3.1150.0 @aws-sdk/client-ec2@3.1150.0 aws-sdk-client-mock@4.1.0",
-    "see": "added <n> packages, and audited <n+1> packages in about a minute\nfound 0 vulnerabilities"
+    "say": "Save the claim and the release. The claim looks for its own VM first; CRASH=1 makes it die right after tagging, like the pod in the story.",
+    "do": "mkdir -p ~/academy-labs/g3-8 && cd ~/academy-labs/g3-8\ncat > acquire.sh <<'EOF'\n#!/bin/sh\n# acquire.sh <run-id>: claim one warm lite VM for this run. Safe to run again after a crash.\nrun=$1\nmine=$(aws ec2 describe-instances --output text --query 'Reservations[].Instances[].InstanceId' \\\n  --filters Name=tag:ai-agents:run-id,Values=$run Name=instance-state-name,Values=pending,running,stopped)\nif [ -n \"$mine\" ]; then echo \"already claimed for $run: $mine\"; exit 0; fi\n\nvm=$(aws ec2 describe-instances --output text \\\n  --query 'Reservations[].Instances[] | [?!(Tags[?Key==`ai-agents:run-id`])].InstanceId | [0]' \\\n  --filters Name=tag:ai-agents:pool,Values=lite Name=instance-state-name,Values=running)\nif [ \"$vm\" = \"None\" ]; then echo \"no warm lite VM left: a cold start\"; exit 1; fi\naws ec2 create-tags --resources $vm --tags Key=ai-agents:run-id,Value=$run\n[ \"$CRASH\" = 1 ] && { echo \"worker died after tagging $vm\"; exit 1; }\necho \"claimed $vm for $run\"\nEOF\ncat > release.sh <<'EOF'\n#!/bin/sh\n# release.sh <instance-id>: called from the workflow's finally. A VM that is already gone is fine.\nout=$(aws ec2 terminate-instances --instance-ids \"$1\" --query 'TerminatingInstances[0].CurrentState.Name' --output text 2>&1)\ncase \"$out\" in\n  *InvalidInstanceID.NotFound*) echo \"$1 is already gone: nothing to do\" ;;\n  *error*|*Error*) echo \"$out\" >&2; exit 1 ;;\n  *) echo \"$1 -> $out\" ;;\nesac\nEOF\nchmod +x acquire.sh release.sh",
+    "see": "(no output: two scripts)"
    },
    {
-    "do": "Save src/sandbox.ts. The top half holds the helpers the sketch assumes. acquireSandbox is the code from sections 2 and 3:\n\nimport { heartbeat } from \"@temporalio/activity\";\nimport {\n  AutoScalingClient, AutoScalingServiceException, DescribeAutoScalingGroupsCommand,\n  DetachInstancesCommand, SetDesiredCapacityCommand,\n} from \"@aws-sdk/client-auto-scaling\";\nimport { CreateTagsCommand, DescribeInstancesCommand, EC2Client } from \"@aws-sdk/client-ec2\";\nimport { setTimeout as sleep } from \"node:timers/promises\";\n\nexport interface ClaimRequest { size: \"lite\" | \"full\" | \"wide\"; runId: string; agent: string; jiraKey: string | null; spot: boolean }\nexport interface Sandbox { instanceId: string; size: string; spot: boolean; runId: string }\n\nconst asg = new AutoScalingClient({ region: \"us-east-1\" });\nconst ec2 = new EC2Client({ region: \"us-east-1\" });\n\n// Small helpers the ticket's sketch assumes. In ai-agents they live next to the activities.\nconst group = async (name: string) =>\n  (await asg.send(new DescribeAutoScalingGroupsCommand({ AutoScalingGroupNames: [name] }))).AutoScalingGroups?.[0];\nconst desired = async (name: string) => (await group(name))?.DesiredCapacity ?? 0;\nconst inServiceIds = async (name: string) =>\n  ((await group(name))?.Instances ?? []).filter((i) => i.LifecycleState === \"InService\").map((i) => i.InstanceId!);\nconst leaseUntil = ({ hours }: { hours: number }) => new Date(Date.now() + hours * 3_600_000).toISOString();\nconst findInstance = async (tags: Record<string, string>): Promise<Sandbox | null> => {\n  const out = await ec2.send(new DescribeInstancesCommand({ Filters: [\n    ...Object.entries(tags).map(([k, v]) => ({ Name: `tag:${k}`, Values: [v] })),\n    { Name: \"instance-state-name\", Values: [\"pending\", \"running\", \"stopping\", \"stopped\"] },\n  ] }));\n  const inst = out.Reservations?.[0]?.Instances?.[0];\n  if (!inst?.InstanceId) return null;\n  const tag = (k: string) => inst.Tags?.find((t) => t.Key === k)?.Value ?? \"\";\n  return { instanceId: inst.InstanceId, size: tag(\"ai-agents:size\"), spot: inst.InstanceLifecycle === \"spot\", runId: tag(\"ai-agents:run-id\") };\n};\n\n/** Take a warm VM of the right size, detach it, and tag it as this run's. Temporal owns it after this. */\nexport const acquireSandbox = async (req: ClaimRequest): Promise<Sandbox> => {\n  const existing = await findInstance({ \"ai-agents:run-id\": req.runId }); // safe to retry\n  if (existing) return existing;\n  const group = `ai-agents-sandbox-${req.size}${req.spot ? \"-spot\" : \"\"}`;\n  const before = await inServiceIds(group);\n  await asg.send(new SetDesiredCapacityCommand({ AutoScalingGroupName: group, DesiredCapacity: (await desired(group)) + 1, HonorCooldown: false }));\n  for (;;) {\n    heartbeat(\"waiting for a warm VM\");\n    for (const instanceId of (await inServiceIds(group)).filter((id) => !before.includes(id))) {\n      try { // two claims may race for one VM: the loser's detach fails and it tries the next\n        await asg.send(new DetachInstancesCommand({ InstanceIds: [instanceId], AutoScalingGroupName: group, ShouldDecrementDesiredCapacity: true }));\n      } catch (err) {\n        if (err instanceof AutoScalingServiceException) continue;\n        throw err;\n      }\n      await ec2.send(new CreateTagsCommand({ Resources: [instanceId], Tags: [\n        { Key: \"ai-agents:run-id\", Value: req.runId },\n        { Key: \"ai-agents:agent\", Value: req.agent },\n        { Key: \"ai-agents:jira\", Value: req.jiraKey ?? \"-\" },\n        { Key: \"ai-agents:lease-until\", Value: leaseUntil({ hours: 2 }) }, // renewed while the run lives\n      ] }));\n      return { instanceId, size: req.size, spot: req.spot, runId: req.runId };\n    }\n    await sleep(5_000);\n  }\n};",
-    "see": "(a 57-line file)"
+    "say": "Claim for run-7f3a and crash, then retry, as Temporal would.",
+    "do": "CRASH=1 ./acquire.sh run-7f3a; echo \"exit $?\"\n./acquire.sh run-7f3a",
+    "see": "worker died after tagging i-52b9d909d01556c40\nexit 1\nalready claimed for run-7f3a: i-52b9d909d01556c40"
    },
    {
-    "do": "Save test/sandbox.test.ts. group() builds a fake DescribeAutoScalingGroups answer; resolvesOnce answers in order, then resolves keeps answering:\n\nimport test, { beforeEach } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { mockClient } from \"aws-sdk-client-mock\";\nimport { MockActivityEnvironment } from \"@temporalio/testing\";\nimport {\n  AutoScalingClient, AutoScalingServiceException, DescribeAutoScalingGroupsCommand,\n  DetachInstancesCommand, SetDesiredCapacityCommand,\n} from \"@aws-sdk/client-auto-scaling\";\nimport { CreateTagsCommand, DescribeInstancesCommand, EC2Client } from \"@aws-sdk/client-ec2\";\nimport { acquireSandbox } from \"../src/sandbox.js\";\n\nconst asgMock = mockClient(AutoScalingClient);\nconst ec2Mock = mockClient(EC2Client);\nconst req = { size: \"full\" as const, runId: \"run-1\", agent: \"nova\", jiraKey: \"RH-1234\", spot: false };\nconst group = (desired: number, ...ids: string[]) => ({ AutoScalingGroups: [{ AutoScalingGroupName: \"ai-agents-sandbox-full\",\n  MinSize: 0, MaxSize: 3, DesiredCapacity: desired, DefaultCooldown: 300, AvailabilityZones: [], HealthCheckType: \"EC2\", CreatedTime: new Date(),\n  Instances: ids.map((InstanceId) => ({ InstanceId, LifecycleState: \"InService\" as const, AvailabilityZone: \"us-east-1a\", HealthStatus: \"Healthy\", ProtectedFromScaleIn: false })) }] });\n\nbeforeEach(() => { asgMock.reset(); ec2Mock.reset(); });\n\ntest(\"a claim raises desired by one, detaches the new VM and tags it\", async () => {\n  ec2Mock.on(DescribeInstancesCommand).resolves({ Reservations: [] });\n  asgMock.on(DescribeAutoScalingGroupsCommand)\n    .resolvesOnce(group(0)) // before: nothing in service\n    .resolvesOnce(group(0)) // desired is 0\n    .resolves(group(1, \"i-new\")); // the warm VM came up\n  const vm = await new MockActivityEnvironment().run(acquireSandbox, req);\n  assert.equal(vm.instanceId, \"i-new\");\n  assert.equal(asgMock.commandCalls(SetDesiredCapacityCommand)[0]!.args[0].input.DesiredCapacity, 1);\n  assert.equal(asgMock.commandCalls(DetachInstancesCommand)[0]!.args[0].input.ShouldDecrementDesiredCapacity, true);\n  const tags = ec2Mock.commandCalls(CreateTagsCommand)[0]!.args[0].input.Tags!;\n  assert.ok(tags.some((t) => t.Key === \"ai-agents:run-id\" && t.Value === \"run-1\"));\n});\n\ntest(\"a retry finds the VM already tagged with this run and claims nothing new\", async () => {\n  ec2Mock.on(DescribeInstancesCommand).resolves({ Reservations: [{ Instances: [{ InstanceId: \"i-mine\", Tags: [{ Key: \"ai-agents:run-id\", Value: \"run-1\" }, { Key: \"ai-agents:size\", Value: \"full\" }] }] }] });\n  const vm = await new MockActivityEnvironment().run(acquireSandbox, req);\n  assert.equal(vm.instanceId, \"i-mine\");\n  assert.equal(asgMock.commandCalls(SetDesiredCapacityCommand).length, 0);\n});\n\ntest(\"when another claim detached the VM first, it takes the next one\", async () => {\n  ec2Mock.on(DescribeInstancesCommand).resolves({ Reservations: [] });\n  asgMock.on(DescribeAutoScalingGroupsCommand).resolvesOnce(group(0)).resolvesOnce(group(0)).resolves(group(2, \"i-a\", \"i-b\"));\n  asgMock.on(DetachInstancesCommand, { InstanceIds: [\"i-a\"] })\n    .rejects(new AutoScalingServiceException({ name: \"ValidationError\", message: \"not part of the group\", $fault: \"client\", $metadata: {} }));\n  const vm = await new MockActivityEnvironment().run(acquireSandbox, req);\n  assert.equal(vm.instanceId, \"i-b\");\n});",
-    "see": "(a file with three tests)"
+    "say": "Two more runs arrive. The pool has one VM left.",
+    "do": "./acquire.sh run-8b21\n./acquire.sh run-9c33",
+    "see": "claimed i-5c90c99cb2f3321aa for run-8b21\nno warm lite VM left: a cold start"
    },
    {
-    "do": "node --import tsx --test test/*.test.ts",
-    "see": "✔ a claim raises desired by one, detaches the new VM and tags it (2.964084ms)\n✔ a retry finds the VM already tagged with this run and claims nothing new (0.389459ms)\n✔ when another claim detached the VM first, it takes the next one (1.04825ms)\nℹ tests 3\nℹ pass 3\nℹ fail 0"
-   },
-   {
-    "do": "Break it on purpose: in src/sandbox.ts change ShouldDecrementDesiredCapacity: true to false. Run the tests again.",
-    "see": "✖ a claim raises desired by one, detaches the new VM and tags it\n  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n  false !== true\nℹ pass 2\nℹ fail 1"
-   },
-   {
-    "do": "Put true back. Then try an unmocked call: node --import tsx -e 'import(\"./src/sandbox.ts\").then((m) => m.acquireSandbox({ size: \"lite\", runId: \"r\", agent: \"n\", jiraKey: null, spot: false })).catch((e) => console.log(e.name + \": \" + e.message))'",
-    "see": "CredentialsProviderError: Could not load credentials from any providers"
+    "say": "The run is over. Release its VM twice, as a retried finally block would, and release one that never existed.",
+    "do": "VM=$(aws ec2 describe-instances --output text --query 'Reservations[].Instances[].InstanceId' \\\n  --filters Name=tag:ai-agents:run-id,Values=run-7f3a Name=instance-state-name,Values=running)\n./release.sh $VM; ./release.sh $VM; ./release.sh i-0000000000000dead",
+    "see": "i-52b9d909d01556c40 -> shutting-down\ni-52b9d909d01556c40 -> shutting-down\ni-0000000000000dead is already gone: nothing to do"
    }
   ],
-  "faded": "Add a fourth test: a Spot claim. Mock the same three DescribeAutoScalingGroups answers with one new VM, i-spot, and run acquireSandbox with { ...req, spot: true }. The assertion is yours: the SetDesiredCapacity command must name the group ai-agents-sandbox-full-spot.",
-  "alone": "Write releaseSandbox from section 6 in src/run.ts, with an exported object brokerInternal = { delete: async (path: string) => {} }. In test/run.test.ts, replace its delete with t.mock.method(brokerInternal, \"delete\", async () => {}). Test two cases. When TerminateInstances rejects with an error named InvalidInstanceID.NotFound, releaseSandbox resolves and delete was called with /internal/runs/run-1. When it rejects with UnauthorizedOperation, releaseSandbox rejects.",
-  "done": "node --import tsx --test test/*.test.ts prints pass 6 and fail 0: three claim tests, the Spot test and two release tests."
+  "build": "Make the claim respect the size. Give the warm VMs a second tag, ai-agents:size (lite or full), create one full VM next to the lite ones, and change acquire.sh to take the size as a second argument: ./acquire.sh run-7f3a full. The \"already claimed\" check must also confirm that the VM it found has the size that was asked for, and say so if it does not, because a retry must return the same kind of VM the run asked for.",
+  "fix": "A teammate removed the three lines at the top of acquire.sh because \"the lookup costs one extra API call on every claim\". Recreate it with sed '4,6d' acquire.sh > naive.sh, create two fresh warm VMs, run CRASH=1 ./naive.sh run-x and then ./naive.sh run-x. List the VMs tagged run-x: there are two. Explain what each one costs until something finds it, which job finally removes the orphan and when, and why one API call is the cheaper price.",
+  "checks": [
+   "After the crash, the retry prints \"already claimed\" with the same instance ID.",
+   "The third claim finds no warm VM and reports a cold start instead of taking a VM that belongs to another run.",
+   "Releasing the same VM twice succeeds both times, and releasing an unknown ID says \"already gone\".",
+   "Without the check (naive.sh), the crash and retry leave two VMs tagged with the same run.",
+   "You stopped LocalStack: docker stop localstack."
+  ],
+  "solution": {
+   "lang": "bash",
+   "file": "acquire.sh with a size",
+   "text": "run=$1; size=$2\nmine=$(aws ec2 describe-instances --output text \\\n  --query 'Reservations[].Instances[].[InstanceId, Tags[?Key==`ai-agents:size`].Value | [0]]' \\\n  --filters Name=tag:ai-agents:run-id,Values=$run Name=instance-state-name,Values=pending,running,stopped)\nif [ -n \"$mine\" ]; then\n  set -- $mine\n  [ \"$2\" = \"$size\" ] || { echo \"run $run already holds $1, but it is $2, not $size\"; exit 1; }\n  echo \"already claimed for $run: $1\"; exit 0\nfi\nvm=$(aws ec2 describe-instances --output text \\\n  --query 'Reservations[].Instances[] | [?!(Tags[?Key==`ai-agents:run-id`])].InstanceId | [0]' \\\n  --filters Name=tag:ai-agents:pool,Values=$size Name=tag:ai-agents:size,Values=$size Name=instance-state-name,Values=running)\n# ...the rest as before"
+  },
+  "explain": [
+   "Why can Temporal not simply remember which VM the first attempt took?",
+   "How does workInSandbox avoid starting a second harness when it is retried?",
+   "Why does releaseSandbox treat InvalidInstanceID.NotFound as success, but no other error?"
+  ],
+  "done": "A crashed claim's retry returns the same VM, a full pool gives a cold start instead of stealing, and a release can run any number of times."
  },
- "quiz": [
+ "check": [
   {
-   "q": "acquireSandbox tagged a VM, then the orchestrator pod restarted before the activity returned. Temporal retries it. What happens?",
+   "q": "acquireSandbox detached and tagged a VM, then its worker died. Temporal retries the activity. What makes the retry return the same VM?",
    "options": [
     {
-     "text": "It claims a second VM, and the sweeper removes the first when its lease ends.",
-     "correct": false,
-     "why": "That would waste a VM for two hours. The first lines exist to prevent it."
-    },
-    {
-     "text": "findInstance finds the VM tagged with this run id and returns it. No new claim.",
+     "text": "It first looks for a VM already tagged with this run's ID and returns it",
      "correct": true,
-     "why": "Look before you claim is what makes the activity safe to run twice."
+     "why": "The tag is written in AWS, so it survives the worker. That one lookup turns a retry into a no-op."
     },
     {
-     "text": "Temporal returns the old result from history without running the activity.",
+     "text": "Temporal passes the first attempt's result to the retry",
      "correct": false,
-     "why": "The activity never completed, so there is no result in history. It runs again."
+     "why": "The first attempt never returned, so there is no result to pass."
+    },
+    {
+     "text": "The warm pool gives back the same VM to the same caller",
+     "correct": false,
+     "why": "The VM was already detached from the pool, which no longer knows about it."
     }
    ]
   },
   {
-   "q": "Why is nova-worker started as a systemd unit instead of running inside the SSM command?",
+   "q": "workInSandbox is retried on a new worker while the harness is still working on the VM. What should the retry do?",
    "options": [
     {
-     "text": "systemd starts processes faster than SSM.",
+     "text": "Start the harness again, to be sure it is running",
      "correct": false,
-     "why": "Speed is not the reason."
+     "why": "Two harnesses on one VM would work on the same branch and session at once."
     },
     {
-     "text": "SSM commands time out after at most 48 hours, and runs have no time limit.",
+     "text": "See that the run's systemd unit is active and start following its heartbeats again",
      "correct": true,
-     "why": "SSM only starts the unit. The unit lives as long as the VM, and a retry re-attaches to it."
+     "why": "The harness does not depend on the worker that watches it, so a new worker just re-attaches."
     },
     {
-     "text": "SSM cannot run commands as the agent user.",
+     "text": "Throw SandboxDead, because the old worker is gone",
      "correct": false,
-     "why": "It can, with sudo or systemd-run --uid. The limit is the command's lifetime."
+     "why": "SandboxDead means the harness went silent, not the worker. Here the harness is fine."
     }
    ]
   },
   {
-   "q": "workInSandbox reads a heartbeat with age_s = 420. What does it do?",
+   "q": "releaseSandbox calls terminate on a VM, and AWS answers InvalidInstanceID.NotFound. What should happen?",
    "options": [
     {
-     "text": "Keeps waiting: a long thinking turn can take minutes.",
+     "text": "The activity fails, so a person checks what happened",
      "correct": false,
-     "why": "The harness heartbeats every 30 s from a timer, even during a long turn. 7 minutes of silence means it is gone."
+     "why": "A missing VM is the goal of a release. Failing would make every retried finally block noisy for nothing."
     },
     {
-     "text": "Retries the activity, which re-attaches to the harness.",
+     "text": "The activity retries until AWS finds the VM",
      "correct": false,
-     "why": "The failure is non-retryable on purpose: re-attaching to a dead VM does not help."
+     "why": "It will never be found; it is gone, which is what we wanted."
     },
     {
-     "text": "Throws a non-retryable ApplicationFailure of type SandboxDead, which recovery handles on a fresh VM.",
+     "text": "The activity treats it as success, but still throws any other error",
      "correct": true,
-     "why": "Over 300 seconds without a heartbeat means the VM or harness died. G3-27 replaces the VM."
+     "why": "Gone is the desired state. Other errors, such as a missing permission, mean the VM may still be running."
     }
    ]
   }
  ],
- "recall": [
-  "From g3-7: why does a claim detach the VM with ShouldDecrementDesiredCapacity, and what refills the pool?",
-  "From p7-2: name two things workflow code must never do."
- ],
- "videos": [
-  {
-   "title": "Connect to AWS EC2 Using AWS SSM Session Manager",
-   "url": "https://www.youtube.com/watch?v=SwSEmvWMuMU",
-   "channel": "Tech With Yeshwanth",
-   "minutes": 19,
-   "why": "Hands-on setup of Session Manager as an SSH replacement."
-  }
- ],
+ "platform": {
+  "p": [
+   "The activities live in ai-agents/orchestrator/src/activities/sandbox.ts and run.ts, as plain async functions on AWS SDK v3, unit-tested with aws-sdk-client-mock. acquireSandbox({ size, runId, agent, jiraKey, spot }) raises desired capacity on ai-agents-sandbox-<size> or its -spot group, detaches with ShouldDecrementDesiredCapacity, tags ai-agents:run-id, agent, jira and lease-until, counts cold starts as a metric, opens the broker scope, mints the gateway run token and writes the task, capability and token to /run/nova/ over SSM (mode 0600, owner agent). freshenSandbox fetches the commit through the broker, reinstalls only lockfiles that differ from the image manifest, refreshes FCP Lab on full and wide, and throws LabNotReady when the lab will not start. ticketToPr claims lite for the plan and full for the build.",
+   "workInSandbox starts the harness with systemd-run --uid agent --unit nova-<run> over SSM if it is not running, reads heartbeats from the broker's internal API every 30 s, heartbeats to Temporal, renews the lease every 5 minutes, and throws a non-retryable SandboxDead after 5 minutes of silence. parkSandbox, wakeSandbox and retireSandbox handle waits (10 idle minutes, lease now + 73 h, retire after 72 h); releaseSandbox revokes the scope and terminates in the workflow's finally. routineRun reuses the same activities."
+  ],
+  "tickets": [
+   {
+    "key": "G3-18",
+    "why": "acquireSandbox and freshenSandbox: claim the right size, detach, tag, open the scope, write the run's files, freshen only the delta."
+   },
+   {
+    "key": "G3-20",
+    "why": "workInSandbox, park, wake, retire and release, each safe to retry."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "claim",
-   "plain": "Take one warm VM for one run: raise desired, wait for InService, detach and tag it."
+   "term": "activity",
+   "plain": "A step of a Temporal workflow that touches the outside world, such as an AWS call. Temporal retries it if its worker dies."
   },
   {
-   "term": "freshen",
-   "plain": "Bring a baked VM to the exact commit, redoing only what changed since the image was built."
+   "term": "idempotent",
+   "plain": "Safe to run twice: the second run has the same effect as the first, so a retry does no harm."
   },
   {
-   "term": "park",
-   "plain": "Stop a VM while its run waits for a person; the disk stays, the cost drops to almost nothing."
-  },
-  {
-   "term": "retire",
-   "plain": "After 72 hours parked: start, checkpoint, terminate. The next answer resumes on a fresh VM."
+   "term": "detach",
+   "plain": "Take a VM out of its Auto Scaling group, so the group forgets it and Temporal owns it."
   },
   {
    "term": "re-attach",
-   "plain": "On retry, follow the harness already running on the VM instead of starting a second one."
+   "plain": "A retried activity finds the work already running and follows it, instead of starting it again."
   },
   {
-   "term": "aws-sdk-client-mock",
-   "plain": "A test library that fakes an AWS SDK v3 client's answers and records what was sent."
+   "term": "cold start",
+   "plain": "A claim that finds no warm VM and must wait for a new one to be built and set up."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-18",
-   "why": "This lesson explained acquireSandbox line by line, what freshen does, and how to test the claim without AWS.",
-   "walk": [
-    "Write acquireSandbox in ai-agents/orchestrator/src/activities/sandbox.ts (code above) with findInstance, inServiceIds, desired and leaseUntil helpers.",
-    "After the claim, open the broker scope (POST /internal/runs) and mint the gateway run token (G0-13). Write task, capability and token to /run/nova/ over SSM, mode 0600, owner agent.",
-    "Count cold starts (empty pool) as a metric.",
-    "Write freshenSandbox(vm, sha). It fetches and checks out through the broker and reinstalls only what changed (lockfile hashes vs manifest.json). On full and wide it runs lab refresh, then expects lab status ready.",
-    "Throw ApplicationFailure type LabNotReady when FCP Lab will not start. The workflow retries once on a fresh VM, then reports with the lab report.",
-    "Unit-test the ASG and EC2 path with aws-sdk-client-mock and MockActivityEnvironment (the lab)."
-   ]
+   "q": "For acquireSandbox, workInSandbox and releaseSandbox, say what each one checks or tolerates so that a retry is harmless.",
+   "a": "acquire: looks for a VM tagged with this run ID first. workInSandbox: starts the harness's systemd unit only if it is not already active, otherwise re-attaches. release: revoking a missing scope and InvalidInstanceID.NotFound both count as success."
   },
   {
-   "key": "G3-20",
-   "why": "This lesson explained workInSandbox, parkSandbox and releaseSandbox line by line, plus wake, retire and the Spot path.",
-   "walk": [
-    "Write workInSandbox in ai-agents/orchestrator/src/activities/run.ts (code above) with ensureHarnessRunning: SSM SendCommand (AWS-RunShellScript) running systemd-run --uid agent --unit nova-<run> /usr/local/bin/nova-worker run /run/nova/task.json, or re-attach.",
-    "Follow the broker's heartbeat every 30 s, renew ai-agents:lease-until every 5 minutes, and throw non-retryable SandboxDead after 5 minutes of silence.",
-    "Write parkSandbox (stop, lease now + 73 h) and wakeSandbox (start, wait for SSM online, freshen if main moved).",
-    "Write retireSandbox: after 72 h stopped, start, run nova-worker checkpoint, terminate.",
-    "Write releaseSandbox: revoke the broker scope, terminate, accept InvalidInstanceID.NotFound. Call it from the workflow's finally.",
-    "Spot: return preempted when the harness exits on /run/nova/preempt. The workflow retries the step on a fresh VM."
-   ]
+   "q": "Two claims race for the same new VM. What decides the winner, and what does the loser do?",
+   "a": "The detach call: AWS lets only one succeed. The loser's detach throws, it skips that VM and takes the next new one in service."
   }
  ],
- "remember": "Every VM activity is safe to run twice, follows heartbeats instead of a clock, and ends in releaseSandbox."
+ "remember": "Temporal will run a step again after a crash, so every step that touches a VM first checks what an earlier attempt already did: find your own VM, re-attach to your own harness, and treat \"already gone\" as done."
 }

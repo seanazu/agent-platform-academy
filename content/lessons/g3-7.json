@@ -1,492 +1,256 @@
 {
+ "v": 2,
  "id": "g3-7",
  "title": "Warm pools, Spot and the sweeper",
- "minutes": 50,
+ "minutes": 40,
  "youNeed": [
-  "g3-6",
   "p3-4",
   "p3-7"
  ],
- "bridge": "A warm pool is like keeping a few laptops set up and asleep in a cupboard. Opening one takes a minute, not an afternoon. Except a laptop that served one run is never put back. It is destroyed, and a fresh one is set up and put to sleep in its place.",
- "intro": "A fresh VM from the image still needs minutes to boot and warm up FCP Lab. This lesson keeps a few stopped VMs ready per size, so a run gets one in about a minute. It adds cheaper Spot groups for routines that can retry. Then it adds the sweeper, which destroys anything no live run owns.",
- "picture": {
-  "caption": "VMs are set up once, stopped, claimed by one run, detached, and later destroyed. The sweeper catches whatever the normal path missed.",
-  "nodes": [
-   {
-    "id": "asg",
-    "label": "ASG ai-agents-sandbox-full (desired 0)",
-    "kind": "service"
-   },
-   {
-    "id": "hook",
-    "label": "lifecycle hook finish-setup + sandbox-warm unit",
-    "kind": "check"
-   },
-   {
-    "id": "pool",
-    "label": "warm pool: stopped VMs",
-    "kind": "machine"
-   },
-   {
-    "id": "claim",
-    "label": "acquireSandbox activity",
-    "kind": "service"
-   },
-   {
-    "id": "vm",
-    "label": "claimed VM, tagged with its run",
-    "kind": "machine"
-   },
-   {
-    "id": "spot",
-    "label": "Spot group (no warm pool)",
-    "kind": "service"
-   },
-   {
-    "id": "sweeper",
-    "label": "sweeper Lambda, every 15 minutes",
-    "kind": "service"
-   }
+ "map": "vm-pool",
+ "hook": {
+  "story": [
+   "Friday, 18:40. The orchestrator, the Temporal worker that claims VMs and drives every run, crashes in the middle of a CI-fixer run and comes back with a bug that keeps it from resuming that run. Its sandbox VM, a full-size machine, keeps running. Nothing is wrong with the VM itself; it is simply that nobody is using it anymore, and nobody remembers it is there. At about 42 cents an hour it would cost twenty dollars by Monday, and it is still a machine with our code on its disk.",
+   "In the same account, two VMs are stopped on purpose: one in the warm pool, waiting for the next run, and one that Nova, our ticket-to-PR agent, parked while it waits for an answer on RH-1234. A cleanup job that only looks for \"VMs nobody is using\" could easily destroy one of those too."
   ],
-  "steps": [
-   {
-    "from": "asg",
-    "to": "hook",
-    "text": "a new VM boots; sandbox-warm starts FCP Lab once, then completes the hook"
-   },
-   {
-    "from": "hook",
-    "to": "pool",
-    "text": "the VM stops and waits in the pool, costing only its disk"
-   },
-   {
-    "from": "claim",
-    "to": "asg",
-    "text": "a run raises desired by 1; a pool VM starts and is InService in about a minute"
-   },
-   {
-    "from": "claim",
-    "to": "vm",
-    "text": "detaches it from the group; Temporal owns it now, and the pool refills"
-   },
-   {
-    "from": "claim",
-    "to": "spot",
-    "text": "a retryable routine claims from the Spot group instead"
-   },
-   {
-    "from": "sweeper",
-    "to": "vm",
-    "text": "lease expired, or stopped over 72 h: terminate"
-   },
-   {
-    "from": "sweeper",
-    "to": "pool",
-    "text": "warm VM older than 24 h: recycle, so the pool tracks the newest image"
-   }
-  ]
+  "question": "Who destroys a VM when whatever owned it is gone, without ever destroying one that is still in use?"
  },
- "sections": [
+ "read": [
   {
-   "h": "A minute instead of ten",
+   "h": "Every VM has exactly one owner",
    "p": [
-    "An Auto Scaling group (ASG) keeps a number of VMs from a launch template. You set the desired count, and it starts or stops VMs to match. A warm pool is a set of VMs the group has already booted and set up, then stopped. When the group needs one more VM, it starts a stopped one instead of building a new one.",
-    "A stopped VM costs only its disk, about $8 to $10 a month. A full VM costs about $0.42 an hour while it runs. So a few warm VMs per size are cheap, and they turn a cold start of many minutes into about one minute.",
-    "G3-15 makes one ASG per size. The steady state is all-warm: desired 0, nothing in service until a run claims a VM. The pools start at lite 2, full 2, wide 0. max_size is 3, because only claims in flight live in the group."
+    "A sandbox VM always belongs to exactly one of three owners, and its tags say which. While it waits in the warm pool, a group of stopped VMs that are already set up, the Auto Scaling group owns it; the tag aws:autoscaling:groupName says so. When a run claims it, the claim activity detaches it from the group and tags it with ai-agents:run-id, so from then on Temporal owns it, through the run's workflow. And when its owner is gone, it belongs to the sweeper, a small job that runs every 15 minutes and destroys whatever nobody owns.",
+    "The hard part is the middle owner, because a workflow cannot wave from inside the AWS console. So a run proves it is alive with a lease: the tag ai-agents:lease-until holds a time a little in the future, and the live run moves it forward every five minutes. A crashed orchestrator stops moving it. The sweeper never asks Temporal anything; it only reads tags, which is why it keeps working when Temporal itself is down."
    ]
   },
   {
-   "h": "The ASG, part 1: the group and its pool",
+   "h": "The sweeper's rules",
    "p": [
-    "The group sits in the sandbox subnets and uses the size's launch template from lesson g3-6. The warm_pool block says how many stopped VMs to keep."
+    "The sweeper is a Python function on AWS Lambda, triggered every 15 minutes, with a role that can only terminate machines tagged ai-agents:managed=true. Each rule covers one owner that has gone away. A VM with a run-id whose lease has passed has lost its run, like the Friday VM. A VM stopped for more than 72 hours is retired, because its work is already saved at every checkpoint. A warm VM older than 24 hours is recycled inside its group, so the pool refills from the newest image. And a disk that belongs to no machine is deleted.",
+    "The lab runs these rules on a pretend fleet every 15 minutes of a pretend week, so you can watch each rule fire on the VM it was written for."
    ],
-   "because": "We set reuse_on_scale_in = false, because a VM that served a run holds that run's files and must never serve another one.",
    "code": {
-    "lang": "hcl",
-    "file": "infrastructure/modules/aws-sandbox-pool/asg.tf (part 1 of 2)",
-    "text": "resource \"aws_autoscaling_group\" \"sandbox\" {\n  for_each = var.sizes\n\n  name                = \"${var.name_prefix}-sandbox-${each.key}\"\n  vpc_zone_identifier = var.subnet_ids\n  min_size            = 0\n  max_size            = 3 # only claims in flight live here; claimed VMs are detached\n  desired_capacity    = 0\n\n  launch_template {\n    id      = aws_launch_template.sandbox[each.key].id\n    version = \"$Latest\"\n  }\n\n  warm_pool {\n    pool_state                  = \"Stopped\" # a stopped VM costs only its disk\n    min_size                    = var.warm_pool_size[each.key] # lite 2, full 2, wide 0 to start\n    max_group_prepared_capacity = var.warm_pool_size[each.key]\n    instance_reuse_policy {\n      reuse_on_scale_in = false # a used VM never goes back to the pool\n    }\n  }",
+    "lang": "python",
+    "file": "sweep.py (the lab's version of the sweeper's rules)",
+    "text": "def sweep(now, vms):\n    for vm in vms:\n        if vm[\"state\"] == \"terminated\":\n            continue\n        tags = vm[\"tags\"]\n        if \"run-id\" in tags and tags[\"lease-until\"] < now:\n            act(now, vm, \"terminate\", \"lease expired: no live run owns this VM\")\n        elif vm[\"state\"] == \"stopped\" and now - vm[\"stopped_at\"] > 72 * H:\n            act(now, vm, \"terminate\", \"stopped for over 72 h\")\n        elif \"asg\" in tags and now - vm[\"launched\"] > 24 * H:\n            act(now, vm, \"recycle\", \"warm VM older than 24 h\")",
     "notes": [
-     {
-      "line": 2,
-      "text": "One group per size, like the launch templates."
-     },
-     {
-      "line": 5,
-      "text": "The three private sandbox subnets, one per availability zone."
-     },
-     {
-      "line": 7,
-      "text": "At most 3 VMs in service: only claims in flight. A claimed VM is detached at once, so it no longer counts."
-     },
-     {
-      "line": 8,
-      "text": "Desired 0: nothing runs until a claim raises it."
-     },
-     {
-      "line": 12,
-      "text": "$Latest: the group always launches from the newest version of the template."
-     },
-     {
-      "line": 16,
-      "text": "Pool VMs are stopped, not running. Only the disk is billed."
-     },
-     {
-      "line": 17,
-      "text": "How many to keep, per size: lite 2, full 2, wide 0 to start."
-     },
-     {
-      "line": 18,
-      "text": "Cap the pool at the same number, so it never grows on its own."
-     },
-     {
-      "line": 20,
-      "text": "A VM leaving service is terminated, never returned to the pool."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "wall",
-    "text": "One fresh VM per run. A claimed VM is detached from its group, used by one run, and destroyed. Nothing goes back to the pool."
-   }
-  },
-  {
-   "h": "The ASG, part 2: finish setup before stopping",
-   "p": [
-    "A VM that joins the warm pool should do its slow first-boot work before it stops. It starts FCP Lab once, pulls images and reads the disk. A lifecycle hook pauses the VM at a point in its life until something says 'continue'.",
-    "The other half is a systemd unit in the image role, sandbox-warm. On boot it reads /latest/meta-data/autoscaling/target-lifecycle-state from the metadata service. Warmed:Stopped means 'going to the pool': start FCP Lab once, stop it, complete the hook. InService means a run is waiting: complete the hook at once."
-   ],
-   "because": "We hold every new VM at launch until it reports ready, because a half-set-up warm VM breaks the next run.",
-   "code": {
-    "lang": "hcl",
-    "file": "infrastructure/modules/aws-sandbox-pool/asg.tf (part 2 of 2)",
-    "text": "  # The VM finishes setup (FCP Lab started once, images pulled, disk warmed) before it is stopped.\n  initial_lifecycle_hook {\n    name                 = \"finish-setup\"\n    lifecycle_transition = \"autoscaling:EC2_INSTANCE_LAUNCHING\"\n    heartbeat_timeout    = 1800\n    default_result       = \"ABANDON\"\n  }\n\n  # + dynamic \"tag\" blocks (propagate_at_launch) for var.tags, ai-agents:managed=true, ai-agents:size\n}",
-    "notes": [
-     {
-      "line": 1,
-      "text": "What the hook waits for: FCP Lab started once, images pulled, disk warmed."
-     },
-     {
-      "line": 4,
-      "text": "The hook fires when a VM launches, for the warm pool or straight into service."
-     },
-     {
-      "line": 5,
-      "text": "The VM has 1800 seconds (30 minutes) to complete the hook."
-     },
      {
       "line": 6,
-      "text": "If it never does, ABANDON: the group terminates that VM and tries a new one."
-     },
-     {
-      "line": 9,
-      "text": "Tags on the group copy to each VM: the account's tags, ai-agents:managed=true and the size."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Claimed VMs leave the group",
-   "p": [
-    "The claim activity (lesson g3-8) raises desired by 1. The group starts a warm VM and waits for its hook. When the VM is InService, the activity calls DetachInstances with ShouldDecrementDesiredCapacity. The VM leaves the group, and desired goes back down.",
-    "From then on Temporal owns the VM, not the group. The group sees its pool is one short and boots a replacement, which goes through the hook and stops. The completed hook is why the instance role has autoscaling:CompleteLifecycleAction, and why the VPC has an autoscaling endpoint (lesson g3-2).",
-    "There is one more cap above all of this. The account's On-Demand and Spot vCPU quotas limit how many VMs can run at once. Check them and request what we need; runs above the cap wait in Temporal's slot queues (G3-25)."
-   ]
-  },
-  {
-   "h": "Spot groups for retryable routines",
-   "p": [
-    "Spot VMs are spare EC2 capacity sold about 56% cheaper. AWS can take one back with a two-minute warning. A routine that can retry, such as a CI fixer, does not mind. spot-watch writes /run/nova/preempt and the harness saves its work. Then the workflow retries the step on a fresh VM (lesson g3-8).",
-    "Nova and the bug fixers stay on the on-demand groups. They wait on people, and a lost VM costs a person's time. Spot groups have no warm pool. lite and full each get one, named ai-agents-sandbox-<size>-spot."
-   ],
-   "because": "We let the group pick among three instance families, because Spot capacity runs out per type.",
-   "code": {
-    "lang": "hcl",
-    "file": "infrastructure/modules/aws-sandbox-pool/spot.tf (a sketch built from G3-15's steps)",
-    "text": "resource \"aws_autoscaling_group\" \"spot\" {\n  for_each = { for k, v in var.sizes : k => v if k != \"wide\" }\n  name                = \"${var.name_prefix}-sandbox-${each.key}-spot\"\n  vpc_zone_identifier = var.subnet_ids\n  min_size            = 0\n  max_size            = 3\n  desired_capacity    = 0\n  mixed_instances_policy {\n    instances_distribution {\n      on_demand_percentage_above_base_capacity = 0\n      spot_allocation_strategy                 = \"price-capacity-optimized\"\n    }\n    launch_template {\n      launch_template_specification {\n        launch_template_id = aws_launch_template.sandbox[each.key].id\n        version            = \"$Latest\"\n      }\n      dynamic \"override\" {\n        for_each = [for family in [\"m8i\", \"m7i\", \"m6i\"] : replace(each.value, \"m8i\", family)]\n        content { instance_type = override.value }\n      }\n    }\n  }\n}",
-    "notes": [
-     {
-      "line": 2,
-      "text": "lite and full only. wide has no Spot group."
-     },
-     {
-      "line": 3,
-      "text": "The name acquireSandbox builds when spot is true: ai-agents-sandbox-full-spot."
+      "text": "Claimed VMs only: the run-id tag says Temporal owned it, and the lease says the owner stopped renewing."
      },
      {
       "line": 8,
-      "text": "A mixed instances policy lets one group use several instance types and buying options."
+      "text": "A VM that has been stopped too long. The lab shows the trap hidden in this line."
      },
      {
       "line": 10,
-      "text": "0% on-demand above the base: every VM in this group is Spot."
-     },
-     {
-      "line": 11,
-      "text": "price-capacity-optimized picks the cheapest Spot pools that are least likely to be taken back."
-     },
-     {
-      "line": 15,
-      "text": "The same launch template as the on-demand group: same image, role and walls."
-     },
-     {
-      "line": 19,
-      "text": "One override per family: m8i, m7i and m6i of the same size, for example m7i.2xlarge."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The sweeper, part 1: the rules",
-   "p": [
-    "Throw-away machines must really be thrown away, even when the orchestrator is down or a run crashed. G3-22 adds a Lambda in the ai-agents account that runs every 15 minutes and works only from tags. It does not ask Temporal anything, so it keeps working when Temporal does not.",
-    "It is a copy of modules/aws-vm-autostop: an EventBridge rule rate(15 minutes), a Python Lambda and tag-scoped IAM. It stays Python although the platform is TypeScript: the infrastructure repo builds its Lambdas in Python with uv, and DevOps owns them. It is not attached to the VPC, so it needs no endpoints."
-   ],
-   "because": "We decide from tags alone, because the cleaner must not depend on the system whose failures it cleans up after.",
-   "code": {
-    "lang": "python",
-    "file": "infrastructure/modules/aws-sandbox-sweeper/lambda/handler.py (part 1 of 2)",
-    "text": "\"\"\"Sandbox sweeper: every 15 minutes, remove VMs and disks that no live run owns. Based on aws-vm-autostop.\"\"\"\nimport datetime as dt\nimport json\nimport os\n\nimport boto3\n\nec2, autoscaling = boto3.client(\"ec2\"), boto3.client(\"autoscaling\")\nDRY_RUN = os.environ.get(\"DRY_RUN\", \"true\") == \"true\"  # start dry, like dev-vm-autostop\n\n\ndef handler(event, context):\n    now = dt.datetime.now(dt.UTC)\n    for inst in managed_instances(states=[\"running\", \"stopped\"]):  # tag ai-agents:managed=true only\n        tags = {t[\"Key\"]: t[\"Value\"] for t in inst.get(\"Tags\", [])}\n        if \"ai-agents:run-id\" in tags and parse(tags.get(\"ai-agents:lease-until\")) < now:\n            act(\"terminate\", inst[\"InstanceId\"], \"lease expired: no live run owns this VM\")\n        elif inst[\"State\"][\"Name\"] == \"stopped\" and stopped_since(inst) < now - dt.timedelta(hours=72):\n            act(\"terminate\", inst[\"InstanceId\"], \"stopped for over 72 h; its work is already saved\")\n        elif \"aws:autoscaling:groupName\" in tags and inst[\"LaunchTime\"] < now - dt.timedelta(hours=24):\n            act(\"recycle\", inst[\"InstanceId\"], \"warm VM older than 24 h; the pool refills from the newest image\")\n    for vol in managed_volumes(status=\"available\"):\n        act(\"delete-volume\", vol[\"VolumeId\"], \"orphaned disk\")",
-    "notes": [
-     {
-      "line": 6,
-      "text": "boto3 is the AWS SDK for Python, the Python twin of the SDK v3 clients in TypeScript."
-     },
-     {
-      "line": 9,
-      "text": "Dry by default: it only logs what it would do, until DevOps sets DRY_RUN=false."
-     },
-     {
-      "line": 13,
-      "text": "One 'now' for the whole run, in UTC."
-     },
-     {
-      "line": 14,
-      "text": "Only instances tagged ai-agents:managed=true. Nothing else in the account is touched."
-     },
-     {
-      "line": 15,
-      "text": "Turn AWS's tag list into a dict, so tags[\"ai-agents:run-id\"] works."
-     },
-     {
-      "line": 16,
-      "text": "A claimed VM has a run-id. If its lease time has passed, no live run renewed it, so nobody owns it."
-     },
-     {
-      "line": 18,
-      "text": "Stopped for over 72 hours. A parked VM is retired by its workflow at 72 h; this rule is the backstop."
-     },
-     {
-      "line": 20,
-      "text": "A warm VM (still in a group) launched over 24 hours ago is recycled, so the pool refills from the newest image."
-     },
-     {
-      "line": 22,
-      "text": "Available volumes are attached to nothing. A managed one is an orphaned disk."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The sweeper, part 2: act, but dry first",
-   "p": [
-    "Every decision goes through act. It always prints one JSON line, so a dry run shows exactly what a real run would do. The IAM role allows ec2:TerminateInstances and ec2:DeleteVolume only when aws:ResourceTag/ai-agents:managed is true, and autoscaling:TerminateInstanceInAutoScalingGroup on the sandbox ASGs only."
-   ],
-   "because": "We start with dry_run = true, because a cleaner with a wrong rule destroys the wrong things every 15 minutes.",
-   "code": {
-    "lang": "python",
-    "file": "infrastructure/modules/aws-sandbox-sweeper/lambda/handler.py (part 2 of 2)",
-    "text": "def act(action: str, resource_id: str, reason: str) -> None:\n    print(json.dumps({\"action\": action, \"id\": resource_id, \"reason\": reason, \"dry_run\": DRY_RUN}))\n    if DRY_RUN:\n        return\n    if action == \"terminate\":\n        ec2.terminate_instances(InstanceIds=[resource_id])\n    elif action == \"recycle\":\n        autoscaling.terminate_instance_in_auto_scaling_group(InstanceId=resource_id, ShouldDecrementDesiredCapacity=False)\n    else:\n        ec2.delete_volume(VolumeId=resource_id)",
-    "notes": [
-     {
-      "line": 2,
-      "text": "One JSON line per action: what, which id, why, and whether it was dry. CloudWatch Logs keeps it."
-     },
-     {
-      "line": 3,
-      "text": "Dry: stop after logging."
-     },
-     {
-      "line": 6,
-      "text": "terminate: an orphan whose lease passed, or a VM stopped too long."
-     },
-     {
-      "line": 8,
-      "text": "recycle: terminate inside the group without lowering desired, so the group launches a new VM from the current image."
-     },
-     {
-      "line": 10,
-      "text": "The only other action: delete an orphaned volume."
+      "text": "Warm-pool VMs only: older than a day, so a fresh one from the newest image takes its place."
      }
     ]
    },
-   "callout": {
-    "kind": "tip",
-    "text": "The Lambda also publishes CloudWatch metrics in AIAgents/Sweeper (OrphansTerminated, VolumesDeleted) for G3-34's alerts. Ask DevOps where the CloudWatch exporter config lives, and add the namespace there."
+   "see": "t=  4.50h  terminate crash  lease expired: no live run owns this VM\nt= 24.25h  recycle   warm-1 warm VM older than 24 h\nt= 82.25h  terminate parked stopped for over 72 h\nt= 82.50h  retire    parked FAILED: the VM is already gone, nothing was checkpointed",
+   "deeper": {
+    "h": "Go deeper: how the pool and Spot fit in",
+    "p": [
+     "Each size has its own group with a warm pool of stopped VMs (two lite, two full and none wide to start, at most three at a time) and reuse on scale-in turned off, so a used VM never goes back. A new pool VM runs its slow setup once, starts and stops FCP Lab, and only then tells the group that setup is done, through a lifecycle hook; a stopped VM costs only its disk, about 8 to 10 dollars a month.",
+     "Routines that can simply retry, such as the CI fixer, use separate Spot groups, where AWS sells spare machines cheaply but can take one back with two minutes' notice. They have no warm pool. When the notice comes, the harness saves a checkpoint and exits as preempted, and the workflow retries on a fresh VM. Nova and the bug fixers stay on normal on-demand machines, because they wait on people."
+    ]
    }
+  },
+  {
+   "h": "Two owners must never overlap",
+   "p": [
+    "The output above has a bug, and it is a bug of ownership. When Nova parks a VM while it waits for a person, the workflow stops it and sets its lease to 73 hours from now. The workflow still owns it: after 72 hours stopped, its own timer starts the VM, pushes a final checkpoint, and terminates it. But the sweeper's \"stopped for over 72 hours\" rule does not look at the lease. If the workflow's timer is a little late, here because the worker was restarting, the sweeper destroys the VM fifteen minutes before its owner arrives to save it.",
+    "The fix is to let the sweeper act only on VMs nobody owns. A VM with a fresh lease is owned, however long it has been stopped, so the stopped rule must also require that the lease has passed. The extra hour between 72 and 73 is the workflow's time to do its own cleanup, and the sweeper stays the job for leftovers only."
+   ],
+   "see": "--- with the stopped rule also checking the lease\nt=  4.50h  terminate crash  lease expired: no live run owns this VM\nt= 24.25h  recycle   warm-1 warm VM older than 24 h\nt= 82.50h  retire    parked checkpoint pushed, then terminated by the workflow"
   }
  ],
  "lab": {
-  "title": "Plan the warm-pool groups with a local backend",
-  "youNeed": [
-   "The ~/academy/sandbox-pool folder from the g3-6 lab (its plan said 8 to add)",
-   "OpenTofu; no AWS account"
+  "id": "g3-7",
+  "title": "A week of sweeping",
+  "minutes": 25,
+  "mode": "guided",
+  "needs": [
+   "python3 (nothing to install)"
   ],
-  "worked": [
+  "goal": "Run the sweeper's rules over a pretend week, see each rule catch the VM it was written for, then find and fix the rule that destroys a VM its owner still needs.",
+  "guess": {
+   "q": "A claimed VM is running and its lease-until is 30 minutes in the past. Its run's workflow is still open in Temporal. What does the sweeper do on its next pass?",
+   "options": [
+    {
+     "text": "It terminates the VM, because the lease has passed.",
+     "correct": true,
+     "why": "The sweeper trusts only tags. A live run renews its lease every five minutes, so a lease that ran out means the run has stopped looking after its VM."
+    },
+    {
+     "text": "It asks Temporal whether the run is still open, and leaves the VM alone.",
+     "correct": false,
+     "why": "The sweeper never talks to Temporal, so it keeps working when Temporal is down. The lease is the only signal."
+    },
+    {
+     "text": "It stops the VM and keeps its disk, to be safe.",
+     "correct": false,
+     "why": "Stopping would leave an orphan that costs money. The sweeper's job is to remove what nobody owns."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "cd ~/academy/sandbox-pool. Add to variables.tf:\n\nvariable \"subnet_ids\" {\n  type    = list(string)\n  default = [\"subnet-0lab1\", \"subnet-0lab2\", \"subnet-0lab3\"]\n}\nvariable \"warm_pool_size\" {\n  type    = map(number)\n  default = { lite = 2, full = 2, wide = 0 }\n}",
-    "see": "(no output)"
+    "say": "Save the simulation. It holds four VMs: one in the warm pool, one live run, one whose orchestrator crashed, and one that Nova parked at hour 10.",
+    "do": "mkdir -p ~/academy-labs/g3-7 && cd ~/academy-labs/g3-7\ncat > sweep.py <<'EOF'\n\"\"\"The sweeper's rules on a pretend fleet. Times are hours since Monday 09:00.\"\"\"\nH = 1.0\n\ndef sweep(now, vms):\n    for vm in vms:\n        if vm[\"state\"] == \"terminated\":\n            continue\n        tags = vm[\"tags\"]\n        if \"run-id\" in tags and tags[\"lease-until\"] < now:\n            act(now, vm, \"terminate\", \"lease expired: no live run owns this VM\")\n        elif vm[\"state\"] == \"stopped\" and now - vm[\"stopped_at\"] > 72 * H:\n            act(now, vm, \"terminate\", \"stopped for over 72 h\")\n        elif \"asg\" in tags and now - vm[\"launched\"] > 24 * H:\n            act(now, vm, \"recycle\", \"warm VM older than 24 h\")\n\ndef act(now, vm, action, why):\n    vm[\"state\"] = \"terminated\"\n    print(f\"t={now:6.2f}h  {action:9} {vm['id']:6} {why}\")\n\nvms = [\n    {\"id\": \"warm-1\", \"state\": \"stopped\", \"launched\": 0, \"stopped_at\": 0.5, \"tags\": {\"asg\": \"lite\"}},\n    {\"id\": \"run-a\",  \"state\": \"running\", \"launched\": 1, \"stopped_at\": None, \"tags\": {\"run-id\": \"run-a\", \"lease-until\": 3}},\n    {\"id\": \"crash\",  \"state\": \"running\", \"launched\": 2, \"stopped_at\": None, \"tags\": {\"run-id\": \"crash\", \"lease-until\": 4}},\n    # parked at 10h while waiting for a person: stopped, lease set to now + 73 h\n    {\"id\": \"parked\", \"state\": \"stopped\", \"launched\": 5, \"stopped_at\": 10, \"tags\": {\"run-id\": \"parked\", \"lease-until\": 83}},\n]\n\ndef renew(now):  # the live run renews its lease every 5 minutes; the crashed one stopped at 2.5 h\n    for vm in vms:\n        if vm[\"id\"] == \"run-a\" and vm[\"state\"] == \"running\":\n            vm[\"tags\"][\"lease-until\"] = now + 2\n        if vm[\"id\"] == \"crash\" and now < 2.5 and vm[\"state\"] == \"running\":\n            vm[\"tags\"][\"lease-until\"] = now + 2\n\nRETIRE_DELAY = 0.5  # the orchestrator's worker was restarting, so the 72 h timer's activity starts 30 minutes late\n\ndef retire(now):  # Temporal: 72 h after parking, start the VM, checkpoint, then terminate it\n    vm = next(v for v in vms if v[\"id\"] == \"parked\")\n    if abs(now - (vm[\"stopped_at\"] + 72 * H + RETIRE_DELAY)) < 0.01:\n        if vm[\"state\"] == \"terminated\":\n            print(f\"t={now:6.2f}h  retire    parked FAILED: the VM is already gone, nothing was checkpointed\")\n        else:\n            vm[\"state\"] = \"terminated\"\n            print(f\"t={now:6.2f}h  retire    parked checkpoint pushed, then terminated by the workflow\")\n\nt = 0.0\nwhile t <= 90:\n    renew(t)\n    retire(t)\n    sweep(t, vms)\n    t += 0.25  # every 15 minutes\nprint(\"still alive:\", [vm[\"id\"] for vm in vms if vm[\"state\"] != \"terminated\"])\nEOF",
+    "see": "(no output: sweep.py is written)"
    },
    {
-    "do": "Save asg.tf: parts 1 and 2 from sections 2 and 3, as one resource (the last comment line can stay).",
-    "see": "(a file)"
+    "say": "Run a pretend week, one sweeper pass every 15 minutes.",
+    "do": "python3 sweep.py",
+    "see": "t=  4.50h  terminate crash  lease expired: no live run owns this VM\nt= 24.25h  recycle   warm-1 warm VM older than 24 h\nt= 82.25h  terminate parked stopped for over 72 h\nt= 82.50h  retire    parked FAILED: the VM is already gone, nothing was checkpointed\nstill alive: ['run-a']"
    },
    {
-    "do": "tofu plan -input=false -no-color | grep -E 'autoscaling_group|Plan:' | grep -v resource",
-    "see": "  # aws_autoscaling_group.sandbox[\"full\"] will be created\n  # aws_autoscaling_group.sandbox[\"lite\"] will be created\n  # aws_autoscaling_group.sandbox[\"wide\"] will be created\nPlan: 11 to add, 0 to change, 0 to destroy."
+    "say": "Check each line against the rules: why did crash go at 4.5 hours and not at 2.5, when its run died?",
+    "do": "grep -n 'lease-until' sweep.py",
+    "see": "(the lines that set and read the lease: crash renewed until hour 2.5, so its lease ran until hour 4.5)"
    },
    {
-    "do": "Read the warm pools: tofu plan -input=false -no-color | grep -E '^\\s+# aws_autoscaling_group|pool_state|reuse_on_scale_in|default_result' | sed 's/^ *//'",
-    "see": "# aws_autoscaling_group.sandbox[\"full\"] will be created\n+ default_result       = \"ABANDON\"\n+ pool_state                  = \"Stopped\"\n+ reuse_on_scale_in = false\n(the same three lines for lite and wide)"
-   },
-   {
-    "do": "Find the pool sizes: tofu plan -input=false -no-color | grep -A3 'warm_pool {' | grep '+ min_size' | sed 's/^ *//'",
-    "see": "+ min_size                    = 2\n+ min_size                    = 2\n+ min_size                    = 0"
-   },
-   {
-    "do": "echo 'var.warm_pool_size' | tofu console",
-    "see": "tomap({\n  \"full\" = 2\n  \"lite\" = 2\n  \"wide\" = 0\n})"
+    "say": "See that the parked VM's loss depends on timing. Make the workflow's retire step on time and run again.",
+    "do": "sed -i.bak 's/^RETIRE_DELAY = 0.5/RETIRE_DELAY = 0/' sweep.py && python3 sweep.py | grep parked\nmv sweep.py.bak sweep.py",
+    "see": "t= 82.00h  retire    parked checkpoint pushed, then terminated by the workflow"
    }
   ],
-  "faded": "Add spot.tf with the Spot groups from section 5. Plan: expect 13 to add. The last step is yours. List the override instance types with one grep on the plan. Say why you see six lines, not nine.",
-  "alone": "Write the sweeper's IAM rule as a data \"aws_iam_policy_document\" \"sweeper\" in sweeper_iam.tf. Allow ec2:TerminateInstances and ec2:DeleteVolume on * with a condition: StringEquals on aws:ResourceTag/ai-agents:managed = \"true\". Add output \"sweeper_policy\" { value = data.aws_iam_policy_document.sweeper.json }. Run the plan and find the StringEquals block in the output. Then say what the policy would allow if you forgot the condition.",
-  "done": "The plan shows three groups with Stopped pools of 2, 2 and 0 and the ABANDON hook. It also shows two Spot groups and a tag-conditioned sweeper policy."
+  "build": "Add the fourth rule, for orphan disks. Give the simulation a list of volumes, each with an id, a status (\"in-use\" or \"available\") and tags, and make sweep() delete every available volume tagged managed (print \"delete-volume vol-1 orphaned disk\"). Add one available managed volume, one in-use managed volume and one available volume without the managed tag, and show that only the first one is deleted.",
+  "fix": "Now fix the real bug. The stopped-for-72-hours rule destroys the parked VM while its workflow still owns it, whenever the workflow's timer is a little late. Change only that rule so it also requires the lease to have passed, run python3 sweep.py with RETIRE_DELAY = 0.5, and check that the parked VM is retired by its workflow at hour 82.5 instead of by the sweeper.",
+  "checks": [
+   "The crashed run's VM is terminated about two hours after its last lease renewal, and the live run's VM is never touched.",
+   "The warm VM is recycled just after 24 hours.",
+   "Before your fix, the parked VM is terminated at 82.25 h and its retire step fails.",
+   "After your fix, the parked VM is retired by the workflow at 82.5 h, and the sweeper prints nothing for it.",
+   "Your volume rule deletes only the available disk that carries the managed tag."
+  ],
+  "solution": {
+   "lang": "python",
+   "file": "sweep.py (the fixed rule and the volume rule)",
+   "text": "        elif vm[\"state\"] == \"stopped\" and now - vm[\"stopped_at\"] > 72 * H and tags.get(\"lease-until\", 0) < now:\n            act(now, vm, \"terminate\", \"stopped for over 72 h\")\n\n# volumes, checked after the VMs in sweep():\nvolumes = [\n    {\"id\": \"vol-1\", \"status\": \"available\", \"tags\": {\"managed\": \"true\"}},\n    {\"id\": \"vol-2\", \"status\": \"in-use\", \"tags\": {\"managed\": \"true\"}},\n    {\"id\": \"vol-3\", \"status\": \"available\", \"tags\": {}},\n]\n\ndef sweep_volumes(now):\n    for vol in volumes:\n        if vol[\"status\"] == \"available\" and vol[\"tags\"].get(\"managed\") == \"true\":\n            vol[\"status\"] = \"deleted\"\n            print(f\"t={now:6.2f}h  delete-volume {vol['id']} orphaned disk\")"
+  },
+  "explain": [
+   "Which three owners can a sandbox VM have, and which tag tells the sweeper which one it is?",
+   "Why does the sweeper read leases instead of asking Temporal whether a run is alive?",
+   "Why must the stopped-too-long rule also check the lease, and what is the extra hour between 72 and 73 for?"
+  ],
+  "done": "Your sweeper removes the crashed run's VM, the old warm VM and the orphan disk, and leaves the parked VM to its workflow."
  },
- "quiz": [
+ "check": [
   {
-   "q": "A full VM finished run-42. Its group has reuse_on_scale_in = false. What happens to that VM?",
+   "q": "The orchestrator crashes and never resumes a run. What tells the sweeper that the run's VM is now nobody's?",
    "options": [
     {
-     "text": "It is stopped and returned to the warm pool for the next run.",
+     "text": "Temporal marks the run as failed and the sweeper reads that",
      "correct": false,
-     "why": "It was detached when it was claimed, and a used VM never goes back. It holds run-42's files."
+     "why": "The sweeper never talks to Temporal, so it works even when Temporal is down."
     },
     {
-     "text": "releaseSandbox terminates it; the group already refilled its pool when the VM was detached.",
+     "text": "The lease tag is no longer renewed, so its time passes",
      "correct": true,
-     "why": "One fresh VM per run. The pool refills from the image, never from used VMs."
+     "why": "A live run moves ai-agents:lease-until forward every five minutes. A lease in the past means the owner is gone."
     },
     {
-     "text": "The sweeper keeps it 24 hours in case run-42 is resumed.",
+     "text": "The VM's CPU goes idle",
      "correct": false,
-     "why": "A resume uses a fresh VM and the session store. Nothing waits for a finished run."
+     "why": "A VM waiting on a person is idle too, and is still owned. Only the lease says who owns it."
     }
    ]
   },
   {
-   "q": "Why do Nova and the bug fixers use on-demand groups instead of Spot?",
+   "q": "Nova parked a VM 72 hours and 10 minutes ago, and its lease runs until 73 hours after parking. The workflow's retire step has not run yet. With the corrected rules, what does the sweeper do?",
    "options": [
     {
-     "text": "Spot VMs cannot run Docker.",
+     "text": "Terminates it, because it has been stopped for over 72 hours",
      "correct": false,
-     "why": "They are ordinary EC2 VMs from the same launch template."
+     "why": "That was the bug: it destroys a VM whose owner is about to save it."
     },
     {
-     "text": "Spot is not allowed in the ai-agents account.",
+     "text": "Starts it and pushes a checkpoint itself",
      "correct": false,
-     "why": "Routines use Spot groups in the same account."
+     "why": "Saving work is the workflow's job. The sweeper only removes what nobody owns."
     },
     {
-     "text": "They wait on people, so a VM taken back by AWS costs a person's time, not only a retry.",
+     "text": "Nothing, because the lease is still in the future, so the workflow still owns it",
      "correct": true,
-     "why": "Spot fits work that can retry on its own. A run waiting for an answer is not that."
+     "why": "The lease is set one hour past the retire time exactly so the workflow can do its own cleanup first."
     }
    ]
   },
   {
-   "q": "The orchestrator was down for a day. A parked VM has been stopped for 80 hours. What does the sweeper do?",
+   "q": "Why does the sweeper recycle warm-pool VMs older than 24 hours?",
    "options": [
     {
-     "text": "Terminates it: stopped for over 72 h. Its work was saved at every checkpoint, and the next answer resumes on a fresh VM.",
+     "text": "So the pool refills from the newest image instead of keeping old ones for days",
      "correct": true,
-     "why": "The 72-hour rule is the backstop for retireSandbox, and it needs nothing from Temporal."
+     "why": "A new image is built every night. Recycling makes the pool follow it within a day."
     },
     {
-     "text": "Nothing, because its lease (now + 73 h when parked) has not expired.",
+     "text": "Because stopped VMs become more expensive after a day",
      "correct": false,
-     "why": "The rules are checked in order. The lease rule does not match, but the stopped-over-72-h rule does."
+     "why": "A stopped VM costs the same for its disk every day. The reason is the image, not the price."
     },
     {
-     "text": "Starts it and runs nova-worker checkpoint first.",
+     "text": "Because AWS deletes warm VMs after 24 hours anyway",
      "correct": false,
-     "why": "That is what retireSandbox does in the workflow. The sweeper only terminates and deletes."
+     "why": "AWS keeps them as long as the pool asks for them. The 24 hours are our rule."
     }
    ]
   }
  ],
- "recall": [
-  "From g3-6: which two permissions does the instance role ai-agent-sandbox have, and why so few?",
-  "From p3-7: what triggers a Lambda every 15 minutes?"
- ],
- "videos": [
-  {
-   "title": "AWS EC2 Auto Scaling - How it Works",
-   "url": "https://www.youtube.com/watch?v=rcWgcFMlwFw",
-   "channel": "Digital Cloud Training",
-   "minutes": 8,
-   "why": "Short, clear overview of Auto Scaling groups and scaling policies."
-  }
- ],
+ "platform": {
+  "p": [
+   "modules/aws-sandbox-pool has one Auto Scaling group per size (desired 0, min 0, max 3) with a Stopped warm pool from var.warm_pool_size (lite 2, full 2, wide 0) and reuse_on_scale_in = false, an initial lifecycle hook on launch (heartbeat 1800 s, default ABANDON) completed by the sandbox-warm unit after FCP Lab started once, and Spot groups for lite and full (0% on-demand, price-capacity-optimized, m8i/m7i/m6i overrides, no warm pool). Claimed VMs are detached and owned by Temporal; the account's On-Demand and Spot vCPU quotas are the final cap.",
+   "modules/aws-sandbox-sweeper is a copy of modules/aws-vm-autostop: EventBridge rate(15 minutes), a Python Lambda outside the VPC, IAM limited to ai-agents:managed=true and the sandbox groups, dry_run on at first, one JSON line per action and the CloudWatch metrics AIAgents/Sweeper (OrphansTerminated, VolumesDeleted). Its stopped-over-72-hours rule should also require an expired lease, so it never races the workflow's retireSandbox (lease now + 73 h)."
+  ],
+  "tickets": [
+   {
+    "key": "G3-15",
+    "why": "The warm pools per size, the setup-before-stop hook and the Spot groups."
+   },
+   {
+    "key": "G3-22",
+    "why": "The sweeper: its four rules, its tag-scoped role, dry run first and its metrics."
+   },
+   {
+    "key": "G3-20",
+    "why": "parkSandbox sets the 73-hour lease and retireSandbox checkpoints after 72 hours, the owner the sweeper must not race."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "Auto Scaling group",
-   "plain": "An AWS group that keeps a desired number of VMs from a launch template."
-  },
-  {
    "term": "warm pool",
-   "plain": "VMs a group has booted, set up and stopped, ready to start in about a minute."
+   "plain": "Stopped VMs that are already set up, waiting so a run gets one in about a minute."
   },
   {
-   "term": "lifecycle hook",
-   "plain": "A pause in a VM's launch until something completes it, or a timeout decides."
+   "term": "lease",
+   "plain": "A tag with a time a little in the future; the live run keeps moving it, so a lease in the past means the owner is gone."
   },
   {
-   "term": "detach",
-   "plain": "Take a VM out of its group, so the group no longer counts or replaces it."
+   "term": "sweeper",
+   "plain": "A Lambda that runs every 15 minutes and destroys sandbox VMs and disks that nobody owns."
   },
   {
    "term": "Spot",
-   "plain": "Spare EC2 capacity, about 56% cheaper, that AWS can take back with two minutes' warning."
+   "plain": "Spare AWS machines sold cheaply, which AWS can take back with two minutes' notice."
   },
   {
-   "term": "lease tag",
-   "plain": "ai-agents:lease-until on a claimed VM; a live run renews it, and the sweeper ends VMs whose lease passed."
+   "term": "owner",
+   "plain": "Whoever is responsible for a VM right now: its Auto Scaling group, a live run, or, when both are gone, the sweeper."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-15",
-   "why": "This lesson explained the warm-pool groups line by line, the setup hook, detaching on claim, and the Spot groups.",
-   "walk": [
-    "In modules/aws-sandbox-pool add asg.tf (code above): one group per size, desired 0, min 0, max 3, plus the tag blocks.",
-    "Set warm_pool from var.warm_pool_size (lite 2, full 2, wide 0) with pool_state Stopped and reuse_on_scale_in = false.",
-    "Add the initial_lifecycle_hook (EC2_INSTANCE_LAUNCHING, 1800 s, ABANDON). Add the sandbox-warm systemd unit to the image role: Warmed:Stopped warms FCP Lab first; InService completes at once.",
-    "Hand G3-18 the claim rule: raise desired by 1, wait for InService, DetachInstances with ShouldDecrementDesiredCapacity.",
-    "Add Spot groups for lite and full: 0% on-demand, price-capacity-optimized, overrides m8i, m7i and m6i of the same size, no warm pool.",
-    "Check the account's On-Demand and Spot vCPU quotas and request what we need."
-   ]
+   "q": "Write the sweeper's four rules from memory, each with the owner it replaces.",
+   "a": "Run-id with an expired lease: the run is gone. Stopped over 72 hours with an expired lease: retired work nobody came back for. Warm VM older than 24 hours: the pool, so it follows the newest image. Available managed disk: a machine that no longer exists."
   },
   {
-   "key": "G3-22",
-   "why": "This lesson explained the four sweeper rules and act() line by line, the tag-scoped IAM and the dry-run start.",
-   "walk": [
-    "Copy modules/aws-vm-autostop to modules/aws-sandbox-sweeper (EventBridge rate(15 minutes), Python Lambda built with uv), not attached to the VPC. Add the unit terraform/accounts/ai-agents/aws/us-east-1/sandboxes/sweeper/.",
-    "Write lambda/handler.py (code above) with managed_instances, managed_volumes, parse and stopped_since helpers.",
-    "IAM: ec2:TerminateInstances and ec2:DeleteVolume only with aws:ResourceTag/ai-agents:managed = true; autoscaling:TerminateInstanceInAutoScalingGroup on the sandbox ASGs only.",
-    "Start with DRY_RUN=true, read the JSON lines for a while, then switch it off in a PR a person approves.",
-    "Publish CloudWatch metrics AIAgents/Sweeper (OrphansTerminated, VolumesDeleted) and add the namespace to the CloudWatch exporter with DevOps.",
-    "Set the On-Demand and Spot vCPU quotas as the final cap; above it, runs wait in the Temporal slot queues (G3-25)."
-   ]
+   "q": "A teammate wants the sweeper to ask Temporal which runs are open instead of reading leases. What do you answer?",
+   "a": "The sweeper is the last line of cleanup and must work when Temporal or the orchestrator is down. Tags and leases need nothing but EC2, and a live run renews its lease every five minutes anyway."
   }
  ],
- "remember": "A VM is set up once, claimed by one run, then destroyed; the sweeper catches what that path missed."
+ "remember": "Every VM has one owner at a time, written in its tags: the pool, a live run with a fresh lease, or nobody, and only what nobody owns belongs to the sweeper."
 }
