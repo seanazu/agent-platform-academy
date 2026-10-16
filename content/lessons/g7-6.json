@@ -1,746 +1,335 @@
 {
+ "v": 2,
  "id": "g7-6",
  "title": "FCP Lab in CI",
  "minutes": 60,
  "youNeed": [
-  "p2-2",
-  "p5-1",
-  "g7-2"
+  "g7-3",
+  "p2-2"
  ],
- "bridge": "Running FCP Lab in CI is like giving every PR its own preview deployment, the way frontend-ci builds dashboard-$BRANCH. Except: the preview is the whole stack (cloud, a real Rhino client, the frontend) inside one runner pod. It is built from images made once per commit, and it is thrown away after the run.",
- "intro": "Today every cloud, client and frontend push waits 20 to 30 minutes for a shared QA lock. FCP Lab boots a private copy of the stack instead. This lesson walks through five tickets. We prove the Lab on Linux, give it its own nodes and build its images once. Then we run it on every PR and move the frontend gate onto it.",
- "picture": {
-  "caption": "Images built once per commit; a private Lab per run on its own node; the gate moves from QA to the Lab.",
-  "nodes": [
-   {
-    "id": "push",
-    "label": "A push or PR in fcp",
-    "kind": "file"
-   },
-   {
-    "id": "images",
-    "label": "_lab-images-reusable.yml",
-    "kind": "service"
-   },
-   {
-    "id": "ecr",
-    "label": "ECR fcp-lab-cloud / -client / -frontend",
-    "kind": "cloud"
-   },
-   {
-    "id": "runner",
-    "label": "lab-runner-set pod on an fcp-lab node",
-    "kind": "machine"
-   },
-   {
-    "id": "smoke",
-    "label": "_lab-smoke-reusable.yml: core, specs, contracts",
-    "kind": "check"
-   },
-   {
-    "id": "gate",
-    "label": "e2e_tests gate (alls-green)",
-    "kind": "check"
-   }
+ "map": "github",
+ "hook": {
+  "story": [
+   "Nova, our ticket-to-PR agent, pushes a fix to its pull request for RH-1234, the \"No projects yet\" card. The unit tests are green in four minutes. Then the integration tests start, and the job says \"Waiting for pending jobs\". Two other pull requests are ahead of it, each holding the shared QA environment for its own run. Twenty-five minutes later Nova's run gets its turn, and fails: the test expects an empty workgroup, but a project from an earlier run is still there.",
+   "With people alone this queue was already annoying. With agents that push after every fix, it grows every week, and every run in it can be broken by the run before it."
   ],
-  "steps": [
-   {
-    "from": "push",
-    "to": "images",
-    "text": "cloud-ci, client-ci and frontend-ci call it; one build per commit"
-   },
-   {
-    "from": "images",
-    "to": "ecr",
-    "text": "skip if the tag exists, else build and push <sha>-lab<version>"
-   },
-   {
-    "from": "runner",
-    "to": "ecr",
-    "text": "lab up pulls this commit's images instead of building"
-   },
-   {
-    "from": "runner",
-    "to": "smoke",
-    "text": "runs the core proof, a few pr/ specs and the fakes' contract suites"
-   },
-   {
-    "from": "smoke",
-    "to": "gate",
-    "text": "the result feeds the one required gate; lab compare runs only on failure"
-   }
-  ]
+  "question": "How can every pull request get a full copy of the product to test on, without waiting for anyone and without inheriting anyone else's data?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Gate D, part 1: measure a clean Linux host (G7-09)",
+   "h": "Why the shared environment needs a lock",
    "p": [
-    "FCP Lab has only passed on Macs. Its own docs/verification.md lists Gate D, a clean Linux host, as never run. CI runners, sandbox VMs and the nightly image are all Linux, so the rest of this lesson waits on Gate D.",
-    "First, with Nave (the Lab's owner), move the lab repo into the RhinoHealth org as a private repo. Then CI can check it out with a GitHub App token. Next, launch one throw-away m8i.2xlarge by hand in the inf account: Ubuntu 24.04, IMDSv2, encrypted gp3, an auto_stop_at tag. It gets no cloud credentials, kubeconfig or VPN; install Docker Engine and Compose v2.",
-    "The ticket's script wraps the Lab's own ci/rehearse.sh and records the numbers G7-16 needs to size the runners."
+    "fcp's integration tests run against QA, one real environment with one database. If two runs used it at the same time, each would change the other's data in the middle of a test. So the workflow takes a lock. In GitHub Actions the lock is a concurrency group: a name, and the rule that only one run with that name may run at a time while the others wait. The QA workflow's group is a fixed string, which means every pull request in the repo shares it.",
+    "The lock solves only half of the problem. It stops two runs from overlapping, but the second run still finds whatever the first one left behind. That is also why tests on QA came to depend on rows that someone created by hand years ago, as you saw in the lesson on builders. A shared environment remembers every run, and the lock turns it into a queue."
    ],
-   "because": "We sample docker stats while the Lab runs, because peak memory per service decides the node size.",
    "code": {
-    "lang": "bash",
-    "file": "fcp-local-lab/ci/gate-d.sh (part 1 of 2; lab repo, final name to confirm with Nave)",
-    "text": "#!/bin/bash\n# Gate D on a fresh Ubuntu 24.04 amd64 VM, plus the numbers G7-16 needs to size lab-runner-set.\n# Usage: ci/gate-d.sh /absolute/path/to/fcp   (no cloud credentials, kubeconfig or VPN on this machine)\nset -euo pipefail\nfcp=\"${1:?usage: ci/gate-d.sh /absolute/path/to/fcp}\"\nlab_root=\"$(cd -- \"$(dirname -- \"$0\")/..\" && pwd)\"\nout=\"gate-d-$(date -u +%Y%m%dT%H%M%SZ)\"\nmkdir -p \"$out\"\n\n{ uname -a; nproc; free -g; df -h /var/lib/docker; docker version --format '{{.Server.Version}}'; docker compose version; } > \"$out/host.txt\"\n\n# Sample per-container CPU and memory every 10 s while the Lab runs.\n( while sleep 10; do\n    docker stats --no-stream --format '{{.Name}},{{.CPUPerc}},{{.MemUsage}}' | sed \"s/^/$(date +%s),/\" >> \"$out/stats.csv\"\n  done ) &\nsampler=$!\ntrap 'kill \"$sampler\"' EXIT",
+    "lang": "yaml",
+    "file": ".github/workflows/_frontend-int-tests-reusable-aws.yml (fcp today)",
+    "text": "# .github/workflows/_frontend-int-tests-reusable-aws.yml, as it is today\nconcurrency:\n  group: frontend_integration_tests_aws\n  cancel-in-progress: false",
     "notes": [
      {
-      "line": 1,
-      "text": "Run with bash."
-     },
-     {
       "line": 3,
-      "text": "One argument: the absolute path to an fcp checkout. The machine holds no credentials."
+      "text": "A fixed name: every pull request's run lands in the same group, so they run one at a time."
      },
      {
       "line": 4,
-      "text": "Stop on any error, on an unset variable, and on a failure inside a pipe."
-     },
-     {
-      "line": 5,
-      "text": "The first argument, or exit with the usage message."
-     },
-     {
-      "line": 6,
-      "text": "The lab repo's root: the folder above ci/, as an absolute path."
-     },
-     {
-      "line": 7,
-      "text": "An output folder named with the UTC time, for example gate-d-20261014T091500Z."
-     },
-     {
-      "line": 10,
-      "text": "Record the host: kernel, CPUs, memory, Docker disk, Docker and Compose versions."
-     },
-     {
-      "line": 13,
-      "text": "In a background subshell, every 10 seconds ..."
-     },
-     {
-      "line": 14,
-      "text": "... append one CSV line per container: time, name, CPU and memory."
-     },
-     {
-      "line": 16,
-      "text": "$! is the process id of the background job."
-     },
-     {
-      "line": 17,
-      "text": "When the script exits, for any reason, stop the sampler."
+      "text": "false means a new run waits for the running one instead of stopping it."
      }
     ]
    }
   },
   {
-   "h": "Gate D, part 2: cold, warm, disk",
+   "h": "A private copy of the product for every run",
    "p": [
-    "The cold run builds every image; the warm run reuses them. Record cold and warm boot time, peak memory per service and docker system df. Note whether Orthanc, the DICOM image server (amd64 only), and the browser proof pass. The Lab's README says one source hash builds about 11 GB of images.",
-    "Turn each failure into a lab patch or an fcp fix with Nave. Rerun on a fresh VM until two runs in a row reach state: ready. Then repeat once inside an ARC dind pod (Docker in Docker, in a sidecar container) on inf-rhinohealth. The Lab's CI template warns against using ARC and dind untested. Terminate the VM at the end."
+    "The other way round is to give every run its own environment and throw it away afterwards. People call this an ephemeral environment: it lives exactly as long as one run. FCP Lab is that for fcp. It boots the full product, the cloud, a real on-prem client (the Rhino software that normally runs inside a customer's network), the frontend and their databases, on one machine from a source tree, with fake seed data, so the workgroup in the story really is empty when the test starts.",
+    "In CI, each run boots its own Lab, named after the run (ci- plus the run's ID), on a runner of its own, and nothing is shared with any other run. That is why the smoke workflow needs no lock. Its concurrency group has a different job: the name contains the branch, and cancel-in-progress is true, so when Nova pushes again, the older run of the same branch is stopped, because its result no longer matters. Two different pull requests never wait for each other."
    ],
-   "because": "We run the Lab cold, then warm, because CI mostly sees warm runs and the sandbox image sees cold ones.",
    "code": {
-    "lang": "bash",
-    "file": "fcp-local-lab/ci/gate-d.sh (part 2 of 2)",
-    "text": "for run in cold warm; do  # the warm run reuses the images the cold run built\n  start=$(date +%s)\n  \"$lab_root/ci/rehearse.sh\" \"$fcp\" > \"$out/$run.json\" || echo \"$run FAILED\" >> \"$out/timings.txt\"\n  echo \"$run $(( $(date +%s) - start ))s\" >> \"$out/timings.txt\"\ndone\n\ndocker system df -v > \"$out/disk.txt\"  # the lab README expects about 11 GB of images per source hash\ndu -sh \"${FCP_LAB_HOME:-$HOME/.fcp-lab}\" >> \"$out/disk.txt\"\necho \"Attach $out/ to the ticket. Keep the lab's reports/ on this VM; they hold the Lab's own evidence.\"",
+    "lang": "yaml",
+    "file": ".github/workflows/_lab-smoke-reusable.yml (shortened)",
+    "text": "jobs:\n  smoke:\n    name: FCP Lab smoke\n    runs-on: lab-runner-set\n    concurrency:\n      group: lab-smoke-${{ github.workflow }}-${{ github.ref }}\n      cancel-in-progress: true\n    env:\n      LAB_ID: ci-${{ github.run_id }}\n    steps:\n      - name: Boot the Lab from this commit's images\n        run: python3 .lab/lab up --source \"$GITHUB_WORKSPACE\" --id \"$LAB_ID\" --mode snapshot --images \"${{ inputs.image_tag }}\"\n      - name: Smoke suite\n        run: python3 .lab/lab test \"$LAB_ID\" --suite core --json > core.json\n      - name: Compare with main, only because something failed\n        if: failure()\n        run: python3 .lab/lab compare --source \"$GITHUB_WORKSPACE\" --id \"cmp-$GITHUB_RUN_ID\" --json > compare.json || true",
     "notes": [
      {
-      "line": 1,
-      "text": "Two runs; the comment says why the second one is faster."
-     },
-     {
-      "line": 2,
-      "text": "Seconds since 1970, to time the run."
-     },
-     {
-      "line": 3,
-      "text": "The Lab's own proof (lab ci --source <fcp> --json). Save its JSON; on failure, note it and continue."
-     },
-     {
       "line": 4,
-      "text": "Write the duration in seconds."
+      "text": "Runners that only run Labs. The deeper panel below says where they live."
+     },
+     {
+      "line": 6,
+      "text": "One group per workflow and branch, not one for the whole repo."
      },
      {
       "line": 7,
-      "text": "How much disk the images, containers and volumes take."
-     },
-     {
-      "line": 8,
-      "text": "The size of the Lab's home folder (FCP_LAB_HOME, default ~/.fcp-lab)."
+      "text": "A newer push on the same branch stops the older run. This is a way to save time, not a lock."
      },
      {
       "line": 9,
-      "text": "What to do with the results: attach the folder to the ticket, keep reports/ on the VM."
-     }
-    ]
-   }
-  },
-  {
-   "h": "A node pool and a runner set of its own (G7-16)",
-   "p": [
-    "A Lab idles at about 3 GB, grows during a job, and builds about 11 GB of images. On the shared spot nodes it would starve fcp-runner-set jobs and fill their disks. So it gets its own pool. Karpenter is the autoscaler on inf-rhinohealth: a NodePool tells it what kind of nodes to start. ARC (Actions Runner Controller) runs GitHub runners as pods; a scale set is one named group of them.",
-    "A taint on a node keeps pods away unless they carry a matching toleration. The new NodePool fcp-lab has 8 vCPU / 32 GiB nodes and the taint example.com/pool=fcp-lab:NoSchedule. It has a cpu limit of 48 (6 nodes) and a short consolidateAfter, the idle time before Karpenter removes a node. It lives in a new module modules/karpenter-node-pool and a unit multi_tenant/accounts/infrastructure/karpenter-fcp-lab/terragrunt.hcl. Decide spot or on-demand: spot is cheaper, but an interruption makes a smoke run look flaky."
-   ],
-   "because": "We request most of a node per runner pod, because the Lab runs in the pod's dind sidecar and needs the node.",
-   "code": {
-    "lang": "hcl",
-    "file": "multi_tenant/accounts/infrastructure/github-runner-scale-sets/terragrunt.hcl (new entry)",
-    "text": "    # New entry in inputs.scale_sets\n    \"fcp-lab\" = {\n      # One FCP Lab per runner pod. The Lab runs in the dind sidecar, so these requests mostly make Karpenter\n      # give each pod its own 8 vCPU / 32 GB node from the fcp-lab NodePool (modules/karpenter-node-pool).\n      github_config_url = \"https://github.com/RhinoHealth/fcp\"\n      release_name      = \"lab-runner-set\"\n      min_runners       = 0\n      max_runners       = 6 # QA has 6 locks today (3 components x 2 clouds); start at the same parallelism\n      runner_resources_requests = {\n        cpu                 = \"6\"\n        memory              = \"24Gi\"\n        \"ephemeral-storage\" = \"80Gi\" # the default EC2NodeClass root volume is 100 GB (eks unit: root_volume_size)\n      }\n      runner_node_selector = {\n        \"karpenter.sh/nodepool\" = \"fcp-lab\"\n      }\n      # New optional field in modules/github-runner-scale-sets/variables.tf, passed to template.spec.tolerations\n      runner_tolerations = [\n        { key = \"example.com/pool\", operator = \"Equal\", value = \"fcp-lab\", effect = \"NoSchedule\" }\n      ]\n    }",
-    "notes": [
-     {
-      "line": 1,
-      "text": "A new entry in the scale_sets map of the existing unit."
-     },
-     {
-      "line": 3,
-      "text": "The comment explains why the requests are large."
-     },
-     {
-      "line": 5,
-      "text": "Runners register for the fcp repo only."
-     },
-     {
-      "line": 6,
-      "text": "The name workflows use in runs-on: lab-runner-set."
-     },
-     {
-      "line": 7,
-      "text": "No idle runners; Karpenter starts nodes on demand."
-     },
-     {
-      "line": 8,
-      "text": "At most 6 at once, the same parallelism as today's 6 QA locks."
-     },
-     {
-      "line": 10,
-      "text": "6 CPUs and 24 GiB requested, so only one pod fits on an 8 vCPU / 32 GiB node."
+      "text": "The Lab is named after this run, so two runs can never meet."
      },
      {
       "line": 12,
-      "text": "80 GiB of disk for images; the default node volume is 100 GB."
+      "text": "Boot from images that were already built for this commit; the next section explains them."
      },
      {
-      "line": 15,
-      "text": "Schedule only on nodes from the fcp-lab pool."
-     },
-     {
-      "line": 18,
-      "text": "A new optional field in modules/github-runner-scale-sets, passed to template.spec.tolerations."
-     },
-     {
-      "line": 19,
-      "text": "Tolerate the pool's taint, so these pods, and only these, may run there."
+      "line": 16,
+      "text": "Comparing with main costs a second Lab, so it only runs when something failed."
      }
     ]
    },
-   "callout": {
-    "kind": "wall",
-    "text": "Plan locally as today and paste the plan in the PR; a person applies. Then check kubectl -n arc-runners get autoscalingrunnerset lab-runner-set, and add lab-runner-set to the labels in fcp's .github/actionlint.yaml."
-   }
-  },
-  {
-   "h": "Images once per commit, part 1: the token (G7-20)",
-   "p": [
-    "A cold Lab build takes 10 minutes or more. Building once per commit and pulling everywhere (PR smoke, compare, sandboxes) is what makes a 15-minute smoke run possible. Add fcp-lab-cloud, fcp-lab-client and fcp-lab-frontend to multi_tenant/accounts/infrastructure/artifacts/artifacts.hcl with tags_immutability_enabled = true.",
-    "The reusable workflow first needs the lab repo, which is private. It mints a short-lived token from a read-only GitHub App (lesson p2-4)."
-   ],
-   "because": "We put a concurrency group on the commit's sha, so three CI workflows on one commit share one build.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/_lab-images-reusable.yml (part 1 of 2)",
-    "text": "name: FCP Lab images (reusable)\non:\n  workflow_call:\n    outputs:\n      tag: { value: \"${{ jobs.images.outputs.tag }}\" }\n\njobs:\n  images:\n    runs-on: lab-runner-set\n    permissions: { id-token: write, contents: read }\n    concurrency: lab-images-${{ github.sha }}  # cloud-ci, client-ci and frontend-ci on one commit share one build\n    outputs:\n      tag: ${{ steps.build.outputs.tag }}\n    steps:\n      - uses: actions/checkout@v6\n      - uses: actions/create-github-app-token@v3\n        id: lab-token\n        with:  # decide which App; read-only, on the lab repo only\n          app-id: ${{ secrets.LAB_READER_APP_ID }}\n          private-key: ${{ secrets.LAB_READER_APP_PRIVATE_KEY }}\n          repositories: fcp-local-lab  # final repo name to confirm with Nave (moved into the org in G7-09)\n          permission-contents: read",
-    "notes": [
-     {
-      "line": 1,
-      "text": "A reusable workflow (lesson p2-2)."
-     },
-     {
-      "line": 3,
-      "text": "Other workflows call it like a shared component."
-     },
-     {
-      "line": 5,
-      "text": "It returns one output: the image tag, taken from the job's output."
-     },
-     {
-      "line": 9,
-      "text": "Builds run on the Lab's own nodes, which have the disk."
-     },
-     {
-      "line": 10,
-      "text": "Needed for OIDC to AWS (lesson p2-3); contents: read for checkout."
-     },
-     {
-      "line": 11,
-      "text": "One group per commit; a second caller waits and then finds the tag."
-     },
-     {
-      "line": 13,
-      "text": "The job's output comes from the build step."
-     },
-     {
-      "line": 15,
-      "text": "Check out fcp."
-     },
-     {
-      "line": 16,
-      "text": "Mint a token from the read-only App."
-     },
-     {
-      "line": 18,
-      "text": "Open decision: which App, read-only, on the lab repo only."
-     },
-     {
-      "line": 21,
-      "text": "The token works only on the lab repo, whose final name Nave confirms."
-     },
-     {
-      "line": 22,
-      "text": "Read only."
-     }
+   "deeper": {
+    "h": "Go deeper: where the Lab runs",
+    "p": [
+     "A Lab is big for a CI job: it idles at about 3 GB of memory, grows during a test run, and its images take about 11 GB of disk. On the shared runners it would take memory and disk from every other job. So Labs get their own machines. Our runners live in the internal Kubernetes cluster, where a tool called Karpenter adds and removes machines (nodes) as pods need them. A NodePool tells Karpenter which kind of node to start, here 8 vCPU and 32 GB, at most six at a time.",
+     "A taint on those nodes keeps every other pod away: Kubernetes only places a pod there if it carries the matching toleration, and only the Lab runners do. Each runner asks for most of a node, so every Lab gets a machine to itself, and the Lab's containers run inside the runner pod through Docker-in-Docker: a second Docker engine that runs in its own container next to the runner, in the same pod. Before any of this, the Lab had to prove it runs on a clean Linux machine at all, because until then it had only been tested on Macs."
     ]
    }
   },
   {
-   "h": "Images once per commit, part 2: skip or build",
+   "h": "Build once per commit, boot many times",
    "p": [
-    "The tag is <git sha>-lab<lab version>, because the images carry the Lab's own patches. modules/aws-ecr keeps only the last N images per repo; check that N covers a week of commits. When G3 creates the ai-agents account, add its root to allowed_principals in artifacts/aws-ecr/terragrunt.hcl, so sandboxes can pull."
+    "A Lab built from source takes ten minutes or more before the first test, which would eat most of a 15-minute budget. But the cloud, client and frontend workflows all run for the same commit, and later the comparison and the agents' VMs want the same Lab too. So the images are built once per commit, pushed to our container registry, and every later caller pulls them.",
+    "The trick is the tag, the name of one image version. Each image is tagged with the commit and the Lab's own version, because the Lab adds its own patches. Before building, the job asks the registry whether that tag exists, and if it does, it skips the build. One race is left: two workflows of the same commit can start at the same second, both find no tag and both build. A concurrency group named after the commit makes the second one wait, and when it runs, the tag is there. The registry also refuses to overwrite a tag, so an image can never change under a name that a test already used."
    ],
-   "because": "We check ECR for the tag before building, because the second and third callers on a commit must not build again.",
    "code": {
     "lang": "yaml",
-    "file": ".github/workflows/_lab-images-reusable.yml (part 2 of 2)",
-    "text": "      - uses: actions/checkout@v6\n        with: { repository: RhinoHealth/fcp-local-lab, path: .lab, token: \"${{ steps.lab-token.outputs.token }}\" }\n      - uses: aws-actions/configure-aws-credentials@v6\n        with: { aws-region: us-east-1, role-to-assume: \"arn:aws:iam::123456789012:role/GitHubActions\" }\n      - uses: aws-actions/amazon-ecr-login@v2\n      - name: Build and push once per commit\n        id: build\n        run: |\n          tag=\"${GITHUB_SHA}-lab$(python3 .lab/lab --version)\"\n          echo \"tag=$tag\" >> \"$GITHUB_OUTPUT\"\n          aws ecr describe-images --repository-name fcp-lab-cloud --image-ids imageTag=\"$tag\" >/dev/null 2>&1 && exit 0\n          # Placeholder CLI: the lab only builds locally today; agree the command with Nave.\n          python3 .lab/lab build --source \"$GITHUB_WORKSPACE\" --push \"123456789012.dkr.ecr.us-east-1.amazonaws.com/fcp-lab-{component}:$tag\"",
+    "file": ".github/workflows/_lab-images-reusable.yml (the build step)",
+    "text": "    concurrency: lab-images-${{ github.sha }}  # callers on one commit wait for each other\n    steps:\n      - name: Build and push once per commit\n        run: |\n          tag=\"${GITHUB_SHA}-lab$(python3 .lab/lab --version)\"\n          echo \"tag=$tag\" >> \"$GITHUB_OUTPUT\"\n          aws ecr describe-images --repository-name fcp-lab-cloud --image-ids imageTag=\"$tag\" >/dev/null 2>&1 && exit 0\n          python3 .lab/lab build --source \"$GITHUB_WORKSPACE\" --push \"$REGISTRY/fcp-lab-{component}:$tag\"",
     "notes": [
      {
-      "line": 2,
-      "text": "Check out the lab repo into .lab with the App token."
-     },
-     {
-      "line": 3,
-      "text": "OIDC to the GitHubActions role in the inf account (123456789012)."
+      "line": 1,
+      "text": "No cancel-in-progress here: the second caller waits, then finds the tag."
      },
      {
       "line": 5,
-      "text": "Log Docker in to ECR."
+      "text": "The commit plus the Lab's version: one tag per source tree the Lab can boot."
      },
      {
       "line": 7,
-      "text": "The step id the job output reads."
-     },
-     {
-      "line": 9,
-      "text": "The tag: commit sha plus the Lab's version."
-     },
-     {
-      "line": 10,
-      "text": "Publish the tag as a step output."
-     },
-     {
-      "line": 11,
-      "text": "If fcp-lab-cloud already has this tag, exit 0: nothing to build."
-     },
-     {
-      "line": 12,
-      "text": "The Lab only builds locally today. Agree the build-and-push command with Nave."
-     },
-     {
-      "line": 13,
-      "text": "Build this checkout's images and push them, one repo per component."
+      "text": "The tag is already in the registry, so this caller is done."
      }
     ]
    }
   },
   {
-   "h": "The smoke run, part 1: inputs and the lock (G7-26)",
+   "h": "When the smoke goes red",
    "p": [
-    "This reusable workflow boots the Lab from this commit's images and runs a smoke suite. It aims at under 15 minutes. Define the suite with the BE and FE guilds: lab test <id> --suite core, plus 4 to 6 fast specs from frontend/e2e/pr/. Pick them by last week's run times. The full allowlist stays nightly.",
-    "The Lab uses its own fake seed data. No QA fixtures and no cloud credentials go into the environment."
-   ],
-   "because": "We cancel an older run of the same branch, because only the newest push matters and this is not a shared lock.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/_lab-smoke-reusable.yml (part 1 of 2)",
-    "text": "name: FCP Lab smoke (reusable)\non:\n  workflow_call:\n    inputs:\n      image_tag: { required: true, type: string }\n      suite: { required: false, type: string, default: smoke }  # G7-33 passes frontend-e2e\n\njobs:\n  smoke:\n    name: FCP Lab smoke\n    runs-on: lab-runner-set\n    permissions: { id-token: write, contents: read }\n    concurrency:\n      group: lab-smoke-${{ github.workflow }}-${{ github.ref }}  # a newer push cancels the older run; not a shared lock\n      cancel-in-progress: true\n    env:\n      LAB_ID: ci-${{ github.run_id }}\n    steps:",
-    "notes": [
-     {
-      "line": 1,
-      "text": "A second reusable workflow."
-     },
-     {
-      "line": 5,
-      "text": "The tag from _lab-images-reusable.yml."
-     },
-     {
-      "line": 6,
-      "text": "smoke by default; G7-33 passes frontend-e2e."
-     },
-     {
-      "line": 10,
-      "text": "The check name a ruleset can require (G7-31)."
-     },
-     {
-      "line": 11,
-      "text": "One Lab per pod, on its own node."
-     },
-     {
-      "line": 14,
-      "text": "One group per workflow and branch."
-     },
-     {
-      "line": 15,
-      "text": "A newer push cancels the older run."
-     },
-     {
-      "line": 17,
-      "text": "A unique Lab id per run, used by every lab command below."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The smoke run, part 2: boot, test, compare",
-   "p": [
-    "The steps check out fcp with full history, then the lab repo, OIDC and ECR login as in the images workflow. lab up boots from the images. The suite runs the core proof and the agreed specs. It also runs the fakes' contract suites against the real client, MinIO and Celery, inside the Lab's web-service. Check with Nave how tests_api gets into the Lab's web-service.",
-    "lab compare boots main next to this commit and says whether main fails the same way. It runs only when something failed. The job summary lists regressed, suspect, and already failing on main."
-   ],
-   "because": "We run lab compare only on failure, because comparing doubles the cost and a green run needs no comparison.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/_lab-smoke-reusable.yml (part 2 of 2)",
-    "text": "      - uses: actions/checkout@v6\n        with: { fetch-depth: 0 }  # compare needs the merge base with origin/main\n      # ...lab checkout, AWS OIDC and ECR login as in _lab-images-reusable.yml\n      - name: Boot the Lab from this commit's images\n        run: python3 .lab/lab up --source \"$GITHUB_WORKSPACE\" --id \"$LAB_ID\" --mode snapshot --images \"${{ inputs.image_tag }}\"  # --images: see G7-20\n      - name: Smoke suite  # inputs.suite == 'frontend-e2e' runs the lab's whole allowlist instead (G7-33)\n        run: |\n          python3 .lab/lab test \"$LAB_ID\" --suite core --json > core.json\n          python3 .lab/lab test \"$LAB_ID\" --suite frontend-e2e --spec not-found-page.spec.ts --json > e2e.json  # + the agreed specs\n          python3 .lab/lab exec \"$LAB_ID\" web-service -- pytest tests_api -m contract --target lab  # path: check with Nave\n      - name: Compare with main, only because something failed\n        if: failure()\n        run: python3 .lab/lab compare --source \"$GITHUB_WORKSPACE\" --id \"cmp-$GITHUB_RUN_ID\" --json > compare.json || true\n      - uses: actions/upload-artifact@v7\n        if: always()\n        with: { name: lab-smoke-reports, path: \"*.json\" }  # plus the lab's reports/ directory for traces",
-    "notes": [
-     {
-      "line": 2,
-      "text": "compare needs the merge base with origin/main."
-     },
-     {
-      "line": 3,
-      "text": "The same three steps as in the images workflow, left out of the sketch."
-     },
-     {
-      "line": 5,
-      "text": "Boot a Lab with this id, in snapshot mode, from the given images (the --images flag comes with G7-20)."
-     },
-     {
-      "line": 6,
-      "text": "The comment says G7-33's suite input switches to the whole allowlist."
-     },
-     {
-      "line": 8,
-      "text": "The Lab's core proof, as JSON."
-     },
-     {
-      "line": 9,
-      "text": "One of the agreed pr/ specs; add the others the guilds pick."
-     },
-     {
-      "line": 10,
-      "text": "Run the contract suites inside the Lab's web-service with --target lab (lesson g7-2)."
-     },
-     {
-      "line": 12,
-      "text": "Only when a step above failed."
-     },
-     {
-      "line": 13,
-      "text": "Boot main for comparison; || true so the report is kept even if compare fails."
-     },
-     {
-      "line": 15,
-      "text": "Upload the reports, pass or fail."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Move the frontend gate, part 1 (G7-33)",
-   "p": [
-    "frontend-ci is the only fcp CI that runs on pull_request, and every FE PR queues for qa-front-end today, under the lock frontend_integration_tests_{aws,gcp}. G7-33 moves pull requests to the Lab and keeps QA for main, the nightly and releases. It depends on G7-31 (lesson g7-7), which does the same for cloud and client pushes.",
-    "Call the smoke workflow with suite frontend-e2e: the Lab's allowlist of 24 pr/ and nightly/ spec files. List the specs the Lab cannot run, such as GCP VMs or a real AWS bucket; the Lab's AGENTS.md names them. Keep only those on the QA nightly."
-   ],
-   "because": "We add a pull_request condition to the QA jobs, so QA keeps running after merge while PRs stop queuing.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/frontend-ci.yaml (part 1 of 2)",
-    "text": "  e2e-lab:\n    name: E2E on FCP Lab\n    needs: [check-changes, lab-images]\n    if: github.event_name == 'pull_request' && needs.check-changes.outputs.has_changes == 'true'\n    uses: ./.github/workflows/_lab-smoke-reusable.yml\n    with:\n      image_tag: ${{ needs.lab-images.outputs.tag }}\n      suite: frontend-e2e  # the lab's allowlist instead of the short smoke list\n    secrets: inherit\n\n  integration-tests-aws:\n    name: \"I&T - AWS\"\n    uses: ./.github/workflows/_frontend-int-tests-reusable-aws.yml\n    needs: [check-changes, build-e2e-app]\n    # qa-front-end (lock frontend_integration_tests_aws) after merge, nightly and releases only\n    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || needs.check-changes.outputs.has_changes == 'true')\n    # with: ...unchanged",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The new job."
-     },
-     {
-      "line": 3,
-      "text": "Needs the change detector and a lab-images job; frontend-ci gets one like cloud-ci's (G7-31)."
-     },
-     {
-      "line": 4,
-      "text": "Only on PRs with frontend changes."
-     },
-     {
-      "line": 5,
-      "text": "Call the smoke workflow from this repo."
-     },
-     {
-      "line": 8,
-      "text": "The allowlist instead of the short smoke list."
-     },
-     {
-      "line": 9,
-      "text": "Pass the repo's secrets (the App key) to the called workflow."
-     },
-     {
-      "line": 11,
-      "text": "The existing QA job ..."
-     },
-     {
-      "line": 15,
-      "text": "... which now runs after merge, nightly and for releases only."
-     },
-     {
-      "line": 16,
-      "text": "Never on PRs. integration-tests-gcp gets the same condition."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "e2e-lab needs a lab-images job in frontend-ci, but no ticket adds one. Add it in this PR, the same way cloud-ci calls _lab-images-reusable.yml. Without it, needs: lab-images fails and the workflow does not even start."
-   }
-  },
-  {
-   "h": "Move the frontend gate, part 2: one gate",
-   "p": [
-    "The required gate e2e_tests lives inside _frontend-int-tests-reusable-aws.yml and -gcp.yml today, as a re-actors/alls-green job. It moves into frontend-ci.yaml, so one gate covers the Lab on PRs and QA on main. Check whether build-e2e-app is still needed on PRs. merge-frontend-coverage reads e2e coverage from QA runs. Point it at the Lab job's artifact, or accept no e2e coverage on PRs; decide with the FE guild.",
-    "Test this on a draft PR. Do not dispatch frontend-ci on a branch: that deploys over main's dev dashboard and Storybook. Ask G0 to make e2e_tests required in the main ruleset."
-   ],
-   "because": "We let alls-green allow skips, because PRs skip the QA jobs and main skips the Lab job.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/frontend-ci.yaml (part 2 of 2)",
-    "text": "  e2e_tests:  # moved here from the reusable workflows: one gate for the Lab on PRs and for QA on main\n    if: always()\n    needs: [e2e-lab, integration-tests-aws, integration-tests-gcp]\n    runs-on: fcp-runner-set\n    steps:\n      - uses: re-actors/alls-green@release/v1\n        with:\n          allowed-skips: e2e-lab, integration-tests-aws, integration-tests-gcp\n          jobs: ${{ toJSON(needs) }}",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The gate job, moved here from the reusable workflows."
-     },
-     {
-      "line": 2,
-      "text": "Run even when a needed job failed or was skipped, so the gate can report it."
-     },
-     {
-      "line": 3,
-      "text": "Wait for the Lab job and both QA jobs."
-     },
-     {
-      "line": 4,
-      "text": "A cheap runner; the job only reads results."
-     },
-     {
-      "line": 6,
-      "text": "An action that fails if any needed job failed."
-     },
-     {
-      "line": 8,
-      "text": "Skipped jobs are fine; only failures count."
-     },
-     {
-      "line": 9,
-      "text": "Hand it every needed job's result."
-     }
-    ]
-   }
+    "A red smoke run raises one question before any other: did this pull request break it, or is main already broken? On QA people answered it by asking around. The smoke workflow answers it itself: only when something failed, it boots a second Lab from main's merge base, runs the same checks, and compares. The job summary then sorts every failure into regressed (red here, green on main), already failing on main, or suspect, where the comparison cannot say for sure and a person should look.",
+    "The smoke suite itself is short on purpose, so a run stays under about 15 minutes: the Lab's core proof, four to six fast frontend Playwright specs from e2e/pr/ picked by run time, and the contract suites that check the test fakes against the real client, object store and task queue. The long list of specs stays in the nightly run."
+   ]
   }
  ],
  "lab": {
-  "title": "Read today's QA gate and size the Lab on your Mac",
-  "youNeed": [
-   "Your fcp checkout (~/Projects/fcp)",
-   "Docker Desktop (for the optional last step)"
+  "id": "g7-6",
+  "title": "A private stack per run, from an image built once",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "Docker running",
+   "git",
+   "About 60 MB for the node:24-alpine image"
   ],
-  "worked": [
+  "goal": "See two test runs break each other on one shared stack, then give every run a private copy named after the run, booted from an image that is built only once per commit.",
+  "guess": {
+   "q": "Run A and then run B use the same running stack. Each run checks that the workgroup is empty, adds one project and checks that there is exactly one. A finishes before B starts. What happens to B?",
+   "options": [
+    {
+     "text": "B passes, because the runs did not overlap.",
+     "correct": false,
+     "why": "A lock that stops overlap is not enough: A's project is still in the stack when B starts."
+    },
+    {
+     "text": "B fails at the first check, because the workgroup is no longer empty.",
+     "correct": true,
+     "why": "A shared environment remembers every run. B inherits A's project."
+    },
+    {
+     "text": "B waits until A's stack is reset.",
+     "correct": false,
+     "why": "Nothing resets a shared stack between runs unless someone builds that. It just keeps its data."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "cd ~/Projects/fcp && grep -n \"_frontend-int-tests-reusable\" .github/workflows/frontend-ci.yaml",
-    "see": "293:    uses: ./.github/workflows/_frontend-int-tests-reusable-aws.yml\n307:    uses: ./.github/workflows/_frontend-int-tests-reusable-gcp.yml"
+    "say": "Write a tiny stand-in for the product: an API that keeps projects in memory, a smoke test, an image for both, and a compose file. The smoke service is only started when you ask for it.",
+    "do": "mkdir -p ~/academy-labs/g7-6 && cd ~/academy-labs/g7-6 && git init -q -b main\ncat > server.mjs <<'EOF'\nimport { createServer } from \"node:http\";\n\nconst projects = []; // the seed data: the workgroup \"Lab A\" exists and has no projects yet\n\ncreateServer(async (req, res) => {\n  if (req.method === \"POST\" && req.url === \"/projects\") {\n    let body = \"\";\n    for await (const chunk of req) body += chunk;\n    projects.push(JSON.parse(body));\n    res.writeHead(201).end();\n    return;\n  }\n  res.writeHead(200, { \"content-type\": \"application/json\" }).end(JSON.stringify(projects));\n}).listen(8080);\nEOF\ncat > smoke.mjs <<'EOF'\n// The smoke test: a fresh workgroup shows the empty card, and one new project makes a list of one.\nconst api = \"http://api:8080/projects\";\nconst list = async () => (await fetch(api)).json();\nconst fail = (message) => {\n  console.log(`FAIL  run ${process.env.RUN}: ${message}`);\n  process.exit(1);\n};\n\nif ((await list()).length !== 0) fail(\"the workgroup is not empty, so the No projects yet card cannot show\");\nawait fetch(api, { method: \"POST\", body: JSON.stringify({ name: `Lung CT ${process.env.RUN}` }) });\nawait new Promise((resolve) => setTimeout(resolve, 2000)); // a real smoke suite takes minutes, not milliseconds\nconst after = await list();\nif (after.length !== 1) fail(`expected 1 project, found ${after.length}: ${after.map((p) => p.name).join(\", \")}`);\nconsole.log(`pass  run ${process.env.RUN}: empty card, then one project`);\nEOF\ncat > Dockerfile <<'EOF'\nFROM node:24-alpine\nWORKDIR /app\nCOPY server.mjs smoke.mjs ./\nCMD [\"node\", \"server.mjs\"]\nEOF\ncat > compose.yaml <<'EOF'\nservices:\n  api:\n    image: lab-api:${TAG:?set TAG to the commit}\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"-qO-\", \"http://localhost:8080/projects\"]\n      interval: 1s\n      retries: 20\n  smoke:\n    image: lab-api:${TAG:?set TAG to the commit}\n    command: [\"node\", \"smoke.mjs\"]\n    depends_on:\n      api: { condition: service_healthy }\n    profiles: [test]\nEOF\ngit add -A && git commit -qm \"lab stack\" && git log --oneline",
+    "see": "bb75c93 lab stack\n(your commit id differs)"
    },
    {
-    "do": "grep -n \"group:\" .github/workflows/_frontend-int-tests-reusable-aws.yml | head -1",
-    "see": "39:  group: frontend_integration_tests_aws\n(the shared lock every FE PR waits for today)"
+    "say": "Build the image for this commit with a script that skips the build when the tag already exists. Run it twice.",
+    "do": "cat > images.sh <<'EOF'\n#!/bin/bash\n# Build the image for this commit once. Every later caller finds the tag and skips the build.\nset -euo pipefail\ntag=$(git rev-parse --short HEAD)\nif docker image inspect \"lab-api:$tag\" >/dev/null 2>&1; then\n  echo \"lab-api:$tag already exists, skipping the build\"\nelse\n  docker build -q -t \"lab-api:$tag\" . >/dev/null && echo \"built lab-api:$tag\"\nfi\nEOF\nchmod +x images.sh && ./images.sh && ./images.sh",
+    "see": "built lab-api:bb75c93\nlab-api:bb75c93 already exists, skipping the build"
    },
    {
-    "do": "grep -n \"e2e_tests:\\|alls-green\" .github/workflows/_frontend-int-tests-reusable-aws.yml",
-    "see": "714:  e2e_tests: # This job does nothing and is only used for the branch protection\n721:        uses: re-actors/alls-green@release/v1"
+    "say": "Start one stack that every run shares, the way QA works, and run two smoke tests one after the other. --wait returns when the API's healthcheck passes.",
+    "do": "export TAG=$(git rev-parse --short HEAD)\ndocker compose -p qa up -d --wait 2>/dev/null\ndocker compose -p qa run --rm -e RUN=A smoke 2>/dev/null; docker compose -p qa run --rm -e RUN=B smoke 2>/dev/null",
+    "see": "pass  run A: empty card, then one project\nFAIL  run B: the workgroup is not empty, so the No projects yet card cannot show"
    },
    {
-    "do": "sed -n '/labels:/,$p' .github/actionlint.yaml",
-    "see": "  labels:\n    - fcp-runner-set\n    - ubuntu-22.04-2core\n    - ubuntu-22.04-8core\n    - ubuntu-22.04-16core\n(no lab-runner-set yet; G7-16 adds it)"
+    "say": "Remove the shared stack. Then give each run a private stack named after it with -p, and run both at the same time.",
+    "do": "docker compose -p qa down 2>/dev/null\n(docker compose -p ci-101 run --rm -e RUN=101 smoke 2>/dev/null & docker compose -p ci-102 run --rm -e RUN=102 smoke 2>/dev/null & wait)\ndocker ps --filter name=ci- --format '{{.Names}}  {{.Status}}'",
+    "see": "pass  run 102: empty card, then one project\npass  run 101: empty card, then one project\nci-101-api-1  Up 3 seconds (healthy)\nci-102-api-1  Up 3 seconds (healthy)"
    },
    {
-    "do": "grep -c \"^\" .github/workflows/frontend-ci.yaml && grep -n \"pull_request\" .github/workflows/frontend-ci.yaml | head -3",
-    "see": "The file's line count, then the pull_request trigger near the top: frontend-ci is the only fcp CI that runs on PRs."
+    "say": "A private stack is thrown away after its run, with everything in it.",
+    "do": "docker compose -p ci-101 down && docker compose -p ci-102 down 2>/dev/null",
+    "see": " Container ci-101-api-1  Stopping\n …\n Container ci-101-api-1  Removed\n Network ci-101_default  Removed"
    },
    {
-    "do": "Optional, in Claude Code inside fcp: run /fcp-lab:lab-doctor",
-    "see": "A short report on Docker, memory, architecture and what already holds room on your Mac (output differs per machine)."
+    "say": "Change the product and commit. The tag follows the commit, so the next build makes a new image and keeps the old one.",
+    "do": "sed -i.bak 's/no projects yet$/no projects yet (seed v2)/' server.mjs && rm server.mjs.bak && git commit -qam \"seed v2\" && ./images.sh && docker images lab-api --format '{{.Repository}}:{{.Tag}}'",
+    "see": "built lab-api:0f2c200\nlab-api:0f2c200\nlab-api:bb75c93"
    }
   ],
-  "faded": "Find where frontend-ci.yaml's e2e job needs build-e2e-app, and decide whether e2e-lab still needs it. The grep is left to you; write your answer in one sentence with the reason.",
-  "alone": "Use the numbers in G7-16: 8 vCPU / 32 GiB nodes, requests of 6 CPU and 24Gi, a cpu limit of 48. Work out how many Labs run at once and what happens to the seventh push. Then say which G7-09 measurement would make you change the requests.",
-  "done": "You can name today's lock, where the gate lives, the missing runner label, and how many Labs run at once."
+  "build": "Write ci-run.sh, the shape of one CI run: it takes a run ID, calls ./images.sh (so only the first caller of a commit builds), boots a private stack named ci-<run id>, runs the smoke test, and always removes the stack at the end, also when the test fails (a trap on EXIT). Its exit code must be the smoke test's. Then start three runs at once with (./ci-run.sh 301 & ./ci-run.sh 302 & ./ci-run.sh 303 & wait) and check that all three pass, that the image was not built again, and that docker ps -a --filter name=ci- shows nothing afterwards.",
+  "checks": [
+   "On the shared stack, the second smoke run fails because it finds the first run's project.",
+   "Two private stacks (-p ci-101 and -p ci-102) run at the same time and both pass.",
+   "./images.sh builds once per commit and prints \"already exists, skipping the build\" on the second call.",
+   "After a new commit, docker images lab-api lists two tags, one per commit.",
+   "Three ci-run.sh runs in parallel all pass, and docker ps -a --filter name=ci- is empty afterwards."
+  ],
+  "solution": {
+   "lang": "bash",
+   "file": "ci-run.sh",
+   "text": "#!/bin/bash\n# One CI run: the commit's image (built once), a private stack named after the run, the smoke test, and cleanup.\nset -uo pipefail\nrun_id=\"${1:?usage: ./ci-run.sh <run id>}\"\n./images.sh\nexport TAG=$(git rev-parse --short HEAD)\ntrap 'docker compose -p \"ci-$run_id\" down >/dev/null 2>&1' EXIT\ndocker compose -p \"ci-$run_id\" run --rm -e RUN=\"$run_id\" smoke 2>/dev/null"
+  },
+  "fix": "Someone wanted a short name in docker ps and added container_name: lab-api under the api service in compose.yaml. Add that line and start two private runs at the same time. One passes, the other fails with Conflict. The container name \"/lab-api\" is already in use. A fixed name is shared state again, just like the fixed QA lock: remove it so compose names each container after its project (ci-201-api-1, ci-202-api-1), and check that both runs pass.",
+  "explain": [
+   "Why does the shared stack need a lock, and why does the lock still not make run B pass?",
+   "What is the difference between the QA workflow's concurrency group and the smoke workflow's, and why does only one of them cancel runs?",
+   "Two workflows of the same commit call ./images.sh at the same second. What can go wrong, and what does the concurrency group named after the commit change?"
+  ],
+  "done": "Parallel runs on private stacks all pass, the image is built once per commit, and docker ps -a --filter name=ci- is empty when you finish."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Why does _lab-images-reusable.yml use a concurrency group on github.sha?",
+   "q": "The QA workflow's concurrency group is the fixed name frontend_integration_tests_aws. What does that mean for two pull requests that push at the same time?",
    "options": [
     {
-     "text": "To cancel older builds of the same branch.",
+     "text": "They run at the same time, each on its own copy of QA.",
      "correct": false,
-     "why": "There is no cancel-in-progress; the group makes callers wait, not cancel."
+     "why": "There is only one QA. The group exists exactly because the runs cannot share it at the same time."
     },
     {
-     "text": "So cloud-ci, client-ci and frontend-ci on one commit share one build.",
+     "text": "The second one waits until the first one is finished with QA.",
      "correct": true,
-     "why": "The second caller waits, then finds the tag in ECR and skips."
+     "why": "A fixed group name is shared by every run in the repo, so they queue, one at a time."
     },
     {
-     "text": "Because ECR allows one push per commit.",
+     "text": "The second one stops the first one.",
      "correct": false,
-     "why": "ECR has no such rule; tag immutability only stops overwriting a tag."
+     "why": "That would need cancel-in-progress: true. The QA group sets false, so the newer run waits."
     }
    ]
   },
   {
-   "q": "The smoke run fails. What does the workflow do next?",
+   "q": "The smoke workflow's group is lab-smoke-<workflow>-<branch> with cancel-in-progress: true. Nova pushes twice in a minute. What happens?",
    "options": [
     {
-     "text": "It retries the smoke suite twice before failing.",
-     "correct": false,
-     "why": "Nothing retries; a retry would hide flakiness."
-    },
-    {
-     "text": "It cancels itself and waits for QA.",
-     "correct": false,
-     "why": "QA no longer runs on PRs once G7-33 and G7-31 land."
-    },
-    {
-     "text": "It runs lab compare against main and uploads the reports.",
+     "text": "The older run of that branch is stopped, and only the newest push is tested.",
      "correct": true,
-     "why": "Compare runs only on failure and says whether main fails the same way."
+     "why": "The older result no longer matters. Other branches have other group names, so they are not touched."
+    },
+    {
+     "text": "Both runs share one Lab to save money.",
+     "correct": false,
+     "why": "Every run boots its own Lab named after the run. Sharing would bring back the leftover data problem."
+    },
+    {
+     "text": "Every other pull request's smoke run is stopped too.",
+     "correct": false,
+     "why": "The branch is part of the name, so only runs of the same branch share the group."
     }
    ]
   },
   {
-   "q": "Why does lab-runner-set request 6 CPU and 24Gi per pod?",
+   "q": "Why are the Lab's images tagged with the commit, and why must the registry refuse to overwrite a tag?",
    "options": [
     {
-     "text": "So Karpenter gives each pod its own 8 vCPU / 32 GiB node from the fcp-lab pool.",
+     "text": "So the newest build always wins under the same name.",
+     "correct": false,
+     "why": "That is the danger, not the goal: a test could then run on code that changed under its feet."
+    },
+    {
+     "text": "Because the registry only accepts commit IDs as tags.",
+     "correct": false,
+     "why": "Any tag works. The commit is our choice, for what it means."
+    },
+    {
+     "text": "So every caller of one commit finds the same image and skips the build, and that image can never change afterwards.",
      "correct": true,
-     "why": "The Lab runs inside the pod's dind sidecar and needs the node to itself."
-    },
-    {
-     "text": "Because GitHub runners need that much to start.",
-     "correct": false,
-     "why": "A runner itself is small; the Lab inside it is not."
-    },
-    {
-     "text": "To stop other repos from using the runners.",
-     "correct": false,
-     "why": "github_config_url does that; the requests are about node size."
+     "why": "One tag means one source tree. Building once and refusing overwrites makes every run of that commit test exactly the same thing."
     }
    ]
   }
  ],
- "recall": [
-  "From g7-2: what does the --target lab option change in the on-prem contract suite?",
-  "From p2-2: why does a caller pin a reusable workflow, and what does secrets: inherit pass?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "First the Lab has to work on Linux: on a throw-away Ubuntu 24.04 m8i.2xlarge (8 vCPU, 32 GB, 100 GB gp3, no cloud credentials), ci/gate-d.sh wraps the Lab's ci/rehearse.sh, cold and warm, and records boot times, memory per service and docker system df, then repeats once inside an ARC dind pod on inf-rhinohealth; the lab repo moves into the RhinoHealth org so CI can check it out with a GitHub App token. lab-runner-set is a new Karpenter NodePool fcp-lab (taint rhinohealth.com/pool=fcp-lab:NoSchedule, cpu limit 48, short consolidateAfter, spot or on-demand still to decide) in modules/karpenter-node-pool, and a scale set with min 0, max 6 runners (QA has 6 locks today), requests of 6 CPU, 24Gi and 80Gi, and a new optional runner_tolerations field in modules/github-runner-scale-sets; add the label to fcp's .github/actionlint.yaml.",
+   "_lab-images-reusable.yml pushes fcp-lab-cloud, -client and -frontend (tags_immutability_enabled) to ECR in the inf account, tagged <sha>-lab<lab version>, with concurrency lab-images-<sha>; the lab build/push and lab up --images commands are still to agree with the Lab's owner. _lab-smoke-reusable.yml runs lab test --suite core, the agreed pr/ specs and pytest tests_api -m contract --target lab inside the Lab's web-service, lab compare only on failure, and uploads the reports. Then frontend-ci moves pull requests to an e2e-lab job (suite frontend-e2e, the Lab's allowlist of 24 spec files) and keeps QA for main, the nightly and releases, with the e2e_tests alls-green gate moved into frontend-ci.yaml. That job needs a lab-images job in frontend-ci, which no ticket adds yet; never test it by dispatching frontend-ci on a branch, which deploys over main's dev dashboard and Storybook."
+  ],
+  "tickets": [
+   {
+    "key": "G7-09",
+    "why": "Prove the Lab on a clean Ubuntu VM and measure what it needs (Gate D)."
+   },
+   {
+    "key": "G7-16",
+    "why": "lab-runner-set: the tainted Karpenter pool and the ARC scale set, one Lab per node."
+   },
+   {
+    "key": "G7-20",
+    "why": "Build the Lab's images once per commit, push them to ECR, skip when the tag exists."
+   },
+   {
+    "key": "G7-26",
+    "why": "The private smoke run on every PR, with lab compare only on failure: this lesson."
+   },
+   {
+    "key": "G7-33",
+    "why": "Move the frontend PR gate from qa-front-end to the Lab."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "FCP Lab",
-   "plain": "Nave's tool that boots a complete, private FCP stack (cloud, client, frontend) from a source tree on one Docker host."
+   "term": "shared environment",
+   "plain": "One real environment, such as QA, that every run uses; it keeps the data each run leaves behind."
   },
   {
-   "term": "Gate D",
-   "plain": "The Lab's own check that it works on a clean Linux host; never run before G7-09."
+   "term": "concurrency group",
+   "plain": "A name in a GitHub workflow; only one run with that name runs at a time."
   },
   {
-   "term": "Karpenter NodePool",
-   "plain": "A rule that tells Karpenter which kind of nodes to start for pods that need them."
+   "term": "cancel-in-progress",
+   "plain": "With true, a new run in the group stops the running one; with false, it waits."
   },
   {
-   "term": "taint and toleration",
-   "plain": "A taint keeps pods off a node; only pods with a matching toleration may run there."
+   "term": "ephemeral environment",
+   "plain": "A private environment that lives for one run and is thrown away after it."
   },
   {
-   "term": "ARC scale set",
-   "plain": "A named group of GitHub runner pods managed by Actions Runner Controller, used in runs-on."
+   "term": "image tag",
+   "plain": "The name of one version of a container image; here the commit plus the Lab's version."
   },
   {
    "term": "lab compare",
    "plain": "A Lab command that runs the same checks on main to say whether a failure is new."
-  },
-  {
-   "term": "alls-green",
-   "plain": "A GitHub action used as one gate job that fails when any job it needs failed."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G7-09",
-   "why": "This lesson walked through gate-d.sh and the numbers it records for sizing.",
-   "walk": [
-    "With Nave, move the lab repo into the RhinoHealth org as a private repo.",
-    "Launch one throw-away m8i.2xlarge in inf: Ubuntu 24.04, IMDSv2, encrypted gp3, auto_stop_at tag, no credentials; install Docker Engine and Compose v2.",
-    "Add ci/gate-d.sh from the two blocks above and run it cold and warm; keep the lab's reports/ on the VM.",
-    "Turn each failure into a lab patch or an fcp fix. Rerun on a fresh VM until two runs in a row reach state: ready.",
-    "Repeat once inside an ARC dind pod on inf-rhinohealth, attach the numbers to the ticket, and terminate the VM."
-   ]
+   "q": "Explain in three sentences why a lock on a shared environment is not enough, and what replaces it.",
+   "a": "A lock stops runs from overlapping, so they queue, but each run still inherits the data the previous one left. A private environment per run, named after the run and thrown away after it, needs no lock and starts clean every time. The only group left is per branch, to stop an outdated run of the same branch."
   },
   {
-   "key": "G7-16",
-   "why": "This lesson explained the NodePool, the taint and toleration, and the scale-set entry line by line.",
-   "walk": [
-    "Add modules/karpenter-node-pool (one kubectl_manifest NodePool) and the unit multi_tenant/accounts/infrastructure/karpenter-fcp-lab/terragrunt.hcl.",
-    "Set 8 vCPU / 32 GiB, generation above 5, the taint, cpu limit 48 and a short consolidateAfter; decide spot or on-demand.",
-    "Add the optional runner_tolerations list to modules/github-runner-scale-sets, left out when empty.",
-    "Add the fcp-lab entry above to the scale-sets unit, with requests from G7-09's numbers.",
-    "Plan locally, paste the plan in the PR, let a person apply, then check the autoscalingrunnerset and add the label to actionlint.yaml."
-   ]
+   "q": "Two workflows of one commit both ask for the Lab's images at the same moment. Describe what happens step by step.",
+   "a": "The concurrency group named after the commit lets the first one run while the second waits. The first finds no tag, builds and pushes. The second then runs, finds the tag in the registry and skips the build."
   },
   {
-   "key": "G7-20",
-   "why": "This lesson walked through _lab-images-reusable.yml: the App token, OIDC, the skip and the build.",
-   "walk": [
-    "Add fcp-lab-cloud, fcp-lab-client and fcp-lab-frontend to artifacts.hcl with tag immutability.",
-    "With Nave, add a lab command that builds and pushes a tree's images, and a way for lab up to pull them.",
-    "Add .github/workflows/_lab-images-reusable.yml from the two blocks above.",
-    "Check that modules/aws-ecr keeps enough images for a week of commits.",
-    "When G3 creates the ai-agents account, add its root to allowed_principals."
-   ]
-  },
-  {
-   "key": "G7-26",
-   "why": "This lesson walked through _lab-smoke-reusable.yml: the lock, boot, suites, contracts and compare on failure.",
-   "walk": [
-    "Define the smoke suite with the BE and FE guilds: core plus 4 to 6 fast pr/ specs by run time.",
-    "Add .github/workflows/_lab-smoke-reusable.yml from the two blocks above, with the lab checkout and AWS login steps.",
-    "With Nave, make tests_api available in the Lab's web-service for the contract suites.",
-    "Add a short job summary: regressed, suspect, already failing on main.",
-    "Call it from cloud-ci.yml and client-ci.yml (push) and frontend-ci.yaml (pull_request) next to the QA jobs."
-   ]
-  },
-  {
-   "key": "G7-33",
-   "why": "This lesson walked through the e2e-lab job, the QA condition and the moved e2e_tests gate.",
-   "walk": [
-    "Add the e2e-lab job (suite frontend-e2e) and a lab-images job to frontend-ci.yaml.",
-    "List the specs the Lab cannot run and keep only those on the QA nightly.",
-    "Add github.event_name != 'pull_request' to integration-tests-aws and -gcp; check whether build-e2e-app is still needed on PRs.",
-    "Move the alls-green e2e_tests gate into frontend-ci.yaml; decide e2e coverage on PRs with the FE guild.",
-    "Test on a draft PR (never dispatch frontend-ci on a branch) and ask G0 to require e2e_tests."
-   ]
+   "q": "The smoke run is red. What does lab compare tell you, and why does it only run on failure?",
+   "a": "It runs the same checks on main and sorts each failure into regressed, already failing on main, or suspect. It needs a second Lab, so a green run skips it."
   }
  ],
- "remember": "Build images once per commit, boot a private Lab per run on its own node, compare with main only on failure."
+ "remember": "Give every run its own throw-away copy of the product, named after the run and booted from images built once per commit: no lock, no queue, no leftovers."
 }
