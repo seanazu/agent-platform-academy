@@ -20,6 +20,18 @@ const readRevealed = (): Set<string> => {
 };
 
 const PANEL = 460;
+const onPhone = () => window.matchMedia('(max-width: 640px)').matches;
+// The tour caption sits at the bottom, so on small screens the stop is framed in the part above it.
+const tourFrame = () => {
+  if (window.matchMedia('(max-height: 520px)').matches) return { scale: 0.6, panel: 400 };
+  return onPhone() ? { scale: 0.6, bottom: 270, yFrac: 0.62 } : { scale: 0.92 };
+};
+// On a phone the island panel is a bottom sheet; the island is framed in the free strip between the island chips and the sheet.
+const phoneFrame = () => {
+  const sheet = Math.round(Math.min(460, Math.max(300, window.innerHeight * 0.5)));
+  const free = window.innerHeight - 64 - sheet - 56;
+  return { top: 56, bottom: sheet, yFrac: 0.6, scale: Math.min(0.55, Math.max(0.34, free / 330)) };
+};
 // The path from zero to hero: the playable lessons in course order.
 const PATH = allLessons.filter((r) => PLAYABLE.has(r.lesson.id));
 
@@ -64,9 +76,15 @@ function IslandsApp({ island, lesson }: Props) {
   }, [pathOpen, island]);
 
   useEffect(() => {
+    const chip = document.querySelector<HTMLElement>('.isl-chips [data-on]');
+    const row = chip?.parentElement;
+    if (chip && row) row.scrollTo({ left: chip.offsetLeft - (row.clientWidth - chip.offsetWidth) / 2, behavior: 'smooth' });
+  }, [island]);
+
+  useEffect(() => {
     if (island) {
       reveal(island);
-      world.current?.flyTo(island, { panel: PANEL });
+      world.current?.flyTo(island, onPhone() ? phoneFrame() : { panel: PANEL });
     }
   }, [island, reveal]);
 
@@ -80,7 +98,7 @@ function IslandsApp({ island, lesson }: Props) {
     if (!id) return;
     setJourney(i);
     reveal(id);
-    world.current?.flyTo(id, { scale: 0.92 });
+    world.current?.flyTo(id, tourFrame());
     const prev = from === undefined ? undefined : JOURNEY[from];
     if (prev && prev !== id) void world.current?.moveToken(prev, id, 1300);
     else void world.current?.moveToken(id, id, 1);
@@ -135,6 +153,14 @@ function IslandsApp({ island, lesson }: Props) {
           go(href.islands(id));
         }}
       />
+
+      {!openLesson && journey === null && (
+        <nav className="isl-chips" aria-label="Islands">
+          {ISLANDS.map((i) => (
+            <a key={i.id} href={href.islands(i.id)} data-on={i.id === island || undefined}>{i.name}</a>
+          ))}
+        </nav>
+      )}
 
       {!island && journey === null && (
         <aside className="isl-path" data-open={pathOpen || undefined}>

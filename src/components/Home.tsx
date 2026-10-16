@@ -36,22 +36,6 @@ function Home() {
         </div>
       </section>
 
-      <section className="pilot" aria-labelledby="pilot-title">
-        <span id="pilot-title" className="eyebrow">New lesson format · pilot</span>
-        <p className="pilot-lead">Three lessons rebuilt to watch, play and do. <a href={href.islands()}>Open the new Islands map →</a></p>
-        <div className="pilot-links">
-          {['p0-2', 'p7-4', 'g5-2'].map((pid) => {
-            const ref = findLesson(pid);
-            return ref ? (
-              <a key={pid} className="pilot-link" href={href.lesson(pid)} data-accent={ref.part.accent}>
-                <span className="pilot-part">{ref.part.title}</span>
-                <span className="pilot-title">{ref.lesson.title}</span>
-              </a>
-            ) : null;
-          })}
-        </div>
-      </section>
-
       <section className="resume" aria-labelledby="resume-title">
         <div className="resume-text">
           <span id="resume-title" className="eyebrow">{doneCount === 0 ? 'Begin' : 'Continue where you left off'}</span>

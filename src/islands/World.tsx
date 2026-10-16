@@ -2,7 +2,7 @@ import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, 
 import { ISLANDS, LINKS, WORLD, asset, islandById, type Island } from './data';
 
 export type IslandProgress = { done: number; total: number; ready: number };
-export type WorldHandle = { flyTo: (id: string, opts?: { panel?: number; scale?: number }) => void; fit: () => void; moveToken: (from: string, to: string, ms: number) => Promise<void>; hideToken: () => void };
+export type WorldHandle = { flyTo: (id: string, opts?: { panel?: number; top?: number; bottom?: number; yFrac?: number; scale?: number }) => void; fit: () => void; moveToken: (from: string, to: string, ms: number) => Promise<void>; hideToken: () => void };
 type Cam = { x: number; y: number; s: number };
 type Pt = { x: number; y: number };
 
@@ -69,8 +69,10 @@ function World({ ref, progress, revealed, selected, dimmed, bloom, leftInset = 0
       if (!island) return;
       const { w, h } = size();
       const panel = opts?.panel ?? 0;
-      const s = opts?.scale ?? clamp(Math.min((w - panel) / 900, h / 760), 0.55, 1.1);
-      fly({ s, x: (w - panel) / 2 - island.x * s, y: h / 2 - (island.y + 10) * s });
+      const top = opts?.top ?? 0;
+      const hVisible = h - (opts?.bottom ?? 0);
+      const s = opts?.scale ?? clamp(Math.min((w - panel) / 900, hVisible / 760), 0.55, 1.1);
+      fly({ s, x: (w - panel) / 2 - island.x * s, y: top + (hVisible - top) * (opts?.yFrac ?? 0.5) - (island.y + 10) * s });
     },
     moveToken: (from, to, ms) =>
       new Promise<void>((resolve) => {
@@ -134,14 +136,14 @@ function World({ ref, progress, revealed, selected, dimmed, bloom, leftInset = 0
       ref={viewport}
       data-dimmed={dimmed || undefined}
       onPointerDown={(e) => {
-        if ((e.target as HTMLElement).closest('button, a')) return;
+        if ((e.target as HTMLElement).closest('.isl-zoom')) return;
         pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
-        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
         if (pointers.current.size === 2) {
           const [a, b] = [...pointers.current.values()] as [Pt, Pt];
           const r = e.currentTarget.getBoundingClientRect();
           pinch.current = { dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, mx: (a.x + b.x) / 2 - r.left, my: (a.y + b.y) / 2 - r.top, cam };
           drag.current = null;
+          pointers.current.forEach((_, id) => e.currentTarget.setPointerCapture(id));
           return;
         }
         drag.current = { px: e.clientX, py: e.clientY, cx: cam.x, cy: cam.y, moved: false };
@@ -161,8 +163,12 @@ function World({ ref, progress, revealed, selected, dimmed, bloom, leftInset = 0
         const d = drag.current;
         if (!d) return;
         const dx = e.clientX - d.px, dy = e.clientY - d.py;
-        if (Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
-        setCam((c) => ({ ...c, x: d.cx + dx, y: d.cy + dy }));
+        // A press that barely moves is a tap on an island; only a real drag takes the pointer, so taps still reach the buttons.
+        if (!d.moved && Math.abs(dx) + Math.abs(dy) > 8) {
+          d.moved = true;
+          e.currentTarget.setPointerCapture(e.pointerId);
+        }
+        if (d.moved) setCam((c) => ({ ...c, x: d.cx + dx, y: d.cy + dy }));
       }}
       onPointerUp={(e) => {
         pointers.current.delete(e.pointerId);
@@ -220,9 +226,7 @@ function World({ ref, progress, revealed, selected, dimmed, bloom, leftInset = 0
                 type="button"
                 className="isl-island"
                 style={{ animationDelay: `${-i * 0.9}s` }}
-                onClick={() => {
-                  if (!drag.current?.moved) onSelect(island.id);
-                }}
+                onClick={() => onSelect(island.id)}
                 aria-label={`${island.name}: ${p.total} lessons, ${p.done} done`}
               >
                 <img src={asset(`${island.art}.webp`)} alt="" draggable={false} />
