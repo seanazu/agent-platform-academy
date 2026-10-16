@@ -1,674 +1,357 @@
 {
+ "v": 2,
  "id": "g7-5",
  "title": "verify and doctor",
  "minutes": 55,
  "youNeed": [
-  "p10-6",
-  "g7-1",
-  "p8-4"
+  "p8-4",
+  "p10-6"
  ],
- "bridge": "verify is like the one npm script you run before you push, which runs lint, types and the tests near your change. Except: the editor, the agent's Stop hook and CI all run the very same command. So green means the same thing in all three places, and doctor makes sure a fresh machine can run it at all.",
- "intro": "Agents and people need one fast command that gives the answer CI will give, before they say done. This lesson builds npm run verify, poe verify and the Stop hook that runs them. Then it builds poe doctor and its nightly run in the sandbox image. The backend parts are Python because fcp's backend is Django and its tooling lives in the root pyproject.toml.",
- "picture": {
-  "caption": "One command per area, three callers, and a nightly proof that a fresh machine can run it.",
-  "nodes": [
-   {
-    "id": "dev",
-    "label": "Engineer in Claude Code",
-    "kind": "person"
-   },
-   {
-    "id": "nova",
-    "label": "Nova in a sandbox VM",
-    "kind": "agent"
-   },
-   {
-    "id": "hook",
-    "label": "Stop hook: claude_stop_verify.sh",
-    "kind": "service"
-   },
-   {
-    "id": "verify",
-    "label": "poe verify / npm run verify",
-    "kind": "check"
-   },
-   {
-    "id": "ci",
-    "label": "CI: poe verify --all, npm run verify -- --all",
-    "kind": "check"
-   },
-   {
-    "id": "doctor",
-    "label": "poe doctor --json in the nightly image build",
-    "kind": "machine"
-   }
+ "map": "vm",
+ "hook": {
+  "story": [
+   "Nova, our ticket-to-PR agent, is working on RH-1234, the \"No projects yet\" card for an empty projects table. The ticket asks for the workgroup's name on the card, so Nova adds a workgroup argument to the small function that builds the card's text, updates that function's test, runs the test file, sees it pass, and writes \"Done, tests pass\".",
+   "Twelve minutes later the pull request's type check is red. A second file, the projects page, still calls the function with one argument. Nova did not lie: the test it ran did pass. It simply ran a different set of checks than CI runs, and nothing made it run the others before it said done. A person would have made the same mistake, because today a frontend change needs four separate commands, and everyone picks a few."
   ],
-  "steps": [
-   {
-    "from": "dev",
-    "to": "hook",
-    "text": "wants to stop; the project's Stop hook runs"
-   },
-   {
-    "from": "nova",
-    "to": "hook",
-    "text": "loads fcp's project settings, so the same hook runs"
-   },
-   {
-    "from": "hook",
-    "to": "verify",
-    "text": "picks the command by changed paths; exit 2 sends the agent back to work"
-   },
-   {
-    "from": "ci",
-    "to": "verify",
-    "text": "runs the same command with --all"
-   },
-   {
-    "from": "doctor",
-    "to": "verify",
-    "text": "proves each night that a fresh setup can run it; a failure blocks the image"
-   }
-  ]
+  "question": "How do we give people, Nova and CI one command that gives the answer CI will give, and make sure the agent runs it before it says done?"
  },
- "sections": [
+ "read": [
   {
-   "h": "npm run verify for the frontend (G7-10)",
+   "h": "One command that answers like CI",
    "p": [
-    "Today a frontend change needs four commands: npm run lint, npm run check-types, the unit tests and Storybook. G7-10 adds one script, frontend/scripts/verify.ts, and \"verify\": \"node scripts/verify.ts\" in frontend/package.json. Node 24 runs .ts files directly, so there is no new .js or .mjs file.",
-    "It checks what changed since main: Biome on the changed files, the type check, and vitest related. vitest related runs only the tests that import the changed files. npm run verify -- --all checks everything; CI uses that."
+    "Today fcp's frontend has separate scripts for lint, the type check and the unit tests, and CI runs all of them on every file. Locally that is slow, so people run a part of it, and an agent does the same. The plan adds one script, npm run verify, that answers the question CI will ask, but only about what changed. It looks at the files that changed since the merge base (the commit where the branch left main), plus new files git does not track yet, and runs three steps.",
+    "The steps are not all narrowed the same way, and that is the important design choice. Biome, the linter and formatter fcp uses, only needs the changed files, because a lint error lives inside one file. Vitest has a command, vitest related, that takes a list of source files and runs every test that imports them, directly or through other files, so a change to the card's text also runs the projects page's tests. But the type check always runs on the whole project, because types cross file boundaries: the error in the story is in a file Nova never touched. At the end the script prints one line per step and exits with 1 if any step failed, which keeps the answer small enough for an agent to read."
    ],
-   "because": "We print one line per step at the end, because the whole result must fit in an agent's context.",
    "code": {
     "lang": "typescript",
-    "file": "frontend/scripts/verify.ts",
-    "text": "// `npm run verify` checks what changed since main; `npm run verify -- --all` checks everything (CI).\nimport {execFileSync, spawnSync} from \"node:child_process\"\n\nconst all = process.argv.includes(\"--all\")\nconst git = (...args: string[]) => execFileSync(\"git\", args, {encoding: \"utf8\"}).trim()\nconst base = process.env.VERIFY_BASE ?? git(\"merge-base\", \"HEAD\", \"origin/main\")\nconst changed = [\n\t...git(\"diff\", \"--name-only\", \"--relative\", \"--diff-filter=ACMR\", base).split(\"\\n\"),\n\t...git(\"ls-files\", \"--others\", \"--exclude-standard\").split(\"\\n\")\n].filter((file) => /\\.(ts|tsx|css|json)$/.test(file))\nconst code = changed.filter((file) => /^(src|test)\\/.*\\.tsx?$/.test(file))\n\nconst steps: [string, string[]][] = [[\"types\", [\"tsc\", \"--noEmit\", \"--pretty\", \"false\"]]]\nif (all || changed.length > 0) steps.unshift([\"lint\", [\"biome\", \"check\", ...(all ? [\".\"] : changed)]])\nif (all) steps.push([\"unit tests\", [\"vitest\", \"run\", ...(process.env.VITEST_MONOCART ? [\"--coverage\"] : [])]])\nelse if (code.length > 0)\n\tsteps.push([\"related unit tests\", [\"vitest\", \"related\", ...code, \"--run\", \"--passWithNoTests\"]])\n// Affected stories: decide with the FE guild (@storybook/addon-vitest would make them part of `vitest related`).\n\nconst results = steps.map(([name, args]) => ({name, ok: spawnSync(\"npx\", args, {stdio: \"inherit\"}).status === 0}))\nconsole.log(`\\nverify: ${all ? \"all files\" : `${changed.length} changed files since ${base.slice(0, 7)}`}`)\nfor (const {name, ok} of results) console.log(`${ok ? \"pass\" : \"FAIL\"}  ${name}`)\nprocess.exit(results.every(({ok}) => ok) ? 0 : 1)",
+    "file": "scripts/verify.ts (the lab version; fcp's is frontend/scripts/verify.ts)",
+    "text": "// `npm run verify` checks what changed since main; `npm run verify -- --all` checks everything (CI).\nimport { execFileSync, spawnSync } from \"node:child_process\";\n\nconst all = process.argv.includes(\"--all\");\nconst git = (...args: string[]) => execFileSync(\"git\", args, { encoding: \"utf8\" }).trim();\nconst base = process.env.VERIFY_BASE ?? git(\"merge-base\", \"HEAD\", \"main\");\nconst changed = [\n  ...git(\"diff\", \"--name-only\", \"--relative\", \"--diff-filter=ACMR\", base).split(\"\\n\"),\n  ...git(\"ls-files\", \"--others\", \"--exclude-standard\").split(\"\\n\"),\n].filter((file) => /\\.(ts|tsx|css|json)$/.test(file));\nconst code = changed.filter((file) => /^src\\/.*\\.tsx?$/.test(file));\n\nconst steps: [string, string[]][] = [[\"types\", [\"tsc\", \"--noEmit\", \"--pretty\", \"false\"]]];\nif (all || changed.length > 0) steps.unshift([\"lint\", [\"biome\", \"check\", ...(all ? [\".\"] : changed)]]);\nif (all) steps.push([\"unit tests\", [\"vitest\", \"run\"]]);\nelse if (code.length > 0)\n  steps.push([\"related unit tests\", [\"vitest\", \"related\", ...code, \"--run\", \"--passWithNoTests\"]]);\n\nconst results = steps.map(([name, args]) => ({ name, ok: spawnSync(\"npx\", args, { stdio: \"inherit\" }).status === 0 }));\nconsole.log(`\\nverify: ${all ? \"all files\" : `${changed.length} changed files since ${base.slice(0, 7)}`}`);\nfor (const { name, ok } of results) console.log(`${ok ? \"pass\" : \"FAIL\"}  ${name}`);\nprocess.exit(results.every(({ ok }) => ok) ? 0 : 1);",
     "notes": [
      {
-      "line": 1,
-      "text": "How to call it: changed files by default, everything with --all."
-     },
-     {
-      "line": 2,
-      "text": "Run git and the tools without a shell (lesson p1-2)."
-     },
-     {
-      "line": 4,
-      "text": "True when the caller passed --all."
-     },
-     {
-      "line": 5,
-      "text": "A helper: run git with arguments and return its trimmed output."
-     },
-     {
       "line": 6,
-      "text": "VERIFY_BASE overrides the base; otherwise the merge base with origin/main."
+      "text": "The merge base with main. VERIFY_BASE lets you compare with something else, for example a release branch."
      },
      {
       "line": 8,
-      "text": "Changed files since the base: added, copied, modified or renamed, relative to frontend/."
+      "text": "Added, copied, modified or renamed files, so a deleted file is not handed to Biome."
      },
      {
       "line": 9,
-      "text": "Plus untracked files that are not ignored."
-     },
-     {
-      "line": 10,
-      "text": "Keep only file types Biome or the tests care about."
-     },
-     {
-      "line": 11,
-      "text": "Source and test files only, for vitest related."
+      "text": "New files that git does not track yet count as changed too."
      },
      {
       "line": 13,
-      "text": "The steps as [name, command]. The type check always runs: types cross file boundaries."
-     },
-     {
-      "line": 14,
-      "text": "Lint first: everything with --all, otherwise only the changed files."
+      "text": "The type check is never narrowed: it always checks the whole project."
      },
      {
       "line": 15,
-      "text": "With --all: the whole unit suite, with coverage when VITEST_MONOCART is set (CI)."
+      "text": "--all is for CI: lint everything and run the whole unit suite."
      },
      {
-      "line": 16,
-      "text": "Otherwise only the tests related to changed code; no tests is not a failure."
-     },
-     {
-      "line": 18,
-      "text": "Open decision with the FE guild: @storybook/addon-vitest or a render smoke test per changed story."
-     },
-     {
-      "line": 20,
-      "text": "Run each step through npx, show its output, and record pass or fail."
-     },
-     {
-      "line": 21,
-      "text": "One summary line: what was checked and since which commit."
+      "line": 17,
+      "text": "Only the tests that import a changed file. No related test is not a failure."
      },
      {
       "line": 22,
-      "text": "One line per step: pass or FAIL."
-     },
-     {
-      "line": 23,
-      "text": "Exit 0 only when every step passed."
+      "text": "The exit code is the answer. Everything that calls verify only reads this."
      }
     ]
    },
-   "callout": {
-    "kind": "tip",
-    "text": "G7-10 also adds a short section to frontend/AGENTS.md: tests assert on what the user sees. Use test ids, ARIA roles and names, visible text and row counts, never class names or internal state."
-   }
+   "see": "verify: 2 changed files since 0e67403\npass  lint\nFAIL  types\npass  related unit tests"
   },
   {
-   "h": "poe verify, part 1: the areas (G7-14)",
+   "h": "Not done while verify is red",
    "p": [
-    "The backend version is a Poe script task in the root pyproject.toml, next to the createsuperuser task. It reads verify = { script = \"scripts.poe_verify:main(all_files=all)\", args = [{ name = \"all\", type = \"boolean\" }] }. A script task calls a Python function, and the boolean arg becomes a --all flag (lesson p10-6).",
-    "The first part names the areas. Some paths force the full API layer, because testmon cannot see them (lesson g7-1)."
+    "A command only helps if it runs. Writing \"always run npm run verify\" into the agent's instructions is a rule the model may forget after an hour of work. A hook cannot be forgotten. Claude Code runs a hook, a command you configure, at fixed moments of a session, and the Stop hook runs every time the agent wants to end its turn. If the hook exits with code 2, Claude Code does not end the turn: it gives the agent whatever the hook wrote to stderr as its next message, so the agent reads \"FAIL types\" and goes back to work. Exit 0 lets it stop. Any other code counts as a broken hook, and the agent stops anyway.",
+    "One field in the hook's input prevents an endless loop. stop_hook_active is true when the agent is already trying again because this hook blocked it once. Then the hook reports and lets the session end, so a problem the agent cannot fix goes to a person instead of spending tokens forever.",
+    "The hook is registered in fcp's .claude/settings.json, the project settings file that is committed to the repo. That is the reason one hook is enough. Every engineer who opens fcp in Claude Code gets it, and so does Nova, because Nova's harness, our program that runs the Claude session in the VM, loads fcp's project settings. Nova's own hooks then only check what is special to Nova, such as proof for each check in its approved plan."
    ],
-   "because": "We list the paths testmon cannot see, because a migration change must run every API test, not none.",
    "code": {
-    "lang": "python",
-    "file": "scripts/poe_verify.py (part 1 of 2)",
-    "text": "\"\"\"poe verify: lint and test what changed since main. The Claude Code Stop hook (scripts/claude_stop_verify.sh),\nNova's Stop hook and CI (`poe verify --all`) run this same command, so \"green\" means the same thing everywhere.\"\"\"\n\nimport subprocess\nimport sys\n\nCORE = \"cloud/rhinoCloud/rhinoCore/\"\nCLOUD = (\"cloud/rhinoCloud/\", \"common/fcp_common/\")\nFULL_RUN = (CORE + \"migrations/\", CORE + \"fixtures/\", \"cloud/rhinoCloud/tests_api/conftest.py\")  # testmon can't see these\n\n\ndef _git(*args: str) -> list[str]:\n    return subprocess.run([\"git\", *args], capture_output=True, text=True, check=True).stdout.splitlines()\n",
+    "lang": "bash",
+    "file": "scripts/claude_stop_verify.sh (fcp)",
+    "text": "#!/bin/bash\n# fcp's Stop hook, for people and for Nova: run the verify of every area that changed.\ninput=$(cat)\nif [ \"$(echo \"$input\" | jq -r '.stop_hook_active')\" = \"true\" ]; then\n  echo \"verify is still red after one more try; ending so a person can look\" >&2\n  exit 0\nfi\ncd \"$CLAUDE_PROJECT_DIR\"\nchanged=$( { git diff --name-only \"$(git merge-base HEAD origin/main)\"; git ls-files --others --exclude-standard; } )\nreport=\"\"\nif grep -q '^frontend/' <<<\"$changed\"; then\n  report+=\"$(cd frontend && npm run verify --silent 2>&1)\"$'\\n' || failed=1\nfi\nif grep -qE '^(cloud|client|common|sdk)/' <<<\"$changed\"; then\n  report+=\"$(uvx --from poethepoet poe verify 2>&1)\"$'\\n' || failed=1\nfi\n[ -z \"$failed\" ] && exit 0\ngrep -E '^(pass|FAIL) ' <<<\"$report\" >&2\necho \"verify failed. Backend details: cloud/rhinoCloud/reports/failures.md\" >&2\nexit 2",
     "notes": [
      {
-      "line": 1,
-      "text": "The docstring names the three callers: the Stop hook, Nova's Stop hook and CI."
-     },
-     {
       "line": 4,
-      "text": "To run git and the steps."
-     },
-     {
-      "line": 7,
-      "text": "The cloud's main app folder."
-     },
-     {
-      "line": 8,
-      "text": "Cloud code and the shared fcp_common package: a change here runs the affected API tests."
+      "text": "The second stop in a row: report and let it end instead of looping."
      },
      {
       "line": 9,
-      "text": "Migrations, fixtures and the conftest: a change here runs the whole layer."
+      "text": "The same changed files verify uses: since the merge base, plus untracked files."
      },
      {
-      "line": 12,
-      "text": "Run git, fail loudly on an error, and return the output as a list of lines."
-     }
-    ]
-   }
-  },
-  {
-   "h": "poe verify, part 2: pick, run, report",
-   "p": [
-    "main() collects the changed files since the merge base plus untracked files, then builds a list of steps. Each area adds its own: lint for Python files, the API layer (all or affected), and the SDK's make targets. client/ has no fast test layer yet. Decide with the BE guild: lint client files only, or run the Docker-based unit tests."
-   ],
-   "because": "We print the failures.md path on stderr when something fails, because the agent should read that page next, not the log.",
-   "code": {
-    "lang": "python",
-    "file": "scripts/poe_verify.py (part 2 of 2)",
-    "text": "def main(all_files: bool = False) -> None:\n    base = _git(\"merge-base\", \"HEAD\", \"origin/main\")[0]\n    changed = _git(\"diff\", \"--name-only\", base) + _git(\"ls-files\", \"--others\", \"--exclude-standard\")\n    python_files = [f for f in changed if f.endswith(\".py\")]\n    steps: list[tuple[str, list[str]]] = []\n    if all_files or python_files:\n        steps.append((\"lint\", [\"pre-commit\", \"run\", *([\"--all-files\"] if all_files else [\"--files\", *python_files])]))\n    if all_files or any(f.startswith(FULL_RUN) for f in changed):\n        steps.append((\"cloud API tests: all\", [\"poe\", \"api-test\"]))\n    elif any(f.startswith(CLOUD) for f in changed):\n        steps.append((\"cloud API tests: affected\", [\"poe\", \"api-test-affected\"]))\n    if any(f.startswith(\"sdk/\") for f in changed):\n        steps.append((\"sdk\", [\"make\", \"-C\", \"sdk\", \"lint\", \"test\"]))\n    # client/: no fast test layer yet. Decide with the BE guild: lint only, or the Docker-based unit tests.\n    failed = {name for name, cmd in steps if subprocess.run(cmd).returncode != 0}\n    for name, _ in steps:\n        print(f\"{'FAIL' if name in failed else 'pass'}  {name}\")\n    if failed:\n        print(\"Details: cloud/rhinoCloud/reports/failures.md\", file=sys.stderr)\n    sys.exit(1 if failed else 0)",
-    "notes": [
-     {
-      "line": 1,
-      "text": "poe passes all_files=True for --all."
-     },
-     {
-      "line": 2,
-      "text": "The first line of git merge-base HEAD origin/main."
-     },
-     {
-      "line": 3,
-      "text": "Changed files since the base plus untracked ones."
-     },
-     {
-      "line": 4,
-      "text": "The .py files among them."
-     },
-     {
-      "line": 5,
-      "text": "An empty list of (name, command) pairs."
-     },
-     {
-      "line": 6,
-      "text": "Lint with pre-commit (black, isort, flake8): all files, or only the changed ones."
-     },
-     {
-      "line": 8,
-      "text": "startswith accepts a tuple: any FULL_RUN path changed means the whole layer."
-     },
-     {
-      "line": 10,
-      "text": "Otherwise, cloud code changed: only the affected tests."
-     },
-     {
-      "line": 12,
-      "text": "SDK changes run the SDK's own lint and tests through its Makefile."
+      "line": 11,
+      "text": "Each area runs its own verify: npm run verify for the frontend."
      },
      {
       "line": 14,
-      "text": "The open decision for the client, written where the next person will look."
+      "text": "And poe verify for the backend areas. poe is the Python version of npm scripts."
      },
      {
-      "line": 15,
-      "text": "Run every step and collect the names of those that failed."
-     },
-     {
-      "line": 16,
-      "text": "One line per step: pass or FAIL."
-     },
-     {
-      "line": 19,
-      "text": "Point at failures.md on stderr."
+      "line": 18,
+      "text": "Only the summary lines go to stderr, so the agent gets a few lines, not a 3,000-line log."
      },
      {
       "line": 20,
-      "text": "Exit 1 on any failure. The exit code is the contract with the hook and CI."
+      "text": "Code 2: the agent does not stop, and it gets the lines above as its next message."
      }
     ]
    }
   },
   {
-   "h": "One Stop hook for people and Nova",
+   "h": "The same command in CI",
    "p": [
-    "A Stop hook is a command Claude Code runs when the agent wants to end its turn (lesson p8-4). G7-14 adds scripts/claude_stop_verify.sh and registers it in fcp's tracked .claude/settings.json. The script picks npm run verify or poe verify by changed paths. On failure it prints the summary and the failures.md path to stderr and exits 2, so Claude keeps working with that message.",
-    "If the hook input has stop_hook_active true, a stop was already blocked once. The script then reports and exits 0, so the session can end and never loops. Nova gets this hook too: its harness loads fcp's project settings (settingSources [\"project\"], G3-19). Nova's own Stop hook (G3-21) then only checks proof for the plan's QA checks.",
-    "CI runs the same commands. The API Tests job runs uvx --from poethepoet poe verify --all. frontend-ci's unit-tests job runs npm run verify -- --all with VITEST_MONOCART=1, in place of its separate lint, check-types and coverage steps."
+    "The last caller is CI. If CI keeps its own separate lint, type and test steps, the two lists will slowly drift apart: someone adds a check to CI and forgets verify, and green on a laptop stops meaning green on the PR. So the frontend's unit-tests job runs npm run verify -- --all in place of its three separate steps, and the backend's API test job runs poe verify --all. --all means the same steps on every file, which is what CI should check anyway.",
+    "So the contract between fcp, Nova and CI is small: one command per area, a few summary lines, and an exit code. Nobody shares code with anybody. If the frontend team changes what verify runs, the editor, Nova and CI all change on the same day, because they all call the same name."
    ],
-   "because": "We register the hook in the tracked project settings, so every person and agent that opens fcp runs the same check.",
-   "code": {
-    "lang": "json",
-    "file": "fcp/.claude/settings.json (the hooks part; a sketch from the ticket's steps)",
-    "text": "{\n  \"hooks\": {\n    \"Stop\": [\n      {\n        \"hooks\": [\n          { \"type\": \"command\", \"command\": \"\\\"$CLAUDE_PROJECT_DIR\\\"/scripts/claude_stop_verify.sh\" }\n        ]\n      }\n    ]\n  }\n}",
-    "notes": [
-     {
-      "line": 2,
-      "text": "The hooks section of Claude Code's settings file."
-     },
-     {
-      "line": 3,
-      "text": "The event: the agent wants to end its turn. Stop has no tool, so no matcher."
-     },
-     {
-      "line": 6,
-      "text": "Run a shell command. CLAUDE_PROJECT_DIR is the repo root, so the path works from any folder."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "why",
-    "text": "The command and its exit code, not shared code, are the contract between fcp and the platform's harness. Agree it with Platform: exit 0 means green, exit 1 means red, and the hook turns red into exit 2."
-   }
-  },
-  {
-   "h": "poe doctor, part 1: read the requirements (G7-22)",
-   "p": [
-    "Setup problems cost developers many hours a year, and agents in fresh VMs hit the same ones. G7-22 adds poe doctor: one command that checks a machine against what fcp needs and, with --fix, repairs what is safe. Its Poe entry is doctor = { script = \"scripts.poe_doctor:main(fix=fix, as_json=json)\", args = [...] }.",
-    "The first part reads the requirements from the repo itself, so the doctor never disagrees with the files it checks."
-   ],
-   "because": "We read node and npm versions from frontend/package.json engines, because a copy in the script would drift.",
-   "code": {
-    "lang": "python",
-    "file": "scripts/poe_doctor.py (part 1 of 2)",
-    "text": "\"\"\"poe doctor: check a local fcp setup; --fix runs the safe local fixes; --json is for the sandbox image build.\"\"\"\nimport json\nimport shutil\nimport subprocess\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\nENGINES = json.loads((ROOT / \"frontend\" / \"package.json\").read_text())[\"engines\"]  # node >=24.15.0, npm >=11.14.1\n\n\ndef _run(*cmd: str) -> str | None:\n    done = shutil.which(cmd[0]) and subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)\n    return done.stdout.strip() if done and done.returncode == 0 else None\n\n\ndef _at_least(have: str | None, want: str) -> bool:  # \"v24.16.0\" >= \">=24.15.0\"\n    return have is not None and [int(p) for p in have.strip(\"v\").split(\".\")] >= [int(p) for p in want.strip(\">=\").split(\".\")]",
-    "notes": [
-     {
-      "line": 1,
-      "text": "What it does and the two flags."
-     },
-     {
-      "line": 3,
-      "text": "shutil.which finds a program on PATH, like the which command."
-     },
-     {
-      "line": 7,
-      "text": "The repo root: two levels up from scripts/poe_doctor.py."
-     },
-     {
-      "line": 8,
-      "text": "The engines block of frontend/package.json: node >=24.15.0, npm >=11.14.1."
-     },
-     {
-      "line": 11,
-      "text": "Run a command from the repo root; return its output, or None if it is missing or fails."
-     },
-     {
-      "line": 12,
-      "text": "If the program is not installed, stop here with a falsy value."
-     },
-     {
-      "line": 13,
-      "text": "Output only on success, else None."
-     },
-     {
-      "line": 16,
-      "text": "Compare versions as lists of numbers: v24.16.0 against >=24.15.0."
-     },
-     {
-      "line": 17,
-      "text": "Strip v and >=, split on dots, and compare the lists number by number."
-     }
+   "deeper": {
+    "h": "Go deeper: poe verify picks its own test set",
+    "p": [
+     "The backend version follows the same shape in Python. It lints the changed .py files with pre-commit, which runs black, isort and flake8, and runs the API tests that the change touched, through pytest-testmon from the API test layer lesson. A few paths force the whole API layer instead: migrations, fixtures and the layer's conftest.py. testmon cannot see them, because they are read while the test database is built, before any test runs, so a change there would otherwise run no tests at all.",
+     "Changes in sdk/ run the SDK's own make lint test. The on-prem client has no fast test layer yet, so for now its step is still open: lint only, or the slower unit tests in Docker."
     ]
    }
   },
   {
-   "h": "poe doctor, part 2: checks, fixes, output",
+   "h": "doctor: can this machine run verify at all?",
    "p": [
-    "Each check is one line: what, a test, the fix, and whether --fix may run it. The other checks (npm, poe, the rhino-net Docker network) follow the same shape. --fix runs only safe local commands such as uv python install, make sync-deps and docker network create. It never touches credentials, ~/.aws or Docker volumes.",
-    "One check is about git hooks. After npm install, husky sets core.hooksPath to frontend/.husky/_, so the black, isort and flake8 hooks in .pre-commit-config.yaml never run on commit. The doctor reports it and points to poe verify."
+    "Green only means the same everywhere if every machine can run the same command. A missing Python version, an old Node, a virtual environment that no longer matches the lockfile: each of these makes verify fail for reasons that have nothing to do with the change, and a new joiner or a fresh agent VM meets all of them on the first day. poe doctor is the second command. It checks the machine against what fcp asks for (Node and npm from frontend/package.json, Python 3.13 through uv, the backend's virtual environment against uv.lock, enough Docker memory for FCP Lab) and prints ok, or FIX with the command to try. With --fix it runs only the safe fixes, such as installing a Python version, and it never touches credentials, ~/.aws or Docker volumes.",
+    "The doctor also reports one problem that surprises people. When npm install runs in frontend/, husky, the tool that installs the frontend's git hooks, sets git's core.hooksPath to its own folder, so the backend's black, isort and flake8 commit hooks never run for anyone. The doctor says so and points to poe verify."
    ],
-   "because": "We print one JSON object per check with --json, because the nightly image build reads the result as data, not as text.",
-   "code": {
-    "lang": "python",
-    "file": "scripts/poe_doctor.py (part 2 of 2)",
-    "text": "CHECKS = [  # (what, passes, fix, safe for --fix); npm, poe and the rhino-net network follow the same pattern\n    (\"node \" + ENGINES[\"node\"], lambda: _at_least(_run(\"node\", \"--version\"), ENGINES[\"node\"]), \"nvm install\", False),\n    (\"Python 3.13 (uv)\", lambda: _run(\"uv\", \"python\", \"find\", \"3.13\"), \"uv python install 3.13\", True),\n    (\"cloud venv = uv.lock\", lambda: _run(\"uv\", \"sync\", \"--check\", \"--directory\", \"cloud/rhinoCloud\"), \"make -C cloud/rhinoCloud sync-deps\", True),\n    (\"Docker >= 16 GiB (FCP Lab)\", lambda: int(_run(\"docker\", \"info\", \"-f\", \"{{.MemTotal}}\") or 0) >= 16 * 2**30, \"raise Docker's memory limit\", False),\n    (\"Python commit hooks (husky owns core.hooksPath, so black/isort/flake8 never run)\", lambda: _run(\"git\", \"config\", \"core.hooksPath\") is None, \"run `poe verify` before you push\", False),\n]\n\n\ndef main(fix: bool = False, as_json: bool = False) -> None:\n    results = [(what, bool(passes()), how, safe) for what, passes, how, safe in CHECKS]\n    for what, ok, how, safe in results:\n        if fix and safe and not ok:\n            subprocess.run(how, shell=True, cwd=ROOT)  # local commands only: never credentials, ~/.aws or volumes\n        print(json.dumps({\"check\": what, \"ok\": ok, \"fix\": how}) if as_json else f\"{'ok ' if ok else 'FIX'}  {what}  {'' if ok else '-> ' + how}\")\n    raise SystemExit(0 if all(ok for _, ok, _, _ in results) else 1)",
-    "notes": [
-     {
-      "line": 1,
-      "text": "A table of checks: (what, passes, fix, safe for --fix)."
-     },
-     {
-      "line": 2,
-      "text": "Node's version against engines. The fix (nvm install) is not run automatically."
-     },
-     {
-      "line": 3,
-      "text": "uv can find Python 3.13; if not, uv python install 3.13 is safe to run."
-     },
-     {
-      "line": 4,
-      "text": "uv sync --check says whether the cloud venv matches the lockfile; make sync-deps fixes it."
-     },
-     {
-      "line": 5,
-      "text": "docker info reports total memory in bytes; FCP Lab needs at least 16 GiB."
-     },
-     {
-      "line": 6,
-      "text": "Passes only when core.hooksPath is unset; otherwise husky owns the hooks."
-     },
-     {
-      "line": 10,
-      "text": "poe passes fix and as_json from the flags."
-     },
-     {
-      "line": 11,
-      "text": "Run every check once and keep the answers."
-     },
-     {
-      "line": 13,
-      "text": "Only safe fixes, only for failed checks, and only with --fix."
-     },
-     {
-      "line": 14,
-      "text": "Run the fix command from the repo root; the comment repeats what it must never touch."
-     },
-     {
-      "line": 15,
-      "text": "One JSON line per check, or a human line: ok, or FIX with the command."
-     },
-     {
-      "line": 16,
-      "text": "Exit 0 only when every check passed."
-     }
-    ]
-   },
-   "see": "(example output; your machine differs)\nok   node >=24.15.0\nok   Python 3.13 (uv)\nFIX  cloud venv = uv.lock  -> make -C cloud/rhinoCloud sync-deps\nok   Docker >= 16 GiB (FCP Lab)\nFIX  Python commit hooks (husky owns core.hooksPath, so black/isort/flake8 never run)  -> run `poe verify` before you push"
-  },
-  {
-   "h": "doctor in the nightly image build (G7-25)",
-   "p": [
-    "The ai-agent-sandbox image (G3) is built every night from a brand-new machine, so it proves a fresh setup still works. G7-25 adds three Ansible tasks to its playbook, after the fcp checkout and the dependency install. Ansible is the tool that configures the machine during the Packer build (lesson p4-4).",
-    "A failing doctor fails the Packer build, so the image is not promoted and yesterday's image stays in use. The failing check names go into the G3 image-build alert, so the owner sees what broke without opening the Packer log."
-   ],
-   "because": "We register the doctor's output and decide later, because the report must be saved even when a check fails.",
-   "code": {
-    "lang": "yaml",
-    "file": "infrastructure/packer/images/ai-agent-sandbox/playbook.yml (G3's playbook, new tasks)",
-    "text": "- name: Prove a fresh fcp setup works (poe doctor)\n  ansible.builtin.command:\n    cmd: uvx --from poethepoet poe doctor --json\n    chdir: \"{{ fcp_checkout_dir }}\"  # the image's fcp checkout; take the variable name from G3's playbook\n  become: true\n  become_user: \"{{ sandbox_user }}\"  # the user Nova runs as, so file ownership matches\n  register: doctor\n  changed_when: false\n  failed_when: false\n\n- name: Keep the doctor report with the image's build evidence\n  ansible.builtin.copy:\n    content: \"{{ doctor.stdout }}\"\n    dest: /var/log/ai-agent-sandbox/doctor.jsonl\n    mode: \"0644\"\n\n- name: Fail the build, so this image is not promoted, when a check fails\n  ansible.builtin.fail:\n    msg: \"poe doctor failed: {{ doctor.stdout_lines | map('from_json') | rejectattr('ok') | map(attribute='check') | join(', ') }}\"\n  when: doctor.rc != 0",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Task 1: run the doctor."
-     },
-     {
-      "line": 3,
-      "text": "The doctor through uvx, with machine output."
-     },
-     {
-      "line": 4,
-      "text": "The image's fcp checkout. Take the variable name from G3's playbook."
-     },
-     {
-      "line": 6,
-      "text": "Run as the sandbox user Nova runs as, not root, so file ownership matches."
-     },
-     {
-      "line": 7,
-      "text": "Keep the result (stdout, return code) in a variable."
-     },
-     {
-      "line": 8,
-      "text": "Running checks changes nothing on the machine."
-     },
-     {
-      "line": 9,
-      "text": "Do not fail here; task 3 decides, after the report is saved."
-     },
-     {
-      "line": 11,
-      "text": "Task 2: save the JSON lines with the image's build evidence."
-     },
-     {
-      "line": 14,
-      "text": "One JSON object per line."
-     },
-     {
-      "line": 17,
-      "text": "Task 3: fail the build when a check failed."
-     },
-     {
-      "line": 19,
-      "text": "Parse each line, keep the ones that are not ok, and list their check names in the message."
-     },
-     {
-      "line": 20,
-      "text": "Only when the doctor exited non-zero."
-     }
+   "see": "ok   node >=24.15.0\nok   Python 3.13 (uv)\nFIX  cloud venv = uv.lock  -> make -C cloud/rhinoCloud sync-deps\nok   Docker >= 16 GiB (FCP Lab)\nFIX  Python commit hooks (husky owns core.hooksPath, so black/isort/flake8 never run)  -> run `poe verify` before you push\n(example output; your machine differs)",
+   "deeper": {
+    "h": "Go deeper: the doctor runs every night",
+    "p": [
+     "The image every agent VM starts from is built every night on a brand-new machine, which makes the build the best test of a fresh setup there is. After the fcp checkout and the dependency install, the build runs poe doctor --json as the user Nova runs as, keeps the report next to the image, and fails if any check failed. A failed build is not promoted, so the VMs keep yesterday's image, and the alert names the failing checks. When the doctor fails there, people's laptops usually meet the same problem a few days later, so it is an early warning for the whole team."
     ]
    }
   }
  ],
  "lab": {
-  "title": "poe verify and its Stop hook on a scratch project",
-  "youNeed": [
-   "Python 3.13 and uv",
+  "id": "g7-5",
+  "title": "One verify, and a Stop hook that waits for it",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "Node 24 (npm 11)",
    "git",
-   "No Claude session: you feed the hook a fake input"
+   "jq",
+   "No Claude session: you feed the hook the same JSON Claude Code would send"
   ],
-  "worked": [
+  "goal": "Build npm run verify for a small TypeScript project, watch it catch a type error that the agent's own test run missed, and make a Stop hook turn that red into \"keep working\".",
+  "guess": {
+   "q": "The agent changes emptyStateText(count) to emptyStateText(count, workgroup) and updates its own test. The projects page still calls it with one argument. Which check fails?",
+   "options": [
+    {
+     "text": "vitest run src/emptyState.test.ts, the test the agent ran.",
+     "correct": false,
+     "why": "That test was updated together with the function, so it passes."
+    },
+    {
+     "text": "vitest related, because it also runs the projects page's test.",
+     "correct": false,
+     "why": "It does run that test, but Vitest does not type-check. At run time the missing argument is just undefined, and the page's test only checks a non-empty list."
+    },
+    {
+     "text": "tsc, the type check, which reads every file in the project.",
+     "correct": true,
+     "why": "Only the type checker sees that a file nobody touched now calls the function with too few arguments."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "mkdir lab75 && cd lab75 && git init -b main && uv init --python 3.13 --bare . && uv add --dev pytest poethepoet",
-    "see": "Initialized empty Git repository in .../lab75/.git/\nInitialized project `lab75`\n + poethepoet==...\n + pytest==...\n(output trimmed)"
+    "say": "Make an empty project with the frontend's three tools: TypeScript, Vitest and Biome, at fcp's major versions.",
+    "do": "mkdir -p ~/academy-labs/g7-5 && cd ~/academy-labs/g7-5 && git init -q -b main && npm init -y >/dev/null && npm pkg set type=module && npm i -D typescript@6 vitest@4 @biomejs/biome@2.4",
+    "see": "added 47 packages, and audited 48 packages in 2s\n…\nfound 0 vulnerabilities"
    },
    {
-    "do": "mkdir -p app tests docs scripts && touch app/__init__.py scripts/__init__.py && printf 'def add(a: int, b: int) -> int:\\n    return a + b\\n' > app/money.py && printf 'from app.money import add\\n\\n\\ndef test_add():\\n    assert add(2, 3) == 5\\n' > tests/test_money.py && printf '[pytest]\\npythonpath = .\\n' > pytest.ini && echo '# Notes' > docs/notes.md && printf '.venv/\\n__pycache__/\\n.pytest_cache/\\n' > .gitignore",
-    "see": "(no output; two areas: app/ with tests, docs/ without)"
+    "say": "Write a tiny version of the projects page: the card's text, the page that uses it, and three tests. Then run all three tools by hand, the way CI does today.",
+    "do": "mkdir -p src scripts && printf 'node_modules/\\n' > .gitignore\ncat > tsconfig.json <<'EOF'\n{\n  \"compilerOptions\": {\n    \"target\": \"es2022\",\n    \"module\": \"esnext\",\n    \"moduleResolution\": \"bundler\",\n    \"strict\": true,\n    \"noEmit\": true,\n    \"skipLibCheck\": true\n  },\n  \"include\": [\"src\"]\n}\nEOF\ncat > biome.json <<'EOF'\n{\n  \"vcs\": { \"enabled\": true, \"clientKind\": \"git\", \"useIgnoreFile\": true },\n  \"formatter\": { \"indentStyle\": \"space\", \"lineWidth\": 120 }\n}\nEOF\ncat > src/emptyState.ts <<'EOF'\nexport const emptyStateText = (count: number): string | null => (count === 0 ? \"No projects yet\" : null);\nEOF\ncat > src/projectsPage.ts <<'EOF'\nimport { emptyStateText } from \"./emptyState\";\n\nexport const pageTitle = (count: number): string => emptyStateText(count) ?? `${count} projects`;\nEOF\ncat > src/emptyState.test.ts <<'EOF'\nimport { expect, test } from \"vitest\";\nimport { emptyStateText } from \"./emptyState\";\n\ntest(\"an empty workgroup gets the empty-state card\", () => {\n  expect(emptyStateText(0)).toBe(\"No projects yet\");\n});\nEOF\ncat > src/projectsPage.test.ts <<'EOF'\nimport { expect, test } from \"vitest\";\nimport { pageTitle } from \"./projectsPage\";\n\ntest(\"the title counts the projects\", () => {\n  expect(pageTitle(3)).toBe(\"3 projects\");\n});\nEOF\ncat > src/format.test.ts <<'EOF'\nimport { expect, test } from \"vitest\";\n\ntest(\"dates use ISO format\", () => {\n  expect(new Date(Date.UTC(2026, 9, 16)).toISOString().slice(0, 10)).toBe(\"2026-10-16\");\n});\nEOF\nnpx biome check . && npx tsc --noEmit && npx vitest run",
+    "see": "Checked 8 files in 11ms. No fixes applied.\n\n Test Files  3 passed (3)\n      Tests  3 passed (3)"
    },
    {
-    "do": "Create scripts/poe_verify.py, a small copy of G7-14's script for this project:\n\n\"\"\"poe verify: check what changed since main. The Stop hook and CI run this same command.\"\"\"\n\nimport os\nimport subprocess\nimport sys\n\n\ndef _git(*args: str) -> list[str]:\n    return subprocess.run([\"git\", *args], capture_output=True, text=True, check=True).stdout.splitlines()\n\n\ndef main(all_files: bool = False) -> None:\n    base = os.environ.get(\"VERIFY_BASE\") or _git(\"merge-base\", \"HEAD\", \"main\")[0]\n    changed = _git(\"diff\", \"--name-only\", base) + _git(\"ls-files\", \"--others\", \"--exclude-standard\")\n    python_files = [f for f in changed if f.endswith(\".py\")]\n    steps: list[tuple[str, list[str]]] = []\n    if all_files or python_files:\n        files = _git(\"ls-files\", \"*.py\") if all_files else python_files\n        steps.append((\"lint\", [sys.executable, \"-m\", \"py_compile\", *files]))\n    if all_files or any(f.startswith((\"app/\", \"tests/\")) for f in changed):\n        steps.append((\"tests\", [sys.executable, \"-m\", \"pytest\", \"-q\"]))\n    failed = {name for name, cmd in steps if subprocess.run(cmd).returncode != 0}\n    for name, _ in steps:\n        print(f\"{'FAIL' if name in failed else 'pass'}  {name}\")\n    print(f\"verify: {len(changed)} changed files since {base[:7]}\")\n    sys.exit(1 if failed else 0)",
-    "see": "(no output)"
+    "say": "Add verify.ts from the Understand step as an npm script, make this state main, and start the ticket's branch. With nothing changed, only the type check runs.",
+    "do": "cat > scripts/verify.ts <<'EOF'\n// `npm run verify` checks what changed since main; `npm run verify -- --all` checks everything (CI).\nimport { execFileSync, spawnSync } from \"node:child_process\";\n\nconst all = process.argv.includes(\"--all\");\nconst git = (...args: string[]) => execFileSync(\"git\", args, { encoding: \"utf8\" }).trim();\nconst base = process.env.VERIFY_BASE ?? git(\"merge-base\", \"HEAD\", \"main\");\nconst changed = [\n  ...git(\"diff\", \"--name-only\", \"--relative\", \"--diff-filter=ACMR\", base).split(\"\\n\"),\n  ...git(\"ls-files\", \"--others\", \"--exclude-standard\").split(\"\\n\"),\n].filter((file) => /\\.(ts|tsx|css|json)$/.test(file));\nconst code = changed.filter((file) => /^src\\/.*\\.tsx?$/.test(file));\n\nconst steps: [string, string[]][] = [[\"types\", [\"tsc\", \"--noEmit\", \"--pretty\", \"false\"]]];\nif (all || changed.length > 0) steps.unshift([\"lint\", [\"biome\", \"check\", ...(all ? [\".\"] : changed)]]);\nif (all) steps.push([\"unit tests\", [\"vitest\", \"run\"]]);\nelse if (code.length > 0)\n  steps.push([\"related unit tests\", [\"vitest\", \"related\", ...code, \"--run\", \"--passWithNoTests\"]]);\n\nconst results = steps.map(([name, args]) => ({ name, ok: spawnSync(\"npx\", args, { stdio: \"inherit\" }).status === 0 }));\nconsole.log(`\\nverify: ${all ? \"all files\" : `${changed.length} changed files since ${base.slice(0, 7)}`}`);\nfor (const { name, ok } of results) console.log(`${ok ? \"pass\" : \"FAIL\"}  ${name}`);\nprocess.exit(results.every(({ ok }) => ok) ? 0 : 1);\nEOF\nnpm pkg set scripts.verify=\"node scripts/verify.ts\" && git add -A && git commit -qm \"start: projects page\" && git switch -qc nova/RH-1234 && npm run verify",
+    "see": "> node scripts/verify.ts\n\nverify: 0 changed files since 0e67403\npass  types\n(your commit id differs)"
    },
    {
-    "do": "Append the task to pyproject.toml:\n\n[tool.poe.tasks]\nverify = { script = \"scripts.poe_verify:main(all_files=all)\", args = [{ name = \"all\", type = \"boolean\" }], help = \"Lint and test what changed since main.\" }",
-    "see": "(no output; uv run poe prints the task list with verify in it)"
+    "say": "Now be the agent: add the workgroup to the card, update the card's test, and run only that test, which is what the agent did in the story.",
+    "do": "cat > src/emptyState.ts <<'EOF'\nexport const emptyStateText = (count: number, workgroup: string): string | null =>\n  count === 0 ? `No projects yet in ${workgroup}` : null;\nEOF\ncat > src/emptyState.test.ts <<'EOF'\nimport { expect, test } from \"vitest\";\nimport { emptyStateText } from \"./emptyState\";\n\ntest(\"an empty workgroup gets the empty-state card\", () => {\n  expect(emptyStateText(0, \"Lab A\")).toBe(\"No projects yet in Lab A\");\n});\nEOF\nnpx vitest run src/emptyState.test.ts",
+    "see": " Test Files  1 passed (1)\n      Tests  1 passed (1)"
    },
    {
-    "do": "git add -A && git commit -qm start && git checkout -qb my-change && uv run poe verify",
-    "see": "Poe => verify\nverify: 0 changed files since a230933\n(your commit id differs)"
+    "say": "Run verify. Lint and the related tests pass, and the type check finds the file nobody touched.",
+    "do": "npm run verify; echo \"exit=$?\"",
+    "see": "src/projectsPage.ts(3,53): error TS2554: Expected 2 arguments, but got 1.\n Test Files  2 passed (2)\n\nverify: 2 changed files since 0e67403\npass  lint\nFAIL  types\npass  related unit tests\nexit=1"
    },
    {
-    "do": "echo 'More notes' >> docs/notes.md && uv run poe verify; echo exit=$?",
-    "see": "Poe => verify\nverify: 1 changed files since a230933\nexit=0\n(a docs change runs no steps)"
+    "say": "Write the Stop hook and feed it the JSON Claude Code sends when the agent wants to stop. Exit 2 means \"not yet\", and the lines on stderr become the agent's next message.",
+    "do": "cat > scripts/stop-verify.sh <<'EOF'\n#!/bin/bash\n# Claude Code Stop hook: Claude may stop only when verify is green. Exit 2 sends it back to work.\ninput=$(cat)\nif [ \"$(echo \"$input\" | jq -r '.stop_hook_active')\" = \"true\" ]; then\n  echo \"verify was already asked for once; letting the session end\" >&2\n  exit 0\nfi\nif ! out=$(npm run verify --silent 2>&1); then\n  echo \"$out\" | grep -E '^(pass|FAIL) ' >&2\n  echo \"npm run verify failed. Fix the steps marked FAIL, then stop again.\" >&2\n  exit 2\nfi\nexit 0\nEOF\nchmod +x scripts/stop-verify.sh\necho '{\"hook_event_name\": \"Stop\", \"stop_hook_active\": false}' | scripts/stop-verify.sh; echo \"exit=$?\"",
+    "see": "pass  lint\nFAIL  types\npass  related unit tests\nnpm run verify failed. Fix the steps marked FAIL, then stop again.\nexit=2"
    },
    {
-    "do": "sed -i '' 's/return a + b/return a - b/' app/money.py && uv run poe verify; echo exit=$?   (on Linux use sed -i without '')",
-    "see": "FAILED tests/test_money.py::test_add - assert -1 == 5\n1 failed in 0.03s\npass  lint\nFAIL  tests\nverify: 2 changed files since a230933\nexit=1"
+    "say": "Send the input Claude Code sends when the agent already tried once more because of this hook. The hook must let it end, or the agent loops forever.",
+    "do": "echo '{\"hook_event_name\": \"Stop\", \"stop_hook_active\": true}' | scripts/stop-verify.sh; echo \"exit=$?\"",
+    "see": "verify was already asked for once; letting the session end\nexit=0"
    },
    {
-    "do": "Create scripts/claude_stop_verify.sh and make it executable (chmod +x):\n\n#!/bin/bash\n# Claude Code Stop hook: run verify before the agent may stop. Exit 2 sends it back to work.\ninput=$(cat)\nif echo \"$input\" | grep -q '\"stop_hook_active\": *true'; then\n  echo \"verify already asked once; letting the session end\" >&2\n  exit 0\nfi\nif ! out=$(uv run poe verify 2>&1); then\n  echo \"$out\" | grep -E '^(pass|FAIL) ' >&2\n  echo \"verify failed. Fix the failures above, then stop again.\" >&2\n  exit 2\nfi\nexit 0\n\nThen: echo '{\"hook_event_name\": \"Stop\", \"stop_hook_active\": false}' | scripts/claude_stop_verify.sh; echo exit=$?",
-    "see": "pass  lint\nFAIL  tests\nverify failed. Fix the failures above, then stop again.\nexit=2"
+    "say": "Register the hook in the project settings that are committed with the code, so every person and agent that opens this folder in Claude Code gets it.",
+    "do": "mkdir -p .claude && cat > .claude/settings.json <<'EOF'\n{\n  \"hooks\": {\n    \"Stop\": [\n      {\n        \"hooks\": [{ \"type\": \"command\", \"command\": \"\\\"$CLAUDE_PROJECT_DIR\\\"/scripts/stop-verify.sh\" }]\n      }\n    ]\n  }\n}\nEOF\njq -r '.hooks.Stop[0].hooks[0].command' .claude/settings.json",
+    "see": "\"$CLAUDE_PROJECT_DIR\"/scripts/stop-verify.sh"
    },
    {
-    "do": "echo '{\"hook_event_name\": \"Stop\", \"stop_hook_active\": true}' | scripts/claude_stop_verify.sh; echo exit=$?",
-    "see": "verify already asked once; letting the session end\nexit=0"
+    "say": "Do what the agent does after the hook sends it back: fix the page that still calls the function with one argument, then try to stop again.",
+    "do": "cat > src/projectsPage.ts <<'EOF'\nimport { emptyStateText } from \"./emptyState\";\n\nexport const pageTitle = (count: number, workgroup: string): string =>\n  emptyStateText(count, workgroup) ?? `${count} projects`;\nEOF\ncat > src/projectsPage.test.ts <<'EOF'\nimport { expect, test } from \"vitest\";\nimport { pageTitle } from \"./projectsPage\";\n\ntest(\"the title counts the projects\", () => {\n  expect(pageTitle(3, \"Lab A\")).toBe(\"3 projects\");\n});\nEOF\necho '{\"hook_event_name\": \"Stop\", \"stop_hook_active\": false}' | scripts/stop-verify.sh; echo \"exit=$?\"",
+    "see": "exit=0"
    }
   ],
-  "faded": "Fix the bug (put return a + b back) and feed the hook the stop_hook_active false input again. Predict the output and the exit code before you run it; the command is left to you.",
-  "alone": "Add a FULL_RUN rule like G7-14's: a change to pytest.ini must run the tests even when app/ and tests/ did not change. Edit only pytest.ini (add a comment line), run uv run poe verify, and show that the tests step runs. Then run uv run poe verify --all and check both steps pass.",
-  "done": "verify runs no steps for a docs change and exits 1 on the bug. The hook turns that into exit 2, and a pytest.ini change runs the tests."
+  "build": "verify narrows the tests to the files that import a change, but some files change every test without being imported by any: package.json, package-lock.json, tsconfig.json and vitest.config.ts. Prove the hole first. Create vitest.config.ts with import { defineConfig } from \"vitest/config\"; export default defineConfig({ test: { include: [\"src/**/*.spec.ts\"] } }), which quietly matches no test file at all, and run npm run verify: everything passes. Then add a FULL_RUN list of those four files to verify.ts, and when any of them changed, run the whole suite (vitest run) instead of the related tests. Run verify again: the unit tests step now fails with \"No test files found\". Delete vitest.config.ts and verify is green again.",
+  "checks": [
+   "npm run verify on the clean branch prints \"0 changed files\" and runs only the type check.",
+   "After the agent's change, verify prints FAIL types and exits with 1, while vitest run src/emptyState.test.ts alone passes.",
+   "The hook exits with 2 and prints the summary lines while verify is red, and exits with 0 when stop_hook_active is true.",
+   "After you fix projectsPage.ts the hook exits with 0.",
+   "With your FULL_RUN rule, a change to vitest.config.ts makes verify run the whole suite and show FAIL unit tests."
+  ],
+  "solution": {
+   "lang": "typescript",
+   "file": "scripts/verify.ts (the changed lines)",
+   "text": "const code = changed.filter((file) => /^src\\/.*\\.tsx?$/.test(file));\nconst FULL_RUN = [\"package.json\", \"package-lock.json\", \"tsconfig.json\", \"vitest.config.ts\"]; // vitest related cannot see these\nconst full = all || changed.some((file) => FULL_RUN.includes(file));\n\nconst steps: [string, string[]][] = [[\"types\", [\"tsc\", \"--noEmit\", \"--pretty\", \"false\"]]];\nif (all || changed.length > 0) steps.unshift([\"lint\", [\"biome\", \"check\", ...(all ? [\".\"] : changed)]]);\nif (full) steps.push([\"unit tests\", [\"vitest\", \"run\"]]);\nelse if (code.length > 0)\n  steps.push([\"related unit tests\", [\"vitest\", \"related\", ...code, \"--run\", \"--passWithNoTests\"]]);"
+  },
+  "fix": "A teammate tidied the hook: it now prints verify's summary with a plain echo and ends with exit 1 \"because 1 means failure\". Make that change in scripts/stop-verify.sh, break projectsPage.ts again, and feed the hook the stop_hook_active false input. It exits with 1 and the summary goes to stdout. In Claude Code, exit 1 is a non-blocking error and stdout is not shown to the agent, so the agent stops with a red type check and never sees why. Put the summary back on stderr (>&2) and the exit code back to 2.",
+  "explain": [
+   "Why does verify narrow lint and tests to the changed files but always run the type check on the whole project?",
+   "What do exit 0, exit 2 and exit 1 from a Stop hook each do to the agent, and why does the hook look at stop_hook_active?",
+   "Why does CI run npm run verify -- --all instead of keeping its own lint, type and test steps?"
+  ],
+  "done": "verify catches the type error the agent's own test missed, the hook turns it into exit 2 and lets go on the second try, and your FULL_RUN rule catches a config change that no related test would see."
  },
- "quiz": [
+ "check": [
   {
-   "q": "The Stop hook finds verify red. What should the script do?",
+   "q": "A teammate suggests making verify faster by type-checking only the changed files, like lint. What goes wrong?",
    "options": [
     {
-     "text": "Exit 1, so Claude Code shows an error and stops.",
+     "text": "Nothing, because a type error is always in the file that changed.",
      "correct": false,
-     "why": "Exit 1 is a hook error that does not send the agent back with the message."
+     "why": "The story's error is in the projects page, a file nobody changed. It broke because a function it calls changed."
     },
     {
-     "text": "Print the summary and the failures.md path to stderr and exit 2.",
+     "text": "A changed function can break the files that call it, and those files would not be checked.",
      "correct": true,
-     "why": "Exit 2 blocks the stop and hands stderr to the agent as its next instruction."
+     "why": "Types cross file boundaries, so the type check has to read the whole project to see every caller."
     },
     {
-     "text": "Fix the failing test itself, then exit 0.",
+     "text": "tsc refuses to run on a list of files.",
      "correct": false,
-     "why": "A hook reports; the agent fixes the code."
+     "why": "tsc can be given files. The problem is what such a run would miss, not whether it runs."
     }
    ]
   },
   {
-   "q": "A change touches only cloud/rhinoCloud/rhinoCore/migrations/. What does poe verify run for the API layer?",
+   "q": "Nova's harness loads fcp's project settings. Why does that matter for the Stop hook?",
    "options": [
     {
-     "text": "Nothing, because no test file changed.",
+     "text": "It lets Nova change the hook when it is in the way.",
      "correct": false,
-     "why": "FULL_RUN exists for exactly this case."
+     "why": "The settings file is a protected path. Loading it means Nova obeys it, not that Nova may edit it."
     },
     {
-     "text": "poe api-test-affected, because migrations are cloud code.",
+     "text": "It makes the hook run faster in the VM.",
      "correct": false,
-     "why": "testmon cannot see migrations, so the affected set could be empty."
+     "why": "Speed is the same. The point is which hook runs."
     },
     {
-     "text": "poe api-test, the whole layer, because migrations are in FULL_RUN.",
+     "text": "Nova runs the very same verify hook as every engineer, so there is one hook to maintain and one meaning of green.",
      "correct": true,
-     "why": "Migrations, fixtures and the conftest are read during setup, which testmon cannot track."
+     "why": "fcp's committed .claude/settings.json is the one place the hook lives. People, Nova and CI then all call the same command."
     }
    ]
   },
   {
-   "q": "poe doctor fails in the nightly sandbox image build. What happens?",
+   "q": "The agent stops twice in a row while verify is still red. On the second stop, stop_hook_active is true. What should the hook do?",
    "options": [
     {
-     "text": "The build fails, the image is not promoted, and yesterday's image stays in use.",
+     "text": "Report the problem and exit 0, so the session ends and a person can look.",
      "correct": true,
-     "why": "The alert names the failing checks so the owner can fix them."
+     "why": "One more try is useful; an endless loop is not. The red result is still visible in the run's evidence."
     },
     {
-     "text": "The doctor runs --fix and the build continues.",
+     "text": "Exit 2 again, until verify is green.",
      "correct": false,
-     "why": "The playbook runs the doctor without --fix; a broken fresh setup must be seen, not patched."
+     "why": "If the agent cannot fix it, this loops forever and keeps spending tokens."
     },
     {
-     "text": "The new image is promoted with a warning.",
+     "text": "Run verify with --all to be sure.",
      "correct": false,
-     "why": "Then Nova would run on a machine that cannot run verify."
+     "why": "A bigger check does not help the agent fix the first one. The question is whether to keep blocking."
     }
    ]
   }
  ],
- "recall": [
-  "From g7-1: which paths can testmon not see, and why?",
-  "From p8-4: what does stop_hook_active tell a Stop hook?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "frontend/scripts/verify.ts with \"verify\": \"node scripts/verify.ts\" (Node 24 runs .ts directly, and CI rejects new .js or .mjs files): biome check on the changed files, tsc --noEmit on the project, vitest related --run --passWithNoTests on changed src/ and test/ files, and --all with VITEST_MONOCART=1 for coverage in CI. Whether stories of changed components also run (option A: @storybook/addon-vitest, option B: a render smoke test per changed *.stories.tsx) is for the FE guild, and frontend/AGENTS.md gets a short rule: tests assert on what the user sees (test ids, ARIA roles and names, visible text, row counts), never class names. The lab's FULL_RUN rule for package.json, tsconfig.json and vitest.config.ts is not in the plan yet.",
+   "scripts/poe_verify.py is a poe script task in the root pyproject.toml (pre-commit on changed .py files, poe api-test when migrations, fixtures or tests_api/conftest.py changed, otherwise poe api-test-affected, make -C sdk lint test for sdk/; the client step is still open). scripts/claude_stop_verify.sh and the Stop entry live in fcp's tracked .claude/settings.json; Nova loads it through settingSources [\"project\"], and Nova's own Stop hook only checks proof for the plan's QA checks. CI: API Tests runs uvx --from poethepoet poe verify --all, and frontend-ci's unit-tests job runs npm run verify -- --all in place of lint, check-types and test:unit:coverage. scripts/poe_doctor.py reads frontend/package.json engines (node >=24.15.0, npm >=11.14.1), checks uv sync --check, Docker memory of 16 GiB and the rhino-net network, and reports husky's core.hooksPath; the nightly ai-agent-sandbox build runs poe doctor --json as the sandbox user, keeps doctor.jsonl and fails the build so the image is not promoted."
+  ],
+  "tickets": [
+   {
+    "key": "G7-10",
+    "why": "npm run verify for the frontend: changed files, the three steps and the one-line summary."
+   },
+   {
+    "key": "G7-14",
+    "why": "poe verify, the shared Stop hook in fcp's project settings, and CI calling the same commands."
+   },
+   {
+    "key": "G7-22",
+    "why": "poe doctor: the setup checks, safe --fix, --json and the husky hooks finding."
+   },
+   {
+    "key": "G7-25",
+    "why": "poe doctor --json in the nightly sandbox image build; a failure keeps yesterday's image."
+   }
+  ]
+ },
  "words": [
   {
    "term": "verify",
-   "plain": "One command per area (npm run verify, poe verify) that checks what changed since main and prints pass or FAIL per step."
+   "plain": "One command per area that checks what changed since main the way CI would, and answers with an exit code."
+  },
+  {
+   "term": "merge base",
+   "plain": "The commit where your branch left main; verify compares the branch with it."
   },
   {
    "term": "vitest related",
-   "plain": "A Vitest command that runs only the tests that import the given files."
+   "plain": "A Vitest command that runs every test importing the given files, directly or through other files."
   },
   {
-   "term": "FULL_RUN paths",
-   "plain": "Paths testmon cannot see (migrations, fixtures, conftest); a change there runs the whole API layer."
+   "term": "Stop hook",
+   "plain": "A command Claude Code runs when the agent wants to end its turn; exit 2 sends the agent back to work."
   },
   {
-   "term": "CLAUDE_PROJECT_DIR",
-   "plain": "The environment variable Claude Code sets to the project root when it runs a hook."
+   "term": "stop_hook_active",
+   "plain": "True in the hook's input when the agent is already trying again because a Stop hook blocked it."
   },
   {
-   "term": "core.hooksPath",
-   "plain": "The git setting that says where git hooks live; husky sets it, so pre-commit's hooks never run."
-  },
-  {
-   "term": "Ansible task",
-   "plain": "One step in a playbook that configures the machine during the image build; register keeps its result."
+   "term": "doctor",
+   "plain": "A command that checks whether a machine can run the project at all, and suggests or applies safe fixes."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G7-10",
-   "why": "This lesson walked through verify.ts line by line: the changed files, the steps and the one-line summary.",
-   "walk": [
-    "Add frontend/scripts/verify.ts from the block above and \"verify\": \"node scripts/verify.ts\" to frontend/package.json.",
-    "Check the base: git merge-base with origin/main, or VERIFY_BASE when set.",
-    "Decide affected stories with the FE guild: @storybook/addon-vitest or a render smoke test per changed story.",
-    "Add the section to frontend/AGENTS.md: tests assert on test ids, ARIA roles and names, visible text and row counts.",
-    "Run npm run verify on a branch with one changed component and check the summary lines."
-   ]
+   "q": "Explain to a teammate in three sentences why one verify command beats four separate scripts plus a line in the agent's instructions.",
+   "a": "The editor, the agent and CI call the same command, so green means the same everywhere and the lists cannot drift apart. The Stop hook runs it whenever the agent wants to stop, which a written instruction cannot promise. Its short summary and exit code are all any caller needs."
   },
   {
-   "key": "G7-14",
-   "why": "This lesson walked through poe_verify.py, the Stop hook and the CI calls that make green mean the same everywhere.",
-   "walk": [
-    "Add scripts/poe_verify.py from the two blocks above and the verify script task in [tool.poe.tasks].",
-    "Add scripts/claude_stop_verify.sh (pick the command by changed paths, exit 2 on failure, exit 0 when stop_hook_active) and the Stop entry in .claude/settings.json.",
-    "Agree with Platform that the command and its exit code are the contract with Nova's harness (settingSources [\"project\"]).",
-    "CI: API Tests runs uvx --from poethepoet poe verify --all. frontend-ci's unit-tests job runs npm run verify -- --all with VITEST_MONOCART=1.",
-    "Decide the client/ step with the BE guild; point the G8 verify skill, the G4 checking guide and be-repo-conventions at both commands."
-   ]
+   "q": "Which files make the backend's poe verify run the whole API layer instead of the affected tests, and why?",
+   "a": "Migrations, fixtures and tests_api/conftest.py: they are read while the test database is built, before any test runs, so testmon cannot connect them to tests."
   },
   {
-   "key": "G7-22",
-   "why": "This lesson walked through poe_doctor.py: the requirements read from the repo, the checks table, safe fixes and JSON output.",
-   "walk": [
-    "Add scripts/poe_doctor.py from the two blocks above and the doctor script task next to scripts/poe_createsuperuser.py.",
-    "Add the remaining checks in the same shape: npm, poe, the rhino-net network, and uv sync --check for the client.",
-    "Keep --fix to safe local commands; never credentials, ~/.aws or Docker volumes.",
-    "Decide with the BE guild whether husky's pre-commit should also call pre-commit for Python files.",
-    "Try it on two laptops, one a new joiner's if possible, and fix the three most confusing messages."
-   ]
-  },
-  {
-   "key": "G7-25",
-   "why": "This lesson walked through the three Ansible tasks that run the doctor in the nightly image build.",
-   "walk": [
-    "In infrastructure/packer/images/ai-agent-sandbox/playbook.yml (from G3), after the fcp checkout and the install, add the three tasks above.",
-    "Use G3's variable names for the checkout folder and the sandbox user; run as that user, not root.",
-    "Check that a failing doctor fails the Packer build and the previous image stays in use.",
-    "Put the failing check names into the G3 image-build alert."
-   ]
+   "q": "The nightly sandbox image build fails on poe doctor. What happens to the agent VMs the next morning?",
+   "a": "The new image is not promoted, so VMs keep starting from yesterday's image, and the alert names the failing checks so the owner can fix the setup."
   }
  ],
- "remember": "The editor, the agent and CI run one verify per area; a nightly doctor proves a fresh machine can run it."
+ "remember": "One verify per area, called the same way by the editor, Nova's Stop hook and CI, and a doctor that proves each machine can run it."
 }
