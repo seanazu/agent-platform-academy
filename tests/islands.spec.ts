@@ -32,4 +32,27 @@ test.describe('islands map', () => {
       await expect(page.getByRole('button', { name: '✓ Lesson done' })).toBeVisible();
     });
   });
+
+  for (const size of [{ width: 1440, height: 900 }, { width: 760, height: 900 }, { width: 390, height: 700 }]) {
+    test(`the path list scrolls inside its card and the tour button stays on screen at ${size.width}x${size.height}`, async ({ page }) => {
+      await test.step('Given the home page is open', async () => {
+        await page.setViewportSize(size);
+        await page.emulateMedia({ reducedMotion: 'reduce' });
+        await page.goto('/#/');
+      });
+      const list = page.locator('.isl-path-list');
+      await test.step('Then the card fits below the top bar', async () => {
+        const card = await page.locator('.isl-path').boundingBox();
+        expect(card?.y ?? 0).toBeGreaterThanOrEqual(64);
+        expect((card?.y ?? 0) + (card?.height ?? 0)).toBeLessThanOrEqual(size.height);
+      });
+      await test.step('When the learner scrolls the list to the end', async () => {
+        await list.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+      });
+      await test.step('Then the last lesson and the tour button are both visible', async () => {
+        await expect(list.locator('li').last()).toBeInViewport();
+        await expect(page.locator('.isl-path-actions').getByRole('button', { name: /Tour the platform/ })).toBeInViewport({ ratio: 1 });
+      });
+    });
+  }
 });

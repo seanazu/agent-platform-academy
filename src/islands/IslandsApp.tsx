@@ -32,6 +32,7 @@ function IslandsApp({ island, lesson }: Props) {
   const [journey, setJourney] = useState<number | null>(null);
   const [celebrate, setCelebrate] = useState<string | null>(null);
   const [pathOpen, setPathOpen] = useState(true);
+  const pathList = useRef<HTMLOListElement | null>(null);
 
   const reveal = useCallback((id: string) => {
     setRevealed((prev) => {
@@ -54,6 +55,13 @@ function IslandsApp({ island, lesson }: Props) {
     }
     return out;
   }, [progress.done]);
+
+  // Open the path card on the next lesson, not on lesson 1.
+  useEffect(() => {
+    const list = pathList.current;
+    const target = list?.querySelector<HTMLElement>('[data-next]');
+    if (list && target) list.scrollTop = target.offsetTop - list.offsetTop - list.clientHeight / 2 + target.offsetHeight / 2;
+  }, [pathOpen, island]);
 
   useEffect(() => {
     if (island) {
@@ -132,14 +140,14 @@ function IslandsApp({ island, lesson }: Props) {
         <aside className="isl-path" data-open={pathOpen || undefined}>
           <button type="button" className="isl-path-head" onClick={() => setPathOpen(!pathOpen)} aria-expanded={pathOpen}>
             <span>
-              <span className="isl-path-kicker">Your path · {PATH.filter((r) => progress.done[r.lesson.id]).length} of {PATH.length} ready lessons done</span>
+              <span className="isl-path-kicker">Your path · {PATH.filter((r) => progress.done[r.lesson.id]).length} of {PATH.length} lessons done</span>
               <span className="isl-path-title">{next ? `Next: ${next.lesson.title}` : 'All ready lessons done'}</span>
             </span>
             <span aria-hidden="true" className="isl-path-chev">{pathOpen ? '–' : '+'}</span>
           </button>
           {pathOpen && (
             <>
-              <ol className="isl-path-list">
+              <ol className="isl-path-list" ref={pathList}>
                 {PATH.map((r, i) => {
                   const where = islandOfLesson(r.lesson.id);
                   const isDone = progress.done[r.lesson.id] === true;
