@@ -1,606 +1,285 @@
 {
+ "v": 2,
  "id": "g7-4",
  "title": "Breaking-change checks",
- "minutes": 50,
+ "minutes": 55,
  "youNeed": [
   "p10-5",
   "g7-1"
  ],
- "bridge": "Each breaking-change check is like tsc failing when you remove an export other files import. Except: the importers are outside the PR (the published SDK, on-prem clients, yesterday's pods). So each check builds the old version from the merge base and compares.",
- "intro": "Agents will change serializers, migrations and protos. Lesson p10-5 explained what oasdiff, the migration linters, buf and the SDK smoke test compare. This lesson builds the four CI steps in fcp, line by line. They are Python and YAML because they check fcp's Django backend in its own CI.",
- "picture": {
-  "caption": "Four contracts, four checks, one shape: old version, new version, compare.",
-  "nodes": [
-   {
-    "id": "pr",
-    "label": "PR changes cloud or common code",
-    "kind": "file"
-   },
-   {
-    "id": "base",
-    "label": "Merge base with origin/main",
-    "kind": "file"
-   },
-   {
-    "id": "oas",
-    "label": "oasdiff on the OpenAPI schema",
-    "kind": "check"
-   },
-   {
-    "id": "mig",
-    "label": "migration linter and Squawk",
-    "kind": "check"
-   },
-   {
-    "id": "buf",
-    "label": "buf breaking on the protos",
-    "kind": "check"
-   },
-   {
-    "id": "sdk",
-    "label": "published SDK smoke test",
-    "kind": "check"
-   },
-   {
-    "id": "person",
-    "label": "A person records a deliberate break",
-    "kind": "person"
-   }
+ "map": "github",
+ "hook": {
+  "story": [
+   "Nova, our ticket-to-PR agent, renames a field in the cloud's projects API from workgroup to workgroup_uid, because the ticket asked for clearer names. It is thorough. It changes the serializer, the frontend, every test, and also the Python SDK in fcp's sdk/ folder, so the SDK's own tests send the new name too. Everything inside the pull request agrees with everything else, and every check is green.",
+   "Customers do not run the sdk/ folder. They run rhino-health, the SDK package they installed from PyPI, the Python package index, months ago, and that version still sends workgroup. The day after the deploy their scripts fail with 400 Bad Request. The pull request had a reader it never tested: the code that was already released."
   ],
-  "steps": [
-   {
-    "from": "pr",
-    "to": "base",
-    "text": "git merge-base HEAD origin/main finds the old version"
-   },
-   {
-    "from": "base",
-    "to": "oas",
-    "text": "the export script runs on both trees; oasdiff compares the YAML"
-   },
-   {
-    "from": "base",
-    "to": "mig",
-    "text": "lintmigrations and sqlmigrate look only at migrations added since the base"
-   },
-   {
-    "from": "base",
-    "to": "buf",
-    "text": "buf compares common/ with .git#ref=<base>"
-   },
-   {
-    "from": "pr",
-    "to": "sdk",
-    "text": "the released rhino-health wheel calls this commit's API over HTTP"
-   },
-   {
-    "from": "person",
-    "to": "oas",
-    "text": "a deliberate break needs a line with a ticket key in a protected ignore file"
-   }
-  ]
+  "question": "How can CI test a pull request against the SDK version customers really have installed, before the change ships?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Who is on the other side",
+   "h": "The reader that is not in the pull request",
    "p": [
-    "The cloud API has readers outside the PR: the rhino-health SDK on PyPI, the frontend and the MCP server. Customers keep old SDK versions for months. The gRPC protos are read by on-prem clients that upgrade later than the cloud. A migration runs while old pods still serve requests.",
-    "G7 adds one check per contract: G7-11 (OpenAPI), G7-15 (migrations), G7-19 (protos) and G7-21 (the SDK). Each one also gets one line in Nova's checking guide (G4), which says when to run it.",
-    "Every job that needs the merge base sets fetch-depth: 0 on checkout, because CI checkouts are shallow by default."
-   ],
-   "callout": {
-    "kind": "wall",
-    "text": "Agents never change the checks they are judged by. A deliberate API break is recorded by a person in openapi-breaking-ignore.txt, a protected path. Migration exceptions are added by a person, with a comment."
-   }
+    "In the frontend, tsc protects you from a rename: every file that reads the old name is in the same repo, and it turns red. fcp's backend has readers outside the pull request. The breaking-change lesson met them: the on-prem client upgrades later than the cloud, old servers keep running during a deploy, and customers keep old versions of the SDK for months. A breaking change is one that such a reader cannot handle.",
+    "That lesson's checks compare descriptions: oasdiff compares the OpenAPI document of the branch with the one of the merge base, and buf compares the proto files. They are fast and catch most breaks. This lesson adds a check of a different kind for the most important outside reader, the SDK: run the code customers actually installed against the API of this commit, and see whether it still works. It catches what a description cannot, for example an SDK that relies on the order of a list, a default value, or a field the schema calls optional. A rule people call Hyrum's law says it well: with enough users, every behaviour you can observe will be depended on by somebody."
+   ]
   },
   {
-   "h": "oasdiff, part 1: the job and its env (G7-11)",
+   "h": "Install the release, not the folder",
    "p": [
-    "First a script, cloud/rhinoCloud/scripts/export_openapi.py. It calls django.setup(), then drf-spectacular's SchemaGenerator(patterns=_MAIN_SCHEMA_PATTERNS, api_version=\"v2\") from rhinoDjango/urls.py. Those are the same patterns /docs/v2/openapi/ serves. It prints the schema as YAML, and does the same for _CONNECT_SCHEMA_PATTERNS.",
-    "The export must need no database. If a serializer queries at import time, fix the serializer; do not add a database to this job."
+    "The trick is in how the test gets the SDK. The smoke test, a small set of tests that tries the most common calls and nothing more, imports the SDK with pytest.importorskip, and the SDK is not a dependency of the cloud project at all. CI installs one exact released version just for this run: it reads the latest version number from PyPI's JSON page for the package, then runs uv run --with rhino-health==<that version>, which adds the package to the environment for this one command only. Without --with, the test is skipped, so nobody runs it by accident against whatever happens to be installed.",
+    "Two details matter in fcp. The cloud project's pyproject.toml sets exclude-newer = \"7 days\", which tells uv to ignore packages published in the last week, and it applies to --with too, so the step must override it or yesterday's release would never be tested. And the latest release is not the only one in use: the SDK's owner picks the oldest version still supported, and the step tests that one as well. In the lab, a folder called released/ plays PyPI, and a wheel, the file format a Python package is published in, plays the release."
    ],
-   "because": "We run this job only on branches, because main has no merge base to compare with except itself.",
+   "see": "$ uv run pytest -q tests\n1 skipped in 0.04s\n$ uv run --with released/projectsdk-1.0.0-py3-none-any.whl pytest -q tests/sdk_smoke\n1 passed in 1.38s"
+  },
+  {
+   "h": "A real server inside the test",
+   "p": [
+    "The SDK speaks HTTP to a URL; it cannot use the in-process client from the earlier lessons. pytest-django has a fixture for exactly this, live_server: it starts this commit's Django on a free port in a thread of the test process, against the test database, and gives you its URL. The SDK then makes real requests, with real JSON, to the real code of the branch.",
+    "One rule comes with it. Normally each test runs inside a database transaction that is rolled back at the end, but the server thread has its own database connection and cannot see rows that the test has not committed. So the smoke tests use django_db(transaction=True): rows are really committed, and pytest-django empties the tables after each test instead of rolling back. That is slower, which is one more reason to keep the smoke test small: a few calls, the ones customers use most, chosen with the SDK's owner."
+   ],
    "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/cloud-ci.yml (openapi-diff job, part 1 of 2)",
-    "text": "  openapi-diff:\n    name: OpenAPI breaking changes\n    runs-on: fcp-runner-set\n    needs: check-changes\n    if: github.ref != 'refs/heads/main' && needs.check-changes.outputs.has_changes == 'true'\n    env:\n      ENV: QA\n      DJANGO_SECRET_KEY: rhino\n      DJANGO_SETTINGS_MODULE: rhinoCloud.rhinoDjango.settings\n      # ...plus whatever settings.py reads at import time (copy from the `test` job); no database is used\n    steps:\n      - uses: actions/checkout@v6\n        with:\n          fetch-depth: 0\n      - uses: actions/setup-python@v6\n        with:\n          python-version: \"3.13\"\n      - name: Install dependencies\n        working-directory: cloud/rhinoCloud\n        run: uv sync --frozen --no-install-project && echo \"$PWD/.venv/bin\" >> \"$GITHUB_PATH\"",
+    "lang": "python",
+    "file": "tests/sdk_smoke/test_published_sdk.py (the lab; fcp's is tests_api/sdk_smoke/)",
+    "text": "\"\"\"The released SDK against this commit's API, over real HTTP. Run it with the released wheel:\nuv run --with released/projectsdk-1.0.0-py3-none-any.whl pytest tests/sdk_smoke\"\"\"\nimport pytest\n\nsdk = pytest.importorskip(\"projectsdk\")  # not a dependency of the app on purpose: the test installs a release\n\npytestmark = pytest.mark.django_db(transaction=True)  # the server thread must see committed rows\n\n\ndef test_the_released_sdk_creates_and_finds_a_project(live_server):\n    client = sdk.Client(f\"{live_server.url}/api\")\n    created = client.create_project(\"Lung CT\", \"lab-a\")\n    assert client.find_project(\"lung ct\")[\"id\"] == created[\"id\"]",
     "notes": [
      {
-      "line": 1,
-      "text": "The job id."
-     },
-     {
-      "line": 2,
-      "text": "The check name GitHub shows on the commit."
-     },
-     {
-      "line": 4,
-      "text": "Wait for the change detector, like the other cloud jobs."
-     },
-     {
       "line": 5,
-      "text": "Only on branches, and only when cloud code changed."
+      "text": "Skipped unless a release was installed with --with. The app itself never depends on the SDK."
      },
      {
       "line": 7,
-      "text": "Settings read ENV at import time."
-     },
-     {
-      "line": 8,
-      "text": "Django refuses to start without a secret key; a dummy value is fine here."
-     },
-     {
-      "line": 9,
-      "text": "Tells django.setup() which settings to load."
+      "text": "Committed rows, so the server thread can see what the test wrote."
      },
      {
       "line": 10,
-      "text": "Copy the other import-time variables from the test job. No Postgres service."
-     },
-     {
-      "line": 14,
-      "text": "Full history, so git merge-base can find the common commit."
-     },
-     {
-      "line": 17,
-      "text": "The cloud's Python version."
-     },
-     {
-      "line": 20,
-      "text": "Install the locked dependencies, then put .venv/bin on PATH for the next steps through GITHUB_PATH."
-     }
-    ]
-   }
-  },
-  {
-   "h": "oasdiff, part 2: two exports and one compare",
-   "p": [
-    "A git worktree is a second checkout of the same repo in another folder. The job checks out the merge base into $RUNNER_TEMP/base. Then this commit's export script runs twice: once with PYTHONPATH pointing at the base tree, once at this tree. So the very first run of the check already has a base to compare with.",
-    "oasdiff runs from its Docker image, pinned by digest. --fail-on ERR fails the job on an error-level change; warnings show as annotations on the PR. A deliberate break is a line with the ticket key in cloud/rhinoCloud/openapi-breaking-ignore.txt, which oasdiff reads with --err-ignore."
-   ],
-   "because": "We run this commit's script against both trees, because the base commit may not have the script yet.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/cloud-ci.yml (openapi-diff job, part 2 of 2)",
-    "text": "      - name: Export the v2 schema for the merge base and for this commit\n        run: |\n          git worktree add \"$RUNNER_TEMP/base\" \"$(git merge-base HEAD origin/main)\"\n          # This commit's export script runs against both trees, so the first run already has a base.\n          PYTHONPATH=\"$RUNNER_TEMP/base/cloud:$RUNNER_TEMP/base/common\" python cloud/rhinoCloud/scripts/export_openapi.py > \"$RUNNER_TEMP/base.yaml\"\n          PYTHONPATH=\"$PWD/cloud:$PWD/common\" python cloud/rhinoCloud/scripts/export_openapi.py > \"$RUNNER_TEMP/head.yaml\"\n      - name: Fail on breaking changes\n        # $RUNNER_TEMP sits on the work volume the dind sidecar shares; pin the image by digest\n        run: >\n          docker run --rm -v \"$RUNNER_TEMP:/work\" -v \"$PWD/cloud/rhinoCloud:/cfg:ro\" tufin/oasdiff@sha256:<digest>\n          breaking /work/base.yaml /work/head.yaml --fail-on ERR --format githubactions\n          --err-ignore /cfg/openapi-breaking-ignore.txt",
-    "notes": [
-     {
-      "line": 1,
-      "text": "One step, two exports."
-     },
-     {
-      "line": 3,
-      "text": "Check out the merge base into a temp folder next to the main checkout."
-     },
-     {
-      "line": 4,
-      "text": "The comment keeps the reason in the file."
-     },
-     {
-      "line": 5,
-      "text": "Python imports rhinoCloud and fcp_common from the base tree, so the base schema comes out."
-     },
-     {
-      "line": 6,
-      "text": "The same script, importing from this commit's tree."
-     },
-     {
-      "line": 8,
-      "text": "On fcp-runner-set, Docker runs in a sidecar container that shares the work volume, so $RUNNER_TEMP is visible to it."
-     },
-     {
-      "line": 10,
-      "text": "Mount the two YAML files at /work and the cloud folder read-only at /cfg."
-     },
-     {
-      "line": 11,
-      "text": "Compare, fail on errors, and print GitHub annotations."
+      "text": "live_server is this commit's Django on a free port. The SDK gets its URL like a customer gets ours."
      },
      {
       "line": 12,
-      "text": "Skip the error lines a person listed in the protected ignore file."
+      "text": "The released code builds the request body, so a renamed field shows up here as a 400."
      }
     ]
    }
   },
   {
-   "h": "Migration lint and Squawk (G7-15)",
+   "h": "When the smoke test goes red",
    "p": [
-    "Two tools check each migration added since main. django-migration-linter catches changes that break code still running during a deploy, such as dropping a column old pods read. Squawk reads the SQL from manage.py sqlmigrate and warns about locks and table rewrites on a live Postgres.",
-    "Add django-migration-linter to the test dependency group, and to INSTALLED_APPS only when RHINO_IS_RUNNING_UNIT_TESTS=1 (in settings_test.py). The step goes into the test job after \"Check for missing migrations\"; that job already has the Postgres service sqlmigrate needs. .squawk.toml at the repo root sets pg_version 17.6 and assume_in_transaction = true, because Django wraps migrations in a transaction. It lists excluded rules with a reason each."
+    "A red smoke test means the change would break customers who have not upgraded, so the change must be made in two steps instead. First expand: the API accepts both the old name and the new one, the SDK switches to the new name in its next release, and both versions keep working. Only when the oldest supported SDK no longer sends the old name do you contract, remove the old name, in a later pull request. The breaking-change lesson called this expand and contract; the smoke test is what proves the expand step really works for the old release.",
+    "The wrong reaction is to make the test agree with the change, for example by pointing it at the sdk/ folder of the branch instead of a release. The test then compares the pull request with itself and is green by definition. That is why the check's command lives in a CI file that agents may not change, and why a deliberate break, when one is ever needed, is a person's decision, recorded with the ticket key."
    ],
-   "because": "We start with continue-on-error for two weeks, so the guild sees real findings before the step blocks anyone.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/cloud-ci.yml (test job, new step)",
-    "text": "      # After \"Check for missing migrations\". This job's checkout needs `fetch-depth: 0` for the merge base.\n      - name: Lint new migrations (django-migration-linter + Squawk)\n        working-directory: cloud/rhinoCloud\n        continue-on-error: true  # advisory for the first 2 weeks, then remove this line\n        run: |\n          base=$(git merge-base HEAD origin/main)\n          ./manage.py lintmigrations --git-commit-id \"$base\"\n          mkdir -p \"$RUNNER_TEMP/sql\"\n          new=$(git diff --name-only --diff-filter=A \"$base\" -- rhinoCore/migrations/ | grep -E '/[0-9]{4}_[^/]+\\.py$' || true)\n          for file in $new; do\n            name=$(basename \"$file\" .py)\n            ./manage.py sqlmigrate rhinoCore \"$name\" > \"$RUNNER_TEMP/sql/$name.sql\"\n          done\n          if [ -n \"$new\" ]; then\n            # .squawk.toml at the repo root: pg_version, assume_in_transaction = true, excluded rules with reasons\n            uvx --from squawk-cli squawk --config ../../.squawk.toml \"$RUNNER_TEMP\"/sql/*.sql\n          fi",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Where the step goes, and the reminder that this job's checkout needs fetch-depth: 0."
-     },
-     {
-      "line": 2,
-      "text": "One step, both tools."
-     },
-     {
-      "line": 3,
-      "text": "Run from cloud/rhinoCloud, where manage.py is."
-     },
-     {
-      "line": 4,
-      "text": "Advisory: a failure shows but does not fail the job. Remove the line after 2 weeks."
-     },
-     {
-      "line": 6,
-      "text": "The commit to compare against."
-     },
-     {
-      "line": 7,
-      "text": "Lint only the migrations added since the base."
-     },
-     {
-      "line": 8,
-      "text": "A temp folder for the SQL files."
-     },
-     {
-      "line": 9,
-      "text": "Only added files under rhinoCore/migrations/ whose name starts with four digits. || true keeps an empty grep from failing the step."
-     },
-     {
-      "line": 10,
-      "text": "For each new migration ..."
-     },
-     {
-      "line": 11,
-      "text": "... take its name without .py, for example 0229_add_owner ..."
-     },
-     {
-      "line": 12,
-      "text": "... and write the SQL Django would run into a file."
-     },
-     {
-      "line": 14,
-      "text": "Run Squawk only when there is SQL to read."
-     },
-     {
-      "line": 16,
-      "text": "Squawk from PyPI in a throw-away environment, with the repo's config, over every SQL file."
-     }
+   "deeper": {
+    "h": "Go deeper: the other three checks in fcp's CI",
+    "p": [
+     "oasdiff: a script exports the cloud's v2 OpenAPI document with drf-spectacular, without a database, for this commit and for a git worktree of the merge base, so even the first run has something to compare. oasdiff breaking --fail-on ERR fails the job on an error-level change, and a deliberate break is one line with the ticket key in a protected ignore file.",
+     "Migrations: django-migration-linter flags operations that break the old code still running during a deploy, such as dropping a column, and Squawk reads the SQL from manage.py sqlmigrate and warns about locks and table rewrites. Both start as advice for two weeks, then block. buf breaking checks the gRPC protos between the cloud and the on-prem client with the PACKAGE rule set, because the cloud calls the client's methods by name, so even a renamed method breaks old clients."
     ]
-   },
-   "callout": {
-    "kind": "tip",
-    "text": "Client migrations (rhinoAgent, rhinoRawDataHandler) run on customer machines at upgrade time. Leave them out for now; add them later if the guild wants it."
-   }
-  },
-  {
-   "h": "buf breaking on the protos (G7-19)",
-   "p": [
-    "The cloud dispatches agent calls by method name: AgentRpcRequest.method_name, field 2 of the proxy proto. So a renamed RPC still parses on the wire and still breaks every client that has not upgraded. buf.yaml picks the rule set that catches that.",
-    "In the cloud-ci.yml lint job, which already runs the protoc drift check, set fetch-depth: 0 and add bufbuild/buf-action with setup_only: true. Then run: buf breaking common --against \".git#ref=$(git merge-base HEAD origin/main),subdir=common\"."
-   ],
-   "because": "We put the module root at common/, because make protoc uses common/ as its proto path.",
-   "code": {
-    "lang": "yaml",
-    "file": "common/buf.yaml",
-    "text": "# Module root is common/ because `make protoc` runs with --proto_path=common, so buf sees\n# fcp_common/rhinoAgentRpc/*.proto with the same paths as the generated _pb2 files.\nversion: v2\nmodules:\n  - path: .\nbreaking:\n  use:\n    # PACKAGE, not WIRE: AgentRpcRequest carries the RPC by method_name, so deleting or renaming an RPC\n    # breaks older on-prem clients even though the bytes still parse. Clients upgrade later than the cloud.\n    - PACKAGE\n  except:\n    # We never use the proto JSON mapping between cloud and client (gRPC binary only). Confirm with the BE guild.\n    - FIELD_SAME_JSON_NAME",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Why common/ is the root: the protoc Makefile's ROOT_DIR is common/, so paths match the generated _pb2 files."
-     },
-     {
-      "line": 3,
-      "text": "The buf configuration format."
-     },
-     {
-      "line": 5,
-      "text": "One module: this folder, common/."
-     },
-     {
-      "line": 6,
-      "text": "The settings for buf breaking."
-     },
-     {
-      "line": 8,
-      "text": "WIRE allows deleting or renaming an RPC, because old bytes still parse. Our method-name dispatch cannot survive that."
-     },
-     {
-      "line": 10,
-      "text": "Stricter rules: no removed or renamed messages, fields, services or RPCs within a package."
-     },
-     {
-      "line": 11,
-      "text": "Rules we turn off, each with a reason."
-     },
-     {
-      "line": 13,
-      "text": "Cloud and client never use the proto JSON mapping, only gRPC binary. Confirm this with the BE guild."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "The protos have no reserved entries today. Add a note to common/fcp_common/rhinoAgentRpc/README.md: when you remove a field, reserve its number and name instead of reusing them. A deliberate break needs a person and a plan for old clients."
-   }
-  },
-  {
-   "h": "The published SDK, part 1: install and log in (G7-21)",
-   "p": [
-    "Customers run the wheel on PyPI, not the SDK folder in the repo. G7-21 runs a few real SDK calls from the latest release against this commit's API, over real HTTP. pytest-django's live_server fixture starts a server thread on a random port over the test database.",
-    "The API Tests job reads the latest version from https://pypi.org/pypi/rhino-health/json and runs uv run --group api-tests --with rhino-health==$SDK_VERSION pytest tests_api/sdk_smoke -m sdk_smoke. cloud/rhinoCloud/pyproject.toml sets exclude-newer = \"7 days\", which also applies to --with. Override it for this step, so yesterday's release is tested too."
-   ],
-   "because": "We skip the module when rhino_health is missing, because only this CI step installs the released wheel.",
-   "code": {
-    "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/sdk_smoke/test_published_sdk.py (part 1 of 2)",
-    "text": "\"\"\"The latest *published* rhino-health SDK against this commit's API, over real HTTP (pytest-django live_server).\nThe API Tests job runs: uv run --group api-tests --with rhino-health==$SDK_VERSION pytest tests_api/sdk_smoke\"\"\"\n\nimport pytest\n\nrh = pytest.importorskip(\"rhino_health\")  # in no uv group on purpose: CI installs the released wheel\n\npytestmark = [pytest.mark.sdk_smoke, pytest.mark.django_db(transaction=True)]  # live_server needs committed rows\n\n\n@pytest.fixture\ndef sdk(live_server, builder):\n    site = builder.site()  # a fake workgroup and user, created through the API\n    session = rh.login(username=site.email, password=site.password, rhino_api_url=f\"{live_server.url}/api/\")\n    return session, site",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The docstring says what this tests and the exact command the job runs."
-     },
-     {
-      "line": 6,
-      "text": "Import rhino_health, or skip every test in this file when it is missing."
-     },
-     {
-      "line": 8,
-      "text": "Marks for every test in the module: sdk_smoke, and django_db with transaction=True."
-     },
-     {
-      "line": 12,
-      "text": "A fixture that needs the live server and the builder from lesson g7-3."
-     },
-     {
-      "line": 13,
-      "text": "A fake workgroup and user, created through the API."
-     },
-     {
-      "line": 14,
-      "text": "The released SDK logs in over HTTP to this commit's API at the live server's URL."
-     },
-     {
-      "line": 15,
-      "text": "The test gets the SDK session and the site."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "live_server runs in another thread, which cannot see rows inside the test's open transaction. transaction=True makes pytest-django commit rows and clean up by truncating tables instead."
-   }
-  },
-  {
-   "h": "The published SDK, part 2: one real call",
-   "p": [
-    "The first test creates a project and finds it by name. Add more calls only for what customers use most, picked with the SDK owner. Also test the oldest SDK version we still support; the SDK owner decides which one."
-   ],
-   "because": "We import the SDK's own dataclass inside the test, because the module may be skipped and the import must not run then.",
-   "code": {
-    "lang": "python",
-    "file": "cloud/rhinoCloud/tests_api/sdk_smoke/test_published_sdk.py (part 2 of 2)",
-    "text": "def test_published_sdk_creates_and_finds_a_project(sdk):\n    from rhino_health.lib.endpoints.project.project_dataclass import ProjectCreateInput\n\n    session, site = sdk\n    project = session.project.add_project(\n        ProjectCreateInput(name=\"SDK smoke\", description=\"\", type=\"Validation\", primary_workgroup_uid=site.workgroup_uid)\n    )\n    assert session.project.get_project_by_name(\"sdk smoke\").uid == project.uid  # the name search ignores case\n\n\n# Next: data schemas, datasets and code objects, picked with the SDK owner from what customers call most.",
-    "notes": [
-     {
-      "line": 1,
-      "text": "One scenario a customer runs every day."
-     },
-     {
-      "line": 2,
-      "text": "The SDK's input dataclass for a new project."
-     },
-     {
-      "line": 4,
-      "text": "Unpack the fixture's tuple."
-     },
-     {
-      "line": 5,
-      "text": "Create a project through the released SDK."
-     },
-     {
-      "line": 6,
-      "text": "A project type and the site's workgroup as the primary one."
-     },
-     {
-      "line": 8,
-      "text": "Find it by name in lower case; the search ignores case, so this checks that too."
-     },
-     {
-      "line": 11,
-      "text": "More calls later: schemas, datasets and code objects."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "While you are in sdk-ci.yml: TEST_USERNAME is set from secrets.SDK_TEST_PASSWORD and TEST_PASSWORD from secrets.SDK_TEST_USERNAME. That looks swapped. Check with the SDK owner before you change it."
    }
   }
  ],
  "lab": {
-  "title": "Find the contracts these checks protect, in your fcp checkout",
-  "youNeed": [
-   "Your fcp checkout (~/Projects/fcp)",
-   "A terminal"
+  "id": "g7-4",
+  "title": "Run the released SDK against your branch",
+  "minutes": 30,
+  "mode": "guided",
+  "needs": [
+   "uv",
+   "No Docker and no account: a local folder plays the package index"
   ],
-  "worked": [
+  "goal": "Build a small SDK release, smoke-test it against the API with live_server, watch the released version catch a rename that the repo's own SDK hides, then fix the API with an expand step.",
+  "guess": {
+   "q": "You rename workgroup to workgroup_uid in the API and in the repo's SDK folder. You run the smoke test twice: once with the SDK installed from the folder, once with the wheel released last month. What happens?",
+   "options": [
+    {
+     "text": "Both fail, because the API changed.",
+     "correct": false,
+     "why": "The folder's SDK was changed together with the API, so it agrees with it."
+    },
+    {
+     "text": "Both pass, because the field still holds the same value.",
+     "correct": false,
+     "why": "The released SDK still sends the old name, and the serializer now requires the new one."
+    },
+    {
+     "text": "The folder's SDK passes and the released one fails with 400, which is what customers would see.",
+     "correct": true,
+     "why": "Testing the folder compares the pull request with itself. Only the released code shows the break."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "cd ~/Projects/fcp && grep -n \"SCHEMA_PATTERNS\" cloud/rhinoCloud/rhinoDjango/urls.py | head -4",
-    "see": "24:_MAIN_SCHEMA_PATTERNS = [path(\"api/\", include(MAIN_URLPATTERNS))]\n25:_CONNECT_SCHEMA_PATTERNS = [path(\"api/\", include(CONNECT_URLPATTERNS))]\n46: ... docs/v1/openapi/ ...\n49: ... docs/v2/openapi/ ..."
+    "say": "Make the project: Django and DRF for the API, pytest and pytest-django for the tests.",
+    "do": "mkdir -p ~/academy-labs/g7-4 && cd ~/academy-labs/g7-4 && uv init --bare --python 3.13 && uv add \"django>=5.2,<5.3\" \"djangorestframework>=3.17,<3.18\" && uv add --dev pytest pytest-django && uv run django-admin startproject mysite . && uv run python manage.py startapp projects",
+    "see": " + django==5.2.18\n + djangorestframework==3.17.2\n …\n + pytest-django==4.14.0"
    },
    {
-    "do": "grep -n \"method_name\" common/fcp_common/rhinoAgentRpc/agent_rpc_internal_cloud_proxy.proto",
-    "see": "13:  string method_name = 2;"
+    "say": "Write a small projects API that can also find a project by name, like the SDK needs.",
+    "do": "printf '\\nINSTALLED_APPS += [\"rest_framework\", \"projects\"]\\n' >> mysite/settings.py\ncat > projects/models.py <<'EOF'\nfrom django.db import models\n\n\nclass Project(models.Model):\n    name = models.CharField(max_length=120)\n    workgroup = models.CharField(max_length=60)\nEOF\ncat > projects/views.py <<'EOF'\nfrom rest_framework import serializers, viewsets\n\nfrom .models import Project\n\n\nclass ProjectSerializer(serializers.ModelSerializer):\n    class Meta:\n        model = Project\n        fields = [\"id\", \"name\", \"workgroup\"]\n\n\nclass ProjectViewSet(viewsets.ModelViewSet):\n    serializer_class = ProjectSerializer\n\n    def get_queryset(self):\n        name = self.request.query_params.get(\"name\")\n        return Project.objects.filter(name__iexact=name) if name else Project.objects.all()\nEOF\ncat > mysite/urls.py <<'EOF'\nfrom rest_framework.routers import DefaultRouter\n\nfrom projects.views import ProjectViewSet\n\nrouter = DefaultRouter()\nrouter.register(\"api/projects\", ProjectViewSet, basename=\"project\")\nurlpatterns = router.urls\nEOF\nuv run python manage.py makemigrations projects",
+    "see": "Migrations for 'projects':\n  projects/migrations/0001_initial.py\n    + Create model Project"
    },
    {
-    "do": "grep -c reserved common/fcp_common/rhinoAgentRpc/*.proto",
-    "see": "common/fcp_common/rhinoAgentRpc/agent_rpc_cloud_side.proto:0\ncommon/fcp_common/rhinoAgentRpc/agent_rpc_internal_cloud_proxy.proto:0\ncommon/fcp_common/rhinoAgentRpc/agent_rpc_onprem_side.proto:0"
+    "say": "Write the SDK as its own package, version 1.0.0, and build it into released/, which plays the package index.",
+    "do": "mkdir -p sdk/src/projectsdk && cat > sdk/pyproject.toml <<'EOF'\n[project]\nname = \"projectsdk\"\nversion = \"1.0.0\"\nrequires-python = \">=3.13\"\ndependencies = [\"requests>=2.32\"]\n\n[build-system]\nrequires = [\"uv_build>=0.9,<0.13\"]\nbuild-backend = \"uv_build\"\nEOF\ncat > sdk/src/projectsdk/__init__.py <<'EOF'\n\"\"\"The SDK customers install from the package index. Version 1.0.0 is in their scripts today.\"\"\"\nimport requests\n\n\nclass Client:\n    def __init__(self, api_url: str):\n        self.api_url = api_url.rstrip(\"/\")\n\n    def create_project(self, name: str, workgroup: str) -> dict:\n        response = requests.post(f\"{self.api_url}/projects/\", json={\"name\": name, \"workgroup\": workgroup}, timeout=30)\n        response.raise_for_status()\n        return response.json()\n\n    def find_project(self, name: str) -> dict:\n        response = requests.get(f\"{self.api_url}/projects/\", params={\"name\": name}, timeout=30)\n        response.raise_for_status()\n        return response.json()[0]\nEOF\n(cd sdk && uv build --out-dir ../released) && ls released",
+    "see": "Successfully built ../released/projectsdk-1.0.0.tar.gz\nSuccessfully built ../released/projectsdk-1.0.0-py3-none-any.whl\nprojectsdk-1.0.0-py3-none-any.whl\nprojectsdk-1.0.0.tar.gz"
    },
    {
-    "do": "grep -n \"ROOT_DIR:=\" common/fcp_common/rhinoAgentRpc/Makefile",
-    "see": "3:ROOT_DIR:=$(shell dirname $(shell dirname $(RHINO_AGENT_RPC_DIR)))\n(two folders up from rhinoAgentRpc/ is common/, buf's module root)"
+    "say": "Write the smoke test. Run it once plainly, where it skips, and once with the released wheel added for this command only.",
+    "do": "printf '\\n[tool.pytest.ini_options]\\nDJANGO_SETTINGS_MODULE = \"mysite.settings\"\\n' >> pyproject.toml && mkdir -p tests/sdk_smoke && cat > tests/sdk_smoke/test_published_sdk.py <<'EOF'\n\"\"\"The released SDK against this commit's API, over real HTTP. Run it with the released wheel:\nuv run --with released/projectsdk-1.0.0-py3-none-any.whl pytest tests/sdk_smoke\"\"\"\nimport pytest\n\nsdk = pytest.importorskip(\"projectsdk\")  # not a dependency of the app on purpose: the test installs a release\n\npytestmark = pytest.mark.django_db(transaction=True)  # the server thread must see committed rows\n\n\ndef test_the_released_sdk_creates_and_finds_a_project(live_server):\n    client = sdk.Client(f\"{live_server.url}/api\")\n    created = client.create_project(\"Lung CT\", \"lab-a\")\n    assert client.find_project(\"lung ct\")[\"id\"] == created[\"id\"]\nEOF\nuv run pytest -q tests; uv run --with released/projectsdk-1.0.0-py3-none-any.whl pytest -q tests/sdk_smoke",
+    "see": "1 skipped in 0.04s\n.                                                                        [100%]\n1 passed in 1.38s"
    },
    {
-    "do": "grep -n \"exclude-newer\" cloud/rhinoCloud/pyproject.toml",
-    "see": "83:exclude-newer = \"7 days\""
+    "say": "Now make the rename from the story, in the API and in the repo's SDK, and bump the SDK to 1.1.0 without releasing it.",
+    "do": "cat > projects/views.py <<'EOF'\nfrom rest_framework import serializers, viewsets\n\nfrom .models import Project\n\n\nclass ProjectSerializer(serializers.ModelSerializer):\n    workgroup_uid = serializers.CharField(source=\"workgroup\")  # renamed: clearer for new readers\n\n    class Meta:\n        model = Project\n        fields = [\"id\", \"name\", \"workgroup_uid\"]\n\n\nclass ProjectViewSet(viewsets.ModelViewSet):\n    serializer_class = ProjectSerializer\n\n    def get_queryset(self):\n        name = self.request.query_params.get(\"name\")\n        return Project.objects.filter(name__iexact=name) if name else Project.objects.all()\nEOF\nsed -i '' -e 's/\"workgroup\": workgroup}/\"workgroup_uid\": workgroup}/' -e 's/version = \"1.0.0\"/version = \"1.1.0\"/' sdk/src/projectsdk/__init__.py sdk/pyproject.toml && grep -n workgroup_uid sdk/src/projectsdk/__init__.py",
+    "see": "10:        response = requests.post(f\"{self.api_url}/projects/\", json={\"name\": name, \"workgroup_uid\": workgroup}, timeout=30)\n(on Linux, use sed -i without the '')"
    },
    {
-    "do": "grep -n \"TEST_USERNAME\\|TEST_PASSWORD\" .github/workflows/sdk-ci.yml",
-    "see": "96:          TEST_USERNAME: ${{ secrets.SDK_TEST_PASSWORD }}\n97:          TEST_PASSWORD: ${{ secrets.SDK_TEST_USERNAME }}"
+    "say": "Run the smoke test against the repo's SDK folder, then against the release customers have.",
+    "do": "uv run --with ./sdk pytest -q tests/sdk_smoke 2>&1 | tail -1; uv run --with released/projectsdk-1.0.0-py3-none-any.whl pytest -q tests/sdk_smoke 2>&1 | grep -E '^E  |passed|failed'",
+    "see": "1 passed in 1.43s\nE           requests.exceptions.HTTPError: 400 Client Error: Bad Request for url: http://localhost:60329/api/projects/\n1 failed in 0.70s"
    }
   ],
-  "faded": "Find the step \"Check for missing migrations\" in .github/workflows/cloud-ci.yml and the checkout of the same job. The command is left to you. Check whether that checkout already has fetch-depth: 0, which G7-15 needs.",
-  "alone": "Pick one serializer in cloud/rhinoCloud/rhinoCore/serializers/. Write down one change to it that oasdiff would call breaking and one it would allow. Then write the line a person would add to openapi-breaking-ignore.txt for the breaking one, with a made-up ticket key.",
-  "done": "You can show where each check reads its contract: schema patterns, method_name, reserved entries, the buf root and exclude-newer."
+  "build": "Make the change safe with an expand step. In ProjectSerializer, add a to_internal_value(self, data) method: when the body has workgroup but no workgroup_uid, copy the value to workgroup_uid, then call super().to_internal_value(data). Release the SDK's 1.1.0 into released/ with (cd sdk && uv build --wheel --out-dir ../released). Then test every release in the folder with one loop: for wheel in released/*.whl; do echo \"$wheel\"; uv run --with \"$wheel\" pytest -q tests/sdk_smoke | tail -1; done. Both versions must pass.",
+  "checks": [
+   "uv run pytest -q tests (without --with) still says 1 skipped.",
+   "released/ holds projectsdk-1.0.0 and projectsdk-1.1.0 wheels.",
+   "The loop prints 1 passed for both wheels.",
+   "A project created by SDK 1.0 shows workgroup_uid in the API's answer: the old name is accepted, the new name is what the API returns.",
+   "You did not change the smoke test or the released wheels to get there."
+  ],
+  "solution": {
+   "lang": "python",
+   "file": "projects/views.py",
+   "text": "from rest_framework import serializers, viewsets\n\nfrom .models import Project\n\n\nclass ProjectSerializer(serializers.ModelSerializer):\n    workgroup_uid = serializers.CharField(source=\"workgroup\")  # renamed: clearer for new readers\n\n    class Meta:\n        model = Project\n        fields = [\"id\", \"name\", \"workgroup_uid\"]\n\n    def to_internal_value(self, data):  # expand: SDK 1.0 still sends the old name\n        if \"workgroup\" in data and \"workgroup_uid\" not in data:\n            data = {**data, \"workgroup_uid\": data[\"workgroup\"]}\n        return super().to_internal_value(data)\n\n\nclass ProjectViewSet(viewsets.ModelViewSet):\n    serializer_class = ProjectSerializer\n\n    def get_queryset(self):\n        name = self.request.query_params.get(\"name\")\n        return Project.objects.filter(name__iexact=name) if name else Project.objects.all()"
+  },
+  "fix": "A teammate is tired of the red smoke test and changes the CI command from uv run --with released/projectsdk-1.0.0-py3-none-any.whl ... to uv run --with ./sdk ..., \"because the released SDK is old anyway\". Undo your expand step (go back to the renamed views.py) and run both commands. The new one is green. Explain why it can never be red for a field rename, and what the command must install instead.",
+  "explain": [
+   "Why does the smoke test install a released version instead of using the SDK in the repo?",
+   "Why does the test need live_server and transaction=True, when the other API tests use an in-process client?",
+   "The smoke test is red after a rename. What are the two steps that make the change safe, and when does the second one happen?"
+  ],
+  "done": "Both releases pass against your expanded API, and you can explain why a smoke test against the repo's own SDK proves nothing about customers."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Why does the oasdiff job run this commit's export script against the merge-base tree too?",
+   "q": "Nova changed the API and the SDK folder together, and the SDK's own tests pass. Why is that not enough?",
    "options": [
     {
-     "text": "Because the base commit may not have the script yet, so the first run still has a base.",
+     "text": "Customers run a released SDK version, which was not changed, so only a test with the release shows whether they break.",
      "correct": true,
-     "why": "PYTHONPATH points the same script at the old code."
+     "why": "The folder and the API come from the same pull request, so they always agree. The release is the reader outside it."
     },
     {
-     "text": "Because the base tree's script would give a different YAML format.",
+     "text": "Because the SDK's tests do not run in CI.",
      "correct": false,
-     "why": "The format is the same; the problem is that the old tree may not have a script."
+     "why": "Even if they run, they test the changed folder, not what customers installed."
     },
     {
-     "text": "Because oasdiff can only read files from the same folder.",
+     "text": "Because the SDK folder is written in a different language.",
      "correct": false,
-     "why": "oasdiff reads any mounted path."
+     "why": "Both are Python. The problem is which version of the code runs, not the language."
     }
    ]
   },
   {
-   "q": "An agent renames the RPC HealthCheck to CheckHealth in the onprem proto. Old bytes still parse. Why must buf fail?",
+   "q": "Why does the smoke test use pytest.importorskip instead of listing the SDK as a dependency of the cloud project?",
    "options": [
     {
-     "text": "Because buf fails on any change to a proto file.",
+     "text": "Because importorskip is faster than a normal import.",
      "correct": false,
-     "why": "buf allows compatible changes, such as a new optional field."
+     "why": "Speed is not the point; the point is which SDK version gets tested."
     },
     {
-     "text": "Because the cloud dispatches by method_name, so older clients do not know CheckHealth.",
+     "text": "So CI decides exactly which release to install with --with for each run, and nothing tests a random installed version by accident.",
      "correct": true,
-     "why": "That is why buf.yaml uses PACKAGE, not WIRE."
+     "why": "Without --with the test skips; with it, it runs against exactly the version CI chose, such as the latest and the oldest supported."
     },
     {
-     "text": "Because the generated _pb2 files were not committed.",
+     "text": "Because pytest cannot import packages from PyPI.",
      "correct": false,
-     "why": "That is the protoc drift check's job, not buf's."
+     "why": "It imports whatever is installed. --with is how the right version gets installed for one command."
     }
    ]
   },
   {
-   "q": "Why does the SDK smoke test use django_db(transaction=True)?",
+   "q": "The smoke test goes red after a field rename. What is the right fix?",
    "options": [
     {
-     "text": "Because the SDK writes directly to Postgres.",
+     "text": "Point the smoke test at the repo's SDK folder, which already has the new name.",
      "correct": false,
-     "why": "The SDK talks HTTP to the live server, never to the database."
+     "why": "Then the test compares the pull request with itself and can never fail on a rename."
     },
     {
-     "text": "Because transaction=True is faster.",
+     "text": "Release a new SDK at once and ask customers to upgrade.",
      "correct": false,
-     "why": "It is slower: tables are truncated after each test."
+     "why": "Customers upgrade when they choose. Until then their scripts break."
     },
     {
-     "text": "Because live_server serves from another thread, which cannot see uncommitted rows.",
+     "text": "Expand first: accept both names in the API and release the SDK with the new name; remove the old name later, when no supported SDK sends it.",
      "correct": true,
-     "why": "Committed rows are visible to the server thread."
+     "why": "Old and new releases both keep working, and the smoke test proves it for the old one."
     }
    ]
   }
  ],
- "recall": [
-  "From p10-5: what is a merge base, and why do CI jobs that need it set fetch-depth: 0?",
-  "From g7-3: what does builder.site() return?"
- ],
- "videos": [
-  {
-   "title": "Testing APIs with Django REST Framework",
-   "url": "https://www.youtube.com/watch?v=sRluxnmZ-H8",
-   "channel": "BugBytes",
-   "minutes": 19,
-   "why": "Recent, focused DRF testing with APIClient and force_authenticate."
-  }
- ],
+ "platform": {
+  "p": [
+   "tests_api/sdk_smoke/test_published_sdk.py logs in with the latest rhino-health release through pytest-django's live_server, creates a project and finds it by name, against a site made by builder.site(). The API Tests job reads the version from https://pypi.org/pypi/rhino-health/json and runs uv run --group api-tests --with rhino-health==$SDK_VERSION pytest tests_api/sdk_smoke -m sdk_smoke, overriding the project's exclude-newer = \"7 days\" for this step; the SDK owner picks the oldest supported version to test too. While there, sdk-ci.yml sets TEST_USERNAME from SDK_TEST_PASSWORD and TEST_PASSWORD from SDK_TEST_USERNAME, which looks swapped and needs the owner's confirmation.",
+   "Three more checks join cloud CI. An OpenAPI breaking changes job exports the v2 schema with export_openapi.py for this commit and a worktree of the merge base and runs oasdiff with --fail-on ERR and the protected openapi-breaking-ignore.txt. The test job lints migrations added since main with django-migration-linter and Squawk, advisory for two weeks (known gap: --git-commit-id needs --project-root-path to see rhinoCore). The lint job runs buf breaking on common/ with PACKAGE rules (a removed field should be reserved, and deleting a reserved one still needs a person). Each check gets one line in Nova's checking guide."
+  ],
+  "tickets": [
+   {
+    "key": "G7-21",
+    "why": "The smoke test of the published SDK against this commit's API: this lesson."
+   },
+   {
+    "key": "G7-11",
+    "why": "oasdiff on the OpenAPI document of the merge base and the branch."
+   },
+   {
+    "key": "G7-15",
+    "why": "django-migration-linter and Squawk on new migrations."
+   },
+   {
+    "key": "G7-19",
+    "why": "buf breaking on the cloud-client gRPC protos."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "git worktree",
-   "plain": "A second checkout of the same repo in another folder, here of the merge base."
+   "term": "published SDK",
+   "plain": "The SDK version on PyPI that customers installed; it can be months older than the repo's sdk/ folder."
   },
   {
-   "term": "export script",
-   "plain": "export_openapi.py: generates the OpenAPI YAML from the URL patterns, with no database."
+   "term": "smoke test",
+   "plain": "A small test of the most common calls, to see quickly whether anything is badly broken."
   },
   {
-   "term": "err-ignore file",
-   "plain": "openapi-breaking-ignore.txt: the protected list of deliberate breaks, one line per break with a ticket key."
-  },
-  {
-   "term": "sqlmigrate",
-   "plain": "The manage.py command that prints the SQL one migration would run."
-  },
-  {
-   "term": "PACKAGE rules",
-   "plain": "buf's stricter rule set: nothing in a package may be removed or renamed, not only kept wire-compatible."
+   "term": "uv run --with",
+   "plain": "Adds a package, such as an exact SDK release, to the environment for one command only."
   },
   {
    "term": "live_server",
-   "plain": "A pytest-django fixture that runs a real HTTP server thread on a random port over the test database."
+   "plain": "A pytest-django fixture that runs the app on a free port inside the test, so real HTTP clients can call it."
+  },
+  {
+   "term": "expand and contract",
+   "plain": "Change a contract in two steps: first accept old and new, later remove the old when nobody uses it."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G7-11",
-   "why": "This lesson walked through the openapi-diff job: the env, the worktree, the two exports and the oasdiff call.",
-   "walk": [
-    "Add cloud/rhinoCloud/scripts/export_openapi.py: django.setup(), SchemaGenerator for _MAIN_SCHEMA_PATTERNS (v2) and _CONNECT_SCHEMA_PATTERNS, printed as YAML.",
-    "Check the export needs no database; fix any serializer that queries at import time.",
-    "Add the openapi-diff job to cloud-ci.yml from the two blocks above, with the oasdiff image pinned by digest.",
-    "Create cloud/rhinoCloud/openapi-breaking-ignore.txt and ask for it to be a protected path.",
-    "Add one line to Nova's checking guide (G4): run this check when a change touches serializers, views or urls.py."
-   ]
+   "q": "Write the CI command that runs the smoke test against one exact SDK release, and say what happens without --with.",
+   "a": "uv run --with rhino-health==<version> pytest tests_api/sdk_smoke (plus the api-tests group in fcp). Without --with, importorskip skips the test."
   },
   {
-   "key": "G7-15",
-   "why": "This lesson walked through the migration step line by line and the .squawk.toml settings.",
-   "walk": [
-    "Add django-migration-linter to the test group, and to INSTALLED_APPS in settings_test.py only.",
-    "Set fetch-depth: 0 on the test job's checkout and add the step above after \"Check for missing migrations\".",
-    "Add .squawk.toml at the repo root: pg_version 17.6 (check the prod RDS version), assume_in_transaction = true, excluded rules with reasons.",
-    "Run it advisory for 2 weeks, go through the findings with the BE guild, then remove continue-on-error.",
-    "Add one line to Nova's checking guide (G4) for migrations."
-   ]
+   "q": "Name three readers of fcp's backend that are not in a pull request, and the check that protects each one.",
+   "a": "The published SDK (smoke test, oasdiff), the on-prem client (buf breaking), the old code during a deploy (migration linter and Squawk)."
   },
   {
-   "key": "G7-19",
-   "why": "This lesson walked through buf.yaml and why PACKAGE, not WIRE, fits method-name dispatch.",
-   "walk": [
-    "Add common/buf.yaml from the block above.",
-    "In the cloud-ci.yml lint job set fetch-depth: 0, add bufbuild/buf-action with setup_only: true, and run buf breaking common against the merge base.",
-    "Add the reserve-don't-reuse note to common/fcp_common/rhinoAgentRpc/README.md.",
-    "Confirm the FIELD_SAME_JSON_NAME exception with the BE guild.",
-    "Add one line to Nova's checking guide (G4): a deliberate break needs a person and a plan for old clients."
-   ]
-  },
-  {
-   "key": "G7-21",
-   "why": "This lesson walked through the SDK smoke test, live_server, importorskip and the exclude-newer override.",
-   "walk": [
-    "Write tests_api/sdk_smoke/test_published_sdk.py from the two blocks above.",
-    "In the API Tests job, read the latest version from PyPI's JSON API. Run the suite with --with rhino-health==$SDK_VERSION, overriding exclude-newer.",
-    "Ask the SDK owner which calls customers use most and which oldest version we support; add both.",
-    "Ask the SDK owner about the swapped TEST_USERNAME and TEST_PASSWORD secrets in sdk-ci.yml.",
-    "Add one line to Nova's checking guide (G4) for the SDK smoke test."
-   ]
+   "q": "Why must the smoke test's command be on a protected path?",
+   "a": "Because changing what it installs, for example to the repo's own folder, makes it always green. Agents may not change the checks they are judged by."
   }
  ],
- "remember": "Build the old version from the merge base, compare, fail on a break, and let only a person record a deliberate one."
+ "remember": "Test the SDK customers really installed against your branch, and when it breaks, expand first and contract later."
 }
