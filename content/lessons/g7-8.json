@@ -1,804 +1,281 @@
 {
+ "v": 2,
  "id": "g7-8",
  "title": "DevOps checks",
- "minutes": 60,
+ "minutes": 50,
  "youNeed": [
   "p4-6",
-  "p2-3",
   "p5-2"
  ],
- "bridge": "The DevOps checks are like the lint and type steps in frontend-ci, moved to the infrastructure and gitops repos. Except: the most useful answer there is a plan or a rendered diff of real infrastructure. So CI gets a read-only role, and no workflow may ever apply, destroy or sync.",
- "intro": "Agents will propose infrastructure changes, and today infrastructure CI only checks formatting while gitops has no checks at all. This lesson adds six checks: validate, tflint and trivy; chart rendering; workflow lint; a read-only role; PR plans; and Argo CD diffs. They are YAML and HCL in the DevOps repos; nothing here is Python.",
- "picture": {
-  "caption": "Cheap checks need no keys; plans use a read-only role; nothing in CI applies or syncs.",
-  "nodes": [
-   {
-    "id": "pr",
-    "label": "An infra or gitops PR (person or agent)",
-    "kind": "file"
-   },
-   {
-    "id": "keyless",
-    "label": "validate, tflint, trivy, helm + kubeconform, actionlint, zizmor",
-    "kind": "check"
-   },
-   {
-    "id": "oidc",
-    "label": "GitHubActionsTerraformPlan (OIDC, PRs only)",
-    "kind": "service"
-   },
-   {
-    "id": "role",
-    "label": "TerraformPlanRole in each account",
-    "kind": "cloud"
-   },
-   {
-    "id": "plan",
-    "label": "One sticky plan comment per PR",
-    "kind": "file"
-   },
-   {
-    "id": "kind",
-    "label": "argocd-diff-preview on a throw-away kind cluster",
-    "kind": "machine"
-   },
-   {
-    "id": "person",
-    "label": "A person applies or syncs",
-    "kind": "person"
-   }
+ "map": "github",
+ "hook": {
+  "story": [
+   "A small pull request in the gitops repo, where the Helm charts for the product clusters live, changes one line in the dashboard chart's prod-aws-values.yaml: the number of copies of the dashboard, replicaCount, becomes \"two\" instead of 2. The diff looks harmless, a reviewer approves it, and nothing in CI checks it, because the gitops repo has no checks at all.",
+   "The first program that really reads the file is Argo CD, the tool that applies the charts to the real cluster. It fails to sync production, and someone spends the evening finding a typo that a machine could have found in seconds. Soon agents will open pull requests in this repo and in the infrastructure repo too, many more of them than people do."
   ],
-  "steps": [
-   {
-    "from": "pr",
-    "to": "keyless",
-    "text": "every push runs the checks that need no cloud keys"
-   },
-   {
-    "from": "pr",
-    "to": "oidc",
-    "text": "a pull_request run of RhinoHealth/infrastructure may assume the plan role"
-   },
-   {
-    "from": "oidc",
-    "to": "role",
-    "text": "assumes TerraformPlanRole: ReadOnlyAccess minus data reads"
-   },
-   {
-    "from": "role",
-    "to": "plan",
-    "text": "terragrunt plan -lock=false per changed unit, summarised in one comment"
-   },
-   {
-    "from": "pr",
-    "to": "kind",
-    "text": "gitops PRs render main and the PR's Applications and post the diff"
-   },
-   {
-    "from": "plan",
-    "to": "person",
-    "text": "reviewers read the result; applying stays a person's job"
-   }
-  ]
+  "question": "How can CI check infrastructure code for every environment before any real system reads it, without giving CI any keys to those systems?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Keyless checks, part 1: validate every module (G7-17)",
+   "h": "Check it where it is still text",
    "p": [
-    "Today the infrastructure repo runs one workflow, terrugrunt-lint.yml (spelled that way), which checks formatting only. Plans are run by hand over VPN and pasted into PRs. G7-17 adds .github/workflows/terraform-checks.yml next to it, with the same pattern. That means the same push paths, infrastructure-runner-set, actions pinned by SHA, and tenv (a version manager) to install OpenTofu.",
-    "tofu validate checks that a module's HCL is consistent: types, references, required arguments. With init -backend=false it needs no state and no credentials. Terragrunt units are covered later by plans (G7-32)."
+    "Infrastructure code has the same problem as the projects page in the verify lesson: the mistake is in one file, but it only shows up when something reads all the files together. For a Helm chart, that something is rendering. A chart is a set of templates plus a values file per environment, and helm template fills the templates with one values file and prints the Kubernetes manifests, the YAML that a cluster would receive. Nothing is sent anywhere, so rendering needs no cluster and no keys.",
+    "Rendering alone is not enough, because replicas: two is still valid YAML. kubeconform reads rendered manifests and checks each one against the Kubernetes API's own schemas, the same rules the cluster would apply, offline. It says replicas must be an integer, which is exactly the error Argo CD hit in production. helm lint, the chart's own linter, does not catch it: it checks that the chart is well formed, not that the result is something a cluster accepts."
    ],
-   "because": "We keep going after a failed module, because one report with all broken modules beats one fix per push.",
    "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/terraform-checks.yml (infrastructure repo, part 1 of 2)",
-    "text": "name: \"[TERRAFORM] Checks\"\non:\n  push:\n    paths: ['.github/workflows/terraform-checks.yml', 'terraform/**', 'modules/**', 'multi_tenant/**', 'single_tenant/**']\n  workflow_dispatch:\n\njobs:\n  validate:\n    name: Validate modules\n    runs-on: infrastructure-runner-set\n    steps:\n      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0\n      - name: Install Tofu\n        env:\n          TENV_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n        run: tenv tofu install\n      - name: tofu validate every module (no backend, no cloud keys)\n        run: |\n          status=0\n          for dir in modules/*/; do\n            (cd \"$dir\" && tofu init -backend=false -input=false -no-color >/dev/null && tofu validate -no-color) \\\n              || { echo \"::error file=${dir}::tofu validate failed\"; status=1; }\n          done\n          exit $status",
+    "lang": "bash",
+    "file": "check-charts.sh (the lab version)",
+    "text": "#!/bin/bash\n# Render every environment of the chart and check the result against the Kubernetes schemas, offline.\nset -o pipefail  # without it, a chart that does not render at all looks green\nstatus=0\nfor values in dashboard/*-values.yaml; do\n  echo \"== $values\"\n  helm template ci dashboard -f \"$values\" | docker run --rm -i ghcr.io/yannh/kubeconform:v0.7.0 -strict -summary - || status=1\ndone\nexit $status",
     "notes": [
-     {
-      "line": 1,
-      "text": "The workflow name in the repo's naming style."
-     },
      {
       "line": 3,
-      "text": "On push; push runs on a PR's head commit already show on the PR."
-     },
-     {
-      "line": 4,
-      "text": "Only when the workflow itself or Terraform code changed."
+      "text": "Without pipefail, the pipe's result is only kubeconform's, and kubeconform says yes to empty input."
      },
      {
       "line": 5,
-      "text": "A person may also run it by hand."
-     },
-     {
-      "line": 8,
-      "text": "Job 1."
-     },
-     {
-      "line": 10,
-      "text": "The infrastructure repo's runner set."
-     },
-     {
-      "line": 12,
-      "text": "checkout pinned by commit SHA, with the version in a comment, as this repo does."
-     },
-     {
-      "line": 15,
-      "text": "tenv downloads OpenTofu from GitHub; the token avoids rate limits."
-     },
-     {
-      "line": 16,
-      "text": "Install the OpenTofu version the repo pins."
-     },
-     {
-      "line": 19,
-      "text": "Remember failures instead of stopping at the first."
-     },
-     {
-      "line": 20,
-      "text": "Every module folder."
-     },
-     {
-      "line": 21,
-      "text": "Download providers without touching any state, then validate."
-     },
-     {
-      "line": 22,
-      "text": "A GitHub annotation on the module folder, and status=1."
-     },
-     {
-      "line": 24,
-      "text": "Fail the job if any module failed."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Keyless checks, part 2: tflint and trivy",
-   "p": [
-    "tflint finds mistakes validate cannot see, such as an instance type that does not exist. Add .tflint.hcl at the repo root with the aws and google rulesets. trivy config scans Terraform for risky settings, such as an open security group.",
-    "trivy runs with --severity HIGH,CRITICAL over modules/, terraform/ and multi_tenant/, advisory (exit code 0) for 2 weeks. Then go through the findings with Security, and fail on new HIGH and CRITICAL findings. Every line in .trivyignore names an owner and a reason. Fix or ignore the first-run errors in the same PR and list every ignored rule in the PR description."
-   ],
-   "because": "We pass GITHUB_TOKEN to tflint, because tflint --init downloads its rulesets from GitHub and would be rate-limited without it.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/terraform-checks.yml (part 2 of 2)",
-    "text": "  tflint:\n    name: tflint\n    runs-on: infrastructure-runner-set\n    steps:\n      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0\n      - uses: terraform-linters/setup-tflint@<sha> # pin by SHA like the checkout above\n      - run: tflint --init && tflint --recursive --config \"$PWD/.tflint.hcl\" --minimum-failure-severity=error\n        env:\n          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n  # trivy: aquasecurity/trivy-action@<sha> with scan-type: config, severity: HIGH,CRITICAL, exit-code: '0' for 2 weeks",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Job 2, in parallel with validate."
-     },
-     {
-      "line": 5,
-      "text": "The same pinned checkout."
-     },
-     {
-      "line": 6,
-      "text": "Install tflint; pin it by SHA too."
+      "text": "Every environment's values file, because a typo in one environment breaks only that one."
      },
      {
       "line": 7,
-      "text": "Download the rulesets in .tflint.hcl, then lint every folder; fail only on errors."
+      "text": "Render with one values file and check every manifest; remember the failure but keep going."
      },
      {
       "line": 9,
-      "text": "The token for those downloads."
-     },
-     {
-      "line": 10,
-      "text": "The third check, as one comment in the sketch: trivy-action with scan-type config, advisory for 2 weeks."
+      "text": "One report with every broken environment, and a red exit code if there was any."
      }
     ]
    },
-   "callout": {
-    "kind": "wall",
-    "text": "Ask for terraform-checks.yml, .tflint.hcl and .trivyignore to be protected paths (G0/G3 walls). An agent cannot loosen the checks that judge its infra PRs."
-   }
+   "see": "== dashboard/dev-values.yaml\nSummary: 4 resources found parsing stdin - Valid: 4, Invalid: 0, Errors: 0, Skipped: 0\n== dashboard/prod-values.yaml\nstdin - Deployment ci-dashboard is invalid: … at '/spec/replicas': got string, want null or integer\nSummary: 4 resources found parsing stdin - Valid: 3, Invalid: 1, Errors: 0, Skipped: 0"
   },
   {
-   "h": "Charts, part 1: setup (G7-23)",
+   "h": "The same idea in every repo",
    "p": [
-    "gitops has no checks today. A typo in a values file reaches Argo CD as a sync error on a real cluster. G7-23 renders every environment of each changed chart and checks the result against the Kubernetes schemas. It takes about a minute and needs no cluster access.",
-    "kubeconform validates Kubernetes YAML against the API schemas, offline. Custom resources (ExternalSecret, KEDA ScaledObject, HTTPRoute, Argo CD Application) take their schemas from the datreeio CRDs-catalog."
-   ],
-   "because": "We install a pinned kubeconform into a temp folder, because the runner image lacks it.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/chart-checks.yml (gitops repo, part 1 of 2)",
-    "text": "name: Chart checks\non:\n  pull_request:\n    branches: [main]\n\npermissions: { contents: read }\n\njobs:\n  charts:\n    runs-on: gitops-runner-set\n    steps:\n      - uses: actions/checkout@<sha> # pin by SHA\n        with: { fetch-depth: 0 }\n      - uses: azure/setup-helm@<sha> # pin by SHA\n      - name: Install kubeconform\n        run: |\n          mkdir -p \"$RUNNER_TEMP/bin\" && echo \"$RUNNER_TEMP/bin\" >> \"$GITHUB_PATH\"\n          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz | tar xz -C \"$RUNNER_TEMP/bin\"",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The workflow name."
-     },
-     {
-      "line": 3,
-      "text": "gitops checks run on PRs to main."
-     },
-     {
-      "line": 6,
-      "text": "Read only."
-     },
-     {
-      "line": 10,
-      "text": "The gitops runner set."
-     },
-     {
-      "line": 13,
-      "text": "Full history, to diff against origin/main."
-     },
-     {
-      "line": 14,
-      "text": "Install helm; pin by SHA."
-     },
-     {
-      "line": 17,
-      "text": "A temp bin folder, added to PATH for the next steps."
-     },
-     {
-      "line": 18,
-      "text": "Download kubeconform v0.7.0 and unpack it into that folder."
-     }
-    ]
-   }
+    "The chart check is one example of a general rule: a check that needs no keys can run on every push, from anyone, including an agent, because it cannot change or read any real system. Each repo gets the checks that fit its files. In the infrastructure repo, where our cloud is described in OpenTofu, tofu validate checks every module's types and references after tofu init -backend=false, which skips the state and every credential. tflint finds mistakes validate cannot see, such as an instance type that does not exist, and trivy config scans the code for risky settings such as a security group open to the whole internet.",
+    "For CI's own files there is a third pair. actionlint finds broken GitHub workflows, and zizmor finds risky ones, such as a ${{ }} expression that puts outside text into a shell script. Every new check starts in a softer mode where it reports and does not fail, because its first run finds old problems that need an owner. Each problem is then fixed, or written into an ignore file with an owner and a reason, before the check may block a pull request. The files that define these checks are on the list of paths agents may not change, so an agent cannot loosen the check that judges its own pull request."
+   ]
   },
   {
-   "h": "Charts, part 2: lint and render every environment",
+   "h": "When a check must read the real thing",
    "p": [
-    "A changed chart is a folder with a Chart.yaml that the PR touches, such as cloud/rhino-server or frontend/dashboard. For each one: helm dependency build (Chart.lock is committed, *.tgz is ignored), then helm lint. Then helm template for every <env>-values.yaml, piped into kubeconform -strict -summary. Use Nexus's helm proxy if a public chart repo rate-limits.",
-    "On the first run, list the current failures per environment in the PR and fix the cheap ones. Skip the rest with a comment and an owner."
+    "Some questions cannot be answered from text alone. A Terraform plan, the list of what an apply would add, change and destroy, has to compare the code with what really exists in the cloud, so it needs credentials. The answer is a role that can read and do nothing else: in each AWS account a TerraformPlanRole with AWS's ReadOnlyAccess policy plus an explicit deny on reading data such as objects, secrets and table rows, because a plan needs configuration, never data. Only pull request runs of the infrastructure repo may take that role.",
+    "With it, CI posts the plan of every changed unit as one comment on the pull request, so reviewers and agents see the real effect of a change. It never writes a plan file, because a plan file holds secret values in plain text, and the workflow has no apply, destroy or manual start anywhere. For the gitops repo the same idea is a diff preview: Argo CD's view of main and of the pull request is rendered on a throw-away kind cluster (Kubernetes running inside Docker, gone with the job), and the difference is posted as a comment. In both cases, applying stays a person's job."
    ],
-   "because": "We render every values file, not only the default, because a typo in prod-aws-values.yaml breaks only prod.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/chart-checks.yml (part 2 of 2)",
-    "text": "      - name: Lint and render every environment of each changed chart\n        run: |\n          status=0\n          charts=$(git diff --name-only origin/main...HEAD | xargs -r -n1 dirname | sort -u \\\n            | while read -r d; do while [ \"$d\" != . ] && [ ! -f \"$d/Chart.yaml\" ]; do d=$(dirname \"$d\"); done; [ -f \"$d/Chart.yaml\" ] && echo \"$d\"; done | sort -u)\n          for chart in $charts; do\n            helm dependency build \"$chart\" >/dev/null && helm lint \"$chart\" || status=1\n            for values in \"$chart\"/*-values.yaml; do\n              [ -e \"$values\" ] || continue\n              helm template ci \"$chart\" -f \"$values\" | kubeconform -strict -summary -kubernetes-version 1.36.0 \\\n                -schema-location default \\\n                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \\\n                || { echo \"::error file=$values::does not render to valid manifests\"; status=1; }\n            done\n          done\n          exit $status",
-    "notes": [
-     {
-      "line": 1,
-      "text": "One step does it all."
-     },
-     {
-      "line": 3,
-      "text": "Collect failures; do not stop at the first."
-     },
-     {
-      "line": 4,
-      "text": "Every changed file's folder ..."
-     },
-     {
-      "line": 5,
-      "text": "... walked up until a folder with Chart.yaml is found; that is the chart."
-     },
-     {
-      "line": 6,
-      "text": "For each changed chart ..."
-     },
-     {
-      "line": 7,
-      "text": "... fetch its dependencies, then lint it."
-     },
-     {
-      "line": 8,
-      "text": "For each environment's values file ..."
-     },
-     {
-      "line": 9,
-      "text": "... skipping when the glob matched nothing."
-     },
-     {
-      "line": 10,
-      "text": "Render the manifests and pipe them into kubeconform. Use the oldest product cluster's Kubernetes version here."
-     },
-     {
-      "line": 11,
-      "text": "Built-in schemas for standard kinds ..."
-     },
-     {
-      "line": 12,
-      "text": "... and the CRDs-catalog for custom resources."
-     },
-     {
-      "line": 13,
-      "text": "Annotate the values file that does not render to valid manifests."
-     },
-     {
-      "line": 16,
-      "text": "Fail if any chart or environment failed."
-     }
+   "deeper": {
+    "h": "Go deeper: why the deny matters",
+    "p": [
+     "ReadOnlyAccess sounds safe, but read access to everything includes the contents of every S3 object, every secret in Secrets Manager and every row in DynamoDB. A plan job runs code from the pull request it is planning, so a malicious or confused change could print those values into a public log. In IAM an explicit deny always beats an allow, so the deny on s3:GetObject, secretsmanager:GetSecretValue, ssm:GetParameter*, kms:Decrypt and DynamoDB reads closes that hole. Units whose data sources need a secret are left out of pull request plans."
     ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "The G7-23 sketch hard-codes --kubernetes-version 1.36.0. Use the Kubernetes version of the oldest product cluster instead, so a chart that only works on a newer cluster fails here. Ask DevOps for that version and keep it in one variable."
-   }
-  },
-  {
-   "h": "Workflow lint in every repo (G7-28)",
-   "p": [
-    "Workflows hold CI tokens and OIDC roles, and agents will open PRs that touch them. actionlint catches broken workflows. zizmor catches risky ones: template injection, unpinned actions, wide permissions. Template injection is a ${{ }} expression with outside text inside a run: script. That text can then run as shell (lesson p2-3).",
-    "One small workflow is copied into fcp, infrastructure, gitops, byte, ai-agents and claude-plugins. Each repo's .github/actionlint.yaml lists its runner labels; add one to gitops with gitops-runner-set. fcp pins actions by tag, so its .github/zizmor.yml allows tags for actions/* and asks for SHAs everywhere else. Look first at comment-triggered workflows such as byte-review.yml: they run on untrusted input."
-   ],
-   "because": "We start zizmor advisory, because the first run will find old problems that need owners before the check may block.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/workflow-lint.yml (one copy per repo)",
-    "text": "name: Workflow lint\non:\n  push:\n    paths: ['.github/workflows/**', '.github/actionlint.yaml', '.github/zizmor.yml']\n\npermissions:\n  contents: read\n\njobs:\n  lint:\n    # fcp-runner-set here; infrastructure-runner-set, gitops-runner-set, ... in the other repos\n    runs-on: fcp-runner-set\n    steps:\n      - uses: actions/checkout@v6  # fcp pins by tag; infrastructure pins by SHA (keep each repo's style)\n        with:\n          persist-credentials: false\n      - name: actionlint (runner labels come from .github/actionlint.yaml)\n        run: uvx --from \"actionlint-py==<pinned>\" actionlint -color\n      - name: zizmor (advisory for now)\n        # .github/zizmor.yml: rules.unpinned-uses.config.policies: { \"actions/*\": ref-pin, \"*\": hash-pin }\n        run: uvx \"zizmor==<pinned>\" --min-severity medium --config .github/zizmor.yml .github/workflows || true",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Same name in every repo."
-     },
-     {
-      "line": 4,
-      "text": "Only when workflows or the two config files change."
-     },
-     {
-      "line": 7,
-      "text": "Read only."
-     },
-     {
-      "line": 11,
-      "text": "Each repo uses its own runner set."
-     },
-     {
-      "line": 14,
-      "text": "Keep each repo's pinning style: tags in fcp, SHAs in infrastructure."
-     },
-     {
-      "line": 16,
-      "text": "Do not leave the token in .git/config for later steps."
-     },
-     {
-      "line": 17,
-      "text": "actionlint from PyPI through uvx; it reads the labels from actionlint.yaml."
-     },
-     {
-      "line": 19,
-      "text": "zizmor with medium severity and up."
-     },
-     {
-      "line": 20,
-      "text": "The pinning policy in .github/zizmor.yml."
-     },
-     {
-      "line": 21,
-      "text": "Never fail the job yet. Byte and ai-agents runners need astral-sh/setup-uv first, because they are Node repos."
-     }
-    ]
-   }
-  },
-  {
-   "h": "A read-only role for plans, part 1 (G7-30)",
-   "p": [
-    "A plan needs to read the cloud, so it needs credentials. G7-30 creates a role that can read and do nothing else. In each AWS account, TerraformPlanRole lives in a new tree, terraform/accounts/<account>/aws/global/iam/terraform-plan/. Its template is the solutions account's github-actions folder.",
-    "Only one principal may assume it: the OIDC role GitHubActionsTerraformPlan in inf (123456789012). That role trusts only repo:RhinoHealth/infrastructure:pull_request, never repo:RhinoHealth/*. It can read the state bucket rhinohealth-terraform-state and assume each account's TerraformPlanRole."
-   ],
-   "because": "We name one exact principal in the trust policy, because any wider trust would let other repos or events read every account.",
-   "code": {
-    "lang": "hcl",
-    "file": "terraform/accounts/<account>/aws/global/iam/terraform-plan/main.tf (part 1 of 2)",
-    "text": "# One per AWS account. Template: terraform/accounts/solutions/aws/global/iam/github-actions. A person applies it.\ndata \"aws_iam_policy_document\" \"assume\" {\n  statement {\n    actions = [\"sts:AssumeRole\"]\n    principals {\n      type        = \"AWS\"\n      identifiers = [\"arn:aws:iam::123456789012:role/GitHubActionsTerraformPlan\"] # OIDC role, trusts PRs of infrastructure only\n    }\n  }\n}\n\nresource \"aws_iam_role\" \"terraform_plan\" {\n  name               = \"TerraformPlanRole\"\n  assume_role_policy = data.aws_iam_policy_document.assume.json\n  tags               = var.tags\n}\n\nresource \"aws_iam_role_policy_attachment\" \"read_only\" {\n  role       = aws_iam_role.terraform_plan.name\n  policy_arn = \"arn:aws:iam::aws:policy/ReadOnlyAccess\"\n}",
-    "notes": [
-     {
-      "line": 1,
-      "text": "One per account, from the template; a person applies it."
-     },
-     {
-      "line": 2,
-      "text": "A trust policy written as an HCL data source."
-     },
-     {
-      "line": 4,
-      "text": "The action a principal uses to take on this role."
-     },
-     {
-      "line": 6,
-      "text": "The principal is an AWS role ..."
-     },
-     {
-      "line": 7,
-      "text": "... exactly the OIDC role in inf that trusts PRs of the infrastructure repo only."
-     },
-     {
-      "line": 12,
-      "text": "The role itself."
-     },
-     {
-      "line": 13,
-      "text": "The name account.hcl will build the ARN from."
-     },
-     {
-      "line": 14,
-      "text": "Attach the trust policy above."
-     },
-     {
-      "line": 15,
-      "text": "The account's standard tags."
-     },
-     {
-      "line": 20,
-      "text": "AWS's managed read-only policy: describe and list nearly everything."
-     }
-    ]
-   }
-  },
-  {
-   "h": "A read-only role for plans, part 2: no data",
-   "p": [
-    "ReadOnlyAccess alone could read S3 objects, secrets and table rows. A plan needs configuration, never data, so the role gets an explicit deny. In IAM an explicit deny beats any allow. Units whose data sources read secrets are skipped in PR plans.",
-    "Two more changes outside this file. account.hcl makes the role switchable: assume_role_arn = \"arn:aws:iam::<id>:role/${get_env(\"TG_ROLE_NAME\", \"TerraformDeploymentRole\")}\". Plans also need a read-only Vault role terraform-plan (after G0 narrows gha-runners) and an EKS access entry with AmazonEKSViewPolicy. Until then, PR plans skip the units that need them."
-   ],
-   "because": "We deny data reads explicitly, because a plan job that can read secrets is one injected step away from leaking them.",
-   "code": {
-    "lang": "hcl",
-    "file": "terraform/accounts/<account>/aws/global/iam/terraform-plan/main.tf (part 2 of 2)",
-    "text": "# A plan needs configuration, never data: ReadOnlyAccess alone could read objects, secrets and tables.\ndata \"aws_iam_policy_document\" \"no_data_reads\" {\n  statement {\n    effect    = \"Deny\"\n    actions   = [\"s3:GetObject\", \"secretsmanager:GetSecretValue\", \"ssm:GetParameter*\", \"kms:Decrypt\", \"dynamodb:GetItem\", \"dynamodb:Query\", \"dynamodb:Scan\"]\n    resources = [\"*\"] # units whose data sources read secrets are skipped in PR plans\n  }\n}\n\nresource \"aws_iam_role_policy\" \"no_data_reads\" {\n  role   = aws_iam_role.terraform_plan.id\n  policy = data.aws_iam_policy_document.no_data_reads.json\n}",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Why this block exists."
-     },
-     {
-      "line": 2,
-      "text": "A second policy document."
-     },
-     {
-      "line": 4,
-      "text": "Deny, which wins over the allow in ReadOnlyAccess."
-     },
-     {
-      "line": 5,
-      "text": "Object reads, secret values, parameters, KMS decryption and table reads."
-     },
-     {
-      "line": 6,
-      "text": "On everything."
-     },
-     {
-      "line": 10,
-      "text": "Attach the deny as an inline policy on the role."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "tip",
-    "text": "New accounts arrive from Control Tower without these roles. Add both to the manual bootstrap list next to TerraformDeploymentRole and the GitHub OIDC role. A person applies."
-   }
-  },
-  {
-   "h": "Plans on PRs (G7-32)",
-   "p": [
-    "The workflow is named \"[TERRAGRUNT] Plan on PRs (read-only)\" and runs on pull_request when files under terraform/, modules/, multi_tenant/ or single_tenant/ change. The block below is the rest of the file, from permissions down.",
-    "Units are the folders with a changed terragrunt.hcl. For a module-only change, add the units that use the module with Terragrunt 1.1's include-units-reading option; check its exact flag name. Never write plan files with -out: a plan file holds secret values in plain text. The comment script posts one sticky comment, edited on each push, with each unit's Plan line and changed addresses. The full output stays in the job log of this private repo."
-   ],
-   "because": "We plan with -lock=false, because the read-only role cannot write the lock file and a plan must never block a real apply.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/terragrunt-plan.yml (infrastructure repo; from permissions on)",
-    "text": "permissions: { id-token: write, contents: read, pull-requests: write }\n\njobs:\n  plan:\n    runs-on: infrastructure-runner-set\n    env:\n      TG_ROLE_NAME: TerraformPlanRole  # read by account.hcl (G7-30); never TerraformDeploymentRole here\n    steps:\n      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0\n        with: { fetch-depth: 0 }\n      - uses: aws-actions/configure-aws-credentials@<sha> # pin by SHA\n        with: { aws-region: us-east-1, role-to-assume: \"arn:aws:iam::123456789012:role/GitHubActionsTerraformPlan\" }\n      - name: Install Tofu and Terragrunt\n        env: { TENV_GITHUB_TOKEN: \"${{ secrets.GITHUB_TOKEN }}\" }\n        run: tenv tofu install && tenv tg install\n      - name: Plan the changed units (read-only, no lock, no plan files)\n        run: |\n          git diff --name-only origin/main...HEAD | grep 'terragrunt.hcl$' | xargs -r -n1 dirname | sort -u > units.txt\n          # Module-only changes: add the units that read the module (Terragrunt 1.1 include-units-reading; check the flag).\n          while read -r unit; do\n            (cd \"$unit\" && terragrunt plan -lock=false -input=false -no-color) > \"plan-${unit//\\//_}.txt\" 2>&1 || true\n          done < units.txt\n      - name: One comment with the summary per unit\n        env: { GH_TOKEN: \"${{ github.token }}\" }\n        run: .github/scripts/post_plan_comment.sh units.txt  # \"Plan: X to add, Y to change, Z to destroy\" + addresses",
-    "notes": [
-     {
-      "line": 1,
-      "text": "id-token for OIDC, read the repo, write PR comments. Nothing else."
-     },
-     {
-      "line": 5,
-      "text": "The repo's runner set."
-     },
-     {
-      "line": 7,
-      "text": "account.hcl reads this, so every unit assumes the read-only role."
-     },
-     {
-      "line": 10,
-      "text": "Full history for the diff against origin/main."
-     },
-     {
-      "line": 11,
-      "text": "OIDC into GitHubActionsTerraformPlan; it only trusts pull_request runs of this repo."
-     },
-     {
-      "line": 15,
-      "text": "Install the pinned OpenTofu and Terragrunt."
-     },
-     {
-      "line": 16,
-      "text": "The step name repeats the three rules."
-     },
-     {
-      "line": 18,
-      "text": "Changed terragrunt.hcl files, turned into a sorted list of unit folders."
-     },
-     {
-      "line": 19,
-      "text": "The open item: find units that read a changed module."
-     },
-     {
-      "line": 20,
-      "text": "For each unit ..."
-     },
-     {
-      "line": 21,
-      "text": "... plan without a lock, without prompts, into plan-<unit>.txt. || true keeps going."
-     },
-     {
-      "line": 25,
-      "text": "One comment with the summary line and addresses per unit."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "wall",
-    "text": "No apply, destroy or workflow_dispatch anywhere in this workflow. Agents can read the comment but cannot act on infrastructure."
-   }
-  },
-  {
-   "h": "Argo CD diffs on a throw-away cluster (G7-34)",
-   "p": [
-    "The workflow is named \"Argo CD diff preview\", runs on pull_request to main, and has permissions contents: read and pull-requests: write. A values change can touch many environments at once, and reviewers cannot see that in the diff. argocd-diff-preview renders the Applications for main and for the PR on a throw-away kind cluster and posts the rendered manifest diff.",
-    "kind runs Kubernetes inside Docker; here it runs inside the runner pod's dind sidecar and dies with the pod. argocd/argocd-apps is a Helm chart installed with helm on inf. So there are no plain Application files for the tool to find, and the job renders them first. Every destination is a remote product cluster; the tool renders locally and never contacts them. Give it a read-only token for gitops and no cluster credentials at all."
-   ],
-   "because": "We check out main and the PR side by side, because the tool needs both rendered trees to compute the diff.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/argocd-diff-preview.yml (gitops repo; the job)",
-    "text": "  diff:\n    runs-on: gitops-runner-set  # ARC dind: kind runs inside the dind sidecar; nothing reaches a real cluster\n    steps:\n      - uses: actions/checkout@<sha> # pin by SHA\n        with: { path: pull-request }\n      - uses: actions/checkout@<sha>\n        with: { ref: main, path: main }\n      - name: Render the Applications (argocd-apps is a Helm chart installed with helm on inf, not plain YAML)\n        run: |\n          for side in main pull-request; do\n            for values in \"$side\"/argocd/argocd-apps/*-values.yaml; do\n              helm template apps \"$side/argocd/argocd-apps\" -f \"$values\" > \"$side/rendered-apps-$(basename \"$values\")\"\n            done\n          done\n      - name: Diff on a throw-away kind cluster\n        run: |\n          docker run --network host -v /var/run/docker.sock:/var/run/docker.sock \\\n            -v \"$PWD/main:/base-branch\" -v \"$PWD/pull-request:/target-branch\" -v \"$PWD/output:/output\" \\\n            -e TARGET_BRANCH=\"${{ github.head_ref }}\" -e REPO=\"${{ github.repository }}\" \\\n            dagandersen/argocd-diff-preview:<pinned version>\n      - name: Post the diff\n        env: { GH_TOKEN: \"${{ github.token }}\" }\n        run: |\n          gh pr comment \"${{ github.event.number }}\" --edit-last --body-file output/diff.md \\\n            || gh pr comment \"${{ github.event.number }}\" --body-file output/diff.md",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The one job."
-     },
-     {
-      "line": 2,
-      "text": "ARC dind: kind runs in the sidecar; nothing reaches a real cluster."
-     },
-     {
-      "line": 5,
-      "text": "The PR's tree into pull-request/."
-     },
-     {
-      "line": 7,
-      "text": "main's tree into main/."
-     },
-     {
-      "line": 8,
-      "text": "argocd-apps is a Helm chart, so render it for both sides."
-     },
-     {
-      "line": 11,
-      "text": "Every environment's values file ..."
-     },
-     {
-      "line": 12,
-      "text": "... rendered into rendered-apps-<file> on that side."
-     },
-     {
-      "line": 15,
-      "text": "Run the tool."
-     },
-     {
-      "line": 17,
-      "text": "Give it the Docker socket so it can start kind, and mount both trees and an output folder."
-     },
-     {
-      "line": 19,
-      "text": "Tell it the PR branch and the repo."
-     },
-     {
-      "line": 20,
-      "text": "The image, pinned."
-     },
-     {
-      "line": 24,
-      "text": "Edit the last comment, or post a new one if there is none."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "wall",
-    "text": "No argocd sync, apply or workflow_dispatch anywhere in this workflow. For very large diffs, post the summary and attach the full diff as an artifact."
    }
   }
  ],
  "lab": {
-  "title": "Read workflows the way actionlint and zizmor do",
-  "youNeed": [
-   "Your fcp checkout (~/Projects/fcp)",
-   "A terminal"
+  "id": "g7-8",
+  "title": "Every environment, checked offline",
+  "minutes": 25,
+  "mode": "guided",
+  "needs": [
+   "helm 3",
+   "Docker running (kubeconform runs from its image)",
+   "tofu (OpenTofu) for the build step",
+   "Internet, once, for the image and kubeconform's schemas"
   ],
-  "worked": [
+  "goal": "Catch a typo in one environment's values file that helm lint misses, by rendering every environment and checking it against the Kubernetes schemas, then do the same for OpenTofu modules.",
+  "guess": {
+   "q": "prod-values.yaml sets replicaCount: two. You run helm lint dashboard -f dashboard/prod-values.yaml. What does it say?",
+   "options": [
+    {
+     "text": "1 chart(s) linted, 0 chart(s) failed",
+     "correct": true,
+     "why": "helm lint checks that the chart is well formed. replicas: two is valid YAML, so lint has nothing to complain about."
+    },
+    {
+     "text": "An error: replicas must be an integer",
+     "correct": false,
+     "why": "That is kubeconform's message. Only a schema check knows what a Deployment's replicas field must be."
+    },
+    {
+     "text": "A warning that the values file is unknown",
+     "correct": false,
+     "why": "Any values file works with -f. Helm does not judge the values themselves."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "cd ~/Projects/fcp && sed -n '/labels:/,$p' .github/actionlint.yaml",
-    "see": "  labels:\n    - fcp-runner-set\n    - ubuntu-22.04-2core\n    - ubuntu-22.04-8core\n    - ubuntu-22.04-16core"
+    "say": "Create a chart with Helm's own example templates, and two environments: dev with a correct value and prod with the typo from the story.",
+    "do": "mkdir -p ~/academy-labs/g7-8 && cd ~/academy-labs/g7-8 && helm create dashboard && printf 'replicaCount: 1\\n' > dashboard/dev-values.yaml && printf 'replicaCount: two\\n' > dashboard/prod-values.yaml",
+    "see": "Creating dashboard"
    },
    {
-    "do": "grep -n 'head_commit.message' .github/workflows/frontend-ci-slack-notify.yml",
-    "see": "21:          COMMIT_SUMMARY=$(echo \"${{ github.event.workflow_run.head_commit.message }}\" | head -n 1)\n(a commit message inside a run: script: zizmor calls this template injection)"
+    "say": "Ask the chart's own linter about prod. It passes, which is the trap.",
+    "do": "helm lint dashboard -f dashboard/prod-values.yaml | tail -1",
+    "see": "1 chart(s) linted, 0 chart(s) failed"
    },
    {
-    "do": "grep -n \"issue_comment\\|pull_request_review_comment\" .github/workflows/byte-review.yml | head -2",
-    "see": "10:  issue_comment:\n19:  pull_request_review_comment:\n(comment-triggered: untrusted input, so review it first)"
+    "say": "Render prod and check the manifests against the Kubernetes schemas. kubeconform runs from its image, so nothing is installed.",
+    "do": "helm template ci dashboard -f dashboard/prod-values.yaml | docker run --rm -i ghcr.io/yannh/kubeconform:v0.7.0 -strict -summary -",
+    "see": "stdin - Deployment ci-dashboard is invalid: problem validating schema. … at '/spec/replicas': got string, want null or integer\nSummary: 4 resources found parsing stdin - Valid: 3, Invalid: 1, Errors: 0, Skipped: 0"
    },
    {
-    "do": "grep -h \"uses: \" .github/workflows/*.yml | grep -c \"@[0-9a-f]\\{40\\}\"",
-    "see": "A small number (2 on 12 Oct): most fcp actions are pinned by tag, which is why G7-28 adds a tag policy for actions/*."
+    "say": "Write the check that CI runs: every environment, one report, a red exit code if any environment is broken.",
+    "do": "cat > check-charts.sh <<'EOF'\n#!/bin/bash\n# Render every environment of the chart and check the result against the Kubernetes schemas, offline.\nset -o pipefail  # without it, a chart that does not render at all looks green\nstatus=0\nfor values in dashboard/*-values.yaml; do\n  echo \"== $values\"\n  helm template ci dashboard -f \"$values\" | docker run --rm -i ghcr.io/yannh/kubeconform:v0.7.0 -strict -summary - || status=1\ndone\nexit $status\nEOF\nchmod +x check-charts.sh && ./check-charts.sh; echo \"exit=$?\"",
+    "see": "== dashboard/dev-values.yaml\nSummary: 4 resources found parsing stdin - Valid: 4, Invalid: 0, Errors: 0, Skipped: 0\n== dashboard/prod-values.yaml\nstdin - Deployment ci-dashboard is invalid: … got string, want null or integer\nSummary: 4 resources found parsing stdin - Valid: 3, Invalid: 1, Errors: 0, Skipped: 0\nexit=1"
    },
    {
-    "do": "Read the G7-30 trust policy above and the G7-32 permissions line. Write down who can assume TerraformPlanRole and what the plan job can write.",
-    "see": "Only GitHubActionsTerraformPlan, which only trusts pull_request runs of RhinoHealth/infrastructure. The job can write PR comments and nothing in AWS."
+    "say": "Add a third environment that does not render at all: staging forgets the image block. The check still catches it, thanks to pipefail.",
+    "do": "printf 'image: null\\n' > dashboard/staging-values.yaml && ./check-charts.sh 2>&1 | grep -A1 staging",
+    "see": "== dashboard/staging-values.yaml\nError: template: dashboard/templates/deployment.yaml:37:28: executing \"dashboard/templates/deployment.yaml\" at <.Values.image.repository>: nil pointer evaluating interface {}.repository"
    }
   ],
-  "faded": "In a scratch copy of frontend-ci-slack-notify.yml (do not commit it), rewrite line 21 so the message is no longer inside the script. Pass it through an env: entry and read it as a shell variable. The env line is given (COMMIT_MESSAGE: ${{ github.event.workflow_run.head_commit.message }}); the new run: line is left to you.",
-  "alone": "Pick one ticket from this lesson (G7-17, G7-23 or G7-34). List the files it adds and to which repo, and the check names GitHub will show. Then name the one thing a person, never an agent, must do.",
-  "done": "You can explain the injection and its fix, the plan role's trust chain, and why no workflow here can change real infrastructure."
+  "build": "Do the same for OpenTofu, the way the infrastructure repo checks its modules. Create modules/bucket-names/main.tf with a variable env, a terraform_data resource whose input is \"rhino-runs-${var.env}\" and an output of terraform_data.bucket.output, and modules/run-ids/main.tf with a random_id resource called run and an output that reads random_id.runs.hex (a typo on purpose). Write check-modules.sh that loops over modules/*/, runs tofu init -backend=false -input=false and tofu validate in each, prints ok or FAIL per module with the first lines of the error, keeps going after a failure and exits with 1 if any module failed. Run it: bucket-names is ok, run-ids fails with Reference to undeclared resource. Fix the typo and run it again.",
+  "checks": [
+   "helm lint passes on prod-values.yaml, and kubeconform reports /spec/replicas: got string.",
+   "check-charts.sh reports every environment and exits with 1 while prod or staging is broken.",
+   "staging-values.yaml, which does not render at all, is not reported as valid.",
+   "check-modules.sh prints ok for bucket-names and FAIL for run-ids with Reference to undeclared resource, without any credentials or state."
+  ],
+  "solution": {
+   "lang": "bash",
+   "file": "check-modules.sh",
+   "text": "#!/bin/bash\n# Validate every module without a backend or cloud keys, and report all broken modules, not only the first.\nstatus=0\nfor dir in modules/*/; do\n  if (cd \"$dir\" && tofu init -backend=false -input=false -no-color >/dev/null && tofu validate -no-color >/dev/null 2>&1); then\n    echo \"ok    $dir\"\n  else\n    echo \"FAIL  $dir\"; (cd \"$dir\" && tofu validate -no-color 2>&1 | grep -E \"Error|on main.tf\" | head -3)\n    status=1\n  fi\ndone\nexit $status"
+  },
+  "fix": "A teammate removed the line set -o pipefail from check-charts.sh, saying \"the || status=1 already handles failures\". Remove it and run ./check-charts.sh with staging-values.yaml still there. Staging now ends with Summary: 0 resource found … Errors: 0, and if you fix prod, the whole check exits with 0, although staging cannot even be rendered. Find why: without pipefail the pipe's exit code is kubeconform's alone, and kubeconform accepts empty input. Put the line back.",
+  "explain": [
+   "Why does helm lint pass on replicaCount: two, and what does kubeconform know that lint does not?",
+   "Why can these checks run on every agent pull request, while a Terraform plan needs a special read-only role?",
+   "What does set -o pipefail change in helm template | kubeconform, and what would CI report for a chart that does not render without it?"
+  ],
+  "done": "Your chart check names every broken environment, a chart that does not render is red, and check-modules.sh validates every module with no keys."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Why does the plan workflow run terragrunt plan with -lock=false?",
+   "q": "A values change is fine in dev but has a typo in prod-aws-values.yaml. CI renders only the chart's default values.yaml. What happens?",
    "options": [
     {
-     "text": "Because locks slow the plan down.",
-     "correct": false,
-     "why": "Speed is not the reason."
-    },
-    {
-     "text": "Because the read-only role cannot write the lock file, and a plan must never block a real apply.",
+     "text": "CI is green, and the typo is found by Argo CD when it syncs production.",
      "correct": true,
-     "why": "use_lockfile writes a .tflock, which the role is not allowed to write."
+     "why": "The broken file is never rendered in CI. Rendering every environment's values file is the whole point of the check."
     },
     {
-     "text": "Because Terragrunt ignores locks on pull requests.",
+     "text": "CI is red, because helm lint reads every values file in the folder.",
      "correct": false,
-     "why": "It does not; the flag is our choice."
+     "why": "helm lint reads the values you give it, and even then it does not check Kubernetes types."
+    },
+    {
+     "text": "CI is red, because kubeconform checks values files directly.",
+     "correct": false,
+     "why": "kubeconform checks rendered manifests. It never sees a values file that was not rendered."
     }
    ]
   },
   {
-   "q": "TerraformPlanRole has ReadOnlyAccess. Why add an explicit deny on s3:GetObject and secretsmanager:GetSecretValue?",
+   "q": "Why may tofu validate, kubeconform and zizmor run on every push, including an agent's, while the plan job needs its own role?",
    "options": [
     {
-     "text": "ReadOnlyAccess could read objects and secret values, and a plan needs configuration only.",
+     "text": "They are faster than a plan.",
+     "correct": false,
+     "why": "Speed is a bonus. The reason is what they can touch."
+    },
+    {
+     "text": "They need no credentials, so they cannot read or change any real system, whoever triggers them.",
      "correct": true,
-     "why": "An explicit deny wins over the allow, so the role reads configuration and no data."
+     "why": "A plan must compare the code with the real cloud, so it needs read access, which is why it gets a role that can only read configuration."
     },
     {
-     "text": "Because ReadOnlyAccess does not include S3.",
+     "text": "Agents are not allowed to see plans.",
      "correct": false,
-     "why": "It does include object reads; that is the problem."
-    },
-    {
-     "text": "To make the plan run faster.",
-     "correct": false,
-     "why": "It changes what the role may read, not speed."
+     "why": "Agents can read the plan comment. What nobody's CI job may do is apply."
     }
    ]
   },
   {
-   "q": "An agent PR changes a gitops values file. What can the Argo CD diff workflow do?",
+   "q": "The plan role has ReadOnlyAccess. Why add an explicit deny on s3:GetObject, secretsmanager:GetSecretValue and similar actions?",
    "options": [
     {
-     "text": "Sync the change to a staging cluster to test it.",
+     "text": "Because ReadOnlyAccess cannot list resources without it.",
      "correct": false,
-     "why": "No argocd sync anywhere; nothing reaches a real cluster."
+     "why": "Listing works either way. The deny removes something, it adds nothing."
     },
     {
-     "text": "Apply it if the diff is small.",
+     "text": "To make the plan faster.",
      "correct": false,
-     "why": "Applying and syncing stay a person's job."
+     "why": "It is about what a plan job could leak, not about speed."
     },
     {
-     "text": "Render main and the PR on a throw-away kind cluster and post the manifest diff.",
+     "text": "Because read access includes the data itself, and a plan runs code from the pull request, which could print secrets into a log.",
      "correct": true,
-     "why": "It renders locally in the dind sidecar and only comments."
+     "why": "A plan needs configuration, never data. An explicit deny beats any allow in IAM."
     }
    ]
   }
  ],
- "recall": [
-  "From g7-6: what does a taint with NoSchedule do to pods without a matching toleration?",
-  "From p2-3: why does a ${{ }} expression inside a run: script count as script injection?"
- ],
- "videos": [
-  {
-   "title": "Terraform Basics",
-   "url": "https://www.youtube.com/watch?v=_45W3Z8XWL4",
-   "channel": "HashiCorp, an IBM Company",
-   "minutes": 21,
-   "why": "Official HashiCorp intro to init, plan, apply and state."
-  }
- ],
+ "platform": {
+  "p": [
+   "infrastructure: .github/workflows/terraform-checks.yml next to terrugrunt-lint.yml (same push paths, infrastructure-runner-set, actions pinned by SHA, tenv tofu install) runs tofu init -backend=false and tofu validate per modules/* folder, tflint --recursive with a root .tflint.hcl (aws and google rulesets, GITHUB_TOKEN for plugin downloads; pin the plugin and trivy-action versions), and trivy config --severity HIGH,CRITICAL over modules/, terraform/ and multi_tenant/, advisory for two weeks, then failing on new findings with an owned .trivyignore. gitops: chart-checks.yml on pull_request (gitops-runner-set) runs helm dependency build, helm lint and helm template per *-values.yaml into kubeconform -strict with the datreeio CRDs-catalog for ExternalSecret, ScaledObject, HTTPRoute and Application; set -kubernetes-version to the oldest product cluster's version rather than a fixed 1.36.0.",
+   "workflow-lint.yml (actionlint and zizmor --min-severity medium, advisory) goes into fcp, infrastructure, gitops, byte, ai-agents and claude-plugins, with each repo's .github/actionlint.yaml for runner labels and a zizmor.yml that allows tags for actions/* in fcp; look first at comment-triggered workflows such as byte-review.yml. TerraformPlanRole lives in terraform/accounts/<account>/aws/global/iam/terraform-plan/, trusted only by GitHubActionsTerraformPlan in inf, which trusts only repo:RhinoHealth/infrastructure:pull_request; account.hcl reads TG_ROLE_NAME; a read-only Vault role and an EKS view access entry come later, and new accounts get both roles in the manual bootstrap list. terragrunt-plan.yml plans changed units with -lock=false and no -out, and posts one sticky comment. argocd-diff-preview.yml renders argocd-apps for both branches and runs dagandersen/argocd-diff-preview (pinned) on kind inside the dind sidecar, with a read-only token and no cluster credentials."
+  ],
+  "tickets": [
+   {
+    "key": "G7-17",
+    "why": "tofu validate, tflint and trivy config in infrastructure CI, with no keys."
+   },
+   {
+    "key": "G7-23",
+    "why": "helm lint and helm template | kubeconform for every environment of each changed chart: this lesson."
+   },
+   {
+    "key": "G7-28",
+    "why": "actionlint and zizmor in every repo with workflows."
+   },
+   {
+    "key": "G7-30",
+    "why": "The read-only TerraformPlanRole and its OIDC trust for pull request plans."
+   },
+   {
+    "key": "G7-32",
+    "why": "Read-only Terragrunt plans posted on infrastructure pull requests; never apply."
+   },
+   {
+    "key": "G7-34",
+    "why": "argocd-diff-preview on a throw-away kind cluster for gitops pull requests."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "tofu validate",
-   "plain": "Checks a module's HCL for consistent types and references, with no state and no credentials."
+   "term": "helm template",
+   "plain": "Fills a chart's templates with one values file and prints the Kubernetes manifests, without a cluster."
   },
   {
    "term": "kubeconform",
-   "plain": "Validates Kubernetes YAML against the API schemas offline; custom resources need extra schemas."
+   "plain": "Checks rendered Kubernetes YAML against the API's schemas, offline."
   },
   {
-   "term": "zizmor",
-   "plain": "A linter for GitHub workflows that finds risky patterns such as template injection and unpinned actions."
+   "term": "keyless check",
+   "plain": "A check that needs no credentials, so it can run on every push from anyone."
   },
   {
-   "term": "template injection",
-   "plain": "Outside text placed into a run: script through ${{ }}, so it can run as shell."
+   "term": "pipefail",
+   "plain": "A bash option: a pipe fails if any command in it fails, not only the last one."
   },
   {
-   "term": "explicit deny",
-   "plain": "An IAM statement with effect Deny; it beats any Allow from another policy."
-  },
-  {
-   "term": "kind",
-   "plain": "Kubernetes in Docker: a throw-away cluster that runs in containers on one machine."
+   "term": "read-only plan role",
+   "plain": "A cloud role that can read configuration but no data, used only to compute plans."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G7-17",
-   "why": "This lesson walked through the validate and tflint jobs and the plan for trivy.",
-   "walk": [
-    "Create .github/workflows/terraform-checks.yml next to terrugrunt-lint.yml from the two blocks above.",
-    "Add .tflint.hcl at the repo root with the aws and google rulesets.",
-    "Add the trivy job (trivy-action pinned by SHA, scan-type config, HIGH and CRITICAL, exit code 0 for 2 weeks).",
-    "Fix or ignore the first-run errors in the same PR and list every ignored rule. Each .trivyignore line names an owner and a reason.",
-    "Ask for the workflow, .tflint.hcl and .trivyignore to be protected paths; go through trivy findings with Security after 2 weeks."
-   ]
+   "q": "Name one keyless check for each of the three kinds of files: Helm charts, OpenTofu modules and GitHub workflows.",
+   "a": "helm template | kubeconform for charts, tofu validate (or tflint, trivy config) for modules, actionlint (or zizmor) for workflows."
   },
   {
-   "key": "G7-23",
-   "why": "This lesson walked through chart-checks.yml: finding changed charts, lint, and rendering every environment into kubeconform.",
-   "walk": [
-    "Create .github/workflows/chart-checks.yml in gitops from the two blocks above, with actions pinned by SHA.",
-    "Set -kubernetes-version to the oldest product cluster's version.",
-    "Use Nexus's helm proxy if a public chart repo rate-limits helm dependency build.",
-    "On the first run, list failures per environment in the PR and fix the cheap ones. Skip the rest with a comment and an owner."
-   ]
+   "q": "Why does a new check start in a mode that reports but does not fail?",
+   "a": "Its first run finds old problems. Each needs a fix or an owned ignore entry before the check may block pull requests, or every pull request would be red for problems it did not cause."
   },
   {
-   "key": "G7-28",
-   "why": "This lesson walked through workflow-lint.yml and the zizmor pinning policy.",
-   "walk": [
-    "Copy workflow-lint.yml into fcp, infrastructure, gitops (and byte with Nave); add it to ai-agents and claude-plugins when they exist.",
-    "Add .github/actionlint.yaml to gitops with gitops-runner-set; keep fcp's and infrastructure's.",
-    "Add fcp's .github/zizmor.yml: ref-pin for actions/*, hash-pin for everything else.",
-    "Add astral-sh/setup-uv before the uvx steps where the runner has no uv.",
-    "Review comment-triggered workflows (byte-review.yml) first."
-   ]
-  },
-  {
-   "key": "G7-30",
-   "why": "This lesson walked through TerraformPlanRole's trust policy, ReadOnlyAccess and the explicit deny on data reads.",
-   "walk": [
-    "Create terraform/accounts/<account>/aws/global/iam/terraform-plan/ per account from the two blocks above.",
-    "Create the OIDC role GitHubActionsTerraformPlan in inf, trusting only repo:RhinoHealth/infrastructure:pull_request, with state-bucket read and AssumeRole on each TerraformPlanRole.",
-    "Make account.hcl's assume_role_arn read TG_ROLE_NAME with TerraformDeploymentRole as default.",
-    "After G0 narrows gha-runners, add a read-only Vault role terraform-plan and an EKS access entry with AmazonEKSViewPolicy.",
-    "Add both roles to the manual bootstrap list for new accounts; a person applies."
-   ]
-  },
-  {
-   "key": "G7-32",
-   "why": "This lesson walked through terragrunt-plan.yml: the role switch, the changed units, plans without lock or plan files, and the comment.",
-   "walk": [
-    "Create .github/workflows/terragrunt-plan.yml from the block above, with configure-aws-credentials pinned by SHA.",
-    "Find the units that read a changed module with Terragrunt 1.1's include-units-reading option (check the flag).",
-    "Write .github/scripts/post_plan_comment.sh: one sticky comment with each unit's Plan line and changed addresses.",
-    "Check there is no apply, destroy or workflow_dispatch anywhere in the file."
-   ]
-  },
-  {
-   "key": "G7-34",
-   "why": "This lesson walked through the render step, the kind-based diff and the comment.",
-   "walk": [
-    "Create .github/workflows/argocd-diff-preview.yml in gitops from the block above, with checkouts pinned by SHA and the tool image pinned.",
-    "Give it a read-only token for gitops and any private chart source; no cluster credentials.",
-    "Post the diff as one comment, edited on each push; for very large diffs post the summary and attach the full diff.",
-    "Check there is no argocd sync, apply or workflow_dispatch anywhere in the file."
-   ]
+   "q": "What two things does the plan workflow never do, and why?",
+   "a": "It never writes a plan file (it holds secrets in plain text) and never applies, destroys or starts by hand; applying is a person's job."
   }
  ],
- "remember": "Run the keyless checks on each push, give plans a read-only role, and leave apply and sync to a person."
+ "remember": "Check infrastructure where it is still text, every environment and without keys; when a check must read the real cloud, give it a role that can only read configuration, and leave apply to a person."
 }

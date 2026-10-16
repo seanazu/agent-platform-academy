@@ -1,573 +1,310 @@
 {
+ "v": 2,
  "id": "g7-7",
  "title": "Nightly: history, triage, mutation and the locks",
- "minutes": 50,
+ "minutes": 55,
  "youNeed": [
-  "g7-6",
-  "p10-5",
-  "p10-6"
+  "p10-2",
+  "g7-6"
  ],
- "bridge": "The nightly history is like the flaky-test view in a CI dashboard: one row per test, one column per night. Except: we build it ourselves from JUnit files, and people act on it. They fix, quarantine with a ticket, or hand off, so that a red night means something again.",
- "intro": "The cloud nightly has failed its last 60 scheduled runs, so nobody reads it. This lesson records per-test results and triages the failures. It adds a mutation report on agent-changed files and takes branch pushes off the QA locks. The test code is Python because it lives in fcp's Django backend; the rest is workflow YAML.",
- "picture": {
-  "caption": "Nightly results become a table, the table becomes decisions, and branch pushes stop waiting for QA.",
-  "nodes": [
-   {
-    "id": "nightly",
-    "label": "Cloud nightly on QA (02:44 UTC)",
-    "kind": "service"
-   },
-   {
-    "id": "junit",
-    "label": "nightly-junit-aws / -gcp artifacts",
-    "kind": "file"
-   },
-   {
-    "id": "hist",
-    "label": "nightly-history.md (20 nights)",
-    "kind": "file"
-   },
-   {
-    "id": "guild",
-    "label": "BE guild triage session",
-    "kind": "person"
-   },
-   {
-    "id": "mut",
-    "label": "Mutation report (04:17 UTC, advisory)",
-    "kind": "check"
-   },
-   {
-    "id": "lab",
-    "label": "FCP Lab smoke on branch pushes",
-    "kind": "check"
-   }
+ "map": "github",
+ "hook": {
+  "story": [
+   "Every night at 02:44 UTC fcp's cloud integration tests run against the shared QA environment, and every morning a Slack channel gets the same red message. It has failed sixty nights in a row, on AWS and on GCP. One night's log is 88 minutes long and says 4 failed, 312 passed and 4 reruns. Nobody opens it any more.",
+   "Then a change that breaks archiving a project is merged on a Tuesday. Wednesday's nightly fails because of it, and the message looks exactly like the fifty-nine messages before it. The nightly caught the bug, and nobody noticed, because red had stopped meaning anything."
   ],
-  "steps": [
-   {
-    "from": "nightly",
-    "to": "junit",
-    "text": "kubectl cp copies junit.xml out of the pod; upload-artifact keeps it 90 days"
-   },
-   {
-    "from": "junit",
-    "to": "hist",
-    "text": "nightly_history.py downloads 20 nights and writes pass, fail or rerun-pass per test"
-   },
-   {
-    "from": "hist",
-    "to": "guild",
-    "text": "each failing or rerun-only test gets a category, an owner and an action"
-   },
-   {
-    "from": "nightly",
-    "to": "mut",
-    "text": "the next job mutates yesterday's agent-changed files, judged by the API layer"
-   },
-   {
-    "from": "lab",
-    "to": "nightly",
-    "text": "branch pushes run the Lab; QA keeps main, the nightly and releases"
-   }
-  ]
+  "question": "How do we make a red nightly mean something again, so people, and later agents, can act on it?"
  },
- "sections": [
+ "read": [
   {
-   "h": "Keep a JUnit file per night (G7-24)",
+   "h": "One red light hides four different stories",
    "p": [
-    "The baseline, read on 12 Oct: \"[CLOUD] - Integration Tests\" (cloud-int-tests-dispatch.yml, 02:44 UTC) failed its last 60 scheduled runs. The 12 Oct AWS run had 4 failed, 312 passed and 4 reruns in 88 minutes. Today a failed night is a Slack message and an 88-minute log.",
-    "The tests run inside a Kubernetes pod through kubectl exec. So the change is in _cloud-int-tests-reusable-aws.yml and -gcp.yml. Add -rR --junitxml=/tmp/junit.xml to the entrypoint call, then copy the file out before the pod is deleted. -rR lists the tests that passed only after a rerun."
-   ],
-   "because": "We copy the report out before \"Delete the integration tests pod\", because the file lives inside the pod and dies with it.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/_cloud-int-tests-reusable-aws.yml (and -gcp.yml)",
-    "text": "      # In \"Run Integration Tests\", add to the entrypoint call inside `kubectl exec`:\n      #   integration-tests-entrypoint-ci.sh -s --durations=0 -vv --color=yes -rR --junitxml=/tmp/junit.xml ...\n      # Then, before \"Delete the integration tests pod\":\n      - name: Copy the JUnit report out of the integration tests pod\n        if: always() && inputs.run_nightly_tests\n        continue-on-error: true\n        run: >\n          kubectl cp -c integration-tests\n          \"${{ needs.prepare_cloud_environment.outputs.pod_with_sdk }}:/tmp/junit.xml\" junit-aws.xml\n      - name: Keep it for the nightly history\n        if: always() && inputs.run_nightly_tests\n        uses: actions/upload-artifact@v7\n        with:\n          name: nightly-junit-aws\n          path: junit-aws.xml\n          retention-days: 90\n      # scripts/nightly_history.py then reads the last 20 scheduled runs:\n      #   gh run list --workflow cloud-int-tests-dispatch.yml --event schedule -L 20 --json databaseId\n      #   gh run download <id> -n nightly-junit-aws\n      # and writes nightly-history.md: one row per test, one column per night (pass / fail / rerun-pass).",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The first change is in an existing step, so it is a comment here."
-     },
-     {
-      "line": 2,
-      "text": "Add -rR (report reruns) and write JUnit XML inside the pod."
-     },
-     {
-      "line": 3,
-      "text": "Where the two new steps go."
-     },
-     {
-      "line": 4,
-      "text": "New step 1."
-     },
-     {
-      "line": 5,
-      "text": "Run even when the tests failed, but only for nightly runs."
-     },
-     {
-      "line": 6,
-      "text": "A missing file must not hide the real test result."
-     },
-     {
-      "line": 8,
-      "text": "Copy from the integration-tests container ..."
-     },
-     {
-      "line": 9,
-      "text": "... of the pod an earlier job created, to junit-aws.xml on the runner."
-     },
-     {
-      "line": 10,
-      "text": "New step 2: upload the file as an artifact."
-     },
-     {
-      "line": 14,
-      "text": "A fixed artifact name per cloud, so the script can find it."
-     },
-     {
-      "line": 16,
-      "text": "Keep 90 days; the history reads 20 nights."
-     },
-     {
-      "line": 17,
-      "text": "The comment shows the two gh commands the script runs."
-     },
-     {
-      "line": 20,
-      "text": "One row per test, one column per night, newest first."
-     }
-    ]
-   }
+    "A night is reported as one result: green or red. Inside a red night there can be four very different kinds of failure. A real bug fails every night from the day it was merged. A flaky test, one that passes or fails on the same code depending on timing, fails on some nights and not others. A test that is retried until it passes looks green, so its flakiness is hidden completely. And when the environment itself breaks, for example a QA image that does not build, many tests fail on the same night for one reason that has nothing to do with the code.",
+    "You cannot tell these apart by looking at one night. You can tell them apart at a glance when you put the nights next to each other, one row per test and one column per night. A row that turns red on one date and stays red is a regression; you look at what was merged that day. A row with scattered red is flaky. A column that is red in many rows is the environment. So the first job is not to fix anything: it is to keep each night's per-test results."
+   ]
   },
   {
-   "h": "Twenty nights in one table",
+   "h": "Keep a JUnit file every night, and read reruns honestly",
    "p": [
-    "scripts/nightly_history.py runs gh run list --workflow cloud-int-tests-dispatch.yml --event schedule -L 20 to find the last 20 scheduled runs. For each run it calls gh run download <id> -n nightly-junit-aws and reads the XML. It writes nightly-history.md: test by night, with pass, fail or rerun-pass, newest night first.",
-    "Ten tests already carry @pytest.mark.flaky(reruns=N), for example in gc/test_gc.py and rhino_sdk/test_metrics/. A test that passed after a rerun counts as flaky, not green. The BE flaky-test fixer (G5) reads the same data later. Do the same for the frontend nightly with Playwright's JUnit reporter, but cloud first."
+    "JUnit XML is the standard report format for test results that almost every test runner can write and almost every CI tool can read: one testcase element per test, with a failure element inside when it failed. pytest writes it with --junitxml=<file>. fcp's nightly runs its tests inside a Kubernetes pod through kubectl exec, so the report is written inside the pod; the job copies it out with kubectl cp before the step that deletes the pod, and uploads it as an artifact, a file GitHub keeps with the run, here for 90 days.",
+    "One detail decides whether the history tells the truth. Ten of fcp's integration tests carry @pytest.mark.flaky(reruns=N) from the pytest-rerunfailures plugin, which runs a failing test again up to N times. In the JUnit file each attempt becomes its own testcase element, and the failed attempts that were retried have no failure element at all. A script that reads every entry on its own counts those tests as green. So the history script groups the entries by test: the last entry is the verdict, and more than one entry means the test needed a rerun. A rerun pass is counted as flaky, not as green."
    ],
-   "see": "| test | 12 Oct | 11 Oct | 10 Oct | ...\n| gc/test_gc.py::test_gc_removes_old_images | rerun-pass | pass | rerun-pass | ...\n| rhino_sdk/test_code_object.py::test_instant_container_code_python_image[...] | fail | fail | pass | ...\n(an example of the shape; the real rows come from your 20 nights)"
-  },
-  {
-   "h": "Triage: four categories, one owner each (G7-29)",
-   "p": [
-    "A nightly that is never green teaches everyone to ignore it. G7-29 is one session with the BE guild over nightly-history.md. Each failing or rerun-only test gets a category and an owner.",
-    "Real bug or test bug: fix it now if it takes under an hour; otherwise open a Jira bug with the output. Environment: hand it to DevOps with the evidence, such as the 12 Oct instant-container failure in rhino_sdk/test_code_object.py. Flaky: quarantine it with a Jira ticket labelled flaky-test for the G5 fixer.",
-    "The 10 existing flaky(reruns=N) markers get flaky-test tickets too, so their flakiness shows in the history instead of being retried away. Post one line a week in #integration-tests-nightly: green nights out of the last 7."
-   ],
-   "callout": {
-    "kind": "wall",
-    "text": "People quarantine tests; agents never quarantine, skip or delete them. The weakened-tests check (G0) fails an agent PR that does."
-   }
-  },
-  {
-   "h": "The quarantine marker",
-   "p": [
-    "A quarantined test keeps running and reporting, but it does not turn the nightly red. The trick is a non-strict xfail: pytest expects the test may fail. If it fails, junit.xml shows it as skipped with the reason; if it passes, nothing breaks. Register the marker in cloud/rhinoCloud/pytest.ini."
-   ],
-   "because": "We turn quarantine into xfail at collection time, because then every quarantined test carries its ticket into the report.",
    "code": {
     "lang": "python",
-    "file": "cloud/rhinoCloud/rhinoCore/integration-tests/conftest.py",
-    "text": "# Called from the existing pytest_collection_modifyitems (which already shuffles tests and adds trace ids).\n# Register the marker in cloud/rhinoCloud/pytest.ini:\n#   quarantine(ticket): known flaky; still runs and reports, but does not turn the nightly red\n\n\ndef _apply_quarantine(items: list[pytest.Item]) -> None:\n    for item in items:\n        marker = item.get_closest_marker(\"quarantine\")\n        if marker is None:\n            continue\n        ticket = marker.kwargs[\"ticket\"]  # required: every quarantined test has a Jira ticket and an owner\n        # Non-strict xfail: the test still runs; junit.xml shows it as skipped with this reason, so\n        # scripts/nightly_history.py can list quarantined tests and their tickets.\n        item.add_marker(pytest.mark.xfail(reason=f\"quarantined, see {ticket}\", strict=False))\n\n\n# In a test module, added by a person after triage (agents never quarantine, skip or delete tests):\n#\n#   @pytest.mark.quarantine(ticket=\"RH-0000\")  # placeholder key\n#   def test_...(api_client): ...\n#\n# The 10 tests with @pytest.mark.flaky(reruns=N) today get a flaky-test ticket each; decide with the guild\n# whether to replace their reruns with quarantine, so the flakiness shows in the history.",
+    "file": "history.py (the lab version; fcp's is scripts/nightly_history.py)",
+    "text": "\"\"\"Turn one JUnit file per night into one table: a row per test, a column per night, newest night first.\"\"\"\nimport xml.etree.ElementTree as ET\nfrom pathlib import Path\n\nnights = sorted(Path(\"nights\").glob(\"night-*.xml\"), reverse=True)\ntable: dict[str, dict[str, str]] = {}\nfor night in nights:\n    attempts: dict[str, list[ET.Element]] = {}\n    for case in ET.parse(night).iter(\"testcase\"):\n        attempts.setdefault(case.get(\"name\"), []).append(case)  # a rerun test has one entry per attempt\n    for test, cases in attempts.items():\n        last = cases[-1]\n        if last.find(\"failure\") is not None or last.find(\"error\") is not None:\n            result = \"FAIL\"\n        elif last.find(\"skipped\") is not None:\n            result = \"quar\" if \"quarantined\" in last.find(\"skipped\").get(\"message\", \"\") else \"skip\"\n        else:\n            result = \"rerun\" if len(cases) > 1 else \"pass\"\n        table.setdefault(test, {})[night.stem.removeprefix(\"night-\")] = result\n\ncolumns = [night.stem.removeprefix(\"night-\") for night in nights]\nprint(f\"{'test':22}\" + \"\".join(f\"{c:>6}\" for c in columns))\nfor test, row in table.items():\n    print(f\"{test:22}\" + \"\".join(f\"{row.get(c, '-'):>6}\" for c in columns))",
     "notes": [
      {
-      "line": 1,
-      "text": "The function is called from the existing pytest_collection_modifyitems hook in this conftest."
-     },
-     {
-      "line": 2,
-      "text": "The pytest.ini line to add, with its meaning."
-     },
-     {
-      "line": 6,
-      "text": "Runs once after collection, over every collected test."
-     },
-     {
-      "line": 8,
-      "text": "The quarantine marker on the test, its class or module, or None."
+      "line": 5,
+      "text": "One JUnit file per night, newest first, so the newest night is the first column."
      },
      {
       "line": 10,
-      "text": "Not quarantined: leave the test alone."
-     },
-     {
-      "line": 11,
-      "text": "The ticket is required; a marker without one raises KeyError at collection."
+      "text": "Group by test name: a rerun test appears once per attempt."
      },
      {
       "line": 12,
-      "text": "Why xfail: the test runs, and the report shows it as skipped with the reason."
-     },
-     {
-      "line": 14,
-      "text": "Add the xfail with the ticket in the reason; strict=False means a pass is fine too."
-     },
-     {
-      "line": 17,
-      "text": "Who adds it, and the wall."
-     },
-     {
-      "line": 19,
-      "text": "What it looks like on a test; RH-0000 is a placeholder."
-     },
-     {
-      "line": 22,
-      "text": "The open decision about the existing rerun markers."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Mutation report, part 1: which files (G7-35)",
-   "p": [
-    "A suite that passes no matter what the code does gives agents false confidence. A mutation tool changes the code on purpose, and each change is a mutant (lesson p10-5). If the tests still pass, the mutant survived and the code is weakly tested. Meta's ACH work used surviving mutants this way.",
-    "G7-35 runs mutmut every night on the cloud files that agent PRs changed the day before, at most 10. It is advisory: never a required check."
-   ],
-   "because": "We pick only yesterday's agent-changed files, because mutation testing is slow and those are the files we most need to trust.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/cloud-mutation-nightly.yml (part 1 of 2)",
-    "text": "name: \"[CLOUD] - Mutation report (advisory)\"\non:\n  schedule:\n    - cron: '17 4 * * *' # after the 02:44 UTC cloud nightly\n\njobs:\n  mutation:\n    runs-on: fcp-runner-set\n    # services and env: the same Postgres service and env as the API Tests job in cloud-ci.yml\n    steps:\n      - uses: actions/checkout@v6\n      - name: Cloud files that agent PRs changed yesterday\n        env:\n          GH_TOKEN: ${{ github.token }}\n        run: |\n          gh pr list --state merged --limit 50 --search \"author:app/rhino-ai-agents merged:>=$(date -u -d yesterday +%F)\" \\\n            --json files --jq '.[].files[].path' \\\n            | grep -E '^cloud/rhinoCloud/rhinoCore/.+\\.py$' | grep -vE '/(tests|migrations|integration-tests)/' \\\n            | sed 's|^cloud/rhinoCloud/||' | sort -u | head -n 10 > touched.txt || true",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The word advisory is in the name on purpose."
-     },
-     {
-      "line": 4,
-      "text": "04:17 UTC, after the 02:44 cloud nightly."
-     },
-     {
-      "line": 8,
-      "text": "The normal runner."
-     },
-     {
-      "line": 9,
-      "text": "Copy the Postgres service and env from the API Tests job; the API layer needs them."
-     },
-     {
-      "line": 14,
-      "text": "The job's own token lets gh read PRs."
+      "text": "Only the last attempt is the verdict."
      },
      {
       "line": 16,
-      "text": "Merged PRs from yesterday by the rhino-ai-agents App."
-     },
-     {
-      "line": 17,
-      "text": "Print the changed file paths of those PRs."
+      "text": "A quarantined test that failed shows up as skipped, with its ticket in the message."
      },
      {
       "line": 18,
-      "text": "Keep rhinoCore Python files, and drop tests, migrations and integration tests."
-     },
-     {
-      "line": 19,
-      "text": "Make paths relative to cloud/rhinoCloud, dedupe, keep 10, and save them."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Mutation report, part 2: mutate and publish",
-   "p": [
-    "Only the API layer judges the mutants, because rhinoCore/tests run on manage.py test, not pytest. Check one thing first: that mutmut 3's mutants/ copy is what rhinoCloud.rhinoCore imports, since the code is imported through PYTHONPATH=cloud. If it is not, run from cloud/ with rhinoCloud/... paths, or try cosmic-ray, and say which in the PR.",
-    "The weekly run review reads the report. The G5 coverage-gap routine turns survivors into test proposals."
-   ],
-   "because": "We write mutmut's config at run time, because the files to mutate change every night.",
-   "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/cloud-mutation-nightly.yml (part 2 of 2)",
-    "text": "      - name: Mutate only those files; only the API layer judges the mutants\n        working-directory: cloud/rhinoCloud\n        run: |\n          [ -s ../../touched.txt ] || { echo \"No agent-changed cloud files yesterday\"; exit 0; }\n          printf '[mutmut]\\npaths_to_mutate=%s\\ntests_dir=tests_api/\\n' \"$(paste -sd, ../../touched.txt)\" > setup.cfg\n          uv run --frozen --group api-tests --with mutmut mutmut run || true\n          uv run --frozen --group api-tests --with mutmut mutmut results > ../../mutation-report.txt\n      - name: Report (advisory, never a required check)\n        if: hashFiles('mutation-report.txt') != ''\n        run: |\n          { echo \"## Surviving mutants in agent-changed files\"; echo '```'; cat mutation-report.txt; echo '```'; } >> \"$GITHUB_STEP_SUMMARY\"\n      - uses: actions/upload-artifact@v7\n        if: hashFiles('mutation-report.txt') != ''\n        with: { name: mutation-report, path: mutation-report.txt }",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The step name repeats the rule."
-     },
-     {
-      "line": 2,
-      "text": "Run from the cloud project."
-     },
-     {
-      "line": 4,
-      "text": "No files yesterday: say so and stop with success."
-     },
-     {
-      "line": 5,
-      "text": "Write setup.cfg: the files to mutate (comma-joined) and tests_api/ as the tests."
-     },
-     {
-      "line": 6,
-      "text": "Run mutmut in the api-tests group; survivors are not a job failure."
-     },
-     {
-      "line": 7,
-      "text": "Write the result list to a file at the repo root."
-     },
-     {
-      "line": 8,
-      "text": "Add the report to the job summary page."
-     },
-     {
-      "line": 9,
-      "text": "Only when the report exists."
-     },
-     {
-      "line": 11,
-      "text": "Text written to this file shows on the run's summary page."
-     },
-     {
-      "line": 12,
-      "text": "Keep the report as an artifact too."
+      "text": "Passed, but only after a rerun: flaky, not green."
      }
     ]
    },
-   "callout": {
-    "kind": "gotcha",
-    "text": "The ticket wants surviving mutants' diffs in the report. mutmut results lists them; check the docs of the pinned mutmut for the command that prints one mutant's diff, and add it."
-   }
+   "see": "test                      10    09    08    07    06    05    04    03    02    01\ntest_list_projects      pass  pass  pass  pass  pass  pass  pass  pass  pass  pass\ntest_archive_project    FAIL  FAIL  FAIL  FAIL  pass  pass  pass  pass  pass  pass\ntest_upload_scan       rerun  pass rerun rerun  pass  pass  pass  pass  pass  pass\ntest_run_report         FAIL  pass  pass  pass  pass  pass  pass  pass  FAIL  FAIL"
   },
   {
-   "h": "Take branch pushes off the QA locks (G7-31)",
+   "h": "Triage: fix, quarantine with a ticket, or hand over",
    "p": [
-    "Every cloud or client branch push waits 20 to 30 minutes on cloud_integration_tests_{aws,gcp} or client_integration_tests_{aws,gcp}. Agents push often, so this queue would grow with them. G7-31 runs QA integration jobs only on main, in the nightly and for releases. Branch pushes get the Lab smoke instead.",
-    "Do not move on day one. Run the Lab smoke next to QA for two weeks (G7-26) and compare the verdicts push by push. Move only when the Lab caught everything QA caught, and keep the exceptions (for example GCP-only paths) on the nightly. The dispatch workflows keep their concurrency groups, which still protect each QA environment."
+    "With the table in front of them, the backend engineers go through every failing or rerun-only test once, together, and give each one a category and an owner. A real bug or a broken test is fixed at once if that takes under an hour, otherwise it gets a bug ticket with the failing output. An environment problem goes to DevOps, the team that owns the QA environments, with the evidence. A flaky test is quarantined.",
+    "Quarantine means the test keeps running and reporting every night, but its failure no longer turns the night red. It is not the same as deleting or skipping the test: the history still shows it, and the quarantine names a Jira ticket labelled flaky-test, which our flaky-test fixer (an agent routine that looks for the real cause of a flaky test and fixes it) can take. In pytest this is a small marker that turns into a non-strict xfail: pytest expects the test may fail, so a failure is reported as expected and a pass is fine too. Only people add the marker. An agent that quarantines, skips or deletes a test to make its own work green is exactly what the checks against weakened tests exist to catch.",
+    "Once the flaky tests are quarantined and the real bugs fixed, a red night means one thing again: something new broke. The team posts one line a week, green nights out of the last seven, so everyone can see whether it stays that way."
    ],
-   "because": "We change only the if: of the QA jobs, because publish already needs both of them on main, so post-merge QA stays.",
    "code": {
-    "lang": "yaml",
-    "file": ".github/workflows/cloud-ci.yml (client-ci.yml gets the same change)",
-    "text": "  lab-images:\n    needs: check-changes\n    if: github.ref != 'refs/heads/main' && needs.check-changes.outputs.has_changes == 'true'\n    uses: ./.github/workflows/_lab-images-reusable.yml\n    secrets: inherit\n\n  lab-smoke:\n    name: FCP Lab smoke\n    needs: [check-changes, lab-images]\n    if: github.ref != 'refs/heads/main' && needs.check-changes.outputs.has_changes == 'true'\n    uses: ./.github/workflows/_lab-smoke-reusable.yml\n    with:\n      image_tag: ${{ needs.lab-images.outputs.tag }}\n    secrets: inherit\n\n  integration-tests-aws:\n    name: \"I&T - AWS\"\n    needs: [build, build-rhino-agent, check-changes]\n    # Shared QA (lock cloud_integration_tests_aws on qa-cloud / rhino-agent-qa-1) only after merge to main.\n    # The nightly (cloud-int-tests-dispatch.yml) and releases keep using it; branch pushes no longer wait for it.\n    if: github.ref == 'refs/heads/main'\n    uses: ./.github/workflows/_cloud-int-tests-reusable-aws.yml\n    # with: ...unchanged\n\n  # integration-tests-gcp: the same `if:`. `publish` already needs both and only runs on main.",
+    "lang": "python",
+    "file": "tests/conftest.py (fcp's is rhinoCore/integration-tests/conftest.py)",
+    "text": "import pytest\n\n\ndef pytest_configure(config: pytest.Config) -> None:\n    config.addinivalue_line(\"markers\", \"quarantine(ticket): known flaky; still runs and reports, but cannot turn the night red\")\n\n\ndef pytest_collection_modifyitems(items: list[pytest.Item]) -> None:\n    for item in items:\n        marker = item.get_closest_marker(\"quarantine\")\n        if marker is None:\n            continue\n        ticket = marker.kwargs[\"ticket\"]  # required: every quarantined test has a ticket and an owner\n        item.add_marker(pytest.mark.xfail(reason=f\"quarantined, see {ticket}\", strict=False))",
     "notes": [
      {
-      "line": 1,
-      "text": "Build this commit's Lab images (lesson g7-6)."
-     },
-     {
-      "line": 3,
-      "text": "Only on branches with cloud changes."
-     },
-     {
-      "line": 4,
-      "text": "The reusable images workflow."
-     },
-     {
       "line": 5,
-      "text": "It needs the App key and AWS access."
-     },
-     {
-      "line": 7,
-      "text": "Then the smoke run."
-     },
-     {
-      "line": 8,
-      "text": "The check name G0 will make required."
-     },
-     {
-      "line": 9,
-      "text": "Wait for the images."
+      "text": "Register the marker, so pytest accepts @pytest.mark.quarantine(ticket=...)."
      },
      {
       "line": 13,
-      "text": "Pass the tag the images job produced."
+      "text": "No quarantine without a ticket: a missing ticket is an error at collection."
      },
      {
-      "line": 16,
-      "text": "The existing QA job."
-     },
-     {
-      "line": 19,
-      "text": "The comment says which lock and environment this job holds."
-     },
-     {
-      "line": 21,
-      "text": "The change: main only. Branch pushes no longer wait."
-     },
-     {
-      "line": 25,
-      "text": "The GCP job gets the same if:."
+      "line": 14,
+      "text": "Non-strict xfail: the test runs, a failure is expected, a pass is fine."
      }
     ]
    },
-   "callout": {
-    "kind": "tip",
-    "text": "Before skipping branch-only jobs that fed QA (build, build-rhino-agent), check who else reads their images. Tell the BE guild in Slack what changed: people, never agents, can still run QA on a branch from the dispatch workflows."
+   "deeper": {
+    "h": "Go deeper: mutants, and QA leaves the branches",
+    "p": [
+     "Green tests can still be weak tests. A nightly, advisory job runs mutmut, a mutation testing tool, on the cloud files that agent pull requests changed the day before, at most ten. mutmut makes small changes to the code on purpose, such as turning < into <=, and each change is a mutant. If the API tests still pass, the mutant survived, which shows a place where the tests do not really check the code. The job is never a required check; it publishes the survivors, and a routine that looks for test gaps turns them into proposals for new tests.",
+     "The nightly also becomes more important for another reason. Once the private FCP Lab smoke run (the full product on one machine, booted for one CI run) has run next to QA for two weeks and caught everything QA caught, branch pushes of cloud and client code stop waiting for the shared QA locks. QA then runs only on main, for releases and in the nightly, so the nightly is where QA-only problems show up first."
+    ]
    }
   }
  ],
  "lab": {
-  "title": "Find the nightly's moving parts in your fcp checkout",
-  "youNeed": [
-   "Your fcp checkout (~/Projects/fcp)",
-   "A terminal"
+  "id": "g7-7",
+  "title": "Ten nights in one table",
+  "minutes": 25,
+  "mode": "guided",
+  "needs": [
+   "uv",
+   "No Docker and no CI: a loop plays ten nights"
   ],
-  "worked": [
+  "goal": "Run a small nightly ten times, turn the JUnit files into a per-test history that counts reruns honestly, and quarantine the flaky test with a ticket so the next night is green.",
+  "guess": {
+   "q": "test_upload_scan fails on its first attempt, is rerun by pytest-rerunfailures, and passes. What does the night's JUnit file show for it?",
+   "options": [
+    {
+     "text": "One entry with a failure, and one entry that passed.",
+     "correct": false,
+     "why": "That would be honest, but the plugin writes the retried attempt without a failure element."
+    },
+    {
+     "text": "Two entries for the same test, and neither has a failure element.",
+     "correct": true,
+     "why": "Each attempt is its own testcase. Only the count of entries shows that a rerun happened."
+    },
+    {
+     "text": "One entry that passed, with a rerun count.",
+     "correct": false,
+     "why": "There is no rerun attribute. The terminal summary shows reruns with -rR, the JUnit file only repeats the entry."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "cd ~/Projects/fcp && grep -n \"cron\" .github/workflows/cloud-int-tests-dispatch.yml",
-    "see": "5:    - cron: '44 2 * * *' # run at 2:44 AM UTC"
+    "say": "Make a project with pytest and the plugin that reruns flaky tests, the same plugin fcp's integration tests use.",
+    "do": "mkdir -p ~/academy-labs/g7-7/tests ~/academy-labs/g7-7/nights && cd ~/academy-labs/g7-7 && uv init --bare --python 3.13 -q && uv add --dev pytest pytest-rerunfailures",
+    "see": " + pytest==9.1.1\n + pytest-rerunfailures==16.7"
    },
    {
-    "do": "grep -n \"integration-tests-entrypoint-ci.sh\\|Delete the integration tests pod\" .github/workflows/_cloud-int-tests-reusable-aws.yml",
-    "see": "686: ... integration-tests-entrypoint-ci.sh -s --durations=0 -vv --color=yes -m \"$markers_filter\" ...\n688:      - name: Delete the integration tests pod\n(G7-24 adds -rR --junitxml to line 686 and two steps before 688)"
+    "say": "Write four nightly tests: one that always passes, one that a change breaks on night 7, a flaky one with reruns and a flaky one without. NIGHT plays the date.",
+    "do": "cat > tests/test_nightly.py <<'EOF'\n\"\"\"Four integration tests that run once per night. NIGHT says which night it is.\"\"\"\nimport os\nimport random\n\nimport pytest\n\nNIGHT = int(os.environ.get(\"NIGHT\", \"1\"))\nattempts: dict[str, int] = {}\n\n\ndef unlucky(name: str, chance: float) -> bool:\n    \"\"\"Whether a timing problem hits this attempt tonight; replaying a night gives the same answer.\"\"\"\n    attempts[name] = attempts.get(name, 0) + 1\n    return random.Random(f\"{name}-{NIGHT}-{attempts[name]}\").random() < chance\n\n\ndef test_list_projects():\n    assert [\"Lung CT\", \"Brain MRI\"] == [\"Lung CT\", \"Brain MRI\"]\n\n\ndef test_archive_project():\n    archived = NIGHT < 7  # on night 7 a change was merged that breaks archiving\n    assert archived, \"archived project still shows in the list\"\n\n\n@pytest.mark.flaky(reruns=2)\ndef test_upload_scan():\n    assert not unlucky(\"upload_scan\", 0.3), \"timed out waiting for the scan upload\"\n\n\ndef test_run_report():\n    assert not unlucky(\"run_report\", 0.35), \"report job did not finish in 60 s\"\nEOF",
+    "see": "(no output)"
    },
    {
-    "do": "grep -rn \"pytest.mark.flaky\" cloud/rhinoCloud/rhinoCore/integration-tests | wc -l",
-    "see": "10"
+    "say": "Play ten nights, each writing its own JUnit file. This is all the morning Slack message knows: red or green, and a count.",
+    "do": "for n in $(seq 1 10); do printf 'night %2d: ' $n; NIGHT=$n uv run pytest -q -p no:cacheprovider --junitxml=nights/night-$(printf %02d $n).xml 2>&1 | tail -1; done",
+    "see": "night  1: 1 failed, 3 passed in 0.02s\nnight  2: 1 failed, 3 passed in 0.02s\nnight  3: 4 passed in 0.01s\n…\nnight  7: 1 failed, 3 passed, 1 rerun in 0.02s\nnight  8: 1 failed, 3 passed, 1 rerun in 0.01s\nnight  9: 1 failed, 3 passed in 0.01s\nnight 10: 2 failed, 2 passed, 1 rerun in 0.02s"
    },
    {
-    "do": "grep -n \"def pytest_collection_modifyitems\" cloud/rhinoCloud/rhinoCore/integration-tests/conftest.py",
-    "see": "122:def pytest_collection_modifyitems(session: pytest.Session, config: pytest.Config, items: list[pytest.Item]):"
+    "say": "See the rerun with your own eyes: night 7's file lists test_upload_scan twice, and neither entry has a failure.",
+    "do": "grep -o 'name=\"test_upload_scan\"[^>]*>' nights/night-07.xml",
+    "see": "name=\"test_upload_scan\" time=\"0.000\" />\nname=\"test_upload_scan\" time=\"0.000\" />"
    },
    {
-    "do": "grep -n \"group: cloud_integration\" .github/workflows/*.yml",
-    "see": ".github/workflows/_cloud-int-tests-reusable-aws.yml:138:  group: cloud_integration_tests_aws\n.github/workflows/_cloud-int-tests-reusable-gcp.yml:141:  group: cloud_integration_tests_gcp"
+    "say": "Write history.py from the Understand step and read the ten nights side by side.",
+    "do": "cat > history.py <<'EOF'\n\"\"\"Turn one JUnit file per night into one table: a row per test, a column per night, newest night first.\"\"\"\nimport xml.etree.ElementTree as ET\nfrom pathlib import Path\n\nnights = sorted(Path(\"nights\").glob(\"night-*.xml\"), reverse=True)\ntable: dict[str, dict[str, str]] = {}\nfor night in nights:\n    attempts: dict[str, list[ET.Element]] = {}\n    for case in ET.parse(night).iter(\"testcase\"):\n        attempts.setdefault(case.get(\"name\"), []).append(case)  # a rerun test has one entry per attempt\n    for test, cases in attempts.items():\n        last = cases[-1]\n        if last.find(\"failure\") is not None or last.find(\"error\") is not None:\n            result = \"FAIL\"\n        elif last.find(\"skipped\") is not None:\n            result = \"quar\" if \"quarantined\" in last.find(\"skipped\").get(\"message\", \"\") else \"skip\"\n        else:\n            result = \"rerun\" if len(cases) > 1 else \"pass\"\n        table.setdefault(test, {})[night.stem.removeprefix(\"night-\")] = result\n\ncolumns = [night.stem.removeprefix(\"night-\") for night in nights]\nprint(f\"{'test':22}\" + \"\".join(f\"{c:>6}\" for c in columns))\nfor test, row in table.items():\n    print(f\"{test:22}\" + \"\".join(f\"{row.get(c, '-'):>6}\" for c in columns))\nEOF\npython3 history.py",
+    "see": "test                      10    09    08    07    06    05    04    03    02    01\ntest_list_projects      pass  pass  pass  pass  pass  pass  pass  pass  pass  pass\ntest_archive_project    FAIL  FAIL  FAIL  FAIL  pass  pass  pass  pass  pass  pass\ntest_upload_scan       rerun  pass rerun rerun  pass  pass  pass  pass  pass  pass\ntest_run_report         FAIL  pass  pass  pass  pass  pass  pass  pass  FAIL  FAIL"
    },
    {
-    "do": "grep -n \"test:unit:mutation\" frontend/package.json",
-    "see": "25:    \"test:unit:mutation\": \"stryker run\",\n(the frontend already has mutation testing with Stryker)"
+    "say": "Triage the table: archiving broke on night 7 (a real bug, so fix it), and test_run_report fails on scattered nights (flaky, so a person quarantines it with a ticket). Then play night 11.",
+    "do": "cat > tests/conftest.py <<'EOF'\nimport pytest\n\n\ndef pytest_configure(config: pytest.Config) -> None:\n    config.addinivalue_line(\"markers\", \"quarantine(ticket): known flaky; still runs and reports, but cannot turn the night red\")\n\n\ndef pytest_collection_modifyitems(items: list[pytest.Item]) -> None:\n    for item in items:\n        marker = item.get_closest_marker(\"quarantine\")\n        if marker is None:\n            continue\n        ticket = marker.kwargs[\"ticket\"]  # required: every quarantined test has a ticket and an owner\n        item.add_marker(pytest.mark.xfail(reason=f\"quarantined, see {ticket}\", strict=False))\nEOF\npython3 - <<'EOF'\nfrom pathlib import Path\np = Path(\"tests/test_nightly.py\")\ns = p.read_text()\ns = s.replace(\"def test_run_report():\", '@pytest.mark.quarantine(ticket=\"RH-1251\")\\ndef test_run_report():')\ns = s.replace(\"archived = NIGHT < 7  # on night 7 a change was merged that breaks archiving\", \"archived = True  # the archiving fix was merged\")\np.write_text(s)\nEOF\nNIGHT=11 uv run pytest -q -rx -p no:cacheprovider --junitxml=nights/night-11.xml",
+    "see": "...x                                                                     [100%]\nXFAIL tests/test_nightly.py::test_run_report - quarantined, see RH-1251\n3 passed, 1 xfailed in 0.02s"
+   },
+   {
+    "say": "Read the history again. Night 11 is green, and the quarantined test is still in the table.",
+    "do": "python3 history.py | cut -c1-40",
+    "see": "test                      11    10    09\ntest_list_projects      pass  pass  pass\ntest_archive_project    pass  FAIL  FAIL\ntest_upload_scan        pass rerun  pass\ntest_run_report         quar  FAIL  pass"
    }
   ],
-  "faded": "List the files that hold the 10 flaky markers. The command is left to you (one grep flag changes from the count above). Then pick one and write the quarantine line a person would put in its place, with a placeholder ticket.",
-  "alone": "Read the if: of integration-tests-aws in .github/workflows/cloud-ci.yml today. Write the before and after lines for G7-31, and name the job that keeps post-merge QA running even after the change.",
-  "done": "You can point at the cron, the entrypoint line, the 10 flaky markers, the hook G7-29 extends and both locks."
+  "build": "A quarantined test that passes is written to JUnit as a plain pass, so on good nights the history forgets it is quarantined, and nobody can list the quarantined tests and their tickets. Play NIGHT=12 to see it: test_run_report shows pass. Fix it in two places. In conftest.py, also add item.user_properties.append((\"quarantined\", ticket)), which pytest writes into JUnit as a property on every night. In history.py, check for that property first (last.find(\"properties/property[@name='quarantined']\")), show quar whenever it is there, and print one line per quarantined test with its ticket under the table. Run night 12 again and read the history.",
+  "checks": [
+   "Night 7's JUnit file lists test_upload_scan twice, without a failure element.",
+   "history.py shows rerun for test_upload_scan on nights 7, 8 and 10, and FAIL for test_archive_project from night 7.",
+   "After the quarantine, night 11 reports 3 passed, 1 xfailed, and the XFAIL line names RH-1251.",
+   "With your change, night 12 shows quar for test_run_report even though it passed, and the history prints quarantined: test_run_report (RH-1251)."
+  ],
+  "solution": {
+   "lang": "python",
+   "file": "the changed lines in tests/conftest.py and history.py",
+   "text": "# tests/conftest.py, after add_marker:\n        item.user_properties.append((\"quarantined\", ticket))  # in junit.xml on every night, also when it passes\n\n# history.py\ntickets: dict[str, str] = {}\n...\n        last = cases[-1]\n        quarantined = last.find(\"properties/property[@name='quarantined']\")\n        if quarantined is not None:\n            result = \"quar\"\n            tickets[test] = quarantined.get(\"value\")\n        elif last.find(\"failure\") is not None or last.find(\"error\") is not None:\n            result = \"FAIL\"\n...\nfor test, ticket in tickets.items():\n    print(f\"quarantined: {test} ({ticket})\")"
+  },
+  "fix": "A teammate made history.py shorter by dropping the grouping. The loop now reads:\nfor night in nights:\n    for case in ET.parse(night).iter(\"testcase\"):\n        result = \"FAIL\" if case.find(\"failure\") is not None else \"pass\"\n        table.setdefault(case.get(\"name\"), {})[night.stem.removeprefix(\"night-\")] = result\nReplace the loop in your history.py with it and run python3 history.py. test_upload_scan now shows pass on every night, and its flakiness is gone from the table. Find why (each attempt is its own entry, and the last entry wins without saying it was a rerun) and put the grouping back.",
+  "explain": [
+   "Why can one red night not tell you whether a failure is a regression, a flaky test or the environment, and what does the table show for each?",
+   "Why does a test that needed a rerun look green in the JUnit file, and how does history.py notice it?",
+   "How is a quarantined test different from a skipped or deleted one, and why may only a person add the marker?"
+  ],
+  "done": "Your table shows the regression, the rerun-only flakiness and the quarantined test, night 11 is green, and the quarantine stays visible on nights it passes."
  },
- "quiz": [
+ "check": [
   {
-   "q": "A nightly test failed once and passed on its rerun. How does the history count it?",
+   "q": "In the table, test_archive_project passes on nights 1 to 6 and fails on every night from 7 on. What is the most likely story?",
    "options": [
     {
-     "text": "As rerun-pass, which the triage treats as flaky, not green.",
+     "text": "It is flaky, so it should be quarantined.",
+     "correct": false,
+     "why": "Flaky tests fail on scattered nights. A clean switch from green to red on one date points at a change."
+    },
+    {
+     "text": "A change merged before night 7 broke it, so look at what was merged that day and fix it.",
      "correct": true,
-     "why": "-rR lists reruns, and passed-after-rerun is flaky by the G7-24 rule."
+     "why": "A regression starts on a date and stays. Quarantining it would hide a real bug."
     },
     {
-     "text": "As pass, because the final result was green.",
+     "text": "The QA environment broke on night 7.",
      "correct": false,
-     "why": "That is how flakiness gets retried away; the history keeps it visible."
-    },
-    {
-     "text": "As fail, because the first attempt failed.",
-     "correct": false,
-     "why": "It is its own category, so triage can see flakiness apart from real failures."
+     "why": "Then many tests would turn red on the same night, not one test alone."
     }
    ]
   },
   {
-   "q": "An agent's PR adds @pytest.mark.quarantine(ticket=\"RH-1234\") to a failing test. What should happen?",
+   "q": "Why is a test that passed only after a rerun counted as flaky and not as green?",
    "options": [
     {
-     "text": "It is fine, because the marker has a ticket.",
-     "correct": false,
-     "why": "People quarantine after triage; agents never quarantine, skip or delete tests."
-    },
-    {
-     "text": "The weakened-tests check fails the PR; only a person quarantines.",
+     "text": "Because it failed on the same code at least once, and the rerun only hid that.",
      "correct": true,
-     "why": "This is a wall: agents never change the checks they are judged by."
+     "why": "Retrying until green makes flakiness invisible. Counting it keeps it in the history, where someone can fix the cause."
     },
     {
-     "text": "The nightly ignores the marker for agent PRs.",
+     "text": "Because reruns make the nightly slower.",
      "correct": false,
-     "why": "The nightly does not know who added the marker; the PR check does."
+     "why": "Speed is not the point. The point is what the result tells you about the test."
+    },
+    {
+     "text": "Because pytest marks reruns as failures in JUnit.",
+     "correct": false,
+     "why": "It does the opposite: the retried attempt has no failure element, which is why the script must count entries."
     }
    ]
   },
   {
-   "q": "Why does G7-31 keep QA running on main?",
+   "q": "A pull request from an agent adds @pytest.mark.quarantine(ticket=...) to a test that its change made red. What should happen?",
    "options": [
     {
-     "text": "Because publish needs both QA jobs, and post-merge QA stays a safety net.",
+     "text": "It is fine, because the test still runs and reports.",
+     "correct": false,
+     "why": "The test still runs, but the night stays green, so the agent's own change escapes its check."
+    },
+    {
+     "text": "It is fine if the ticket key is real.",
+     "correct": false,
+     "why": "A ticket does not change who made the decision. Quarantine is a person's call after triage."
+    },
+    {
+     "text": "The checks against weakened tests should reject it: only people quarantine tests.",
      "correct": true,
-     "why": "Only branch pushes move to the Lab; main, the nightly and releases keep QA."
-    },
-    {
-     "text": "Because the Lab cannot run on main.",
-     "correct": false,
-     "why": "It could; the plan keeps QA there on purpose."
-    },
-    {
-     "text": "Because the QA locks only exist on main.",
-     "correct": false,
-     "why": "The locks exist for every run; that is why branches waited for them."
+     "why": "An agent that can quarantine the test it broke can make any change look green."
     }
    ]
   }
  ],
- "recall": [
-  "From g7-6: when does the smoke workflow run lab compare, and why only then?",
-  "From p10-5: what is a surviving mutant?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "In _cloud-int-tests-reusable-aws.yml and -gcp.yml, the entrypoint call inside kubectl exec gets -rR --junitxml=/tmp/junit.xml; a new step copies it out with kubectl cp -c integration-tests before \"Delete the integration tests pod\" and uploads nightly-junit-<cloud> with retention-days 90. scripts/nightly_history.py reads the last 20 scheduled runs (gh run list --workflow cloud-int-tests-dispatch.yml --event schedule -L 20, then gh run download -n nightly-junit-aws) and writes nightly-history.md; the frontend nightly follows later with Playwright's JUnit reporter.",
+   "Triage happens in one session with the BE guild. The quarantine marker is registered in cloud/rhinoCloud/pytest.ini and applied from the existing pytest_collection_modifyitems; each quarantined test, and each of the ten tests with @pytest.mark.flaky(reruns=N), gets a flaky-test Jira ticket for the BE flaky-test fixer; environment failures such as the instant-container image tests go to DevOps; #integration-tests-nightly gets a weekly green-nights line. cloud-mutation-nightly.yml (17 4 * * *) runs mutmut 3 with tests_dir = tests_api/ on at most 10 rhinoCore files that rhino-ai-agents PRs changed the day before and publishes the survivors as a job summary and an artifact. In cloud-ci.yml and client-ci.yml, integration-tests-aws and -gcp get if: github.ref == 'refs/heads/main' once the Lab smoke has matched QA for two weeks; the dispatch workflows keep their concurrency groups, and FCP Lab smoke and API Tests become required checks."
+  ],
+  "tickets": [
+   {
+    "key": "G7-24",
+    "why": "A JUnit file per night and the 20-night history table: this lesson."
+   },
+   {
+    "key": "G7-29",
+    "why": "Triage with the BE guild, the quarantine marker with a ticket, and the weekly green-nights line."
+   },
+   {
+    "key": "G7-35",
+    "why": "The advisory nightly mutation report on files that agent PRs changed."
+   },
+   {
+    "key": "G7-31",
+    "why": "Cloud and client branch pushes leave the shared QA locks; QA stays on main, releases and the nightly."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "nightly history",
-   "plain": "nightly-history.md: one row per test, one column per night, with pass, fail or rerun-pass."
+   "term": "flaky test",
+   "plain": "A test that passes or fails on the same code, depending on timing or luck."
   },
   {
-   "term": "rerun-pass",
-   "plain": "A test that failed and then passed on a rerun; counted as flaky, not green."
+   "term": "JUnit XML",
+   "plain": "The standard test report file: one testcase per test, with a failure inside when it failed."
+  },
+  {
+   "term": "rerun pass",
+   "plain": "A test that failed, was run again and passed; counted as flaky, not green."
   },
   {
    "term": "triage",
-   "plain": "Sorting each failure into real bug, test bug, environment or flaky, with an owner and an action."
+   "plain": "Sorting every failure into real bug, test bug, environment or flaky, each with an owner."
   },
   {
    "term": "quarantine",
-   "plain": "A marker a person adds with a ticket; the test still runs and reports but does not turn the nightly red."
+   "plain": "A marker a person adds with a ticket: the test still runs and reports, but cannot turn the night red."
   },
   {
    "term": "xfail",
-   "plain": "A pytest mark meaning the test may fail; non-strict means a pass is fine too."
-  },
-  {
-   "term": "job summary",
-   "plain": "Markdown a step writes to GITHUB_STEP_SUMMARY; it shows on the run's page."
+   "plain": "A pytest mark meaning a test is expected to fail; non-strict means a pass is fine too."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G7-24",
-   "why": "This lesson walked through the two new steps and what nightly_history.py does with their artifacts.",
-   "walk": [
-    "In _cloud-int-tests-reusable-aws.yml and -gcp.yml, add -rR --junitxml=/tmp/junit.xml to the entrypoint call inside kubectl exec.",
-    "Add the two steps above before \"Delete the integration tests pod\", with nightly-junit-aws and nightly-junit-gcp.",
-    "Add scripts/nightly_history.py: gh run list for the last 20 scheduled runs, gh run download each artifact, write nightly-history.md newest first.",
-    "Count passed-after-rerun as flaky, not green.",
-    "Do the frontend nightly later with Playwright's JUnit reporter."
-   ]
+   "q": "Describe what each pattern in the nightly table usually means: a row that turns red on one date, a row with scattered red, a column with many reds.",
+   "a": "A regression from a change merged that day; a flaky test; an environment problem that hit many tests on one night."
   },
   {
-   "key": "G7-29",
-   "why": "This lesson explained the four triage categories and walked through the quarantine marker line by line.",
-   "walk": [
-    "Go through nightly-history.md with the BE guild in one session; give each test a category and an owner.",
-    "Fix quick real and test bugs now and open Jira bugs for the rest. Hand environment problems to DevOps with evidence.",
-    "Add _apply_quarantine to the integration-tests conftest, call it from pytest_collection_modifyitems, and register the marker in cloud/rhinoCloud/pytest.ini.",
-    "Quarantine flaky tests with a Jira ticket labelled flaky-test; give the 10 existing flaky markers tickets too.",
-    "Post green nights out of the last 7 in #integration-tests-nightly once a week."
-   ]
+   "q": "Why must the history script group JUnit entries by test name?",
+   "a": "pytest-rerunfailures writes one entry per attempt, and retried attempts have no failure element. Grouping lets the last entry be the verdict and the count reveal the rerun."
   },
   {
-   "key": "G7-35",
-   "why": "This lesson walked through the mutation workflow: picking agent-changed files, mutmut on the API layer, and the advisory report.",
-   "walk": [
-    "Add .github/workflows/cloud-mutation-nightly.yml from the two blocks above, with the API Tests job's Postgres service and env.",
-    "Check that mutmut 3's mutants/ copy is what rhinoCloud.rhinoCore imports; otherwise run from cloud/ or try cosmic-ray, and say which.",
-    "Add the surviving mutants' diffs to the report.",
-    "Confirm it is never a required check; point the weekly run review and the G5 coverage-gap routine at the artifact."
-   ]
-  },
-  {
-   "key": "G7-31",
-   "why": "This lesson walked through the lab-images and lab-smoke jobs and the main-only if: on the QA jobs.",
-   "walk": [
-    "Run the Lab smoke next to QA for two weeks and compare verdicts push by push; list the exceptions for the nightly.",
-    "Add lab-images and lab-smoke to cloud-ci.yml and client-ci.yml, and set the QA jobs' if: to main only.",
-    "Leave cloud-int-tests-dispatch.yml and client-int-tests-dispatch.yml unchanged.",
-    "Check who reads the images of build and build-rhino-agent before skipping them on branches.",
-    "Agree with G0 that FCP Lab smoke and API Tests become required checks; tell the BE guild in Slack."
-   ]
+   "q": "What three things make a quarantine safe instead of a way to hide failures?",
+   "a": "The test still runs and reports every night, every quarantine names a ticket with an owner, and only people can add it."
   }
  ],
- "remember": "Record every night per test, triage with a person and a ticket, mutate what agents changed, free branches from QA locks."
+ "remember": "Keep every night per test, count a rerun as flaky, and let a person quarantine with a ticket, so a red night means something new broke."
 }

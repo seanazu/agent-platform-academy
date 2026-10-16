@@ -42,7 +42,7 @@
    "h": "A private copy of the product for every run",
    "p": [
     "The other way round is to give every run its own environment and throw it away afterwards. People call this an ephemeral environment: it lives exactly as long as one run. FCP Lab is that for fcp. It boots the full product, the cloud, a real on-prem client (the Rhino software that normally runs inside a customer's network), the frontend and their databases, on one machine from a source tree, with fake seed data, so the workgroup in the story really is empty when the test starts.",
-    "In CI, each run boots its own Lab, named after the run (ci- plus the run's ID), on a runner of its own, and nothing is shared with any other run. That is why the smoke workflow needs no lock. Its concurrency group has a different job: the name contains the branch, and cancel-in-progress is true, so when Nova pushes again, the older run of the same branch is stopped, because its result no longer matters. Two different pull requests never wait for each other."
+    "In CI, each run boots its own Lab, named after the run (ci- plus the run's ID), on a runner of its own (the machine that runs one CI job), and nothing is shared with any other run. That is why the smoke workflow needs no lock. Its concurrency group has a different job: the name contains the branch, and cancel-in-progress is true, so when Nova pushes again, the older run of the same branch is stopped, because its result no longer matters. Two different pull requests never wait for each other."
    ],
    "code": {
     "lang": "yaml",
@@ -78,7 +78,7 @@
    "deeper": {
     "h": "Go deeper: where the Lab runs",
     "p": [
-     "A Lab is big for a CI job: it idles at about 3 GB of memory, grows during a test run, and its images take about 11 GB of disk. On the shared runners it would take memory and disk from every other job. So Labs get their own machines. Our runners live in the internal Kubernetes cluster, where a tool called Karpenter adds and removes machines (nodes) as pods need them. A NodePool tells Karpenter which kind of node to start, here 8 vCPU and 32 GB, at most six at a time.",
+     "A Lab is big for a CI job: it idles at about 3 GB of memory, grows during a test run, and its images take about 11 GB of disk. On the shared runners it would take memory and disk from every other job. So Labs get their own machines. Our runners live in the internal Kubernetes cluster as pods, Kubernetes' unit of one or more containers, and a tool called Karpenter adds and removes machines (nodes) as those pods need them. A NodePool tells Karpenter which kind of node to start, here 8 vCPU and 32 GB, at most six at a time.",
      "A taint on those nodes keeps every other pod away: Kubernetes only places a pod there if it carries the matching toleration, and only the Lab runners do. Each runner asks for most of a node, so every Lab gets a machine to itself, and the Lab's containers run inside the runner pod through Docker-in-Docker: a second Docker engine that runs in its own container next to the runner, in the same pod. Before any of this, the Lab had to prove it runs on a clean Linux machine at all, because until then it had only been tested on Macs."
     ]
    }
@@ -86,7 +86,7 @@
   {
    "h": "Build once per commit, boot many times",
    "p": [
-    "A Lab built from source takes ten minutes or more before the first test, which would eat most of a 15-minute budget. But the cloud, client and frontend workflows all run for the same commit, and later the comparison and the agents' VMs want the same Lab too. So the images are built once per commit, pushed to our container registry, and every later caller pulls them.",
+    "A Lab built from source takes ten minutes or more before the first test, which would eat most of a 15-minute budget. But the cloud, client and frontend workflows all run for the same commit, and later the comparison and the virtual machines our agents work in want the same Lab too. So the images are built once per commit, pushed to our container registry, and every later caller pulls them.",
     "The trick is the tag, the name of one image version. Each image is tagged with the commit and the Lab's own version, because the Lab adds its own patches. Before building, the job asks the registry whether that tag exists, and if it does, it skips the build. One race is left: two workflows of the same commit can start at the same second, both find no tag and both build. A concurrency group named after the commit makes the second one wait, and when it runs, the tag is there. The registry also refuses to overwrite a tag, so an image can never change under a name that a test already used."
    ],
    "code": {
@@ -243,30 +243,30 @@
    ]
   },
   {
-   "q": "Why are the Lab's images tagged with the commit, and why must the registry refuse to overwrite a tag?",
+   "q": "A teammate suggests tagging the Lab's images latest instead of with the commit and the Lab's version. What goes wrong?",
    "options": [
     {
-     "text": "So the newest build always wins under the same name.",
+     "text": "Nothing, as long as every run pulls the image right before it boots.",
      "correct": false,
-     "why": "That is the danger, not the goal: a test could then run on code that changed under its feet."
+     "why": "Pulling latest gives you whatever was pushed last, which may be another branch's commit. The run then tests code that is not in its pull request."
     },
     {
-     "text": "Because the registry only accepts commit IDs as tags.",
+     "text": "The registry refuses a tag called latest.",
      "correct": false,
-     "why": "Any tag works. The commit is our choice, for what it means."
+     "why": "latest is a normal tag. The problem is what it means, not whether it is allowed."
     },
     {
-     "text": "So every caller of one commit finds the same image and skips the build, and that image can never change afterwards.",
+     "text": "One name now points at many versions over time, so a run can boot another commit's code and nobody can tell afterwards what was tested.",
      "correct": true,
-     "why": "One tag means one source tree. Building once and refusing overwrites makes every run of that commit test exactly the same thing."
+     "why": "A tag per commit, which the registry never overwrites, means one name is one source tree, so every run tests exactly its own code."
     }
    ]
   }
  ],
  "platform": {
   "p": [
-   "First the Lab has to work on Linux: on a throw-away Ubuntu 24.04 m8i.2xlarge (8 vCPU, 32 GB, 100 GB gp3, no cloud credentials), ci/gate-d.sh wraps the Lab's ci/rehearse.sh, cold and warm, and records boot times, memory per service and docker system df, then repeats once inside an ARC dind pod on inf-rhinohealth; the lab repo moves into the RhinoHealth org so CI can check it out with a GitHub App token. lab-runner-set is a new Karpenter NodePool fcp-lab (taint rhinohealth.com/pool=fcp-lab:NoSchedule, cpu limit 48, short consolidateAfter, spot or on-demand still to decide) in modules/karpenter-node-pool, and a scale set with min 0, max 6 runners (QA has 6 locks today), requests of 6 CPU, 24Gi and 80Gi, and a new optional runner_tolerations field in modules/github-runner-scale-sets; add the label to fcp's .github/actionlint.yaml.",
-   "_lab-images-reusable.yml pushes fcp-lab-cloud, -client and -frontend (tags_immutability_enabled) to ECR in the inf account, tagged <sha>-lab<lab version>, with concurrency lab-images-<sha>; the lab build/push and lab up --images commands are still to agree with the Lab's owner. _lab-smoke-reusable.yml runs lab test --suite core, the agreed pr/ specs and pytest tests_api -m contract --target lab inside the Lab's web-service, lab compare only on failure, and uploads the reports. Then frontend-ci moves pull requests to an e2e-lab job (suite frontend-e2e, the Lab's allowlist of 24 spec files) and keeps QA for main, the nightly and releases, with the e2e_tests alls-green gate moved into frontend-ci.yaml. That job needs a lab-images job in frontend-ci, which no ticket adds yet; never test it by dispatching frontend-ci on a branch, which deploys over main's dev dashboard and Storybook."
+   "First the Lab has to work on Linux: on a throw-away Ubuntu 24.04 m8i.2xlarge (8 vCPU, 32 GB, 100 GB gp3, no cloud credentials), ci/gate-d.sh wraps the Lab's ci/rehearse.sh, cold and warm, and records boot times, memory per service and docker system df, then repeats once inside a runner pod from ARC (Actions Runner Controller, which runs GitHub runners on Kubernetes) with Docker-in-Docker on inf-rhinohealth; the lab repo moves into the RhinoHealth org so CI can check it out with a GitHub App token. lab-runner-set is a new Karpenter NodePool fcp-lab (taint rhinohealth.com/pool=fcp-lab:NoSchedule, cpu limit 48, a short consolidateAfter; decide spot or on-demand, since a Spot interruption makes a smoke run look flaky) in modules/karpenter-node-pool, and a scale set with min 0, max 6 runners (QA has 6 locks today), requests of 6 CPU, 24Gi and 80Gi, and a new optional runner_tolerations field in modules/github-runner-scale-sets; add the label to fcp's .github/actionlint.yaml.",
+   "_lab-images-reusable.yml pushes fcp-lab-cloud, -client and -frontend (tags_immutability_enabled) to ECR in the inf account, tagged <sha>-lab<lab version>, with concurrency lab-images-<sha>; add, with the Lab's owner, a lab command that builds and pushes a source tree's images and a way for lab up to pull them. _lab-smoke-reusable.yml runs lab test --suite core, the agreed pr/ specs and pytest tests_api -m contract --target lab inside the Lab's web-service, lab compare only on failure, and uploads the reports. Then frontend-ci moves pull requests to an e2e-lab job (suite frontend-e2e, the Lab's allowlist of 24 spec files) and keeps QA for main, the nightly and releases, with the e2e_tests alls-green gate moved into frontend-ci.yaml. Test it on a draft PR, never by dispatching frontend-ci on a branch, which deploys over main's dev dashboard and Storybook."
   ],
   "tickets": [
    {
