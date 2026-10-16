@@ -4,6 +4,7 @@ import { ISLANDS, LINKS, WORLD, asset, islandById, type Island } from './data';
 export type IslandProgress = { done: number; total: number; ready: number };
 export type WorldHandle = { flyTo: (id: string, opts?: { panel?: number; scale?: number }) => void; fit: () => void; moveToken: (from: string, to: string, ms: number) => Promise<void>; hideToken: () => void };
 type Cam = { x: number; y: number; s: number };
+type Pt = { x: number; y: number };
 
 const LIFT = 46; // wires meet the islands a little below their centre, where the rock is
 
@@ -35,6 +36,8 @@ function World({ ref, progress, revealed, selected, dimmed, bloom, leftInset = 0
   const [cam, setCam] = useState<Cam>({ x: 0, y: 0, s: 0.5 });
   const [flying, setFlying] = useState(false);
   const [token, setToken] = useState<{ x: number; y: number } | null>(null);
+  const pointers = useRef(new Map<number, Pt>());
+  const pinch = useRef<{ dist: number; mx: number; my: number; cam: Cam } | null>(null);
   const drag = useRef<{ px: number; py: number; cx: number; cy: number; moved: boolean } | null>(null);
   const paths = useRef(new Map<string, SVGPathElement>());
 
@@ -132,17 +135,44 @@ function World({ ref, progress, revealed, selected, dimmed, bloom, leftInset = 0
       data-dimmed={dimmed || undefined}
       onPointerDown={(e) => {
         if ((e.target as HTMLElement).closest('button, a')) return;
-        drag.current = { px: e.clientX, py: e.clientY, cx: cam.x, cy: cam.y, moved: false };
+        pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
         (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        if (pointers.current.size === 2) {
+          const [a, b] = [...pointers.current.values()] as [Pt, Pt];
+          const r = e.currentTarget.getBoundingClientRect();
+          pinch.current = { dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, mx: (a.x + b.x) / 2 - r.left, my: (a.y + b.y) / 2 - r.top, cam };
+          drag.current = null;
+          return;
+        }
+        drag.current = { px: e.clientX, py: e.clientY, cx: cam.x, cy: cam.y, moved: false };
       }}
       onPointerMove={(e) => {
+        if (!pointers.current.has(e.pointerId)) return;
+        pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        const p = pinch.current;
+        if (p && pointers.current.size === 2) {
+          const [a, b] = [...pointers.current.values()] as [Pt, Pt];
+          const r = e.currentTarget.getBoundingClientRect();
+          const s = clamp((p.cam.s * Math.hypot(a.x - b.x, a.y - b.y)) / p.dist, 0.25, 1.6);
+          const mx = (a.x + b.x) / 2 - r.left, my = (a.y + b.y) / 2 - r.top;
+          setCam({ s, x: mx - ((p.mx - p.cam.x) / p.cam.s) * s, y: my - ((p.my - p.cam.y) / p.cam.s) * s });
+          return;
+        }
         const d = drag.current;
         if (!d) return;
         const dx = e.clientX - d.px, dy = e.clientY - d.py;
         if (Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
         setCam((c) => ({ ...c, x: d.cx + dx, y: d.cy + dy }));
       }}
-      onPointerUp={() => {
+      onPointerUp={(e) => {
+        pointers.current.delete(e.pointerId);
+        pinch.current = null;
+        const rest = [...pointers.current.values()][0];
+        drag.current = rest ? { px: rest.x, py: rest.y, cx: cam.x, cy: cam.y, moved: true } : null;
+      }}
+      onPointerCancel={(e) => {
+        pointers.current.delete(e.pointerId);
+        pinch.current = null;
         drag.current = null;
       }}
     >

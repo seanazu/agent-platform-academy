@@ -41,6 +41,10 @@ test.describe('islands map', () => {
         await page.goto('/#/');
       });
       const list = page.locator('.isl-path-list');
+      await test.step('When the card is folded, the learner opens it', async () => {
+        const head = page.locator('.isl-path-head');
+        if ((await head.getAttribute('aria-expanded')) === 'false') await head.click();
+      });
       await test.step('Then the card fits below the top bar', async () => {
         const card = await page.locator('.isl-path').boundingBox();
         expect(card?.y ?? 0).toBeGreaterThanOrEqual(64);

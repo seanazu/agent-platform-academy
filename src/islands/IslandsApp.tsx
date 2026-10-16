@@ -31,7 +31,7 @@ function IslandsApp({ island, lesson }: Props) {
   const [revealed, setRevealed] = useState<Set<string>>(readRevealed);
   const [journey, setJourney] = useState<number | null>(null);
   const [celebrate, setCelebrate] = useState<string | null>(null);
-  const [pathOpen, setPathOpen] = useState(true);
+  const [pathOpen, setPathOpen] = useState(() => window.innerWidth >= 900);
   const pathList = useRef<HTMLOListElement | null>(null);
 
   const reveal = useCallback((id: string) => {

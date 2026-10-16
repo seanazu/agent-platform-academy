@@ -5,6 +5,7 @@ type Props = { route: Route; theme: Theme; onToggleTheme: () => void };
 
 function Header({ route, theme, onToggleTheme }: Props) {
   const links = [
+    { name: 'islands', label: 'Map', to: href.islands() },
     { name: 'home', label: 'Path', to: href.home() },
     { name: 'tickets', label: 'Tickets', to: href.tickets() },
     { name: 'cast', label: "Who's who", to: href.cast() },
