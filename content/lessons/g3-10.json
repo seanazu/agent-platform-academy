@@ -11,7 +11,7 @@
  "map": "temporal",
  "hook": {
   "story": [
-   "Monday, 09:00. After sprint planning, four tickets are assigned to Nova in the same minute: RH-1234, RH-1235, RH-1236 and RH-1240. Nova plans each one, and three of the plans then wait for their requesters, who are in meetings until lunch. One of them is on holiday until Thursday.",
+   "Monday, 09:00. After sprint planning, four tickets are assigned to Nova, our ticket-to-PR agent, in the same minute: RH-1234, RH-1235, RH-1236 and RH-1240. Nova plans each one, and three of the plans then wait for their requesters, who are in meetings until lunch. One of them is on holiday until Thursday.",
    "Picture the simplest workflow: claim a big VM when the ticket arrives and keep it until the PR is open. By 09:01 four full machines are running. By lunch they have spent hours doing nothing while people decide, and the one waiting for Thursday will run for three days. Now picture a busy Monday with forty tickets instead of four."
   ],
   "question": "How does one run hold a machine only while the machine is working, and how do we stop many runs from taking more machines than we planned?"
@@ -20,16 +20,16 @@
   {
    "h": "Plan small, wait for free, build big",
    "p": [
-    "ticketToPr is the Temporal workflow for one Nova ticket, started with the ID nova:RH-1234 as you saw in the lesson about one run per ticket. Its shape follows the money. Planning only reads code, so it claims a lite VM, the smallest size, and releases it as soon as the plan is posted. Waiting for the requester costs nothing at all: condition() with a timeout is a durable timer inside Temporal, so no VM runs, no worker is busy, and a deploy of the orchestrator does not lose the wait. Only an approved plan claims a full VM for the build.",
-    "Every claim sits in a try block whose finally releases the VM. That is the rule that keeps the bill honest: an error, a Stop from a person or a cancelled run all leave through finally. The release is wrapped in CancellationScope.nonCancellable, because a cancelled workflow would otherwise cancel the release too, and a forgotten VM costs money every hour until the sweeper finds it."
+    "ticketToPr is the Temporal workflow for one Nova ticket, started with the ID nova:RH-1234 as you saw in the lesson about one run per ticket. Its shape follows the money. Planning only reads code, so it claims a lite VM, the smallest size, and releases it as soon as the plan is posted. Waiting for the requester costs nothing at all: condition() with a timeout is a durable timer inside Temporal, so no VM runs, no worker is busy, and a deploy of the orchestrator, our Temporal worker that runs every agent workflow, does not lose the wait. Only an approved plan claims a full VM for the build.",
+    "Every claim sits in a try block whose finally releases the VM. That is the rule that keeps the bill honest: an error, a Stop from a person or a cancelled run all leave through finally. The release is wrapped in CancellationScope.nonCancellable, because a cancelled workflow would otherwise cancel the release too, and a forgotten VM costs money every hour until the sweeper, a job that destroys leftover VMs every 15 minutes, finds it."
    ],
    "code": {
     "lang": "typescript",
     "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts",
-    "text": "export async function ticketToPr(t: Handoff): Promise<string> {\n  const run: RunState = { stopped: false };\n  let decision: PlanDecision | undefined;\n  setHandler(decidePlan, (d) => { decision = d; });\n  setHandler(answerQuestion, (text) => { run.answer = text; });\n  const base = await act.mainHead(); // plan and build start from the same main commit\n\n  const inSandbox = (task: Task, size: Size) => withSlot(\"nova\", async () => {\n    const vm = await act.acquireSandbox({ runId: workflowInfo().runId, size, agent: \"nova\", jiraKey: t.key });\n    try {\n      await act.freshenSandbox(vm, base);\n      return await act.workInSandbox(vm, task); // heartbeats; no work-time limit\n    } finally {\n      await CancellationScope.nonCancellable(() => act.releaseSandbox(vm)); // always: no VM is left behind\n    }\n  });\n\n  const plan = await inSandbox(planTask(t), \"lite\"); // plan small\n  await act.postPlan(t, plan);\n  if (!(await waitForPerson(run, \"plan\", () => decision !== undefined, t))) return \"parked\"; // no VM while we wait\n  if (decision?.kind !== \"approve\") return \"stopped\";\n  const built = await inSandbox(buildTask(t, plan), \"full\"); // build big\n  return built.parked ? \"parked\" : built.prUrl;\n}",
+    "text": "export async function ticketToPr(t: Handoff): Promise<string> {\n  const run: RunState = { stopped: false };\n  let decision: PlanDecision | undefined;\n  setHandler(decidePlan, (d) => { decision = d; });\n  setHandler(answerQuestion, (text) => { run.answer = text; });\n  const base = await act.mainHead(); // plan and build start from the same main commit\n\n  const inSandbox = (task: Task, size: Size) => withSlot(\"nova\", async () => {\n    const vm = await act.acquireSandbox({ runId: workflowInfo().runId, size, agent: \"nova\", jiraKey: t.key });\n    try {\n      await act.freshenSandbox(vm, base);\n      return await act.workInSandbox(vm, task); // heartbeats; no work-time limit\n    } finally {\n      await CancellationScope.nonCancellable(() => act.releaseSandbox(vm)); // always: no VM is left behind\n    }\n  });\n\n  const plan = await inSandbox(planTask(t), \"lite\"); // plan small\n  await act.postPlan(t, plan);\n  if (!(await waitForPerson(run, \"plan\", () => decision !== undefined, t))) return run.stopped ? \"stopped\" : \"parked\"; // no VM while we wait\n  if (decision?.kind !== \"approve\") return \"stopped\";\n  const built = await inSandbox(buildTask(t, plan), \"full\"); // build big\n  return built.parked ? \"parked\" : built.prUrl;\n}",
     "notes": [
      {
-      "line": 3,
+      "line": 4,
       "text": "Signals are how a click in Slack reaches this function. The Slack app lesson shows where they come from."
      },
      {
@@ -41,8 +41,8 @@
       "text": "In the full version a question from Nova loops here: the VM is parked after 10 idle minutes and woken when the answer comes."
      },
      {
-      "line": 19,
-      "text": "waitForPerson adds a reminder and a deadline to the wait. The lesson about waiting covers it."
+      "line": 20,
+      "text": "waitForPerson adds a reminder and a deadline to the wait. It returns false when the ticket was handed back or a person pressed Stop, and run.stopped says which. The lesson about waiting covers it."
      }
     ]
    },
@@ -57,8 +57,8 @@
   {
    "h": "A fixed number of slots per agent",
    "p": [
-    "Plan small fixes the waiting, but not the Monday morning. Forty tickets would still mean forty planning VMs at once. So each agent has a fixed number of slots, where a slot is permission to have one VM running: Nova has 3, the CI fixer 2, the security fixer 1. A fourth Nova step waits in line until a slot comes back.",
-    "The line is itself a workflow that never ends, slots:nova. Runs send it a request signal with their workflow ID; it answers with slotGranted when fewer than three runs hold a slot, and a release signal gives the slot back. A signal is a message to a running workflow, and Temporal stores it, so the line survives restarts without a database or a lock. withSlot wraps a step in request and release, and the release sits in finally for the same reason the VM release does. The order matters: a run takes the slot before it claims the VM and gives it back after the VM is released, so a run waiting for a person holds neither."
+    "Plan small fixes the waiting, but not the Monday morning. Forty tickets would still mean forty planning VMs at once. So each agent has a fixed number of slots, where a slot is permission to have one VM running: Nova has 3, the CI fixer (the routine that repairs a red main branch) 2, the security fixer 1. A fourth Nova step waits in line until a slot comes back.",
+    "The line is itself a workflow that never ends, slots:nova, and it talks to runs with signals. A signal is a message to a running workflow, and Temporal stores it, so the line survives restarts without a database or a lock. Runs send it a request signal with their workflow ID; it answers with slotGranted when fewer than three runs hold a slot, and a release signal gives the slot back. withSlot wraps a step in request and release, and the release sits in finally for the same reason the VM release does. The order matters: a run takes the slot before it claims the VM and gives it back after the VM is released, so a run waiting for a person holds neither."
    ],
    "code": {
     "lang": "typescript",
@@ -74,7 +74,7 @@
       "text": "Sleeps, without any polling, until someone waits and a slot is free."
      },
      {
-      "line": 10,
+      "line": 8,
       "text": "The run that waited longest gets the slot: first come, first served."
      },
      {
@@ -87,7 +87,7 @@
     "h": "Go deeper: the other fan-out walls",
     "p": [
      "Slots are one of several walls against agent storms, which are many agents doing work nobody needed. Each agent also has its own task queue, such as ai-agents-nova and ai-agents-cifix, served by its own workers, so a flood of one kind of work cannot take every worker. Only the orchestrator starts runs, through startRun, and the VM has no route to Temporal, so an agent can never start another agent.",
-     "The kill switch is a row per agent in the broker's database. A local activity reads it before every step, so a stopped agent ends cleanly at the next step boundary and keeps its branch, and startRun reads it too and refuses new starts. To stop every open run of one agent at once, a person signals stop to all of them with one temporal workflow signal command that selects runs by the Agent search attribute."
+     "The kill switch, which stops one agent at once, is a row per agent in the database of the broker, the service that holds our GitHub, Jira and Slack credentials. A local activity (a short activity that runs inside the workflow's own worker) reads it before every step, so a stopped agent ends cleanly at the next step boundary and keeps its branch, and startRun reads it too and refuses new starts. To stop every open run of one agent at once, a person signals stop to all of them with one temporal workflow signal command that selects runs by the Agent search attribute, a field Temporal can filter runs by."
     ]
    }
   },
@@ -104,7 +104,11 @@
     "notes": [
      {
       "line": 6,
-      "text": "AWS calls retry from 1 second up to 1 minute, 10 times; Jira, Slack and GitHub calls through the broker retry without an attempt limit."
+      "text": "AWS calls retry from 1 second up to 1 minute, 10 times."
+     },
+     {
+      "line": 7,
+      "text": "Jira, Slack and GitHub calls through the broker retry without an attempt limit, so a long outage never makes them stop trying."
      }
     ]
    }
@@ -149,7 +153,7 @@
    },
    {
     "say": "Replace workflows.mjs with ticketToPr and the slot line. withSlot does nothing yet, which is the bug you will see first.",
-    "do": "cat > workflows.mjs <<'EOF'\n// Nova's run for one ticket and the line of VM slots, cut down to what this lab needs.\nimport {\n  CancellationScope, condition, continueAsNew, defineQuery, defineSignal,\n  getExternalWorkflowHandle, proxyActivities, setHandler, workflowInfo,\n} from '@temporalio/workflow';\n\nconst act = proxyActivities({ startToCloseTimeout: '7 days', heartbeatTimeout: '2 minutes' });\n\nexport const request = defineSignal('request');\nexport const release = defineSignal('release');\nexport const slotGranted = defineSignal('slotGranted');\nexport const decidePlan = defineSignal('decidePlan');\nexport const lineQuery = defineQuery('line');\nexport const statusQuery = defineQuery('status');\n\nconst SLOTS = { nova: 3 };\n\n// One per agent, ID slots:<agent>. It never ends; it hands out slots in the order they were asked for.\nexport async function slots(agent, holders = [], waiting = []) {\n  setHandler(request, (id) => void waiting.push(id));\n  setHandler(release, (id) => { holders = holders.filter((h) => h !== id); });\n  setHandler(lineQuery, () => ({ holders, waiting }));\n  while (workflowInfo().historyLength < 5000) {\n    await condition(() => waiting.length > 0 && holders.length < (SLOTS[agent] ?? 1));\n    const holder = waiting.shift();\n    holders.push(holder);\n    await getExternalWorkflowHandle(holder).signal(slotGranted);\n  }\n  await continueAsNew(agent, holders, waiting);\n}\n\n// Hold one of the agent's slots only while fn runs, and give it back on every path.\n// Build it: hold one of the agent's slots only while fn runs, and give it back on every path.\n// 1. register a handler for slotGranted, 2. signal request to slots:<agent> with your workflow ID,\n// 3. wait until granted, 4. run fn, 5. in finally, signal release (nonCancellable, like the VM release).\n// For now it holds no slot at all, so every ticket gets a VM at once.\nexport const withSlot = async (agent, fn) => fn();\n\nexport async function ticketToPr(ticket) {\n  let status = 'Checking';\n  let decision;\n  setHandler(statusQuery, () => status);\n  setHandler(decidePlan, (d) => { decision = d; });\n\n  const inSandbox = async (task, size, label) => {\n    status = 'Waiting for a slot';\n    return withSlot('nova', async () => {\n      status = label;\n      const vm = await act.acquireSandbox(ticket, size);\n      try {\n        return await act.workInSandbox(vm, task);\n      } finally {\n        await CancellationScope.nonCancellable(() => act.releaseSandbox(vm)); // no VM is ever left behind\n      }\n    });\n  };\n\n  await inSandbox(`plan ${ticket}`, 'lite', 'Planning');\n  status = 'Awaiting approval';\n  await condition(() => decision !== undefined, '3 days'); // no VM and no slot while a person thinks\n  if (decision !== 'approve') return (status = 'Stopped');\n  const pr = await inSandbox(`build ${ticket}`, 'full', 'Working');\n  return (status = `PR open: ${pr}`);\n}\nEOF",
+    "do": "cat > workflows.mjs <<'EOF'\n// Nova's run for one ticket and the line of VM slots, cut down to what this lab needs.\nimport {\n  CancellationScope, condition, continueAsNew, defineQuery, defineSignal,\n  getExternalWorkflowHandle, proxyActivities, setHandler, workflowInfo,\n} from '@temporalio/workflow';\n\nconst act = proxyActivities({ startToCloseTimeout: '7 days', heartbeatTimeout: '2 minutes' });\n\nexport const request = defineSignal('request');\nexport const release = defineSignal('release');\nexport const slotGranted = defineSignal('slotGranted');\nexport const decidePlan = defineSignal('decidePlan');\nexport const lineQuery = defineQuery('line');\nexport const statusQuery = defineQuery('status');\n\nconst SLOTS = { nova: 3 };\n\n// One per agent, ID slots:<agent>. It never ends; it hands out slots in the order they were asked for.\nexport async function slots(agent, holders = [], waiting = []) {\n  setHandler(request, (id) => void waiting.push(id));\n  setHandler(release, (id) => { holders = holders.filter((h) => h !== id); });\n  setHandler(lineQuery, () => ({ holders, waiting }));\n  while (workflowInfo().historyLength < 5000) {\n    await condition(() => waiting.length > 0 && holders.length < (SLOTS[agent] ?? 1));\n    const holder = waiting.shift();\n    holders.push(holder);\n    await getExternalWorkflowHandle(holder).signal(slotGranted);\n  }\n  await continueAsNew(agent, holders, waiting);\n}\n\n// Build it: hold one of the agent's slots only while fn runs, and give it back on every path.\n// 1. register a handler for slotGranted, 2. signal request to slots:<agent> with your workflow ID,\n// 3. wait until granted, 4. run fn, 5. in finally, signal release (nonCancellable, like the VM release).\n// For now it holds no slot at all, so every ticket gets a VM at once.\nexport const withSlot = async (agent, fn) => fn();\n\nexport async function ticketToPr(ticket) {\n  let status = 'Checking';\n  let decision;\n  setHandler(statusQuery, () => status);\n  setHandler(decidePlan, (d) => { decision = d; });\n\n  const inSandbox = async (task, size, label) => {\n    status = 'Waiting for a slot';\n    return withSlot('nova', async () => {\n      status = label;\n      const vm = await act.acquireSandbox(ticket, size);\n      try {\n        return await act.workInSandbox(vm, task);\n      } finally {\n        await CancellationScope.nonCancellable(() => act.releaseSandbox(vm)); // no VM is ever left behind\n      }\n    });\n  };\n\n  await inSandbox(`plan ${ticket}`, 'lite', 'Planning');\n  status = 'Awaiting approval';\n  await condition(() => decision !== undefined, '3 days'); // no VM and no slot while a person thinks\n  if (decision !== 'approve') return (status = 'Stopped');\n  const pr = await inSandbox(`build ${ticket}`, 'full', 'Working');\n  return (status = `PR open: ${pr}`);\n}\nEOF",
     "see": "(no output: the file is saved)"
    },
    {
@@ -309,8 +313,8 @@
    "a": "Then runs waiting for people hold slots, and with three such runs Nova stops working for everyone. The few seconds to get a slot after approval cost nothing."
   },
   {
-   "q": "Why can a workflow with a 7-day timeout still run an 8-day build?",
-   "a": "The timeout fires a retry, and workInSandbox re-attaches to the harness still running on the VM. Only the heartbeat timeout says a worker is dead."
+   "q": "Why does withSlot give the slot back in finally, inside a non-cancellable scope, just like the VM release?",
+   "a": "A run can end with an error, a Stop or a cancellation. Without finally, or if the cancellation also cancelled the release signal, the slot would stay taken, and Nova would work with one slot less until someone noticed."
   }
  ],
  "remember": "Hold a machine only while it works, and hold a slot only while you hold a machine: waiting for people is free."
