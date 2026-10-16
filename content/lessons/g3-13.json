@@ -1,497 +1,315 @@
 {
+ "v": 2,
  "id": "g3-13",
  "title": "The Slack app",
- "minutes": 40,
+ "minutes": 60,
  "youNeed": [
   "p9-1",
-  "g3-10"
+  "p7-3",
+  "g3-12"
  ],
- "bridge": "The Slack app is like a small Express server whose routes are /nova and the buttons. Except nobody calls it over HTTP. It dials out to Slack over a WebSocket, and every route ends in a Temporal call.",
- "intro": "People hand work to Nova and follow it where they already talk. This lesson builds our own Slack app: the /nova command, a status message per ticket and the plan buttons. Replies in a thread answer Nova's questions. Every click reaches the waiting workflow at once and is never lost.",
- "picture": {
-  "caption": "Slack talks to the app over a socket the app opened; each command, click and reply becomes a Temporal call.",
-  "nodes": [
-   {
-    "id": "person",
-    "label": "Sean in the Nova channel",
-    "kind": "person"
-   },
-   {
-    "id": "slack",
-    "label": "Slack",
-    "kind": "cloud"
-   },
-   {
-    "id": "app",
-    "label": "slack-app (Bolt, Socket Mode)",
-    "kind": "service"
-   },
-   {
-    "id": "wf",
-    "label": "workflow nova:RH-1234",
-    "kind": "service"
-   },
-   {
-    "id": "thread",
-    "label": "status message and thread",
-    "kind": "file"
-   },
-   {
-    "id": "broker",
-    "label": "broker: thread to workflow map",
-    "kind": "service"
-   }
+ "map": "slack",
+ "hook": {
+  "story": [
+   "Tuesday, 11:02. Nova is building RH-1234 and reaches a question its plan does not answer. It posts in the ticket's Slack thread, \"Should the empty card have a Create project button?\", and waits; ten minutes later its VM is parked. At 11:05 the platform team deploys a new version of the Slack app, so the old process stops and a new one starts.",
+   "At 11:20 Sean replies in the thread: \"Yes, the same button as in the header.\" A minute later he adds: \"And the text should say No projects yet.\" Suppose the old app had kept \"this thread belongs to nova:RH-1234\" in a variable. The new process has never heard of the thread, so both replies go nowhere. Nobody sees an error, and two days later Nova hands the ticket back because \"nobody answered\"."
   ],
-  "steps": [
-   {
-    "from": "app",
-    "to": "slack",
-    "text": "at start, opens a WebSocket out to Slack"
-   },
-   {
-    "from": "person",
-    "to": "slack",
-    "text": "types /nova RH-1234 or clicks Approve"
-   },
-   {
-    "from": "slack",
-    "to": "app",
-    "text": "sends the event down the open socket; the app acks within 3 seconds"
-   },
-   {
-    "from": "app",
-    "to": "wf",
-    "text": "startRun, a status query, or a signal with who did it"
-   },
-   {
-    "from": "app",
-    "to": "thread",
-    "text": "edits the message in place: who decided, no more buttons"
-   },
-   {
-    "from": "broker",
-    "to": "app",
-    "text": "a reply in a thread maps to its workflow: answerQuestion"
-   }
-  ]
+  "question": "How does every click, command and reply in Slack reach the right run, with the right person's name on it, when the Slack app itself can restart at any moment?"
  },
- "sections": [
+ "read": [
   {
-   "h": "No public endpoint: Socket Mode",
+   "h": "The thread is the address",
    "p": [
-    "A normal Slack app gives Slack a public URL, and Slack calls it for every command and click. We do not want a public endpoint on the agent platform. Socket Mode turns this around: our app opens a WebSocket to Slack, and Slack sends events down that connection.",
-    "The app needs two tokens. The app token (xapp-) opens the socket. The bot token (xoxb-) calls Slack's API, for example to post or edit a message. Both come from Vault at infrastructure/ai-agents/slack-app through the ExternalSecret.",
-    "A Slack admin creates the app with Socket Mode and the scopes chat:write, commands, users:read.email and channels:history in the Nova channel. Claude Tag is not an option for us under ZDR, so we run our own app."
+    "Three things take part: Slack, where people talk; the run nova:RH-1234 in Temporal, which waits for signals; and between them our Slack app, a small Bolt program that translates. Every ticket gets one thread in the Nova channel. Its first message is the status message, one line such as \"RH-1234 · Nova: Needs info\", and the run keeps it current with chat.update on the same message instead of posting a new one at every step. A Slack message is identified by its channel and its ts, a timestamp string like 1792135138.000001 that Slack gives every message, and a reply in a thread carries the first message's ts as its thread_ts.",
+    "The run keeps that ts in its own state, and the broker records the thread as part of the run's Slack scope, which is also why Nova can post only into this one thread. From then on, everything people do can be traced back to the run from the event alone, plus at most one lookup. A button carries the workflow ID in its value. A reply carries thread_ts, and the broker's record says which run owns that thread. A command names the ticket, and the run's ID is nova:<ticket>. The app needs no memory of its own, because every event carries its address."
    ],
-   "callout": {
-    "kind": "wall",
-    "text": "Nothing on the internet can call the platform. The Jira poll and this socket both dial out."
-   }
-  },
-  {
-   "h": "/nova, part 1: parse the command",
-   "p": [
-    "The command has three forms: /nova RH-1234 starts, /nova status RH-1234 asks, /nova stop RH-1234 stops. Part 1 reads the words and finds the person and the workflow."
-   ],
-   "because": "We call ack() first, because Slack wants an answer within 3 seconds, and Temporal calls can take longer.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/slack-app/src/app.ts (part 1 of 2)",
-    "text": "import { App } from \"@slack/bolt\";\n\nconst app = new App({ token: process.env.SLACK_BOT_TOKEN, appToken: process.env.SLACK_APP_TOKEN, socketMode: true });\nconst USAGE = \"Try /nova RH-1234, /nova status RH-1234 or /nova stop RH-1234.\";\n\napp.command(\"/nova\", async ({ ack, command, respond }) => {\n  await ack(); // Slack needs an answer within 3 seconds; the work happens after\n  const words = command.text.trim().split(/\\s+/).filter(Boolean);\n  const [verb, key] = words.length > 1 ? [words[0], words[1]!.toUpperCase()] : [\"start\", (words[0] ?? \"\").toUpperCase()];\n  if (!JIRA_KEY.test(key)) {\n    await respond(USAGE);\n    return;\n  }\n  const by = people.bySlackId(command.user_id); // config/people.yaml (G4-05)\n  const temporal = await temporalClient();\n  const handle = temporal.workflow.getHandle(`nova:${key}`);",
+    "file": "ai-agents/slack-app/src/app.ts",
+    "text": "app.command(\"/nova\", async ({ ack, command, respond }) => {\n  await ack(); // Slack waits at most 3 seconds; the work comes after\n  const { verb, key } = parseNova(command.text); // \"/nova RH-1234\" means start\n  const by = people.bySlackId(command.user_id); // config/people.yaml: Slack ID -> Jira account, GitHub login, email\n  const run = temporal.workflow.getHandle(`nova:${key}`);\n  if (verb === \"start\") {\n    await jira.setIssueProperty(key, \"nova.requester\", by.jiraAccountId);\n    await jira.assign(key, NOVA_ACCOUNT_ID); // the Jira poll starts the run, like any other hand-off\n    return respond(`Nova has ${key}. Follow along in its thread.`);\n  }\n  if (verb === \"status\") return respond(oneLine(await run.query(status))); // the run's own answer\n  if (verb === \"stop\") {\n    await run.signal(stop, by.email);\n    return respond(`Stopping ${key}. The branch and notes are kept.`);\n  }\n  await respond(USAGE);\n});",
     "notes": [
      {
-      "line": 1,
-      "text": "Bolt 5 is Slack's own framework for apps in Node (lesson p9-1)."
-     },
-     {
-      "line": 3,
-      "text": "socketMode: true with an appToken: the app dials out. The bot token is for API calls."
-     },
-     {
       "line": 4,
-      "text": "The help text, sent back whenever the command makes no sense."
-     },
-     {
-      "line": 6,
-      "text": "app.command registers a handler for /nova. respond answers only the person who typed it."
-     },
-     {
-      "line": 7,
-      "text": "ack() tells Slack \"got it\" at once. The real work comes after."
+      "text": "Every signal says who did it, so Jira and the PR can record it. The mapping lives in a file in the repo, not in the app."
      },
      {
       "line": 8,
-      "text": "Split the text on spaces and drop empty pieces."
-     },
-     {
-      "line": 9,
-      "text": "Two words: verb and key. One word: the verb is start and the word is the key. Keys are upper-cased, so rh-1234 works."
-     },
-     {
-      "line": 10,
-      "text": "JIRA_KEY is a regex like ^[A-Z]+-\\d+$. Anything else gets the usage text."
-     },
-     {
-      "line": 14,
-      "text": "Map the Slack user to a person: Slack ID, Jira accountId and GitHub login, from config/people.yaml (G4-05)."
-     },
-     {
-      "line": 16,
-      "text": "The workflow ID is nova:<key>, the same one the Jira poll builds."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "people.bySlackId reads a people block in config/people.yaml (Slack ID, email, Jira accountId). No ticket defines that block. Agree its shape with the G4-05 owner before you write the lookup."
-   }
-  },
-  {
-   "h": "/nova, part 2: start, status, stop",
-   "p": [
-    "Part 2 does the work for each verb. Start goes through startRun, so a ticket that the poll already started is joined, not started twice."
-   ],
-   "because": "We pass who did it on every signal, because Jira and the PR must record which person started, stopped or decided.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/slack-app/src/app.ts (part 2 of 2)",
-    "text": "  if (verb === \"start\") {\n    // G4-05 turns this into \"assign the ticket to Nova\", so the poll starts it and records the requester\n    await startRun(temporal, \"nova\", key, \"ticketToPr\", { key, requester: by.jiraAccountId }); // a Handoff (G4-04)\n    await respond(`Nova has ${key}. Follow along in its thread.`);\n  } else if (verb === \"status\") {\n    await respond(oneLine(await handle.query<RunStatus>(\"status\")));\n  } else if (verb === \"stop\") {\n    await handle.signal(\"stop\", by);\n    await respond(`Stopping ${key}. The branch and notes are kept.`);\n  } else {\n    await respond(USAGE);\n  }\n});\n\nawait app.start(); // dials out to Slack over a WebSocket",
-    "notes": [
-     {
-      "line": 2,
-      "text": "Later G4-05 changes start to \"assign the ticket to Nova\". Then the poll starts it and records the requester the same way as in Jira."
-     },
-     {
-      "line": 3,
-      "text": "startRun from lesson g3-10, with a Handoff: the key and the requester's Jira accountId."
-     },
-     {
-      "line": 4,
-      "text": "respond sends a message only this person sees, an ephemeral message."
-     },
-     {
-      "line": 6,
-      "text": "status is a Temporal query: it reads the workflow's state without changing it. oneLine formats it."
-     },
-     {
-      "line": 8,
-      "text": "stop is a signal. by records who pressed it."
-     },
-     {
-      "line": 9,
-      "text": "The branch and notes are kept on Stop (lesson g3-12)."
-     },
-     {
-      "line": 15,
-      "text": "app.start() opens the WebSocket. From now on Slack sends events down it."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "tip",
-    "text": "If a Temporal call fails, the error goes back as an ephemeral message to the person who typed the command. Nobody else's channel fills with errors."
-   }
-  },
-  {
-   "h": "One thread and one status message per ticket",
-   "p": [
-    "Each ticket gets one thread in the Nova channel. Its first message is the status message. It moves through Checking, Planning, Awaiting approval, Working and PR open, or ends at Needs info or Stopped.",
-    "The app keeps it current with chat.update, which edits a message in place. People see one line that is always right, not a stream of updates.",
-    "The thread's channel and ts (Slack's ID for a message) become the run's Slack scope in the broker. So the run may post only in its own thread, and the broker knows which workflow owns which thread."
-   ]
-  },
-  {
-   "h": "Buttons, part 1: who may decide",
-   "p": [
-    "The plan arrives with buttons: Approve, Change, Stop. A running ticket has a Stop button, and the backstop (lesson g3-14) has Continue. Each button has an action_id, Slack's name for the button, and a value that we fill. G4-14 decides how the plan looks and who may click."
-   ],
-   "because": "We check who clicked before we signal, because only the requester decides a plan.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/slack-app/src/actions.ts (part 1 of 2)",
-    "text": "const SIGNALS: Record<string, string> = { plan_approve: \"decidePlan\", plan_stop: \"stop\", run_stop: \"stop\", backstop_continue: \"resume\" };\n\napp.action(/^(plan_approve|plan_change|plan_stop|run_stop|backstop_continue)$/, async ({ ack, body, action, client }) => {\n  await ack();\n  if (body.type !== \"block_actions\" || action.type !== \"button\") return;\n  const [workflowId = \"\", version = \"\"] = (action.value ?? \"\").split(\"|\"); // \"nova:RH-1234|3\": plan v3 (G4-14)\n  const person = people.bySlackId(body.user.id); // config/people.yaml (G4-05)\n  if (!(await mayDecide(person, workflowId, action.action_id))) { // G4-14: only the requester\n    return ephemeral(client, body, \"Only the requester can decide this.\");\n  }\n  if (action.action_id === \"plan_change\") {\n    await client.views.open({ trigger_id: body.trigger_id, view: changeModal(workflowId, version) });\n    return;\n  }",
-    "notes": [
-     {
-      "line": 1,
-      "text": "action_id to signal name. Approve is decidePlan; both stops are stop; Continue is resume."
-     },
-     {
-      "line": 3,
-      "text": "One handler for all five known action_ids, matched by a regex."
-     },
-     {
-      "line": 4,
-      "text": "ack() first, as for commands."
-     },
-     {
-      "line": 5,
-      "text": "Only button clicks in messages. Other payload shapes are ignored."
-     },
-     {
-      "line": 6,
-      "text": "The value is \"nova:RH-1234|3\": the workflow ID and the plan version, set by G4-14."
-     },
-     {
-      "line": 8,
-      "text": "mayDecide is the permission hook G4-14 fills in: only the requester decides a plan."
-     },
-     {
-      "line": 9,
-      "text": "Anyone refused gets an ephemeral message that says who can decide."
+      "text": "/nova does not start a run itself. It hands the ticket over the same way a person does in Jira, so there is one door for new work and the requester is recorded in one way."
      },
      {
       "line": 11,
-      "text": "Change needs a comment, so it opens a modal (a Slack form) first. The form's submit handler sends decidePlan with the comment."
+      "text": "A query, answered by the worker from the run's current state. The app never keeps its own copy of the status."
+     }
+    ]
+   },
+   "deeper": {
+    "h": "Go deeper: Socket Mode and the three-second rule",
+    "p": [
+     "The app runs in Socket Mode: it opens a WebSocket to Slack and receives events through it, so we publish no URL that anyone on the internet could call. It needs two tokens from Vault, the app token (xapp-) to open the socket and the bot token (xoxb-) to call Slack's Web API.",
+     "Slack waits at most three seconds for an acknowledgement, so every handler calls ack() first and only then talks to Temporal, Jira or Slack. You built both of these in the lesson about Slack apps with Bolt."
+    ]
+   }
+  },
+  {
+   "h": "The app remembers nothing",
+   "p": [
+    "The Slack app is a process on our internal cluster, and processes there are replaced all the time: every deploy, every node that restarts, and during a rollout two copies run side by side for a moment. A value kept in a variable is lost on restart, and in a rollout one copy may know it while the other does not. That is exactly the bug from the story. So the app follows one rule, the same one as any stateless web service: every handler gets what it needs from the event itself, from the run, or from a durable record, and never from its own memory.",
+    "Here is the handler that turns a reply into an answer. It keeps only messages written by people inside a thread: no subtype, which would mean an edit, a join or another system message; no bot_id, which would mean a bot, Nova's own question included; and a thread_ts. Then it asks the broker which run owns the thread, on every message, and sends the answerQuestion signal with the text and who wrote it. Temporal stores the signal in the run's history at once, even if no worker is running at that moment, so once the signal call succeeds, the reply cannot be lost."
+   ],
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/slack-app/src/actions.ts",
+    "text": "app.event(\"message\", async ({ event, client }) => {\n  if (event.subtype !== undefined || event.bot_id || !event.thread_ts) return; // people only, inside a thread\n  const workflowId = await workflowForThread(event.channel, event.thread_ts); // the broker's record, every time\n  if (!workflowId) return; // a thread that belongs to no run\n  const person = people.bySlackId(event.user);\n  try {\n    await temporal.workflow.getHandle(workflowId).signal(answerQuestion, event.text ?? \"\", person.email);\n  } catch { // Temporal unreachable: tell the person, never drop an answer silently\n    await client.chat.postEphemeral({ channel: event.channel, user: event.user,\n      text: \"Your answer didn't reach Nova. Please send it again in a minute.\" });\n  }\n});",
+    "notes": [
+     {
+      "line": 2,
+      "text": "Without the bot_id check, Nova's own question would arrive as an answer to itself."
+     },
+     {
+      "line": 3,
+      "text": "Asked on every message. A copy cached when the app started would miss every thread opened after that."
+     },
+     {
+      "line": 9,
+      "text": "An ephemeral message is one only that person can see."
      }
     ]
    }
   },
   {
-   "h": "Buttons, part 2: signal, then remove the buttons",
+   "h": "Several replies, one answer",
    "p": [
-    "A decision must reach the waiting workflow, be recorded, and never be lost. And an old button must not fire twice."
+    "People rarely answer in one message. Sean wrote two, a minute apart, and while Nova's parked VM wakes up a third could arrive. If the run's signal handler simply stored the latest text, the earlier replies would disappear, and Nova would build the card without the button. So the handler adds each reply to a list, and when the VM is awake the run joins the list, with who wrote each line, into the one message the session resumes with.",
+    "Decisions work the other way. A plan has exactly one decision, so after a click the app edits the message to say who decided and removes the buttons, and the run ignores any decision that arrives after it already has one. Replies are joined; decisions are taken once."
    ],
-   "because": "We update the message only after the signal arrives, so a failed click keeps its buttons for a retry.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/slack-app/src/actions.ts (part 2 of 2)",
-    "text": "  const payload = action.action_id === \"plan_approve\" ? { kind: \"approve\", by: person.email, version } : person.email;\n  try {\n    await (await temporalClient()).workflow.getHandle(workflowId).signal(SIGNALS[action.action_id]!, payload);\n  } catch { // Temporal down: never drop a decision silently\n    return ephemeral(client, body, \"That didn't reach Nova. Please try again in a minute.\");\n  }\n  await client.chat.update({ channel: body.channel?.id ?? \"\", ts: body.message?.ts ?? \"\", // no second click\n    blocks: decidedBlocks(body.message, action.action_id, person) });\n});",
+    "file": "ai-agents/orchestrator/src/workflows/ticket-to-pr.ts (the question part)",
+    "text": "const replies: Reply[] = [];\nsetHandler(answerQuestion, (text, by) => { replies.push({ text, by }); }); // never overwrite: people answer in pieces\n\nawait act.ask(t, question); // posted in the ticket's thread\nif (!(await waitForPerson(run, \"question\", () => replies.length > 0, t))) return run.stopped ? \"stopped\" : \"parked\";\nawait act.wakeSandbox(vm); // replies that arrive while the VM wakes up are joined too\nconst answer = replies.splice(0).map((r) => `${r.by}: ${r.text}`).join(\"\\n\");\nawait act.workInSandbox(vm, resumeWith(answer));",
     "notes": [
      {
-      "line": 1,
-      "text": "Approve carries a PlanDecision with who decided and which plan version. Stop and Continue carry who did it."
-     },
-     {
-      "line": 3,
-      "text": "Send the signal to the workflow named in the button's value."
-     },
-     {
-      "line": 4,
-      "text": "If Temporal is down, the signal throws."
-     },
-     {
-      "line": 5,
-      "text": "Tell the person to try again. A decision is never dropped silently."
+      "line": 2,
+      "text": "The handler only records. The workflow body decides when to use the replies."
      },
      {
       "line": 7,
-      "text": "chat.update edits the plan message in place."
-     },
-     {
-      "line": 8,
-      "text": "decidedBlocks shows who decided and removes the buttons. The workflow also ignores a decision that arrives after one was taken."
+      "text": "splice(0) takes every reply so far and empties the list, ready for the next question."
      }
     ]
    },
-   "callout": {
-    "kind": "gotcha",
-    "text": "Two ticket mix-ups to fix in the PR. First, /nova stop (G3-30) sends the whole person object as by, but these buttons (G3-35) send person.email. Use the email in both, as the batch stop does. Second, Continue sends a resume signal that no workflow defines yet. Agree with the backstop owner (lesson g3-14) where resume is handled."
-   }
-  },
-  {
-   "h": "Replies in the thread answer questions",
-   "p": [
-    "When Nova asks a question with ask_human, the broker posts it in the ticket's thread and records which workflow posted there. A person's reply in that thread becomes answerQuestion(text, by)."
-   ],
-   "because": "We map threads to workflows in the broker, because the broker already owns the run's Slack scope and survives app restarts.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/slack-app/src/actions.ts (thread replies)",
-    "text": "app.event(\"message\", async ({ event }) => {\n  if (event.subtype !== undefined || event.bot_id || !event.thread_ts) return; // only people, only inside a ticket's thread\n  const workflowId = await workflowForThread(event.channel, event.thread_ts);\n  if (!workflowId) return;\n  const person = people.bySlackId(event.user);\n  await (await temporalClient()).workflow.getHandle(workflowId).signal(\"answerQuestion\", event.text ?? \"\", person.email);\n});",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Every message the app can see arrives here."
-     },
-     {
-      "line": 2,
-      "text": "Skip edits and joins (subtype), bot messages (bot_id) and top-level messages (no thread_ts). Only people, only inside a thread."
-     },
-     {
-      "line": 3,
-      "text": "workflowForThread asks the broker which workflow owns this thread."
-     },
-     {
-      "line": 4,
-      "text": "A thread that is not a ticket's: ignore."
-     },
-     {
-      "line": 6,
-      "text": "Signal answerQuestion with the text and who wrote it. ticketToPr wakes up from its wait (lesson g3-10)."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "The ticket says several replies before Nova resumes are joined. ticketToPr's handler in lesson g3-10 overwrites run.answer. Append instead, for example run.answer = [run.answer, text].filter(Boolean).join(\"\\n\")."
-   }
+   "see": "10:19:06  RH-1234  waking the parked VM (10 seconds)\n10:19:16  RH-1234  Nova resumes the session with:\nsean@example.com: Yes, the same button as in the header.\nsean@example.com: And the text should say No projects yet.\n(from the lab: the second reply arrived while the VM was waking up)"
   }
  ],
  "lab": {
-  "title": "Trace commands, clicks and replies through the code",
-  "youNeed": [
-   "this lesson open",
-   "lesson g3-10's ticketToPr signals",
-   "paper or a text file for your answers"
+  "id": "g3-13",
+  "title": "Replies find their run",
+  "minutes": 35,
+  "needs": [
+   "Node 22+",
+   "The temporal CLI (brew install temporal)",
+   "The course repo at ~/Projects/ai-agents-course (the lab starts from the p7-4 lab's files)",
+   "Four terminal tabs"
   ],
-  "worked": [
+  "goal": "Run a real Bolt app, a pretend Slack and a Temporal run on your laptop, and make a person's replies in a ticket's thread reach the right run as one joined answer, even across a restart of the app.",
+  "guess": {
+   "q": "Nova asked its question in RH-1234's thread, then the Slack app restarted. Now Sean replies. Where must the app look to find which run owns the thread?",
+   "options": [
+    {
+     "text": "In a Map the app filled when the question was posted",
+     "correct": false,
+     "why": "The Map died with the old process. The new process has an empty Map, so the reply goes nowhere."
+    },
+    {
+     "text": "In a durable record outside the app, read when the reply arrives",
+     "correct": true,
+     "why": "The broker recorded the thread when Nova posted in it. Any copy of the app, old or new, finds the same answer."
+    },
+    {
+     "text": "In the reply's text, which mentions the ticket key",
+     "correct": false,
+     "why": "People do not write ticket keys in their replies. The address is the thread, not the words."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "Sean types /nova rh-1234. Read app.ts part 1, lines 8 and 9. What are verb and key?",
-    "see": "verb is \"start\", key is \"RH-1234\"."
+    "say": "Copy the p7-4 lab's files, because they already connect to Temporal and run Nova's worker, and add Bolt, Slack's framework for apps.",
+    "do": "cp -r ~/Projects/ai-agents-course/labs/p7-4/start ~/academy-labs/g3-13 && cd ~/academy-labs/g3-13\nrm triggers.mjs try-default.mjs start-run.mjs\nnpm install @slack/bolt@5.1.0",
+    "see": "added 258 packages, and audited 259 packages in 5s\nfound 0 vulnerabilities"
    },
    {
-    "do": "Read part 2, line 3. Which workflow ID and which input does startRun get?",
-    "see": "nova:RH-1234, with the Handoff { key: \"RH-1234\", requester: <Sean's Jira accountId> }."
+    "say": "Save a pretend Slack Web API that prints every call, and a script that plays Slack by sending signed requests to the app, the way the lesson about Bolt did.",
+    "do": "cat > fake-slack.mjs <<'EOF'\n// A pretend Slack Web API on your laptop: it prints every call the app or the broker makes.\nimport { createServer } from 'node:http';\n\nlet n = 0;\ncreateServer((req, res) => {\n  let body = '';\n  req.on('data', (c) => (body += c));\n  req.on('end', () => {\n    const method = req.url.replace('/api/', '');\n    const args = req.headers['content-type']?.includes('json') ? JSON.parse(body) : Object.fromEntries(new URLSearchParams(body));\n    res.setHeader('content-type', 'application/json');\n    if (method === 'auth.test') return res.end(JSON.stringify({ ok: true, user_id: 'U_NOVA', bot_id: 'B_NOVA' }));\n    const where = method === 'respond' ? '(only you see this)' : args.thread_ts ? `in thread ${args.thread_ts}` : `ts=${args.ts ?? '(new)'}`;\n    console.log(`${method.padEnd(16)} ${where.padEnd(28)} ${args.text}`);\n    res.end(JSON.stringify({ ok: true, channel: args.channel, ts: args.ts ?? `${Math.floor(Date.now() / 1000)}.${String(++n).padStart(6, \"0\")}` }));\n  });\n}).listen(process.env.SLACK_PORT ?? 3999, () => console.log('fake Slack API listening'));\nEOF\ncat > slack.mjs <<'EOF'\n// Plays Slack: signs a request the way Slack does and sends it to the app.\n//   node slack.mjs reply U_SEAN \"text\"      a person replies in RH-1234's thread\n//   node slack.mjs bot \"text\"               Nova's own message in the thread, as Slack echoes it\n//   node slack.mjs command \"/nova status RH-1234\"\nimport { createHmac } from 'node:crypto';\nimport { readFileSync } from 'node:fs';\n\nconst [kind, a, b] = process.argv.slice(2);\n// Slack knows which thread you typed in; here we look up RH-1234's newest thread in the broker's record.\nconst thread = () => Object.entries(JSON.parse(readFileSync('threads.json', 'utf8'))).findLast(([, id]) => id === 'nova:RH-1234')?.[0];\nconst event = (fields) => JSON.stringify({ type: 'event_callback', event_id: `Ev${Date.now()}`,\n  event: { type: 'message', channel: 'C_NOVA', ts: `${Date.now() / 1000}`, thread_ts: thread(), ...fields } });\nconst body = kind === 'command'\n  ? new URLSearchParams({ command: a.split(' ')[0], text: a.split(' ').slice(1).join(' '), user_id: 'U_SEAN', channel_id: 'C_NOVA',\n      response_url: `http://localhost:${process.env.SLACK_PORT ?? 3999}/api/respond` }).toString()\n  : kind === 'bot' ? event({ bot_id: 'B_NOVA', text: a }) : event({ user: a, text: b });\nconst ts = Math.floor(Date.now() / 1000);\nconst sig = 'v0=' + createHmac('sha256', 'lab-secret').update(`v0:${ts}:${body}`).digest('hex');\nconst type = kind === 'command' ? 'application/x-www-form-urlencoded' : 'application/json';\nconst res = await fetch(`http://localhost:${process.env.PORT ?? 3000}/slack/events`, { method: 'POST', body,\n  headers: { 'content-type': type, 'x-slack-request-timestamp': ts, 'x-slack-signature': sig } });\nconsole.log(`app answered ${res.status}`);\nEOF\ncat > worker-and-slack.mjs <<'EOF'\n// One terminal for Nova's worker and the pretend Slack, so you can read both in order.\nimport './fake-slack.mjs';\nimport './worker.mjs';\nEOF",
+    "see": "(no output: the files are saved)"
    },
    {
-    "do": "Sean types /nova please. Follow part 1, lines 9 to 12. What does he see, and who else sees it?",
-    "see": "key is \"PLEASE\", JIRA_KEY fails, and he gets the usage text. Nobody else sees it: respond is ephemeral."
+    "say": "Save the broker's side and the run. openThread posts the status message and records which run owns the thread in threads.json; the run asks one question and keeps every reply.",
+    "do": "cat > activities.mjs <<'EOF'\n// Stand-ins for the broker's Slack calls and for the VM. The broker posts in the pretend Slack and records\n// in threads.json which run owns which thread, so nothing depends on the Slack app's memory.\nimport { readFile, writeFile } from 'node:fs/promises';\nimport { sleep } from '@temporalio/activity';\n\nconst slack = async (method, args) => {\n  const res = await fetch(`http://localhost:${process.env.SLACK_PORT ?? 3999}/api/${method}`,\n    { method: 'POST', body: new URLSearchParams({ channel: 'C_NOVA', ...args }) });\n  return res.json();\n};\nconst now = () => new Date().toTimeString().slice(0, 8);\n\n// The ticket's thread starts with its status message. The broker records thread -> run.\nexport const openThread = async (workflowId, key) => {\n  const { ts } = await slack('chat.postMessage', { text: `${key} · Nova: Checking` });\n  const threads = JSON.parse(await readFile('threads.json', 'utf8').catch(() => '{}'));\n  await writeFile('threads.json', JSON.stringify({ ...threads, [ts]: workflowId }) + '\\n');\n  return ts;\n};\n\n// One status message, edited in place: same ts every time.\nexport const setStatus = async (ts, key, state) => { await slack('chat.update', { ts, text: `${key} · Nova: ${state}` }); };\n\nexport const ask = async (ts, question) => { await slack('chat.postMessage', { thread_ts: ts, text: question }); };\n\nexport const wakeSandbox = async (key) => {\n  console.log(`${now()}  ${key}  waking the parked VM (10 seconds)`);\n  await sleep(10_000);\n};\n\nexport const resume = async (key, answer) => console.log(`${now()}  ${key}  Nova resumes the session with:\\n${answer}`);\nEOF\ncat > workflows.mjs <<'EOF'\n// Nova's run for one ticket, cut down to one question in its Slack thread.\nimport { condition, defineQuery, defineSignal, proxyActivities, setHandler, workflowInfo } from '@temporalio/workflow';\n\nconst act = proxyActivities({ startToCloseTimeout: '1 minute' });\n\nexport const answerQuestion = defineSignal('answerQuestion');\nexport const statusQuery = defineQuery('status');\n\nexport async function ticketToPr(t) {\n  let state = 'Checking';\n  const replies = [];\n  setHandler(statusQuery, () => state);\n  setHandler(answerQuestion, (text, by) => { replies.push(`${by}: ${text}`); }); // every reply is kept\n\n  const thread = await act.openThread(workflowInfo().workflowId, t.key);\n  const set = async (s) => { state = s; await act.setStatus(thread, t.key, s); };\n  await set('Working');\n  await act.ask(thread, 'Should the empty card have a Create project button?');\n  await set('Needs info');\n  if (!(await condition(() => replies.length > 0, '10 minutes'))) return 'nobody answered';\n  await act.wakeSandbox(t.key); // replies that arrive while the VM wakes up are joined into one answer\n  await set('Working');\n  await act.resume(t.key, replies.join('\\n'));\n  await set('PR open');\n  return replies.join(' | ');\n}\nEOF\ncat > start.mjs <<'EOF'\n// Starts Nova's run for RH-1234, the way the Jira poll would.\nimport { WorkflowIdConflictPolicy } from '@temporalio/common';\nimport { connect } from './connect.mjs';\n\nconst client = await connect();\nawait client.workflow.start('ticketToPr', { taskQueue: 'ai-agents-nova', workflowId: 'nova:RH-1234', args: [{ key: 'RH-1234', requester: 'sean' }],\n  workflowIdConflictPolicy: WorkflowIdConflictPolicy.USE_EXISTING });\nconsole.log('started nova:RH-1234');\nawait client.connection.close();\nEOF",
+    "see": "(no output)"
    },
    {
-    "do": "Sean, the requester, clicks Approve on plan version 3. Read actions part 1, line 6, and part 2, lines 1 and 3. Which signal and payload reach the workflow?",
-    "see": "decidePlan with { kind: \"approve\", by: <Sean's email>, version: \"3\" }."
+    "say": "Save the Slack app. /nova status asks the run; the message handler is the part you will write.",
+    "do": "cat > app.mjs <<'EOF'\n// The Nova Slack app, small. It keeps nothing in memory: the run, the event and the broker's record know everything.\nimport { readFile } from 'node:fs/promises';\nimport bolt from '@slack/bolt';\nimport { connect } from './connect.mjs';\n\nconst temporal = await connect();\nconst people = { U_SEAN: 'sean@example.com', U_DANA: 'dana@example.com' }; // config/people.yaml in the platform\n\nconst app = new bolt.App({\n  signingSecret: 'lab-secret', // HTTP mode for the lab; the platform uses Socket Mode, with the same handlers\n  token: 'xoxb-lab',\n  tokenVerificationEnabled: false,\n  clientOptions: { slackApiUrl: `http://localhost:${process.env.SLACK_PORT ?? 3999}/api/` },\n});\n\n// /nova status RH-1234: ask the run itself.\napp.command('/nova', async ({ ack, command, respond }) => {\n  await ack(); // within 3 seconds; the work comes after\n  const [verb, key = ''] = command.text.trim().split(/\\s+/);\n  if (verb !== 'status') return respond('This lab knows /nova status RH-1234.');\n  const state = await temporal.workflow.getHandle(`nova:${key.toUpperCase()}`).query('status');\n  await respond(`${key.toUpperCase()}: ${state}`);\n});\n\n// Build it: a person's reply in a ticket's thread becomes the answerQuestion signal for that thread's run.\napp.event('message', async ({ event }) => {\n  console.log(`ignored a message in thread ${event.thread_ts ?? '-'}`);\n});\n\nawait app.start(process.env.PORT ?? 3000);\nconsole.log('Nova Slack app is listening');\nEOF",
+    "see": "(no output)"
    },
    {
-    "do": "Dana clicks Approve on the same plan. Read part 1, lines 8 and 9.",
-    "see": "mayDecide refuses; Dana gets \"Only the requester can decide this.\" No signal is sent."
+    "say": "Start Temporal in the first terminal, the worker and the pretend Slack in the second, and the app in the third. Leave all three open.",
+    "do": "temporal server start-dev\n# second terminal:\ncd ~/academy-labs/g3-13 && node worker-and-slack.mjs\n# third terminal:\ncd ~/academy-labs/g3-13 && node app.mjs",
+    "see": "fake Slack API listening\nNova's worker is listening on the ai-agents-nova queue. Leave this terminal open (Ctrl+C stops it).\n(third terminal) Nova Slack app is listening"
    },
    {
-    "do": "Temporal is down when Sean clicks. Read part 2, lines 4 to 7. What does Sean see, and are the buttons still there?",
-    "see": "\"That didn't reach Nova. Please try again in a minute.\" The return comes before chat.update, so the buttons stay."
+    "say": "In the fourth terminal start the run and ask for its status. Watch the second terminal: one status message, edited in place, and a question inside its thread.",
+    "do": "cd ~/academy-labs/g3-13 && node start.mjs && sleep 2\nnode slack.mjs command \"/nova status RH-1234\"",
+    "see": "started nova:RH-1234\napp answered 200\n(second terminal)\nchat.postMessage ts=(new)                     RH-1234 · Nova: Checking\nchat.update      ts=1792135138.000001         RH-1234 · Nova: Working\nchat.postMessage in thread 1792135138.000001  Should the empty card have a Create project button?\nchat.update      ts=1792135138.000001         RH-1234 · Nova: Needs info\nrespond          (only you see this)          RH-1234: Needs info"
+   },
+   {
+    "say": "Reply as Sean. Slack delivers the reply, the app acknowledges it, and nothing else happens, because no handler turns it into a signal yet.",
+    "do": "node slack.mjs reply U_SEAN \"Yes, the same button as in the header.\"\nnode slack.mjs command \"/nova status RH-1234\"",
+    "see": "app answered 200\n(third terminal) ignored a message in thread 1792135138.000001\n(second terminal) respond          (only you see this)          RH-1234: Needs info"
    }
   ],
-  "faded": "Trace a reply. Nova asked a question in RH-1234's thread, and Sean replies \"use the v2 endpoint\" in that thread. Follow the message handler line by line: which checks pass, and what workflowForThread returns. The last step is yours: write the exact signal name and both arguments.",
-  "alone": "Trace two new cases with no help. First, the Nova bot itself posts a progress line in the thread: say which line stops it. Second, Sean clicks Change: say what opens, why no signal is sent yet, and what the form's submit handler must send.",
-  "done": "For every command, click and reply, you can name the Temporal call it makes and who ends up recorded."
+  "build": "Write the message handler in app.mjs, following its comment: return early for a message with a subtype, a bot_id or no thread_ts; read threads.json (the broker's record) inside the handler; find the workflow ID for event.thread_ts; and signal answerQuestion with the text and people[event.user]. Restart the app (Ctrl+C, node app.mjs). Then play the thread: node slack.mjs bot \"Should the empty card have a Create project button?\" (Nova's own message, which must be ignored), then reply as Sean, and within ten seconds reply again: node slack.mjs reply U_SEAN \"And the text should say No projects yet.\" Last, prove the restart is harmless: node start.mjs for a new run, restart the app before you answer, and reply as U_DANA.",
+  "checks": [
+   "The bot message produces no answerQuestion line in the third terminal.",
+   "The third terminal shows sean@example.com replied in the thread of nova:RH-1234 -> answerQuestion once per reply.",
+   "The second terminal shows Nova resumes the session with both of Sean's replies, each on its own line with his email.",
+   "temporal workflow result --workflow-id nova:RH-1234 shows both replies joined, and the status message ends as RH-1234 · Nova: PR open, edited in place (always the same ts).",
+   "With a restart of the app between the question and the answer, Dana's reply still reaches the new run."
+  ],
+  "solution": {
+   "lang": "javascript",
+   "file": "~/academy-labs/g3-13/app.mjs (the message handler)",
+   "text": "// A person's reply in a ticket's thread becomes the answerQuestion signal for that thread's run.\napp.event('message', async ({ event }) => {\n  if (event.subtype || event.bot_id || !event.thread_ts) return; // only people, only inside a thread\n  const threads = JSON.parse(await readFile('threads.json', 'utf8')); // the broker's record, read every time\n  const workflowId = threads[event.thread_ts];\n  if (!workflowId) return; // a thread that belongs to no run\n  await temporal.workflow.getHandle(workflowId).signal('answerQuestion', event.text, people[event.user]);\n  console.log(`${people[event.user]} replied in the thread of ${workflowId} -> answerQuestion`);\n});"
+  },
+  "fix": "A teammate moved the read of threads.json to the top of app.mjs, \"so we don't read the file on every message\". Make the same change (read it once into a const next to people), restart the app, start a new run with node start.mjs and reply as Sean. The reply is acknowledged with 200, no answerQuestion line appears, and /nova status still says Needs info: the new thread was opened after the app read the file, so the app's copy has never heard of it. Read the record inside the handler again.",
+  "explain": [
+   "Which three places may the Slack app get information from, and why never from its own variables?",
+   "Why does the handler skip messages with a bot_id, and what would happen without that check?",
+   "Why does the run join replies but take only the first decision on a plan?"
+  ],
+  "done": "Two replies arrive in the run as one joined answer, a restart of the app loses nothing, and you stopped the app, the worker and the dev server with Ctrl+C."
  },
- "quiz": [
+ "check": [
   {
-   "q": "Why does the Slack app use Socket Mode?",
+   "q": "The Slack app restarts between Nova's question and Sean's reply. Which design still delivers the reply to nova:RH-1234?",
    "options": [
     {
-     "text": "Bolt 5 only supports Socket Mode.",
+     "text": "The app keeps a Map from thread to run and saves it to the pod's local disk on shutdown",
      "correct": false,
-     "why": "Bolt also supports HTTP endpoints. We choose sockets."
+     "why": "A new pod starts with a new disk, and during a rollout two copies run at once. Only a record outside the app is shared by all copies."
     },
     {
-     "text": "Socket Mode is faster for slash commands.",
-     "correct": false,
-     "why": "Speed is not the reason."
-    },
-    {
-     "text": "The app dials out to Slack over a WebSocket, so the platform has no public endpoint.",
+     "text": "On every reply, the app asks the broker which run owns the reply's thread",
      "correct": true,
-     "why": "Like the Jira poll, nothing on the internet calls us."
+     "why": "The broker recorded the thread when Nova posted in it, so any copy of the app finds the same run."
+    },
+    {
+     "text": "The app asks Sean to repeat his answer after every deploy",
+     "correct": false,
+     "why": "Nobody would know that a deploy happened, and the answer would still be lost until someone noticed."
     }
    ]
   },
   {
-   "q": "Why does every handler call ack() before calling Temporal?",
+   "q": "Why does /nova RH-1234 assign the ticket to Nova instead of starting the run itself?",
    "options": [
     {
-     "text": "Slack needs an answer within 3 seconds, and a Temporal call can take longer.",
+     "text": "Because a Slack app is not allowed to call Temporal",
+     "correct": false,
+     "why": "The app does call Temporal, for status queries and for signals such as stop."
+    },
+    {
+     "text": "Because assigning is faster than starting a workflow",
+     "correct": false,
+     "why": "It is slower, since the poll needs up to a minute. Speed is not the reason."
+    },
+    {
+     "text": "Because then every hand-off goes through the Jira poll, which records the requester and applies the walls in one place",
      "correct": true,
-     "why": "ack() answers at once; the work and the reply come after."
-    },
-    {
-     "text": "ack() sends the result of the command to the person.",
-     "correct": false,
-     "why": "respond or ephemeral sends the result. ack only confirms receipt."
-    },
-    {
-     "text": "ack() starts the workflow.",
-     "correct": false,
-     "why": "startRun starts it. ack talks only to Slack."
+     "why": "One door for new work: the same requester rule, the same one-run-per-ticket name and the same kill switch, whether you used Jira or Slack."
     }
    ]
   },
   {
-   "q": "After Sean approves a plan, the app edits the message. Why?",
+   "q": "Sean answers Nova's question in two messages before Nova's VM is awake. What should the run hand to Nova?",
    "options": [
     {
-     "text": "Slack requires every button message to be edited after a click.",
-     "correct": false,
-     "why": "Slack requires an ack, not an edit."
-    },
-    {
-     "text": "To show who decided and remove the buttons, so an old button cannot fire twice.",
+     "text": "Both replies joined, each with who wrote it",
      "correct": true,
-     "why": "The workflow also ignores a late decision; two guards for one rule."
+     "why": "People answer in pieces. The handler appends every reply, and the run joins them when the session resumes."
     },
     {
-     "text": "To make the thread look tidy.",
+     "text": "Only the last reply, because it is the most recent",
      "correct": false,
-     "why": "It does look tidy, but the reason is a decision that must count once."
+     "why": "That is the overwrite bug: the first reply, the button, would be lost."
+    },
+    {
+     "text": "Only the first reply, because a question has one answer",
+     "correct": false,
+     "why": "That rule is for plan decisions, which are taken once. Answers to questions are joined."
     }
    ]
   }
  ],
- "recall": [
-  "From lesson g3-12: name four ways a person can stop a run.",
-  "From lesson g3-11: when Slack is down, where does notify send Nova's message?"
- ],
- "videos": [
-  {
-   "title": "How to Build a Slack App",
-   "url": "https://www.youtube.com/watch?v=25ArxpK48tU",
-   "channel": "Fireship",
-   "minutes": 10,
-   "why": "Quick overview of Slack app pieces: slash commands, events, interactivity."
-  }
- ],
+ "platform": {
+  "p": [
+   "The app lives in ai-agents/slack-app: src/app.ts with Bolt 5 in Socket Mode and the /nova command, and src/actions.ts with one app.action handler that maps every button to a signal, the change modal, and the message handler for replies. Its tokens come from Vault at infrastructure/ai-agents/slack-app. config/people.yaml maps Slack IDs to Jira accounts, GitHub logins and emails, and the broker records which run posted in which thread, which is also the run's Slack scope.",
+   "Details to settle while you build: G3-35 says replies are joined, but the answerQuestion handler in G3-24 overwrites, so use a list as in this lesson. G3-30 passes `by` as a person object and G3-35 as an email; pick one. G3-35 maps the backstop's Continue button to a resume signal that no workflow defines yet, and its button value format (nova:RH-1234|3) differs from G4-14's (nova:RH-1234|v2)."
+  ],
+  "tickets": [
+   {
+    "key": "G3-30",
+    "why": "The Bolt app in Socket Mode, /nova start, status and stop, one status message per ticket."
+   },
+   {
+    "key": "G3-35",
+    "why": "Buttons and modals as signals with who did it, replies in the thread as answerQuestion."
+   },
+   {
+    "key": "G4-05",
+    "why": "/nova RH-1234 becomes \"assign the ticket to Nova\", and config/people.yaml."
+   },
+   {
+    "key": "G4-14",
+    "why": "What the plan message looks like, the version in the button value, and who may decide."
+   }
+  ]
+ },
  "words": [
   {
-   "term": "Socket Mode",
-   "plain": "A Slack app mode where the app opens a WebSocket to Slack, so it needs no public URL."
+   "term": "ts and thread_ts",
+   "plain": "Slack's ID of a message (a timestamp string), and, on a reply, the ts of the thread's first message."
   },
   {
-   "term": "ack",
-   "plain": "The call that tells Slack an event was received; it must come within 3 seconds."
+   "term": "status message",
+   "plain": "The first message of a ticket's thread, edited in place with chat.update as the run moves."
+  },
+  {
+   "term": "stateless app",
+   "plain": "An app that keeps nothing between requests; everything comes from the event, the run or a durable record."
+  },
+  {
+   "term": "answerQuestion",
+   "plain": "The signal a person's reply in the thread becomes, carrying the text and who wrote it."
   },
   {
    "term": "ephemeral message",
-   "plain": "A Slack message only one person sees, used for errors and command answers."
-  },
-  {
-   "term": "action_id",
-   "plain": "Slack's name for a button, for example plan_approve; our handler maps it to a signal."
-  },
-  {
-   "term": "thread_ts",
-   "plain": "The ID of the message that starts a Slack thread; replies carry it."
-  },
-  {
-   "term": "chat.update",
-   "plain": "The Slack API call that edits a message in place."
+   "plain": "A Slack message only one person can see, used to tell them something went wrong."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-30",
-   "why": "This lesson explained Socket Mode, the two tokens, the /nova handler line by line, and the status message.",
-   "walk": [
-    "Ask a Slack admin to create the app with Socket Mode and the /nova command. Scopes: chat:write, commands, users:read.email, channels:history in the Nova channel.",
-    "Put the xapp- and xoxb- tokens in Vault at infrastructure/ai-agents/slack-app. The ExternalSecret gives them to the slack-app pod as SLACK_APP_TOKEN and SLACK_BOT_TOKEN.",
-    "Create ai-agents/slack-app/src/app.ts (code above) with JIRA_KEY, the people lookup from config/people.yaml and a temporalClient helper.",
-    "Post one thread per ticket in the Nova channel. Its first message is the status message, kept current with chat.update.",
-    "Give the thread's channel and ts to the broker as the run's Slack scope.",
-    "Pass by on every signal. Send errors back as ephemeral messages after ack.",
-    "Test the command parsing with node:test. Leave a note that G4-05 changes start to \"assign the ticket to Nova\"."
-   ]
+   "q": "From memory: the three checks that decide whether a Slack message is an answer, and what the handler does next.",
+   "a": "No subtype, no bot_id, and a thread_ts. Then it asks the broker which run owns the thread and signals answerQuestion with the text and the person."
   },
   {
-   "key": "G3-35",
-   "why": "This lesson explained the button handler and the thread-reply handler line by line, and how no decision is lost or counted twice.",
-   "walk": [
-    "Create ai-agents/slack-app/src/actions.ts with the action handler and the message handler (code above).",
-    "Add the view_submission handler for the Change modal. It sends decidePlan with kind change, the comment, who and the version.",
-    "Leave mayDecide as the hook G4-14 fills in, and let G4-14 put the plan version in the button value.",
-    "After a decision, update the message: who decided, no buttons. Make ticketToPr ignore a decision after one was taken.",
-    "Have the broker record which workflow posted in which thread, and add workflowForThread. Join several replies into one answer.",
-    "If a signal cannot be delivered, tell the person to try again. Never drop it.",
-    "Write node:test cases for each action with recorded Bolt payloads."
-   ]
+   "q": "A teammate caches the thread record when the app starts \"to save a call\". What breaks, and when?",
+   "a": "Every thread opened after the app started is unknown, so replies there are silently ignored until the next restart. Read the record on every message."
+  },
+  {
+   "q": "Why does the status message use chat.update instead of a new message per step?",
+   "a": "One message per ticket stays readable and always shows the current state; its ts is stored in the run, so any copy of the app or worker can edit it."
   }
  ],
- "remember": "The Slack app dials out, acks at once, and turns every command, click and reply into one recorded Temporal call."
+ "remember": "The Slack app remembers nothing: every event carries its address, and the run and the broker hold the rest."
 }
