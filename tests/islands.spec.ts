@@ -2,9 +2,9 @@ import { expect, test } from '@playwright/test';
 
 test.describe('islands map', () => {
   test('a learner can open an island, jump between any steps and mark the lesson done', async ({ page }) => {
-    await test.step('Given the islands map is open, with reduced motion so the islands hold still', async () => {
+    await test.step('Given the home page is open, which is the islands map, with reduced motion so the islands hold still', async () => {
       await page.emulateMedia({ reducedMotion: 'reduce' });
-      await page.goto('/#/islands');
+      await page.goto('/#/');
     });
     await test.step('Then all nine islands are on the map', async () => {
       await expect(page.locator('.isl-island')).toHaveCount(9);

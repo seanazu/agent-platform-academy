@@ -25,7 +25,8 @@ export const parseHash = (hash: string): Route => {
   if (head === 'cast') return { name: 'cast' };
   if (head === 'islands') return { name: 'islands', island: id, lesson: parts[2] };
   if (head === 'search') return { name: 'search', q: params.get('q') ?? undefined };
-  return { name: 'home' };
+  if (head === 'path') return { name: 'home' };
+  return { name: 'islands' };
 };
 
 export const useRoute = (): Route => {
@@ -39,7 +40,7 @@ export const useRoute = (): Route => {
 };
 
 export const href = {
-  home: () => '#/',
+  home: () => '#/path',
   part: (id: string) => `#/part/${id}`,
   lesson: (id: string) => `#/lesson/${id}`,
   card: (key: string) => `#/card/${key}`,

@@ -4,7 +4,7 @@ import { course } from './helpers';
 test.describe('home', () => {
   test('renders every part as a card in course order', async ({ page }) => {
     await test.step('Given the home page is open', async () => {
-      await page.goto('/#/');
+      await page.goto('/#/path');
       await expect(page.getByRole('heading', { level: 1 })).toHaveText('Agent Platform Academy');
     });
     await test.step('Then one card per part is shown', async () => {

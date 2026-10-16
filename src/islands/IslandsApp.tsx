@@ -110,7 +110,7 @@ function IslandsApp({ island, lesson }: Props) {
         <div className="isl-top-right">
           <span className="isl-stat"><b>{doneCount}</b> of {course.lessonCount} lessons</span>
           <span className="isl-stat"><b>{revealed.size}</b> of {ISLANDS.length} islands explored</span>
-          <a className="isl-classic" href={href.home()}>Classic view</a>
+          <a className="isl-classic" href={href.home()}>List view</a>
         </div>
       </header>
 
@@ -158,7 +158,7 @@ function IslandsApp({ island, lesson }: Props) {
               </ol>
               <div className="isl-path-actions">
                 <button type="button" className="isl-btn isl-btn-primary" onClick={startJourney}>▶ Tour the platform</button>
-                <span className="isl-path-note">{course.lessonCount - PATH.length} more lessons are being rebuilt for this map.</span>
+                {PATH.length < course.lessonCount && <span className="isl-path-note">{course.lessonCount - PATH.length} more lessons are being rebuilt for this map.</span>}
               </div>
             </>
           )}

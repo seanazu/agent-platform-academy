@@ -26,8 +26,8 @@ test.describe('ticket map', () => {
   test('a finished lesson unlocks its tickets', async ({ page }) => {
     await test.step('Given a walkthrough lesson is marked done', async () => {
       await page.goto('/#/lesson/g0-1');
-      await page.getByRole('button', { name: 'Mark lesson done' }).click();
-      await expect(page.getByRole('button', { name: 'Lesson done' })).toBeVisible();
+      await page.getByRole('button', { name: 'Mark as done' }).click();
+      await expect(page.getByRole('button', { name: '✓ Lesson done' })).toBeVisible();
     });
     await test.step('When the ticket map opens', async () => {
       await page.goto('/#/tickets?k=G0-01');

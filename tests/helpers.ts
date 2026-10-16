@@ -6,5 +6,5 @@ export type Course = { parts: CoursePart[]; lessonCount: number; ticketCount: nu
 
 export const course: Course = JSON.parse(readFileSync(resolve(process.cwd(), 'content/course.json'), 'utf8')) as Course;
 
-// A lesson that always renders: the writers' file when it exists, else the sample in src/sample.
-export const LESSON_ID = 'p7-2';
+// The reference lesson, open in the lesson sheet on its island.
+export const LESSON_URL = '/#/islands/temporal/p7-4';
