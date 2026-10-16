@@ -1,0 +1,584 @@
+[
+ {
+  "key": "G1-01",
+  "title": "[Shai] Run the October developer survey (10 questions, team level)",
+  "team": [
+   "shai",
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   2,
+   3
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "",
+  "what": "Send a 10-question anonymous survey to R&D in October as the baseline: time saved, time lost and confidence when changing code.",
+  "why": "Delivery metrics show what changed, not where time goes or how it feels. METR found developers felt faster while being slower, so we ask about time lost too and read it next to the metrics.",
+  "how": [
+   "Build the Google Form from the questions file in the sketch. Don't collect emails; the only grouping field is team.",
+   "Send it in #engineering by 21 Oct with one line on why. Remind once after 3 days.",
+   "Report team level only, and fold any team with fewer than 5 answers into 'Other'.",
+   "Export the answers as CSV to a restricted Drive folder, and keep the questions file unchanged for December (G1-18)."
+  ],
+  "code": {
+   "file": "ai-agents/metrics/survey/questions.yaml",
+   "lang": "yaml",
+   "text": "# ai-agents/metrics/survey/questions.yaml\n# Builds the October form and the December one. Don't edit the questions between the two runs.\ngroup_by: team        # FE, BE, DevOps, Data Science, Other. No names and no emails are collected.\nmin_group_size: 5     # smaller teams fold into Other when we report\nscales:\n  hours: [\"0\", \"under 1 h\", \"1-3 h\", \"3-6 h\", \"more than 6 h\"]\n  agree: [\"1 strongly disagree\", \"2\", \"3\", \"4\", \"5 strongly agree\"]\nquestions:\n  - { id: time_saved,       scale: hours, text: \"In a normal week, how much time do AI tools save you?\" }\n  - { id: lost_meetings,    scale: hours, text: \"In a normal week, how much time do you lose to meetings that didn't need you?\" }\n  - { id: lost_interrupts,  scale: hours, text: \"In a normal week, how much time do you lose to interruptions and switching tasks?\" }\n  - { id: lost_builds,      scale: hours, text: \"In a normal week, how much time do you lose waiting for builds, tests and CI?\" }\n  - { id: lost_review,      scale: hours, text: \"In a normal week, how much time do you lose waiting for code review?\" }\n  - { id: lost_setup,       scale: hours, text: \"In a normal week, how much time do you lose to a broken or slow dev setup?\" }\n  - { id: lost_finding,     scale: hours, text: \"In a normal week, how much time do you lose looking for information?\" }\n  - { id: confident_change, scale: agree, text: \"I feel confident changing code in a part of the product I don't know well.\" }\n  - { id: confident_ci,     scale: agree, text: \"When CI is green, I trust that my change works.\" }\n  - { id: biggest_drag,     scale: text,  text: \"What one thing slows you down the most?\" }"
+  }
+ },
+ {
+  "key": "G1-02",
+  "title": "[DevOps] Deploy the OTel Collector on inf with content scrubbing",
+  "team": [
+   "devops"
+  ],
+  "days": 1.5,
+  "w": [
+   3,
+   4
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "Sean fills the email → team map in Vault",
+  "what": "Run an OpenTelemetry Collector on inf-rhinohealth as a Terraform helm_release unit. It takes OTLP in, drops content attributes, swaps the person's email for a team name, and writes metrics to VictoriaMetrics and events to VictoriaLogs.",
+  "why": "Claude Code and the Agent SDK already export cost, tokens and tool decisions over OTel, but we have no collector. Scrubbing in one place means no prompt, command or file path is stored, even from a misconfigured client.",
+  "how": [
+   "Create modules/otel-collector: a helm_release of the upstream open-telemetry/opentelemetry-collector chart (contrib image, deployment mode, 2 replicas) plus an ExternalSecret from vault-store. Unit: multi_tenant/accounts/infrastructure/otel-collector/terragrunt.hcl.",
+   "Generate ingest_token and user_salt with Terraform into kvv2 infrastructure/otel-collector, like modules/n8n-secrets. Read the team map (work email → team) from infrastructure/ai-agents/teams with a vault_kv_secret_v2 data source and render it into the values template (sketch).",
+   "Drop prompt, prompt_text, user_system_prompt, full_command, file_path, tool_parameters and user.email before export. Keep user.hash (salted SHA-256), so weekly active users can be counted without names.",
+   "Ask for -opentelemetry.usePrometheusNaming=true on vminsert, so series get Prometheus names (claude_code_cost_usage_USD_total). Send logs to the long-term VictoriaLogs (1 year). No traces pipeline: there is no trace store yet.",
+   "Test from a pod with telemetrygen, then one real `claude -p` session with OTEL_LOG_USER_PROMPTS=1 set on purpose: the prompt must not show up in VictoriaLogs."
+  ],
+  "code": {
+   "file": "infrastructure/modules/otel-collector/templates/otel_collector_values.yml.tpl",
+   "lang": "yaml",
+   "text": "mode: deployment\nreplicaCount: 2\nimage:\n  repository: otel/opentelemetry-collector-contrib   # contrib: transform processor and bearertokenauth\nextraEnvsFrom:\n  - secretRef: { name: otel-collector }              # ExternalSecret from kvv2 infrastructure/otel-collector\nconfig:\n  extensions:\n    bearertokenauth: { token: \"$${env:INGEST_TOKEN}\" }\n  receivers:\n    otlp:\n      protocols:\n        http: { endpoint: \"0.0.0.0:4318\", auth: { authenticator: bearertokenauth } }\n  processors:\n    memory_limiter: { check_interval: 1s, limit_percentage: 80, spike_limit_percentage: 20 }\n    transform/scrub:\n      error_mode: ignore\n      log_statements:\n        - context: log      # metric_statements repeat this list with context: datapoint\n          statements:\n            - delete_matching_keys(attributes, \"^(prompt|prompt_text|user_system_prompt|full_command|file_path|tool_parameters)$\")\n%{ for email, team in teams ~}\n            - set(attributes[\"team\"], \"${team}\") where attributes[\"user.email\"] == \"${email}\"\n%{ endfor ~}\n            - set(attributes[\"user.hash\"], SHA256(Concat([attributes[\"user.email\"], \"$${env:USER_SALT}\"], \"\"))) where attributes[\"user.email\"] != nil\n            - delete_key(attributes, \"user.email\")\n    batch: {}\n  exporters:\n    otlphttp/metrics: { metrics_endpoint: \"${metrics_endpoint}\" }   # vminsert .../insert/0/opentelemetry/v1/metrics\n    otlphttp/logs: { logs_endpoint: \"${logs_endpoint}\" }            # vlsingle-rhino-logs-longterm:9428\n  service:\n    extensions: [bearertokenauth]\n    pipelines:\n      metrics: { receivers: [otlp], processors: [memory_limiter, transform/scrub, batch], exporters: [otlphttp/metrics] }\n      logs: { receivers: [otlp], processors: [memory_limiter, transform/scrub, batch], exporters: [otlphttp/logs] }"
+  }
+ },
+ {
+  "key": "G1-03",
+  "title": "[Platform] Metrics job: pull fcp PRs nightly into VictoriaMetrics",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   3,
+   4
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G3 creates RhinoHealth/ai-agents; decide the runner (no 'agents runner set' exists yet)",
+  "what": "Start the nightly delivery-metrics job: a TypeScript workspace (`ai-agents/metrics`) that pulls fcp pull requests with their review timeline from GitHub and writes team-level series to VictoriaMetrics.",
+  "why": "Review wait, lead time and change failure all start from the same PR data. We need it nightly, with a 12-week baseline before agents start, or we can't tell whether they helped.",
+  "how": [
+   "Create the metrics workspace in RhinoHealth/ai-agents (`ai-agents/metrics/`, TypeScript on Node 24, global `fetch`): `src/github.ts` (sketch), `src/vm.ts` (writer), `src/teams.ts` (login → team from kvv2 infrastructure/ai-agents/teams), and a `delivery-metrics` bin (`src/cli.ts`) with `nightly` and `backfill --weeks 12`.",
+   "Read GitHub with a separate read-only App (pull requests, contents, actions, checks: read) through actions/create-github-app-token, so the rhino-ai-agents key stays with the broker alone.",
+   "Write Prometheus text with millisecond timestamps to the integration VMUser, the way infrastructure's send-workflow-result.yml does (Secrets Manager integration-metrics-user via the GitHubActions OIDC role; confirm it trusts RhinoHealth/ai-agents). Timestamps put backfilled points on the right days.",
+   "Workflow `ai-agents/.github/workflows/delivery-metrics.yml` on cron '20 2 * * *': actions/setup-node (24, npm cache), `npm ci --workspace metrics --include-workspace-root`, `npm run build -w shared -w metrics` (metrics imports the shared package), `node metrics/dist/cli.js nightly`. runs-on: an ai-agents runner set if G3 or G5 adds one by W3; until then ubuntu-22.04-2core, since the job only calls public APIs.",
+   "Aggregate before writing: series carry team, never login. Teams under 3 people report as 'other'."
+  ],
+  "code": {
+   "file": "ai-agents/metrics/src/github.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/metrics/src/github.ts\n// Pull fcp PRs with the timeline facts the delivery metrics need.\nimport { graphql } from \"./gh.js\"; // fetch POST https://api.github.com/graphql with a read-only App token\nimport type { PrSearch } from \"./types.js\"; // the shape of this query's result\n\nconst QUERY = `\nquery($q: String!, $after: String) {\n  search(query: $q, type: ISSUE, first: 50, after: $after) {\n    pageInfo { hasNextPage endCursor }\n    nodes { ... on PullRequest {\n      number createdAt mergedAt bodyText author { login }\n      commits(first: 100) { nodes { commit { authoredDate message } } }\n      timelineItems(itemTypes: [READY_FOR_REVIEW_EVENT, PULL_REQUEST_REVIEW], first: 50) {\n        nodes { __typename\n          ... on ReadyForReviewEvent { createdAt }\n          ... on PullRequestReview { createdAt state author { login __typename } } } }\n    } }\n  }\n}`;\n\n/** One week per query (GitHub search stops at 1000 results). Run again with field = \"merged\". */\nexport async function* pullRequests(repo: string, weekStart: string, weekEnd: string, field: \"created\" | \"merged\" = \"created\") {\n  const q = `repo:${repo} is:pr ${field}:${weekStart}..${weekEnd}`;\n  let after: string | null = null;\n  do {\n    const { search }: PrSearch = await graphql(QUERY, { q, after });\n    for (const { commits, timelineItems, ...pr } of search.nodes) {\n      const done = commits.nodes.map((n) => n.commit);\n      const firstCommitAt = done.map((c) => c.authoredDate).sort()[0] ?? pr.createdAt; // ISO strings sort by time\n      const aiTrailer = pr.bodyText.includes(\"Generated with Claude Code\") || done.some((c) => c.message.includes(\"Co-Authored-By: Claude\"));\n      yield { ...pr, firstCommitAt, aiTrailer, timeline: timelineItems.nodes };\n    }\n    after = search.pageInfo.hasNextPage ? search.pageInfo.endCursor : null;\n  } while (after);\n}"
+  }
+ },
+ {
+  "key": "G1-04",
+  "title": "[DevOps] Open the OTel ingest endpoint for laptops and agent VMs",
+  "team": [
+   "devops"
+  ],
+  "days": 0.5,
+  "w": [
+   4,
+   4
+  ],
+  "flag": null,
+  "deps": [
+   "G1-02"
+  ],
+  "needs": "G3: allow-list otel.example.com in the egress proxy, or relay (G1-05)",
+  "what": "Give the collector a public HTTPS route, otel.example.com, behind Envoy's external gateway and the WAF, accepting only OTLP/HTTP with the ingest token.",
+  "why": "Engineers are not always on VPN, and agent VMs have no peering to inf. One authenticated ingest address serves both.",
+  "how": [
+   "Add the external route to the unit (sketch): envoy-external, Coraza WAF failing closed like n8n's webhooks, paths /v1/metrics and /v1/logs only.",
+   "The collector checks the bearer token itself (bearertokenauth). The token only lets you write telemetry, and it reaches people through server-managed settings (G1-05).",
+   "Test from a laptop off VPN with telemetrygen, with and without the token (401 expected without it).",
+   "Check the WAF doesn't block protobuf bodies; add a rule exception for these two paths if it does."
+  ],
+  "code": {
+   "file": "infrastructure/multi_tenant/accounts/infrastructure/otel-collector/terragrunt.hcl",
+   "lang": "hcl",
+   "text": "# infrastructure/multi_tenant/accounts/infrastructure/otel-collector/terragrunt.hcl\ninclude \"root\" {\n  path   = find_in_parent_folders(\"root.hcl\")\n  expose = true\n}\n\nterraform {\n  source = \"../../../../modules/otel-collector//\" # module from the collector ticket\n}\n\ninputs = {\n  namespace     = \"otel-collector\"\n  chart_version = \"0.0.0\" # pin the current open-telemetry/opentelemetry-collector chart release\n\n  vault_kv_mount_path = include.root.locals.vault_kv_mount_path\n  vault_secret_path   = \"infrastructure/otel-collector\"  # ingest_token, user_salt (generated by Terraform)\n  teams_secret_path   = \"infrastructure/ai-agents/teams\" # work email -> team; owner Sean\n\n  metrics_endpoint = \"http://vminsert-rhino-metrics.${include.root.locals.metrics_namespace}.svc:8480/insert/0/opentelemetry/v1/metrics\"\n  logs_endpoint    = \"http://vlsingle-rhino-logs-longterm.${include.root.locals.logs_namespace}.svc:9428/insert/opentelemetry/v1/logs\"\n\n  # This ticket: a public OTLP/HTTP route, like n8n's webhook host. Laptops are not always on VPN.\n  external_route = {\n    parent_ref = \"envoy-external\"\n    hostname   = \"otel.example.com\"\n    paths      = [\"/v1/metrics\", \"/v1/logs\"] # no traces store yet\n  }\n  waf_enabled   = true\n  waf_fail_open = false # fail closed, like n8n's webhooks\n}"
+  }
+ },
+ {
+  "key": "G1-05",
+  "title": "[Platform] Managed settings: send Claude Code telemetry, content off",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   4,
+   4
+  ],
+  "flag": null,
+  "deps": [
+   "G1-04"
+  ],
+  "needs": "G0 managed settings (same folder); G3's Packer image bakes the agent copy; G3 decides the agents' relay",
+  "what": "Turn on Claude Code telemetry for every engineer and every agent through managed settings, pointed at our collector, with all content flags off.",
+  "why": "Telemetry only helps if everyone sends it the same way. Content stays off at the source, and the collector scrubs again.",
+  "how": [
+   "Add settings/managed-settings.d/20-telemetry.json next to G0's 10-models.json. Paste the people version into claude.ai server-managed settings with the real ingest token; the token never goes into git.",
+   "Team is not set here, because the file is org-wide; the collector turns the email into a team (G1-02).",
+   "Agents: the image's copy has no OTEL_RESOURCE_ATTRIBUTES (the harness sets them per step) and no token. Proposal for G3: point agents at a small OTLP relay in the LLM gateway that checks the run token and adds the ingest token, so the VM holds no ingest token.",
+   "Leave OTEL_LOG_RAW_API_BODIES and the traces exporter unset.",
+   "Check: on a laptop /status lists the managed source, and within a minute claude_code_cost_usage_USD_total appears in Grafana with a team label and no email."
+  ],
+  "code": {
+   "file": "ai-agents/settings/managed-settings.d/20-telemetry.json",
+   "lang": "json",
+   "text": "{\n  \"$schema\": \"https://json.schemastore.org/claude-code-settings.json\",\n  \"env\": {\n    \"CLAUDE_CODE_ENABLE_TELEMETRY\": \"1\",\n    \"OTEL_METRICS_EXPORTER\": \"otlp\",\n    \"OTEL_LOGS_EXPORTER\": \"otlp\",\n    \"OTEL_EXPORTER_OTLP_PROTOCOL\": \"http/protobuf\",\n    \"OTEL_EXPORTER_OTLP_ENDPOINT\": \"https://otel.example.com\",\n    \"OTEL_EXPORTER_OTLP_HEADERS\": \"Authorization=Bearer <ingest token: set only in the admin console>\",\n    \"OTEL_LOG_USER_PROMPTS\": \"0\",\n    \"OTEL_LOG_ASSISTANT_RESPONSES\": \"0\",\n    \"OTEL_LOG_TOOL_DETAILS\": \"0\",\n    \"OTEL_LOG_TOOL_CONTENT\": \"0\",\n    \"OTEL_METRICS_INCLUDE_ACCOUNT_UUID\": \"false\",\n    \"OTEL_RESOURCE_ATTRIBUTES\": \"department=rnd,source=human\"\n  }\n}"
+  }
+ },
+ {
+  "key": "G1-06",
+  "title": "[Platform] Metrics job: add Jira tickets and CI runs on main",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   4,
+   4
+  ],
+  "flag": null,
+  "deps": [
+   "G1-03"
+  ],
+  "needs": "G0 ruleset renames the unit-test jobs",
+  "what": "Add two collectors to the nightly job: Jira tickets for project RH (cycle times, Bug tickets, tickets given to Nova) and the required unit-test runs on fcp main (for red-main time).",
+  "why": "Change failure needs Bug tickets, red-main time needs CI history, and the agent cohort needs to know which tickets went to Nova.",
+  "how": [
+   "`src/jira.ts` (Jira REST v3 through the small fetch client in `shared/src/jira.ts`): JQL `project = RH AND updated >= -13w` against rhino-fcp.atlassian.net with a read-only service account token (kvv2 infrastructure/ai-agents/jira-metrics). Keep key, type, status changes, the Nova assignee flag and the PR keys from titles. No names are stored.",
+   "`src/ci.ts` (sketch): runs of cloud-ci.yml, client-ci.yml and frontend-ci.yaml on main. Count only the required unit-test jobs, so the flaky I&T jobs don't paint main red.",
+   "Main is red while any required job is red; overlapping red windows count once.",
+   "Store each day's raw pull as a JSON artifact, so a metric fix can be recomputed without calling the APIs again."
+  ],
+  "code": {
+   "file": "ai-agents/metrics/src/ci.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/metrics/src/ci.ts\n// Hours fcp main stays red, from the required unit-test jobs only (I&T flakiness is G7's problem).\nimport { rest, restPages } from \"./gh.js\"; // small fetch helpers with the read-only App token; restPages follows Link: next\nimport type { Job, WorkflowRun } from \"./types.js\";\nconst REQUIRED: Record<string, string[]> = { // workflow file -> job names (the second one is the name before G0's rename)\n  \"cloud-ci.yml\": [\"Cloud Unit Tests\", \"Unit Tests\"],\n  \"client-ci.yml\": [\"Client Unit Tests\", \"Unit Tests\"],\n  \"frontend-ci.yaml\": [\"Frontend Unit Tests\", \"Unit Tests\"],\n};\nexport type Result = { workflow: string; at: Date; ok: boolean };\nexport async function* mainResults(repo: string, since: string): AsyncGenerator<Result> {\n  for (const [workflow, names] of Object.entries(REQUIRED)) {\n    const query = { branch: \"main\", status: \"completed\", created: `>=${since}` };\n    for await (const run of restPages<WorkflowRun>(`/repos/${repo}/actions/workflows/${workflow}/runs`, query)) {\n      const { jobs } = await rest<{ jobs: Job[] }>(`/repos/${repo}/actions/runs/${run.id}/jobs`);\n      const job = jobs.find((j) => names.includes(j.name));\n      if (job?.completed_at && (job.conclusion === \"success\" || job.conclusion === \"failure\")) {\n        yield { workflow, at: new Date(job.completed_at), ok: job.conclusion === \"success\" };\n      }\n    }\n  }\n}\n\n/** main is red while any required job's latest result is a failure; overlaps count once. */\nexport function redHours(results: Result[]): number {\n  const state = new Map<string, boolean>();\n  let redSince: Date | undefined, total = 0;\n  for (const { workflow, at, ok } of results.toSorted((a, b) => a.at.getTime() - b.at.getTime())) {\n    state.set(workflow, ok);\n    const redNow = [...state.values()].includes(false);\n    if (redNow && !redSince) redSince = at;\n    else if (!redNow && redSince) { total += (at.getTime() - redSince.getTime()) / 3_600_000; redSince = undefined; }\n  }\n  return total;\n}"
+  }
+ },
+ {
+  "key": "G1-07",
+  "title": "[Platform] Metrics job: compute delivery metrics, backfill 12 weeks",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   4,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G1-03",
+   "G1-06"
+  ],
+  "needs": "G2 golden-set miner (bug → PR that introduced it); G2 live metrics (Byte's two rates); G3 run records (stuck loops, clean endings)",
+  "what": "Compute the delivery metrics that have history (review wait, lead time, change failure, red-main time, share of PRs with AI help) and the agent ones (agent PR merge rate, human rework, CI auto-fix success), and backfill the 12 weeks before October.",
+  "why": "The baseline is the 12 weeks before October. Without it, December's numbers have nothing to be compared with.",
+  "how": [
+   "`src/compute.ts` (sketch): one function per metric, weekly, per team, with p50, p85 and counts so the dashboard can show ranges. Weekly numbers for about 25 engineers are noisy.",
+   "Change failure reuses G2's golden-set miner: a merged PR failed when a revert, hotfix or Bug fix within 14 days touches its lines.",
+   "Cohorts: agent vs. human by PR author; agent-eligible tickets by the Jira label G4 uses for its alternating comparison. Agent-only metrics start as 'no data', not 0, so charts don't show a fake drop.",
+   "Run `delivery-metrics backfill --weeks 12 --until 2026-09-30` once and write the baseline as delivery_baseline_* series. Check three numbers by hand against GitHub.",
+   "Copy Byte's addressed and wrong-finding rates (G2) and stuck loops and clean endings (G3) into the same delivery_* names, so one dashboard holds all seventeen."
+  ],
+  "code": {
+   "file": "ai-agents/metrics/src/compute.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/metrics/src/compute.ts\n// Weekly, team-level delivery metrics. Nothing here is ever written per person.\nimport { days, hours, median, quantile } from \"./stats.js\"; // ISO timestamps in, numbers out; quantile as Python's statistics\nimport type { Fix, MergedPr, Point, PullRequest } from \"./types.js\";\n\n/** Ready for review (or opened, if never a draft) to the first review by another person. */\nexport function reviewWaitHours(pr: PullRequest): number | undefined {\n  const ready = pr.timeline.find((e) => e.__typename === \"ReadyForReviewEvent\")?.createdAt ?? pr.createdAt;\n  const first = pr.timeline.find((e) => e.__typename === \"PullRequestReview\"\n    && e.author?.__typename === \"User\" && e.author.login !== pr.author.login)?.createdAt;\n  return first ? hours(ready, first) : undefined;\n}\n\nexport const leadTimeHours = (pr: PullRequest) => (pr.mergedAt ? hours(pr.firstCommitAt, pr.mergedAt) : undefined);\n\n/** A revert, hotfix or Bug fix within 14 days on the same lines (G2's miner does the blame). */\nexport const changeFailed = (pr: MergedPr, fixes: Fix[]) =>\n  fixes.some((f) => f.introducedBy === pr.number && days(pr.mergedAt, f.mergedAt) <= 14);\n\nexport function* weeklyPoints(prs: PullRequest[], fixes: Fix[], teamOf: (pr: PullRequest) => string, weekTs: number): Generator<Point> {\n  const byTeam = new Map<string, PullRequest[]>();\n  for (const pr of prs) { // agent PRs count for the requester's team; teams under 3 people map to \"other\"\n    byTeam.set(teamOf(pr), [...(byTeam.get(teamOf(pr)) ?? []), pr]);\n  }\n  for (const [team, items] of byTeam) {\n    const waits = items.map(reviewWaitHours).filter((w) => w !== undefined);\n    if (waits.length >= 2) {\n      yield [\"delivery_review_wait_hours\", { team, q: \"p50\" }, median(waits), weekTs];\n      yield [\"delivery_review_wait_hours\", { team, q: \"p85\" }, quantile(waits, 0.85), weekTs];\n    }\n    const merged = items.filter((p): p is MergedPr => p.mergedAt !== null);\n    yield [\"delivery_merged_prs\", { team }, merged.length, weekTs];\n    yield [\"delivery_failed_changes\", { team }, merged.filter((p) => changeFailed(p, fixes)).length, weekTs];\n  }\n}"
+  }
+ },
+ {
+  "key": "G1-08",
+  "title": "[Platform] Eval results store: JSON in S3, pass rates as metrics",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   5,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G1-03"
+  ],
+  "needs": "G3 ai-agents account and its GitHub OIDC role; suites from G2, G4, G5, G6 and G8 write through it",
+  "what": "One place for every eval run: each suite writes one JSON file per run to an S3 bucket in the ai-agents account, and the nightly job turns new files into pass-rate, spread and cost series.",
+  "why": "Five suites from five goals need one format, so a change can be judged on quality, cost, steps and time together. JSON plus Grafana is enough until Q1; Langfuse needs ClickHouse.",
+  "how": [
+   "Bucket rhino-ai-agents-eval-results: one unit at terraform/accounts/ai-agents/aws/us-east-1/evals/results-bucket/terragrunt.hcl (tfr:///terraform-aws-modules/s3-bucket/aws 5.13.0, KMS, versioning, no public access). A person applies.",
+   "`ai-agents/evals/results.py` (sketch; it stays Python, next to Harbor and the suites that call it): suites call record(). Sandbox VMs write with their instance role through the S3 VPC endpoint, so no key sits in the VM.",
+   "The nightly metrics job (TypeScript, `ai-agents/metrics/src/eval-results.ts` with `@aws-sdk/client-s3`) reads new files with a read-only role in the ai-agents account (GitHub OIDC) and pushes ai_agents_eval_pass_rate, _pass_rate_spread, _cost_per_case_usd and _median_turns with suite, version, split, model and effort labels.",
+   "Schema rules: every case runs 3 times, and each run records pass, cost, turns, agents used, seconds and a cause label for failures."
+  ],
+  "code": {
+   "file": "ai-agents/evals/results.py",
+   "lang": "python",
+   "text": "# ai-agents/evals/results.py  (every suite calls record(); Python, like Harbor and the suites around it)\n\"\"\"One JSON file per eval run. Quality, cost, steps, agents and time are scored together.\"\"\"\nimport json\nimport statistics\n\nimport boto3\n\nBUCKET = \"rhino-ai-agents-eval-results\"\nCAUSES = {\"too_many_tools\", \"bad_handoff\", \"contradicting_prompt\", \"missing_context\", \"flaky_environment\"}\n\n\ndef record(suite: str, version: str, setup: dict, cases: list[dict], started_at: str) -> str:\n    \"\"\"setup: {\"split\": \"dev\", \"model\": \"claude-opus-5-5\", \"effort\": \"medium\", \"harness\": \"0.4.1\"}\n    cases: [{\"id\": \"T-017\", \"runs\": [{\"pass\": True, \"cost_usd\": 1.9, \"turns\": 41, \"agents\": 3,\n                                       \"seconds\": 820, \"cause\": None}, ...]}]   # 3 runs per case\"\"\"\n    assert all(len(case[\"runs\"]) == 3 for case in cases), \"every case runs 3 times\"\n    runs = [run for case in cases for run in case[\"runs\"]]\n    assert all(run[\"cause\"] in CAUSES for run in runs if not run[\"pass\"]), \"label every failure\"\n    per_round = [statistics.mean(case[\"runs\"][i][\"pass\"] for case in cases) for i in range(3)]\n    summary = {\n        \"pass_rate\": statistics.mean(per_round),\n        \"pass_rate_spread\": max(per_round) - min(per_round),  # small suites swing a lot; always show it\n        \"cost_per_case_usd\": sum(run[\"cost_usd\"] for run in runs) / len(runs),\n        \"median_turns\": statistics.median(run[\"turns\"] for run in runs),\n    }\n    key = f\"{suite}/{version}/{setup['split']}/{started_at}.json\"\n    body = {\"suite\": suite, \"version\": version, \"setup\": setup, \"summary\": summary, \"cases\": cases}\n    boto3.client(\"s3\").put_object(Bucket=BUCKET, Key=key, Body=json.dumps(body).encode())\n    return key  # the nightly job turns new keys into ai_agents_eval_<summary field> series"
+  }
+ },
+ {
+  "key": "G1-09",
+  "title": "[Platform] Grafana: agent operations dashboard",
+  "team": [
+   "plat",
+   "devops"
+  ],
+  "days": 1,
+  "w": [
+   5,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G1-02",
+   "G1-05"
+  ],
+  "needs": "G0 gateway metrics",
+  "what": "A Grafana dashboard for running agents: cost and tokens per agent, cache-read share, API errors and rejected tool calls.",
+  "why": "This is the screen we open when something feels off, and in the weekly run review. It shows agents, never people.",
+  "how": [
+   "Add modules/grafana/dashboards/AI-Agents/ai-agents-operations.json in infrastructure. The sidecar loads every JSON file there, and the folder name becomes the Grafana folder.",
+   "Cost and tokens come from the gateway series. People's Claude Code series are not on this dashboard.",
+   "Errors and rejected tools come from Claude Code events in VictoriaLogs (api_error, tool_decision with decision reject), per agent.",
+   "Cache-read share under 70% turns red: something is breaking the prompt cache (a model switch, a changing tool list, a timestamp in the prompt).",
+   "Check the exact series and field names in vmui and VictoriaLogs first; Prometheus naming adds unit and _total suffixes."
+  ],
+  "code": {
+   "file": "infrastructure/modules/grafana/dashboards/AI-Agents/ai-agents-operations.json",
+   "lang": "json",
+   "text": "{\n  \"title\": \"AI agents: operations\",\n  \"uid\": \"ai-agents-ops\",\n  \"tags\": [\"ai-agents\"],\n  \"time\": { \"from\": \"now-7d\", \"to\": \"now\" },\n  \"templating\": { \"list\": [ {\n    \"name\": \"agent\", \"type\": \"query\", \"multi\": true, \"includeAll\": true,\n    \"datasource\": { \"type\": \"victoriametrics-metrics-datasource\" },\n    \"query\": \"label_values(ai_agents_llm_cost_usd_total, agent)\" } ] },\n  \"panels\": [\n    { \"title\": \"Cost per agent, USD per day\", \"type\": \"timeseries\", \"gridPos\": { \"x\": 0, \"y\": 0, \"w\": 12, \"h\": 8 },\n      \"targets\": [ { \"expr\": \"sum by (agent) (increase(ai_agents_llm_cost_usd_total{agent=~\\\"$agent\\\"}[1d]))\" } ] },\n    { \"title\": \"Tokens by type\", \"type\": \"timeseries\", \"gridPos\": { \"x\": 12, \"y\": 0, \"w\": 12, \"h\": 8 },\n      \"targets\": [ { \"expr\": \"sum by (type) (increase(ai_agents_llm_tokens_total{agent=~\\\"$agent\\\"}[1h]))\" } ] },\n    { \"title\": \"Cache-read share (healthy at 80% or more)\", \"type\": \"stat\", \"gridPos\": { \"x\": 0, \"y\": 8, \"w\": 6, \"h\": 6 },\n      \"fieldConfig\": { \"defaults\": { \"unit\": \"percentunit\", \"thresholds\": { \"mode\": \"absolute\", \"steps\": [\n        { \"color\": \"red\", \"value\": null }, { \"color\": \"yellow\", \"value\": 0.7 }, { \"color\": \"green\", \"value\": 0.8 } ] } } },\n      \"targets\": [ { \"expr\": \"sum(rate(ai_agents_llm_tokens_total{type=\\\"cache_read\\\",agent=~\\\"$agent\\\"}[6h])) / sum(rate(ai_agents_llm_tokens_total{type=~\\\"input|cache_read|cache_write\\\",agent=~\\\"$agent\\\"}[6h]))\" } ] },\n    { \"title\": \"API errors\", \"type\": \"timeseries\", \"gridPos\": { \"x\": 6, \"y\": 8, \"w\": 9, \"h\": 6 },\n      \"datasource\": { \"type\": \"victoriametrics-logs-datasource\" },\n      \"targets\": [ { \"expr\": \"event.name:api_error agent:~\\\"$agent\\\" | stats by (agent, status_code) count()\" } ] },\n    { \"title\": \"Rejected tool calls\", \"type\": \"timeseries\", \"gridPos\": { \"x\": 15, \"y\": 8, \"w\": 9, \"h\": 6 },\n      \"datasource\": { \"type\": \"victoriametrics-logs-datasource\" },\n      \"targets\": [ { \"expr\": \"event.name:tool_decision decision:reject agent:~\\\"$agent\\\" | stats by (agent, tool_name) count()\" } ] }\n  ]\n}"
+  }
+ },
+ {
+  "key": "G1-10",
+  "title": "[Platform] Grafana spend view and a burn-rate alert for Sean and Nir",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G1-07",
+   "G1-09"
+  ],
+  "needs": "G0 spend-limits.yaml for the monthly budget",
+  "what": "A spend dashboard with team totals, spend per agent, cost per ticket and per merged PR, and cache-read share, plus a daily check that alerts Sean and Nir when the month runs more than 25% ahead of budget.",
+  "why": "We control tokens with visibility first. The forecast catches a bad month while there is time to act, and it never stops anything.",
+  "how": [
+   "Add AI-Agents/ai-spend.json: people's spend by team (claude_code_cost_usage_USD_total by team), agent spend by agent (gateway), cost per ticket (gateway series by jira), and cost per merged agent PR (merged PR keys from G1-07).",
+   "No panel has a person dimension. Each person sees their own spend in /usage and the status line only.",
+   "The nightly job writes ai_spend_mtd_usd and ai_spend_budget_usd (from spend-limits.yaml) per scope: people, and each agent.",
+   "Add the rules in the sketch and route them to #ai-agents-alerts, mentioning Sean and Nir, with what drives the spend (the top 3 teams or agents by week-over-week growth)."
+  ],
+  "code": {
+   "file": "infrastructure/multi_tenant/accounts/infrastructure/victoria-metrics/alerting/templates/alert_rules/ai-spend.yml",
+   "lang": "yaml",
+   "text": "# infrastructure/multi_tenant/accounts/infrastructure/victoria-metrics/alerting/templates/alert_rules/ai-spend.yml\n---\n\n- name: ai-spend\n  interval: 1h\n  rules:\n    - alert: AISpendAheadOfBudget\n      # Month-to-date spend more than 25% ahead of a straight line to the monthly budget.\n      expr: |-\n        sum by (scope) (ai_spend_mtd_usd)\n          > 1.25 * sum by (scope) (ai_spend_budget_usd) * day_of_month() / days_in_month()\n      for: 6h\n      labels:\n        severity: warning\n        cloud.account.name: inf\n        service.name: ai-agents\n        service.component: spend\n      annotations:\n        summary: \"[AI spend «{{ $labels.scope }}»] month-to-date is more than 25% ahead of budget\"\n        description: \"An alert, never a stop. The AI spend dashboard shows which teams or agents drive it.\"\n        external_link: \"https://grafana.example.com/d/ai-spend\"\n    - alert: AICacheReadShareLow\n      expr: |-\n        sum by (agent) (rate(ai_agents_llm_tokens_total{type=\"cache_read\"}[6h]))\n          / sum by (agent) (rate(ai_agents_llm_tokens_total{type=~\"input|cache_read|cache_write\"}[6h])) < 0.70\n      for: 2h\n      labels:\n        severity: warning\n        cloud.account.name: inf\n        service.name: ai-agents\n        service.component: spend\n      annotations:\n        summary: \"[AI agent «{{ $labels.agent }}»] reads under 70% of its input from the prompt cache\""
+  }
+ },
+ {
+  "key": "G1-11",
+  "title": "[Platform] Grafana: eval scoreboard for the five suites",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G1-08"
+  ],
+  "needs": "G2 BYTE-GOLD and G4 TICKET-BENCH write the first results",
+  "what": "One dashboard with a row per eval suite: pass rate with its spread, cost per case and median turns, per version, model and effort.",
+  "why": "Every rule, prompt and model change has to hold up in the evals. This makes the comparison one glance instead of a spreadsheet.",
+  "how": [
+   "Add AI-Agents/ai-evals.json with suite, split and model variables.",
+   "Show pass rate as a line with its low edge (pass rate minus spread); a change only counts when it moves past that.",
+   "Next to each pass rate show cost per case and median turns, so a right answer reached the long way still shows.",
+   "Link each point to its S3 JSON key with a data link, for the cause labels."
+  ],
+  "code": {
+   "file": "infrastructure/modules/grafana/dashboards/AI-Agents/ai-evals.json",
+   "lang": "json",
+   "text": "{\n  \"title\": \"AI agents: eval scoreboard\",\n  \"uid\": \"ai-evals\",\n  \"tags\": [\"ai-agents\", \"evals\"],\n  \"templating\": { \"list\": [\n    { \"name\": \"suite\", \"type\": \"query\", \"multi\": true, \"includeAll\": true,\n      \"datasource\": { \"type\": \"victoriametrics-metrics-datasource\" },\n      \"query\": \"label_values(ai_agents_eval_pass_rate, suite)\" },\n    { \"name\": \"split\", \"type\": \"custom\", \"query\": \"dev,holdout,smoke,full\",\n      \"current\": { \"text\": \"dev\", \"value\": \"dev\" } } ] },\n  \"panels\": [\n    { \"title\": \"$suite: pass rate (band = spread of 3 runs)\", \"type\": \"timeseries\", \"repeat\": \"suite\",\n      \"gridPos\": { \"x\": 0, \"y\": 0, \"w\": 12, \"h\": 8 },\n      \"fieldConfig\": { \"defaults\": { \"unit\": \"percentunit\", \"min\": 0, \"max\": 1 } },\n      \"targets\": [\n        { \"refId\": \"A\", \"legendFormat\": \"{{version}} {{model}} {{effort}}\",\n          \"expr\": \"max by (version, model, effort) (ai_agents_eval_pass_rate{suite=\\\"$suite\\\", split=\\\"$split\\\"})\" },\n        { \"refId\": \"B\", \"legendFormat\": \"{{version}} low edge\",\n          \"expr\": \"max by (version, model, effort) (ai_agents_eval_pass_rate{suite=\\\"$suite\\\", split=\\\"$split\\\"} - ai_agents_eval_pass_rate_spread{suite=\\\"$suite\\\", split=\\\"$split\\\"})\" } ] },\n    { \"title\": \"$suite: cost per case and median turns\", \"type\": \"table\", \"repeat\": \"suite\",\n      \"gridPos\": { \"x\": 12, \"y\": 0, \"w\": 12, \"h\": 8 },\n      \"targets\": [\n        { \"refId\": \"C\", \"format\": \"table\", \"instant\": true,\n          \"expr\": \"max by (version, model, effort) (ai_agents_eval_cost_per_case_usd{suite=\\\"$suite\\\", split=\\\"$split\\\"})\" },\n        { \"refId\": \"D\", \"format\": \"table\", \"instant\": true,\n          \"expr\": \"max by (version, model, effort) (ai_agents_eval_median_turns{suite=\\\"$suite\\\", split=\\\"$split\\\"})\" } ] }\n  ]\n}"
+  }
+ },
+ {
+  "key": "G1-12",
+  "title": "[Platform] Grafana: delivery impact dashboard, team level only",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G1-07"
+  ],
+  "needs": "",
+  "what": "A team-level dashboard of the delivery metrics against the September baseline, with throughput always next to change failure.",
+  "why": "This answers 'is it helping?'. Throughput alone rewards the wrong thing, so it never appears without change failure beside it.",
+  "how": [
+   "Add AI-Agents/delivery-impact.json with a team variable; no person variable exists anywhere.",
+   "Rows: review wait (p50, p85), lead time for agent vs. human PRs, merged PRs next to change failure, red-main hours, then the agent rows (merge rate, human rework, CI auto-fix success).",
+   "Draw the baseline (the 12 weeks before October) as a reference line on each panel.",
+   "Show counts next to medians and a note that weekly numbers are noisy at our size; default the range to 12 weeks.",
+   "Walk Nir through it before it's shared."
+  ],
+  "code": {
+   "file": "infrastructure/modules/grafana/dashboards/AI-Agents/delivery-impact.json",
+   "lang": "json",
+   "text": "{\n  \"title\": \"Delivery impact (team level)\",\n  \"uid\": \"delivery-impact\",\n  \"tags\": [\"ai-agents\", \"delivery\"],\n  \"time\": { \"from\": \"now-12w\", \"to\": \"now\" },\n  \"templating\": { \"list\": [ {\n    \"name\": \"team\", \"type\": \"query\", \"multi\": true, \"includeAll\": true,\n    \"datasource\": { \"type\": \"victoriametrics-metrics-datasource\" },\n    \"query\": \"label_values(delivery_review_wait_hours, team)\" } ] },\n  \"panels\": [\n    { \"title\": \"Review wait, hours (p50 and p85)\", \"type\": \"timeseries\", \"gridPos\": { \"x\": 0, \"y\": 0, \"w\": 12, \"h\": 8 },\n      \"targets\": [\n        { \"refId\": \"A\", \"legendFormat\": \"{{team}} {{q}}\", \"expr\": \"max by (team, q) (delivery_review_wait_hours{team=~\\\"$team\\\"})\" },\n        { \"refId\": \"B\", \"legendFormat\": \"baseline {{q}}\", \"expr\": \"max by (q) (delivery_baseline_review_wait_hours)\" } ] },\n    { \"title\": \"Merged PRs next to change failure\", \"type\": \"timeseries\", \"gridPos\": { \"x\": 12, \"y\": 0, \"w\": 12, \"h\": 8 },\n      \"targets\": [\n        { \"refId\": \"A\", \"legendFormat\": \"merged PRs\", \"expr\": \"sum(delivery_merged_prs{team=~\\\"$team\\\"})\" },\n        { \"refId\": \"B\", \"legendFormat\": \"change failure %\",\n          \"expr\": \"100 * sum(delivery_failed_changes{team=~\\\"$team\\\"}) / sum(delivery_merged_prs{team=~\\\"$team\\\"})\" } ],\n      \"fieldConfig\": { \"defaults\": {}, \"overrides\": [ { \"matcher\": { \"id\": \"byName\", \"options\": \"change failure %\" },\n        \"properties\": [ { \"id\": \"custom.axisPlacement\", \"value\": \"right\" }, { \"id\": \"unit\", \"value\": \"percent\" } ] } ] } },\n    { \"title\": \"Lead time, hours: agent vs. human PRs\", \"type\": \"timeseries\", \"gridPos\": { \"x\": 0, \"y\": 8, \"w\": 12, \"h\": 8 },\n      \"targets\": [ { \"refId\": \"A\", \"legendFormat\": \"{{cohort}}\",\n        \"expr\": \"max by (cohort) (delivery_lead_time_hours{q=\\\"p50\\\", team=~\\\"$team\\\"})\" } ] },\n    { \"title\": \"Hours main stayed red, per week\", \"type\": \"barchart\", \"gridPos\": { \"x\": 12, \"y\": 8, \"w\": 12, \"h\": 8 },\n      \"targets\": [ { \"refId\": \"A\", \"expr\": \"sum(delivery_red_main_hours)\" } ] }\n  ]\n}"
+  }
+ },
+ {
+  "key": "G1-13",
+  "title": "[Platform] DX's three lenses side by side: utilization, impact, cost",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G1-07",
+   "G1-10",
+   "G1-12"
+  ],
+  "needs": "G4 plan step records the human-equivalent hours",
+  "what": "Compute and show DX's three lenses side by side, team level only: utilization (weekly AI users, share of PRs with AI help, tasks given to agents), impact (merged PRs next to change failure, human-equivalent hours of agent work) and cost (AI spend total and per engineer, agent cost per human-equivalent hour).",
+  "why": "Any one lens alone misleads: usage can rise while impact falls, and impact can rise at a cost we don't want. DX's framework reads them together.",
+  "how": [
+   "Add `src/lenses.ts` (sketch) to the nightly job and write delivery_lens_* series per team and week.",
+   "Weekly AI users: distinct user.hash in Claude Code metrics. Share of PRs with AI help: Co-Authored-By: Claude trailers or 'Generated with Claude Code' in the body. Tasks given to agents: Jira tickets assigned to Nova plus routine runs.",
+   "Human-equivalent hours: decide with Nir. Proposal: Nova's plan states how long an engineer would need, and the plan approver confirms or corrects it.",
+   "The plan writes the agent hourly rate as 'hours ÷ cost'; as a rate it is cost ÷ hours. Show dollars per human-equivalent hour and confirm the wording with Nir.",
+   "Add a 'Three lenses' row at the top of delivery-impact.json, the three side by side over the same weeks."
+  ],
+  "code": {
+   "file": "ai-agents/metrics/src/lenses.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/metrics/src/lenses.ts\n// DX's three lenses for one team and week, side by side. Never a per-person number.\n// Keys stay snake_case: each one becomes a delivery_lens_<key> series.\nimport type { AgentRun, Gateway, Jira, Otel, PullRequest, Week } from \"./types.js\";\n\nexport const share = <T>(items: T[], predicate: (item: T) => boolean): number =>\n  items.length ? items.filter(predicate).length / items.length : 0;\n\nexport const utilization = async (week: Week, otel: Otel, prs: PullRequest[], jira: Jira) => ({\n  weekly_ai_users: await otel.distinct(\"user_hash\", week), // salted hash from the collector; no emails\n  pr_ai_share: share(prs, (pr) => pr.aiTrailer), // Co-Authored-By: Claude / \"Generated with Claude Code\"\n  tasks_to_agents: (await jira.count('assignee = \"Nova\"', week)) + (await jira.routineRuns(week)),\n});\n\nexport const impact = (_week: Week, prs: PullRequest[], failed: Set<number>, agentRuns: AgentRun[]) => {\n  const merged = prs.filter((pr) => pr.mergedAt);\n  return {\n    merged_prs: merged.length, // always shown next to change failure, never alone\n    change_fail_pct: 100 * share(merged, (pr) => failed.has(pr.number)),\n    // decide (Nir): proposal = the hours an engineer would need, stated in Nova's approved plan\n    human_equivalent_hours: agentRuns.filter((run) => run.merged).reduce((sum, run) => sum + run.humanHours, 0),\n  };\n};\n\nexport const cost = async (week: Week, gateway: Gateway, otel: Otel, engineers: number, humanHours: number) => {\n  const agentsUsd = await gateway.totalUsd(week); // ai_agents_llm_cost_usd_total\n  const peopleUsd = await otel.costUsd(week); // claude_code_cost_usage_USD_total\n  return {\n    ai_spend_usd: agentsUsd + peopleUsd,\n    ai_spend_per_engineer_usd: (agentsUsd + peopleUsd) / Math.max(engineers, 1), // a team average\n    // The plan writes \"hours / cost\"; as a rate it is cost per hour. Confirm the wording with Nir.\n    agent_usd_per_human_hour: humanHours ? agentsUsd / humanHours : null,\n  };\n};"
+  }
+ },
+ {
+  "key": "G1-14",
+  "title": "[Platform] Step tracing: tag every run by step and harness version",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G1-05"
+  ],
+  "needs": "G3 harness (nova-worker) and G3 workflows; G0 gateway reads the step header",
+  "what": "Every OTel signal, gateway call and Temporal activity of a run carries the same tags: agent, Jira key, run, one of the nine steps, and the harness version.",
+  "why": "When a run goes wrong we need to see which step spent the tokens and which step should have caught the problem. That needs every signal tagged the same way.",
+  "how": [
+   "Add `ai-agents/harness/src/telemetry.ts` (sketch): one env per Agent SDK session, passed as `options.env` to `query()` on top of `process.env` (the option replaces the environment, so spread it). Each step is its own session, so the resource attributes stay right.",
+   "The gateway already reads x-ai-agents-step; check its token and cost series carry the step label.",
+   "Set Temporal search attributes Step and HarnessVersion (`upsertSearchAttributes` with typed keys from `defineSearchAttributeKey`), so the Temporal UI filters the same way.",
+   "harness.version comes from harness/package.json's version and changes on every harness release, so evals and live runs can be split by it.",
+   "Check one dogfood run end to end: cost by step in Grafana adds up to the run's gateway total."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/telemetry.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/telemetry.ts  (the harness itself is G3's)\nimport { readFileSync } from \"node:fs\";\n\n// harness/package.json is one level above both src/ and dist/; its version changes on every harness release\nconst pkg = JSON.parse(readFileSync(new URL(\"../package.json\", import.meta.url), \"utf8\")) as { version: string };\nexport const HARNESS_VERSION = pkg.version;\nexport const STEPS = [\"ticket\", \"plan\", \"plan_ok\", \"vm\", \"build\", \"pr\", \"byte\", \"approve\", \"learn\"] as const;\nexport type Step = (typeof STEPS)[number];\nexport interface RunTags { agent: string; jira: string; id: string }\n\n/** Env for one Agent SDK session. Its OTel data and its gateway calls carry the same tags. */\nexport function stepEnv(run: RunTags, step: Step): Record<string, string> {\n  if (!STEPS.includes(step)) throw new Error(`unknown step ${step}`);\n  const tags = { agent: run.agent, jira: run.jira, run: run.id, step, \"harness.version\": HARNESS_VERSION };\n  return {\n    OTEL_RESOURCE_ATTRIBUTES: Object.entries(tags).map(([k, v]) => `${k}=${v}`).join(\",\"),\n    // agent, jira and run reach the gateway inside the run token; step and version ride on headers\n    ANTHROPIC_CUSTOM_HEADERS: `x-ai-agents-step: ${step}\\nx-ai-agents-harness: ${HARNESS_VERSION}`,\n  };\n}\n\n// In a step (no maxTurns, no maxBudgetUsd, no taskBudget: the far-away backstop acts between turns, in the harness).\n// options.env replaces the session's whole environment, so spread process.env (gateway URL and run token) first:\n//   const options: Options = { model: route.model, effort: route.effort, env: { ...process.env, ...stepEnv(run, \"build\") } };\n//   for await (const message of query({ prompt: task, options })) { ... }\n// The Temporal workflow also sets search attributes Step and HarnessVersion for the same run\n// (upsertSearchAttributes with typed keys from defineSearchAttributeKey)."
+  }
+ },
+ {
+  "key": "G1-15",
+  "title": "[Platform] Label failed runs with the step that should have caught them",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G1-08",
+   "G1-14"
+  ],
+  "needs": "",
+  "what": "A small command for the weekly run review that labels each failed or rejected run with where it failed, the step that should have caught it, and a cause.",
+  "why": "A problem seen twice should become a check, a lint rule or a skill line. That only happens if failures are labelled the same way every week.",
+  "how": [
+   "Add `ai-agents/harness/src/label-run.ts` (sketch), run from an ai-agents checkout as `npx tsx harness/src/label-run.ts <run-id> --failed-at … --should-have-caught … --cause …`. It writes runs/<run>/label.json to the eval results bucket.",
+   "Steps are the nine from the quality table; causes are the five eval cause labels plus 'model' and 'unknown'.",
+   "The nightly job counts labels into ai_agents_run_failures_total{failed_at, should_have_caught, cause}; add a panel to the operations dashboard.",
+   "Use it in the weekly 30-minute run review of 5 traces (2 at random, the 3 worst). A label seen twice in a month gets a ticket."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/label-run.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/label-run.ts  (npx tsx harness/src/label-run.ts <run-id> --failed-at ... --cause ...)\n// Weekly run review: label a failed run with where it failed and which step should have caught it.\nimport { parseArgs } from \"node:util\";\nimport { PutObjectCommand, S3Client } from \"@aws-sdk/client-s3\";\nimport { STEPS } from \"./telemetry.js\";\n\nconst CAUSES = [\"too_many_tools\", \"bad_handoff\", \"contradicting_prompt\", \"missing_context\",\n  \"flaky_environment\", \"model\", \"unknown\"] as const;\n\nconst { values: a, positionals: [runId] } = parseArgs({\n  allowPositionals: true,\n  options: {\n    \"failed-at\": { type: \"string\" },\n    \"should-have-caught\": { type: \"string\" },\n    cause: { type: \"string\" },\n    note: { type: \"string\", default: \"\" }, // one line; no PHI, no secrets, no customer names\n  },\n});\nconst oneOf = (flag: string, value: string | undefined, allowed: readonly string[]): string => {\n  if (!value || !allowed.includes(value)) throw new Error(`--${flag} must be one of: ${allowed.join(\", \")}`);\n  return value;\n};\nif (!runId) throw new Error(\"usage: label-run <run-id> --failed-at <step> --should-have-caught <step> --cause <cause>\");\n\nconst label = { // the JSON keys are what the nightly job and the dashboards read\n  run: runId, failed_at: oneOf(\"failed-at\", a[\"failed-at\"], STEPS),\n  should_have_caught: oneOf(\"should-have-caught\", a[\"should-have-caught\"], STEPS),\n  cause: oneOf(\"cause\", a.cause, CAUSES), note: a.note, labelled_at: new Date().toISOString(),\n};\nawait new S3Client({}).send(new PutObjectCommand({\n  Bucket: \"rhino-ai-agents-eval-results\", Key: `runs/${runId}/label.json`,\n  Body: JSON.stringify(label), ContentType: \"application/json\",\n}));\nconsole.log(`${runId}: failed at ${label.failed_at}, should have been caught at ${label.should_have_caught}`);"
+  }
+ },
+ {
+  "key": "G1-16",
+  "title": "[Platform] Nightly quality numbers for each step of a Nova run",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   9,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G1-07",
+   "G1-12",
+   "G1-14"
+  ],
+  "needs": "G4 readiness check, plan step and self-review receipt; G2 Byte findings",
+  "what": "Add the step-quality numbers to the nightly job: ready on first try, plan adherence, first-pass green, caught before the PR, and approvals faster than 60 seconds flagged.",
+  "why": "Each step has one gate and one number. These show which gate is weak before the end result does.",
+  "how": [
+   "Read run records from Temporal and the run JSON in S3; read Byte's findings from G2's live metrics.",
+   "Write per agent and week: delivery_ready_first_try_ratio, delivery_plan_unplanned_files, delivery_plan_items_not_done, delivery_first_pass_green_ratio, delivery_caught_before_pr_ratio.",
+   "Fast approvals are a list, not a score: post the run links of plan or PR approvals under 60 s to the weekly review thread. They flag the run, never rank a person.",
+   "Add a 'Quality at every step' row to the delivery-impact dashboard."
+  ],
+  "code": {
+   "file": "ai-agents/metrics/src/quality.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/metrics/src/quality.ts\n// Step-quality numbers per agent and week, from run records. A gate's number, not a person's.\nimport type { Approval, ByteFinding, CheckRun, RunRecord } from \"./types.js\";\n\n/** Tickets that passed the readiness check without being sent back / tickets assigned to Nova. */\nexport function readyOnFirstTry(runs: RunRecord[]): number | null {\n  const assigned = runs.filter((r) => r.agent === \"nova\");\n  return assigned.length ? assigned.filter((r) => r.readiness.sent_back === 0).length / assigned.length : null;\n}\n\nexport function planAdherence(run: RunRecord, changedFiles: string[]) {\n  const planned = new Set(run.plan.files);\n  return {\n    unplanned_files: new Set(changedFiles.filter((f) => !planned.has(f))).size,\n    items_not_done: run.plan.items.filter((item) => !item.done).length,\n  };\n}\n\n/** The required checks on the PR's first pushed commit were all green. */\nexport function firstPassGreen(checkRuns: CheckRun[], required: Set<string>): boolean {\n  const first = checkRuns.reduce((a, b) => (b.started_at < a.started_at ? b : a)); // ISO strings compare by time\n  return checkRuns.filter((c) => c.head_sha === first.head_sha && required.has(c.name)).every((c) => c.conclusion === \"success\");\n}\n\nexport function caughtBeforePr(run: RunRecord, byteFindings: ByteFinding[]): number | null {\n  const fixed = run.self_review.important_fixed; // from the self-review receipt in the PR\n  const left = byteFindings.filter((f) => (f.severity === \"HIGH\" || f.severity === \"MED\") && f.new).length;\n  return fixed + left ? fixed / (fixed + left) : null;\n}\n\n/** Plan or PR approvals given under 60 s after the request: run links for the weekly review. */\nexport function fastApprovals(approvals: Approval[], seconds = 60): string[] {\n  return approvals.filter((a) => Date.parse(a.approved_at) - Date.parse(a.requested_at) < seconds * 1000).map((a) => a.run_url);\n}"
+  }
+ },
+ {
+  "key": "G1-17",
+  "title": "[Platform] Effort sweep: confirm the routing table on our code",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   9,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G1-08",
+   "G1-11"
+  ],
+  "needs": "G2 BYTE-GOLD dev split, G4 TICKET-BENCH smoke, G3 routing table in the harness",
+  "what": "Before real pilot tickets, run a small effort sweep on TICKET-BENCH and BYTE-GOLD that tries each routing table row one level up and one level down.",
+  "why": "Most routing numbers are Anthropic's, not ours. A row that loses quality on our code goes one level up, and a cheaper setting stays only while its slice holds.",
+  "how": [
+   "Write the sweep file (sketch) and run it on wide sandbox VMs; results land in the eval store.",
+   "Each setting runs 3 times. A cheaper setting passes when its pass rate is within the current setting's spread.",
+   "Effort changes per message, not per session, so the prompt cache stays warm.",
+   "Update the harness routing table in one PR that links the scoreboard; a person approves it."
+  ],
+  "code": {
+   "file": "ai-agents/evals/sweeps/2026-w9-effort.yaml",
+   "lang": "yaml",
+   "text": "# ai-agents/evals/sweeps/2026-w9-effort.yaml\n# Confirms the routing table on our code before real pilot tickets. Results go to the eval store.\nvm_size: wide\nrepeats: 3                          # report the spread, never a single run\nsuites:\n  ticket-bench: { split: smoke }    # 15 tasks (G4)\n  byte-gold:    { split: dev }      # never the holdout (G2)\nrows:                               # the table's current setting first, then one level each side\n  - job: build_typical\n    suite: ticket-bench\n    settings: [opus-5-5/medium, opus-5-5/low, opus-5-5/high]\n  - job: build_hard\n    suite: ticket-bench\n    settings: [opus-5-5/high, opus-5-5/medium, opus-5-5/xhigh]\n  - job: review_logic_security\n    suite: byte-gold\n    settings: [opus-5-5/medium, opus-5-5/low, opus-5-5/high]\n  - job: review_conventions\n    suite: byte-gold\n    settings: [sonnet-5-5/low, sonnet-5-5/medium, opus-5-5/low]\neffort_changes: per message         # keeps the prompt cache warm\ndecision:\n  keep_cheaper_if: its pass_rate >= current pass_rate - current spread\n  if_a_row_loses_quality: move that row one level up\n  apply_as: one harness PR that links the scoreboard; a person approves it"
+  }
+ },
+ {
+  "key": "G1-18",
+  "title": "[Shai] Repeat the developer survey in December and compare",
+  "team": [
+   "shai",
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   12,
+   12
+  ],
+  "flag": null,
+  "deps": [
+   "G1-01"
+  ],
+  "needs": "",
+  "what": "Send the same 10 questions in December and compare with October, team level, with ranges.",
+  "why": "The December survey says whether people's time and confidence moved, next to what the metrics say.",
+  "how": [
+   "Rebuild the form from the unchanged questions.yaml and send it by 10 Dec with the same wording.",
+   "From an ai-agents checkout (after `npm ci`), run `npx tsx metrics/src/survey-compare.ts october.csv december.csv` (sketch) on the two CSV exports. Teams under 5 answers fold into 'Other'.",
+   "Put it next to the delivery-impact numbers in the quarter report: both directions, with ranges, no per-person view."
+  ],
+  "code": {
+   "file": "ai-agents/metrics/src/survey-compare.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/metrics/src/survey-compare.ts  (npx tsx metrics/src/survey-compare.ts october.csv december.csv)\n// October vs. December survey, team level only. Groups under 5 answers fold into 'Other'.\nimport { readFileSync } from \"node:fs\";\nimport { parse } from \"csv-parse/sync\"; // Google Forms answers can hold commas and quotes\nimport { median, quantile } from \"./stats.js\"; // quantile uses the same method as Python's statistics.quantiles\n\nconst MIN_GROUP = 5;\nconst HOURS: Record<string, number> = { \"0\": 0, \"under 1 h\": 0.5, \"1-3 h\": 2, \"3-6 h\": 4.5, \"more than 6 h\": 7 };\nconst QUESTIONS = [\"time_saved\", \"lost_builds\", \"lost_review\", \"lost_setup\", \"lost_finding\", \"confident_change\", \"confident_ci\"];\ntype Row = Record<string, string | undefined>;\n\nfunction load(path: string): Map<string, Row[]> {\n  const groups = new Map<string, Row[]>();\n  for (const row of parse<Row>(readFileSync(path, \"utf8\"), { columns: true })) {\n    const team = row.team ?? \"Other\";\n    groups.set(team, [...(groups.get(team) ?? []), row]);\n  }\n  const keep = new Map([...groups].filter(([team, rows]) => rows.length >= MIN_GROUP && team !== \"Other\"));\n  keep.set(\"Other\", [...groups].filter(([team]) => !keep.has(team)).flatMap(([, rows]) => rows));\n  return keep;\n}\n\nfunction summary(rows: Row[], question: string): string {\n  const values = rows.flatMap((r) => { const a = r[question]; return a ? [HOURS[a] ?? Number(a[0])] : []; }); // agree: its digit\n  if (values.length < MIN_GROUP) return \"too few answers\";\n  const [mid, q1, q3] = [median(values), quantile(values, 0.25), quantile(values, 0.75)];\n  return `median ${mid.toFixed(1)} (IQR ${q1.toFixed(1)}-${q3.toFixed(1)}, n=${values.length})`;\n}\nconst [october, december] = [load(process.argv[2] ?? \"\"), load(process.argv[3] ?? \"\")];\nfor (const question of QUESTIONS) {\n  for (const team of [...october.keys()].filter((t) => december.has(t)).sort()) {\n    const oct = summary(october.get(team) ?? [], question), dec = summary(december.get(team) ?? [], question);\n    console.log(`${question.padEnd(17)} ${team.padEnd(12)} Oct ${oct.padEnd(34)} Dec ${dec}`);\n  }\n}"
+  }
+ },
+ {
+  "key": "G1-19",
+  "title": "[Platform] New-model check: rerun suites with and without each harness part",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   12,
+   12
+  ],
+  "flag": null,
+  "deps": [
+   "G1-17"
+  ],
+  "needs": "G3 harness flags that switch parts off",
+  "what": "A repeatable check for every new model: run each suite on the new model with and without each harness part, and move a setting only if its slice holds.",
+  "why": "Anthropic dropped a whole harness step when a newer model no longer needed it. Parts that stopped helping cost tokens and slow runs.",
+  "how": [
+   "Add `ai-agents/evals/sweeps/new-model.yaml` (sketch) listing the harness parts that can be switched off.",
+   "Run it once in W12 on the current model as the reference, so the next model release has a baseline.",
+   "A part goes only when removing it keeps the pass rate within the spread and lowers cost or time; that change goes into the monthly rule-diet PR."
+  ],
+  "code": {
+   "file": "ai-agents/evals/sweeps/new-model.yaml",
+   "lang": "yaml",
+   "text": "# ai-agents/evals/sweeps/new-model.yaml\n# Run when a new model ships, and once in W12 on today's model as the reference.\nmodel_under_test: claude-opus-5-5         # replace with the new model's ID\nreference: { model: claude-opus-5-5, harness: current }\nrepeats: 3\nsuites: [ticket-bench/smoke, byte-gold/dev, routine-bench/weekly, skill-evals/nightly, brain-qa/nightly]\nharness_parts:                            # each one is switched off alone; all others stay on\n  - self_review_subagent\n  - qa_agent\n  - scope_judge\n  - progress_watcher_nudges\n  - plan_grill\n  - kb_skill\nruns:\n  - { name: full, model: \"{model_under_test}\", parts_off: [] }\n  - { name: without-each-part, model: \"{model_under_test}\", parts_off: each }\ndecision:\n  move_model_if: every suite's pass_rate >= reference pass_rate - spread, and cost per case doesn't rise\n  drop_part_if: pass_rate stays within the spread without it, and cost or time falls\n  apply_as: the monthly rule-diet PR; a person approves it"
+  }
+ }
+]
