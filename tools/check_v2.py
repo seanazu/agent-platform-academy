@@ -155,9 +155,12 @@ def check(lid):
             lines = code['text'].count('\n') + 1
             if lines > 30:
                 warns.append(f'code in "{code_owner["h"]}" is {lines} lines')
+            text_lines = code['text'].split('\n')
             for note in code.get('notes', []):
                 if not 1 <= note['line'] <= lines:
                     errors.append(f'code note on line {note["line"]} is outside "{code_owner["h"]}" ({lines} lines)')
+                elif not text_lines[note['line'] - 1].strip():
+                    warns.append(f'code note on line {note["line"]} of "{code_owner["h"]}" points at a blank line (probably one line off)')
 
     for where, text in teaching_texts(d):
         for key in sorted(set(TICKET.findall(text))):
