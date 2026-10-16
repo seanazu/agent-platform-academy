@@ -109,6 +109,11 @@ def check(lid):
     if d.get('play'):
         if WIDGETS and d['play']['widget'] not in WIDGETS:
             errors.append(f'play widget "{d["play"]["widget"]}" is not in src/widgets/index.ts ({", ".join(sorted(WIDGETS))})')
+    lab_dir = (ROOT / 'labs' / lid).is_dir()
+    if lab_dir and d['lab'].get('mode') != 'checked':
+        errors.append('labs/<id>/ exists, so the lab mode must be "checked"')
+    if not lab_dir and d['lab'].get('mode') != 'guided':
+        errors.append('no labs/<id>/ folder, so the lab mode must be "guided" (otherwise the page shows ./academy commands that do not exist)')
     if d['lab'].get('mode') == 'guided' and not d['lab'].get('checks'):
         errors.append('a guided lab needs a "checks" list the learner can tick off')
     clips_file = ROOT / 'content/clips' / f'{lid}.json'

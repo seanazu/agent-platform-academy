@@ -1,4 +1,5 @@
 {
+ "v": 2,
  "id": "g3-14",
  "title": "Watcher, ladder, routing and backstop",
  "minutes": 55,
@@ -7,668 +8,310 @@
   "p8-8",
   "g3-11"
  ],
- "bridge": "The progress watcher is like a code reviewer watching your terminal over your shoulder. Except it never says \"you took too long\". It only notices when you repeat yourself. Then it steps in one rung at a time: a hint, a re-plan, more thought, a fresh start, a person.",
- "intro": "We never limit an agent's time, turns or budget. So we need another way to catch an agent going in circles. This lesson builds the watcher that measures real progress and the ladder that steps in. It adds the model routing the ladder climbs, and a far cost backstop that pauses only between turns.",
- "picture": {
-  "caption": "Every tool result feeds the watcher; flat progress climbs the ladder; the backstop checks spend only at step boundaries.",
-  "nodes": [
-   {
-    "id": "model",
-    "label": "Nova's turn: tool calls",
-    "kind": "agent"
-   },
-   {
-    "id": "watcher",
-    "label": "Watcher (PostToolUse hook)",
-    "kind": "check"
-   },
-   {
-    "id": "verdict",
-    "label": "verdict: flatFor, loopKind",
-    "kind": "file"
-   },
-   {
-    "id": "loop",
-    "label": "step loop (between turns)",
-    "kind": "service"
-   },
-   {
-    "id": "gateway",
-    "label": "gateway: run spend",
-    "kind": "service"
-   },
-   {
-    "id": "person",
-    "label": "Requester",
-    "kind": "person"
-   }
+ "map": "vm",
+ "hook": {
+  "story": [
+   "Wednesday, 14:10. Nova is on step 2 of RH-1234, writing the test for the empty card. The test times out. Nova reads the component again and runs the test again: timeout. Again. An hour later it has run the same test forty times, every turn has gone through the gateway and been billed, and nothing has changed. Nobody noticed, because a run in our platform may take as long as it needs: there is no turn limit, no time limit and no budget limit.",
+   "A limit would have stopped this loop. But it would also have stopped the run next to it, which is slow because it is careful: it reads twenty files and runs the whole suite before every change. From the outside, both runs look equally busy."
   ],
-  "steps": [
-   {
-    "from": "model",
-    "to": "watcher",
-    "text": "every tool result becomes a small event"
-   },
-   {
-    "from": "watcher",
-    "to": "verdict",
-    "text": "progress resets flatFor; repeats name a loop"
-   },
-   {
-    "from": "watcher",
-    "to": "model",
-    "text": "rungs 1-2 inside the turn: a nudge, then a re-plan"
-   },
-   {
-    "from": "verdict",
-    "to": "loop",
-    "text": "rungs 3-5 at the step boundary: think harder, fresh start"
-   },
-   {
-    "from": "loop",
-    "to": "gateway",
-    "text": "afterStep reads the run's spend; shadow mode only logs"
-   },
-   {
-    "from": "loop",
-    "to": "person",
-    "text": "rung 5 or a live backstop: ask in the thread, keep the session"
-   }
-  ]
+  "question": "How does the platform tell a run going in circles from a run that is slow but useful, and what does it do about the loop without throwing the work away?"
  },
- "sections": [
+ "read": [
   {
-   "h": "A flaky test and no time limit",
+   "h": "Progress, not activity",
    "p": [
-    "Nova runs npx playwright test login.spec.ts. It times out. Nova runs it again, and again, with the same error. A time limit would kill the run at some hour and throw away the good work before the loop.",
-    "We measure progress, not activity. Real progress is a check that failed and now passes, a plan item done, or a file read for the first time. Activity without progress is a sign of a loop. A loop is a reason to change approach, not to kill the run.",
-    "Four pieces do this. The watcher keeps score. The ladder steps in. The routing table says which model and effort each job gets, and how to think harder. The backstop catches a runaway the watcher missed, far above a normal ticket's cost."
+    "Counting tool calls, turns or minutes measures activity, and both runs in the story are very active. What separates them is progress, so the harness counts that instead. Three things count as real progress: a check that failed before now passes, an item of the plan is marked done, or the agent reads a file it has not read before, which means it learned something new. Running a test again, editing a file or reading the same file again is activity, not progress.",
+    "The progress watcher is a hook in the harness, registered for PostToolUse and PostToolUseFailure, so it sees every tool call and its result, as you saw in the lesson about hooks. It keeps one number, flatFor: how many tool events in a row brought no progress. Any real progress sets it back to 0. The careful run reads new files and turns failing checks green, so its counter keeps falling back to zero; the looping run's counter only goes up. The verdict goes into the run's state and into every heartbeat, so the orchestrator can see it too."
    ],
-   "callout": {
-    "kind": "wall",
-    "text": "No maxTurns, no maxBudgetUsd, no taskBudget, no time limit. Only a person's Stop ends a run that is still working."
-   }
-  },
-  {
-   "h": "The watcher, part 1: every tool result",
-   "p": [
-    "The watcher is a hook (lesson p8-4) registered for PostToolUse and PostToolUseFailure, so it sees every tool result. WatchEvent.of turns the hook's input into a small record. Timestamps and temp paths are stripped, and numbers in errors are masked. So two runs of the same command look the same."
-   ],
-   "because": "We keep a score instead of a clock, because a slow but useful run must never look like a stuck one.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/harness/src/watcher.ts (part 1 of 2)",
-    "text": "import type { HookCallback } from \"@anthropic-ai/claude-agent-sdk/core\";\n\nexport class Watcher {\n  readonly events: WatchEvent[] = []; // the last 200\n  readonly errors = new Map<string, number>();\n  readonly fileHashes = new Map<string, string[]>();\n  readonly failing = new Set<string>();\n  flatFor = 0;\n  onTool: HookCallback = async (input) => { // registered for PostToolUse and PostToolUseFailure\n    const ev = WatchEvent.of(input); // tool, normalized input hash, output hash, error signature, file hash\n    this.events.push(ev);\n    if (this.events.length > 200) this.events.shift();\n    this.flatFor = this.progressed(ev) ? 0 : this.flatFor + 1;\n    state.verdict = { flatFor: this.flatFor, loopKind: this.loopKind(ev), evidence: ev.evidence() }; // G3-36 acts on it\n    return {};\n  };",
+    "file": "ai-agents/harness/src/watcher.ts",
+    "text": "export class Watcher {\n  readonly events: WatchEvent[] = []; // the last 200\n  readonly failing = new Set<string>();\n  readonly seen = new Set<string>();\n  flatFor = 0;\n\n  onTool: HookCallback = async (input) => { // PostToolUse and PostToolUseFailure\n    const ev = WatchEvent.of(input); // tool, normalized input hash, output hash, error signature, file hash\n    this.events.push(ev);\n    if (this.events.length > 200) this.events.shift();\n    this.flatFor = this.progressed(ev) ? 0 : this.flatFor + 1;\n    state.verdict = { flatFor: this.flatFor, loopKind: this.loopKind(ev), evidence: ev.evidence() };\n    return {};\n  };\n\n  progressed(ev: WatchEvent): boolean {\n    const fixed = ev.isCheck && ev.passed && this.failing.has(ev.check); // failed before, passes now\n    if (ev.isCheck) this.failing[ev.passed ? \"delete\" : \"add\"](ev.check);\n    const firstRead = ev.tool === \"Read\" && !this.seen.has(ev.file);\n    if (ev.tool === \"Read\") this.seen.add(ev.file);\n    return fixed || ev.todoCompleted || firstRead;\n  }\n}",
     "notes": [
      {
-      "line": 1,
-      "text": "The bundled harness imports the SDK from /core (lesson g3-1). HookCallback is the type of a hook function."
-     },
-     {
-      "line": 4,
-      "text": "The last 200 events. Old ones fall off."
-     },
-     {
-      "line": 5,
-      "text": "How often each error signature (the first error line, numbers masked) has appeared."
-     },
-     {
-      "line": 6,
-      "text": "The hashes each file had after each edit, to spot undo and redo."
-     },
-     {
-      "line": 7,
-      "text": "Checks that are failing right now, by command."
-     },
-     {
       "line": 8,
-      "text": "flatFor counts tool events since the last real progress."
-     },
-     {
-      "line": 9,
-      "text": "The hook function. The SDK calls it after every tool call, failed or not."
-     },
-     {
-      "line": 10,
-      "text": "One record: tool, input hash, output hash, error signature, and the file hash after an edit."
-     },
-     {
-      "line": 13,
-      "text": "Progress resets the counter to 0; anything else adds 1."
-     },
-     {
-      "line": 14,
-      "text": "The verdict goes into run state and the heartbeat. The ladder reads it."
-     },
-     {
-      "line": 15,
-      "text": "Return nothing for now. The ladder (section 6) makes this return extra context."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The watcher, part 2: progress and loops",
-   "p": [
-    "progressed decides what counts as progress. loopKind names the loop, following the stuck detector in OpenHands, an open-source coding agent. Four kinds: same action and result 3 times, same error 3 times, a file back to an earlier state, and A-B-A-B."
-   ],
-   "because": "We name the kind of loop, because the nudge works better when it tells the model exactly what it keeps doing.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/harness/src/watcher.ts (part 2 of 2)",
-    "text": "  progressed(ev: WatchEvent): boolean {\n    const fixed = ev.isCheck && ev.passed && this.failing.has(ev.check); // a check that failed now passes\n    if (ev.isCheck) this.failing[ev.passed ? \"delete\" : \"add\"](ev.check);\n    return fixed || ev.todoCompleted || ev.firstRead; // or a plan item done, or a new fact\n  }\n\n  loopKind(ev: WatchEvent): string | null {\n    const last = this.events.slice(-6);\n    if (ev.error) this.errors.set(ev.error, (this.errors.get(ev.error) ?? 0) + 1);\n    const undo = this.rememberFile(ev); // true when an edit brings a file back to an earlier state\n    if (last.filter((e) => e.key === ev.key).length >= 3) return \"same command, same result\";\n    if (ev.error && (this.errors.get(ev.error) ?? 0) >= 3) return \"same error again\";\n    if (undo) return \"undo and redo\";\n    const keys = (from: number) => new Set(last.filter((_, i) => i % 2 === from).map((e) => e.key));\n    if (last.length === 6 && keys(0).size === 1 && keys(1).size === 1) return \"ping-pong\";\n    return null;\n  }\n}",
-    "notes": [
-     {
-      "line": 2,
-      "text": "A check command that was failing and now passes. A check that passes the first time is not counted here."
-     },
-     {
-      "line": 3,
-      "text": "Remember the check's state: passing removes it from failing, failing adds it."
-     },
-     {
-      "line": 4,
-      "text": "Or a TodoWrite item turned completed, or a file or symbol read for the first time."
-     },
-     {
-      "line": 8,
-      "text": "Look at the last 6 events."
-     },
-     {
-      "line": 9,
-      "text": "Count this error signature."
-     },
-     {
-      "line": 10,
-      "text": "rememberFile (not shown) stores the file hash and says if it matches an earlier one."
+      "text": "Normalized: timestamps and temp paths are removed and numbers in errors masked, so two runs of the same command look the same."
      },
      {
       "line": 11,
-      "text": "The key is tool + input hash + output hash. Three equal keys: same command, same result."
-     },
-     {
-      "line": 12,
-      "text": "The same error signature three times, even from different commands."
-     },
-     {
-      "line": 13,
-      "text": "An edit brought a file back to an earlier state: undo and redo."
-     },
-     {
-      "line": 14,
-      "text": "keys(0) collects the keys at even positions, keys(1) at odd positions."
-     },
-     {
-      "line": 15,
-      "text": "Six events, one key at even positions and one at odd: A-B-A-B-A-B, ping-pong."
-     },
-     {
-      "line": 16,
-      "text": "No loop seen."
-     }
-    ]
-   },
-   "callout": {
-    "kind": "gotcha",
-    "text": "In this order, an exact A-B-A-B-A-B also has 3 equal keys, so line 11 answers first with \"same command, same result\". The lab's last task shows it. Raise it with the G3-32 owner: check ping-pong before line 11."
-   }
-  },
-  {
-   "h": "Routing, part 1: model and effort per job",
-   "p": [
-    "Effort is how hard the model thinks before it answers: low, medium, high or xhigh. In Anthropic's tests, Opus 5.5 at medium, re-running only failed attempts at high, was cheaper and better than high for everything. So the routing table starts most jobs at medium.",
-    "The plan (G4) names the job for each step, and the harness looks it up. Helpers are subagents (AgentDefinitions) with their own model and effort."
-   ],
-   "because": "We keep the table in code, because G1's effort sweep will change rows, and a change should be one reviewed line.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/harness/src/routing.ts (part 1 of 2)",
-    "text": "// Starting values; G1's effort sweep confirms each row.\nexport type Effort = \"low\" | \"medium\" | \"high\" | \"xhigh\";\nexport interface Route { model: string; effort: Effort }\n\nexport const ROUTES: Record<string, Route> = {\n  readiness: { model: \"claude-sonnet-5-5\", effort: \"low\" },\n  plan: { model: \"claude-opus-5-5\", effort: \"medium\" }, // the plan asks for \"high\" on fuzzy or cross-module tickets\n  build: { model: \"claude-opus-5-5\", effort: \"medium\" }, // the default for every job not listed\n  \"build-hard\": { model: \"claude-opus-5-5\", effort: \"high\" }, // a bug in existing code, many edge cases\n  helper: { model: \"claude-haiku-5-5\", effort: \"medium\" }, // reading and search; returns file:line pointers\n  qa: { model: \"claude-sonnet-5-5\", effort: \"medium\" },\n  \"ci-fix\": { model: \"claude-opus-5-5\", effort: \"low\" }, // CI is the checker; re-run at medium if it fails\n};\nconst LEVELS: Effort[] = [\"low\", \"medium\", \"high\", \"xhigh\"];\nexport const ROUTING_ENV = {\n  CLAUDE_CODE_MAX_OUTPUT_TOKENS: \"64000\", // at 16K most long attempts were cut off\n  CLAUDE_CODE_PROMPT_CACHE_TTL: \"1h\", // Nova waits on people; routines use 5m\n};",
-    "notes": [
-     {
-      "line": 2,
-      "text": "The four effort levels we use."
-     },
-     {
-      "line": 3,
-      "text": "A route is a model and an effort."
-     },
-     {
-      "line": 6,
-      "text": "Readiness checks are short: Sonnet 5.5 at low."
-     },
-     {
-      "line": 7,
-      "text": "Plans at medium; the plan itself asks for high on fuzzy or cross-module tickets."
-     },
-     {
-      "line": 8,
-      "text": "build is the fallback for any job not listed."
-     },
-     {
-      "line": 10,
-      "text": "Helpers read and search with Haiku 5.5 and return file:line pointers."
-     },
-     {
-      "line": 12,
-      "text": "CI fixers start at low, because CI checks their work. A failure re-runs at medium."
-     },
-     {
-      "line": 14,
-      "text": "The order in which effort goes up."
-     },
-     {
-      "line": 16,
-      "text": "64K output tokens. At 16K most long attempts were cut off. Big steps may go up to 128000."
+      "text": "No clock and no turn count anywhere: only progress moves this number."
      },
      {
       "line": 17,
-      "text": "Keep the prompt cache 1 hour for Nova and bug fixers, which wait on people; 5 minutes for routines."
-     }
-    ]
-   }
-  },
-  {
-   "h": "Routing, part 2: one level up on failure",
-   "p": [
-    "When a step's checks fail, the harness re-runs that step once, one effort level higher. It does not restart the session. It changes the effort on the running query, so the prompt cache stays warm."
-   ],
-   "because": "We change effort inside the same session, because a restart would throw away the cached context and cost more.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/harness/src/routing.ts (part 2 of 2)",
-    "text": "export const routeFor = (job: string): Route => ROUTES[job] ?? ROUTES.build!;\n\n/** A step whose checks failed is re-run once, one level higher, in the same session (warm cache). */\nexport const rerunOneLevelUp = async (session: NovaSession, step: Step, route: Route): Promise<Route> => {\n  const higher = LEVELS[Math.min(LEVELS.indexOf(route.effort) + 1, LEVELS.length - 1)]!;\n  await session.query.applyFlagSettings({ effortLevel: higher }); // from the next turn; check cache reads in the W6 spike\n  await session.send(step.retryPrompt()); // streaming input: the same session, no restart\n  return { model: route.model, effort: higher };\n};\n\n// No maxTurns, no maxBudgetUsd, no taskBudget: test/no-limits.test.ts fails if one appears.",
-    "notes": [
-     {
-      "line": 1,
-      "text": "Look up a job's route. Unknown jobs fall back to build."
-     },
-     {
-      "line": 4,
-      "text": "Re-run a failed step one level higher."
-     },
-     {
-      "line": 5,
-      "text": "The next level, never past xhigh."
-     },
-     {
-      "line": 6,
-      "text": "applyFlagSettings changes effort on the running query from the next turn. G4's W6 spike checks that cache reads stay at 80% or more."
-     },
-     {
-      "line": 7,
-      "text": "The session uses streaming input, so we send the retry prompt into the same session."
-     },
-     {
-      "line": 8,
-      "text": "Return the new route, so the ladder knows where it stands."
-     },
-     {
-      "line": 11,
-      "text": "test/no-limits.test.ts fails if the session options ever get maxTurns, maxBudgetUsd or taskBudget."
-     }
-    ]
-   }
-  },
-  {
-   "h": "The ladder, part 1: rungs inside the turn",
-   "p": [
-    "When the watcher sees no real progress, the harness steps in one rung at a time. The first two rungs happen inside the turn, through the watcher's hook. A PostToolUse hook can return additionalContext: text the model reads with the tool result."
-   ],
-   "because": "We start with words, because a nudge that names the loop is cheap and often enough.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/harness/src/ladder.ts (part 1 of 2)",
-    "text": "const RUNGS = [\"nudge\", \"replan\", \"think_harder\", \"fresh_start\", \"ask_person\"] as const; // also the metric's rung label\nconst STEP_IN_AT = [6, 9, 12, 15, 18]; // tool events with no real progress; tuned from logged verdicts\n\n/** Rungs 1-2: extra context returned by the watcher's PostToolUse hook. */\nexport const inTurnContext = (verdict: WatcherVerdict): string | undefined => {\n  if (verdict.flatFor === STEP_IN_AT[0]) {\n    return `Heads up: ${verdict.loopKind} (${verdict.evidence}). Try a different approach, or say what blocks you.`;\n  }\n  if (verdict.flatFor === STEP_IN_AT[1]) return \"Step back: write a short new plan for this step before you do anything else.\";\n  return undefined;\n};",
-    "notes": [
-     {
-      "line": 1,
-      "text": "The five rungs, in order. The names are also the metric's rung label."
-     },
-     {
-      "line": 2,
-      "text": "How many flat tool events before each rung. Starting values, tuned from logged verdicts."
-     },
-     {
-      "line": 5,
-      "text": "inTurnContext returns the text for rungs 1 and 2, or nothing."
-     },
-     {
-      "line": 6,
-      "text": "After 6 flat events: rung 1, the nudge."
-     },
-     {
-      "line": 7,
-      "text": "The nudge names the loop and its evidence, and offers a way out: say what blocks you."
-     },
-     {
-      "line": 9,
-      "text": "After 9 flat events: rung 2, step back and re-plan."
-     },
-     {
-      "line": 10,
-      "text": "Otherwise, no extra context."
+      "text": "A check passing is progress only if it failed before. A test that was always green proves nothing new."
      }
     ]
    },
-   "callout": {
-    "kind": "tip",
-    "text": "To wire it, the watcher's hook returns a text from inTurnContext instead of {}. The shape is { hookSpecificOutput: { hookEventName: \"PostToolUse\", additionalContext: text } }."
-   }
-  },
-  {
-   "h": "The ladder, part 2: rungs between turns",
-   "p": [
-    "Rungs 3 to 5 happen at a step boundary, in the step loop, after a checkpoint. Rung 3 thinks harder, rung 4 starts a fresh session from the notes, rung 5 asks a person. Any real progress resets the ladder."
-   ],
-   "because": "We climb only while progress stays flat, because each rung costs more than the one before.",
-   "code": {
-    "lang": "typescript",
-    "file": "ai-agents/harness/src/ladder.ts (part 2 of 2)",
-    "text": "/** Rungs 3-5: at a step boundary, after a checkpoint. Real progress resets the ladder. */\nexport const betweenTurns = async (run: Run, session: NovaSession, verdict: WatcherVerdict): Promise<void> => {\n  if (verdict.flatFor === 0) {\n    run.rung = 2;\n    return;\n  }\n  const rung = RUNGS[run.rung];\n  if (!rung || verdict.flatFor < STEP_IN_AT[run.rung]!) return;\n  metrics.handoffs.add(1, { rung }); // ai_agents_watcher_handoffs_total{rung}\n  if (rung === \"think_harder\") {\n    run.route = await rerunOneLevelUp(session, run.step, run.route);\n  } else if (rung === \"fresh_start\") {\n    await checkpoint(run, run.step);\n    await run.restartSession({ seed: await run.notes() }); // new context, same branch and notes\n  } else if (rung === \"ask_person\") {\n    await askHuman(run, `I'm stuck on '${run.step.title}': ${verdict.summary()}. What should I try?`);\n  }\n  run.rung += 1;\n};",
-    "notes": [
-     {
-      "line": 3,
-      "text": "Real progress: reset to index 2, the first between-turns rung."
-     },
-     {
-      "line": 7,
-      "text": "The next rung to try, by index in RUNGS."
-     },
-     {
-      "line": 8,
-      "text": "Past the last rung, or not flat long enough yet: do nothing."
-     },
-     {
-      "line": 9,
-      "text": "Count the hand-off: ai_agents_watcher_handoffs_total{rung}, for alerts and the weekly run review."
-     },
-     {
-      "line": 10,
-      "text": "Rung 3: re-run the step one effort level higher (section 5)."
-     },
-     {
-      "line": 12,
-      "text": "Rung 4: save everything first."
-     },
-     {
-      "line": 14,
-      "text": "Then a new session seeded with notes.md: new context, same branch and notes."
-     },
-     {
-      "line": 15,
-      "text": "Rung 5: ask_human with what was tried and the evidence."
-     },
-     {
-      "line": 18,
-      "text": "Move to the next rung for the next time."
-     }
+   "deeper": {
+    "h": "Go deeper: check-ins, and one line far away",
+    "p": [
+     "Time is still measured, just never used to stop anything. When a run passes twice its own estimate from the plan, Nova posts a three-line check-in in the ticket's thread, what is taking time and why it is worth it, and keeps going; again at four and eight times. Only a Stop from a person ends a run that is working.",
+     "Behind the watcher sits a cost backstop, set far above what a normal ticket costs (later about three times the 99th percentile of successful runs). It reads the run's spend from the gateway at step boundaries only, never in the middle of a turn. For the first four weeks it runs in shadow mode: it only counts the runs it would have paused. After that it may pause a run between turns, save a checkpoint and ask in the thread with Continue and Stop buttons; Continue resumes the same session exactly where it was."
     ]
-   },
-   "callout": {
-    "kind": "why",
-    "text": "A review finding that comes back after a fix, with the same fingerprint, goes straight to rung 5. G4 provides the fingerprints."
    }
   },
   {
-   "h": "Check-ins and the far cost backstop",
+   "h": "Naming the loop",
    "p": [
-    "Time is measured, never limited. When a run passes 2 times its own estimate, Nova posts a short check-in and keeps going. It does it again at 4 and 8 times. Only a Stop from a person ends the run.",
-    "The backstop is a cost far above a normal ticket, NOVA_BACKSTOP_USD, later about 3 times the 99th percentile of successful runs. Spend comes from the gateway's GET /v1/runs/{run_id}/spend; the SDK's total_cost_usd is the fallback. For the first 4 weeks it runs in shadow mode: it only counts and logs."
+    "A flat counter says that something is wrong; it does not say what. So the watcher also looks for four patterns that agents fall into, the same ones OpenHands, an open-source coding agent, checks for in its stuck detector. The same command with the same result, three times in a row. The same error again, three times, recognised by its error signature: the first line of the error with every number masked, so \"Timeout of 5002 ms\" and \"Timeout of 5004 ms\" count as one error. Undo and redo: an edit brings a file back to a state it had before. And ping-pong: two actions taking turns, A-B-A-B-A-B.",
+    "The name matters because it goes straight into the first nudge the agent reads, and good advice depends on the right diagnosis. \"You ran the same command three times\" is useful when the agent repeats itself, but it is the wrong advice for an agent that alternates between two edits. That is also why the order and the exact wording of the rules matter, as you will see in the lab."
    ],
-   "because": "We check spend only at step boundaries, because the backstop must never cut a run mid-thought.",
    "code": {
     "lang": "typescript",
-    "file": "ai-agents/harness/src/backstop.ts",
-    "text": "const SHADOW = (process.env.NOVA_BACKSTOP_MODE ?? \"shadow\") === \"shadow\"; // shadow for the first 4 weeks\nconst BACKSTOP_USD = Number(process.env.NOVA_BACKSTOP_USD ?? \"200\"); // far away; set from real data later\nconst CONTINUE: StepGate = { kind: \"continue\" };\n\nexport const afterStep = async (run: Run): Promise<StepGate> => {\n  if (run.elapsedMs() > run.estimate.durationMs * run.nextCheckin) {\n    const note = await run.askModel(\"In 3 short lines: what is taking time, and why is it worth it?\");\n    await run.broker.postProgress(`Check-in: I'm past my estimate of ${run.estimate.text}.\\n${note}`);\n    run.nextCheckin *= 2; // at 2x, 4x, 8x ... and keep going unless someone says stop\n  }\n\n  const spend = await run.gateway.spend(run.runId); // the gateway is the source of truth\n  if (spend < BACKSTOP_USD) return CONTINUE;\n  metrics.backstop.add(1, { mode: SHADOW ? \"shadow\" : \"live\" }); // ai_agents_backstop_would_pause_total{mode}\n  if (SHADOW) {\n    log.info(\"backstop would pause\", { run: run.runId, spend_usd: spend });\n    return CONTINUE;\n  }\n  await checkpoint(run, run.step); // nothing is lost; one tap resumes exactly here\n  return { kind: \"ask\", question: \"I've used more than the far-away budget for one ticket. Continue?\" };\n};",
+    "file": "ai-agents/harness/src/watcher.ts (loopKind)",
+    "text": "loopKind(ev: WatchEvent): string | null {\n  const last = this.events.slice(-6);\n  if (ev.error) this.errors.set(ev.error, (this.errors.get(ev.error) ?? 0) + 1);\n  const undo = this.rememberFile(ev); // an edit that brings a file back to an earlier hash\n  if (last.length >= 3 && last.slice(-3).every((e) => e.key === ev.key)) return \"same command, same result\";\n  if (ev.error && (this.errors.get(ev.error) ?? 0) >= 3) return \"same error again\";\n  if (undo) return \"undo and redo\";\n  const keys = (from: number) => new Set(last.filter((_, i) => i % 2 === from).map((e) => e.key));\n  if (last.length === 6 && keys(0).size === 1 && keys(1).size === 1) return \"ping-pong\";\n  return null;\n}",
     "notes": [
-     {
-      "line": 1,
-      "text": "Shadow mode is the default. Live mode needs 4 weeks of data and a decision in the weekly review."
-     },
-     {
-      "line": 2,
-      "text": "The far-away number. 200 is a placeholder until real data sets it."
-     },
      {
       "line": 5,
-      "text": "afterStep runs after every step, never inside a turn."
+      "text": "Three in a row. Counted anywhere in the last six, this rule would also match A-B-A-B-A-B, and the ping-pong rule below could never answer."
      },
      {
       "line": 6,
-      "text": "Past 2 times the estimate (then 4, then 8)?"
-     },
-     {
-      "line": 7,
-      "text": "Ask the model for a 3-line check-in: what takes time, and why it is worth it."
-     },
-     {
-      "line": 8,
-      "text": "Post it in the thread with post_progress."
+      "text": "ev.error is already the signature, with numbers masked."
      },
      {
       "line": 9,
-      "text": "Double the next check-in point, and keep going."
-     },
+      "text": "Even positions all the same action, odd positions all the same other action."
+     }
+    ]
+   }
+  },
+  {
+   "h": "The ladder: change the approach, one rung at a time",
+   "p": [
+    "A loop is a reason to change the approach, not to kill the run. So when flatFor keeps growing, the harness steps in one rung at a time, and each rung is cheap. After 6 tool events without progress it nudges: a short message that names the loop and asks for a different approach. After 9 it asks the agent to step back and write a short new plan for the step. Both happen inside the turn: the watcher's hook returns additionalContext, text the model reads together with the tool result.",
+    "The next three rungs happen between turns, at a step boundary, after a checkpoint, so nothing is lost. After 12 the step is re-run one effort level higher, which is the routing rule below. After 15 the harness checkpoints, ends the session and starts a fresh one from notes.md, so a context full of failed attempts is thrown away but the work is not. After 18 it asks a person in the ticket's thread, with what was tried and the evidence, and from then on the waiting rules for questions apply. Any real progress resets the ladder, and a review finding that comes back after a \"fix\" goes straight to the last rung."
+   ],
+   "code": {
+    "lang": "typescript",
+    "file": "ai-agents/harness/src/ladder.ts",
+    "text": "const RUNGS = [\"nudge\", \"replan\", \"think_harder\", \"fresh_start\", \"ask_person\"] as const;\nconst STEP_IN_AT = [6, 9, 12, 15, 18]; // tool events with no real progress; tuned from logged verdicts\n\n/** Rungs 1-2: extra context returned by the watcher's PostToolUse hook. */\nexport const inTurnContext = (v: WatcherVerdict): string | undefined => {\n  if (v.flatFor === STEP_IN_AT[0]) return `Heads up: ${v.loopKind} (${v.evidence}). Try a different approach, or say what blocks you.`;\n  if (v.flatFor === STEP_IN_AT[1]) return \"Step back: write a short new plan for this step before you do anything else.\";\n  return undefined;\n};\n\n/** Rungs 3-5: at a step boundary, after a checkpoint. */\nexport const betweenTurns = async (run: Run, session: NovaSession, v: WatcherVerdict): Promise<void> => {\n  if (v.flatFor === 0) { run.rung = 2; return; } // real progress resets the ladder\n  const rung = RUNGS[run.rung];\n  if (!rung || v.flatFor < STEP_IN_AT[run.rung]!) return;\n  metrics.handoffs.add(1, { rung });\n  if (rung === \"think_harder\") run.route = await rerunOneLevelUp(session, run.step, run.route);\n  if (rung === \"fresh_start\") { await checkpoint(run, run.step); await run.restartSession({ seed: await run.notes() }); }\n  if (rung === \"ask_person\") await askHuman(run, `I'm stuck on '${run.step.title}': ${v.summary()}. What should I try?`);\n  run.rung += 1;\n};",
+    "notes": [
      {
-      "line": 12,
-      "text": "Ask the gateway for this run's spend. The gateway is the source of truth."
+      "line": 2,
+      "text": "Starting values. The watcher logs verdicts on real runs, and the numbers are tuned from those logs."
      },
      {
       "line": 13,
-      "text": "Under the backstop: carry on."
+      "text": "Index 2 is think_harder: the first rung that lives between turns."
      },
      {
-      "line": 14,
-      "text": "Count it either way: ai_agents_backstop_would_pause_total{mode}."
-     },
-     {
-      "line": 15,
-      "text": "Shadow mode: log the spend and carry on. Nothing else."
-     },
-     {
-      "line": 19,
-      "text": "Live mode: checkpoint first, so nothing is lost."
-     },
-     {
-      "line": 20,
-      "text": "Ask. The harness ends with needs_answer, reason backstop; the workflow posts Continue and Stop; Continue resumes the same session."
+      "line": 16,
+      "text": "Counted as ai_agents_watcher_handoffs_total{rung}, for the alerts and the weekly run review."
      }
     ]
    },
-   "callout": {
-    "kind": "wall",
-    "text": "The per-agent monthly limit and the hold on new runs live in the gateway and the queues (G0, lesson g3-10). Not here."
+   "deeper": {
+    "h": "Go deeper: which model, how much effort, and thinking harder",
+    "p": [
+     "Effort is how much work the model puts into an answer: low, medium, high or xhigh. A routing table in the harness gives each kind of job a model and an effort: planning and building use Opus 5.5 at medium, the readiness check Sonnet 5.5 at low, read-only helpers Haiku 5.5 at medium, QA Sonnet 5.5 at medium, and the CI fixer Opus 5.5 at low, because CI itself is the checker. In Anthropic's tests, Opus at medium with only the failed attempts re-run at high was both cheaper and better than running everything at high.",
+     "So when a step's checks fail, the harness re-runs that step once, one level higher, in the same session: it changes the effort with applyFlagSettings at the step boundary instead of starting a new session, so the prompt cache stays warm. The output limit is 64,000 tokens, never a tight one that cuts long answers, and a test fails the build if anyone ever adds maxTurns, maxBudgetUsd or taskBudget to the session options."
+    ]
    }
   }
  ],
  "lab": {
-  "title": "Test the watcher with recorded tool events",
-  "youNeed": [
-   "Node 24 (nvm use 24)",
-   "npm",
-   "a scratch folder (nothing from the company)"
+  "id": "g3-14",
+  "title": "Catch the loop, not the slow run",
+  "minutes": 30,
+  "needs": [
+   "Node 22+"
   ],
-  "worked": [
+  "goal": "Feed recorded tool events from four runs to a small progress watcher and ladder on your laptop, and make it step in on the loop while leaving the slow, healthy run alone.",
+  "guess": {
+   "q": "A run fails a test, edits the file, fails again with a different message, edits again, and the test passes. Six tool events. With a ladder that nudges after 6 events without progress, does it nudge?",
+   "options": [
+    {
+     "text": "Yes: six tool calls happened, and none of them finished the ticket",
+     "correct": false,
+     "why": "That counts activity. The test that failed and now passes is real progress, and it sets the counter back to 0."
+    },
+    {
+     "text": "No: the counter rises to 4 and drops to 0 when the failing test passes",
+     "correct": true,
+     "why": "Failing, editing and failing again are not progress, but the pass is. The healthy loop never reaches 6."
+    },
+    {
+     "text": "No: the watcher only looks at runs that are older than an hour",
+     "correct": false,
+     "why": "The watcher has no clock at all. It only counts events without progress."
+    }
+   ]
+  },
+  "follow": [
    {
-    "do": "mkdir -p watcher-lab/src watcher-lab/test/events && cd watcher-lab && npm init -y >/dev/null && npm pkg set type=module\nnpm i -D tsx@4.20.3 typescript@5.9.3 @types/node@24",
-    "see": "added <n> packages, and audited <n> packages in 3s\nfound 0 vulnerabilities"
+    "say": "Make a folder. This lab needs no packages: the watcher is plain JavaScript, fed with recorded events.",
+    "do": "mkdir -p ~/academy-labs/g3-14 && cd ~/academy-labs/g3-14\nnpm init -y > /dev/null && npm pkg set type=module",
+    "see": "(no output)"
    },
    {
-    "do": "Create src/watch-event.ts. It is a small stand-in for the harness's normalizer. It hashes inputs and outputs and masks numbers in errors. It marks checks, todos, first reads and file hashes. A recorded Edit carries its file hash as after_hash.\n\nimport { createHash } from \"node:crypto\";\n\n// A recorded PostToolUse input: the fields the watcher reads.\nexport interface ToolInput { tool_name: string; tool_input: Record<string, unknown>; tool_response?: string; error?: string }\nconst hash = (s: string) => createHash(\"sha256\").update(s).digest(\"hex\").slice(0, 12);\nconst normalize = (s: string) => s.replace(/\\d{4}-\\d\\d-\\d\\dT[\\d:.]+Z?/g, \"<time>\").replace(/\\/tmp\\/\\S+/g, \"<tmp>\");\nconst CHECK = /^(npm test|npx playwright test|npm run lint)/;\nconst seen = new Set<string>();\n\nexport class WatchEvent {\n  constructor(readonly key: string, readonly error: string | null, readonly isCheck: boolean, readonly passed: boolean,\n    readonly check: string, readonly todoCompleted: boolean, readonly firstRead: boolean, readonly file: string | null, readonly fileHash: string | null) {}\n  static of(input: ToolInput): WatchEvent {\n    const command = String(input.tool_input.command ?? \"\");\n    const inputHash = hash(normalize(JSON.stringify(input.tool_input)));\n    const outputHash = hash(normalize(input.tool_response ?? input.error ?? \"\"));\n    const error = input.error ? input.error.split(\"\\n\")[0]!.replace(/\\d+/g, \"N\") : null;\n    const isCheck = input.tool_name === \"Bash\" && CHECK.test(command);\n    const path = String(input.tool_input.file_path ?? \"\");\n    const firstRead = input.tool_name === \"Read\" && !seen.has(path) && (seen.add(path), true);\n    const todoCompleted = input.tool_name === \"TodoWrite\" && JSON.stringify(input.tool_input).includes('\"completed\"');\n    const isEdit = input.tool_name === \"Edit\" || input.tool_name === \"Write\";\n    return new WatchEvent(`${input.tool_name}:${inputHash}:${outputHash}`, error, isCheck, isCheck && !input.error,\n      command, todoCompleted, firstRead, isEdit ? path : null, isEdit ? String(input.tool_input.after_hash ?? \"\") : null);\n  }\n  evidence(): string { return this.error ?? this.key; }\n}",
-    "see": "(a file)"
+    "say": "Save four recorded runs on RH-1234: a healthy one, a flaky test retried again and again, an edit that is undone and redone, and two commands taking turns.",
+    "do": "cat > events.mjs <<'EOF'\n// Recorded tool events from four runs on RH-1234, shortened. Each one is what a PostToolUse hook would see.\nconst test = (out, passed) => ({ tool: 'Bash', input: 'npm test -- ProjectsTable', output: out, check: 'ProjectsTable', passed });\nconst edit = (content) => ({ tool: 'Edit', input: 'src/ProjectsTable.tsx', file: 'src/ProjectsTable.tsx', content });\nconst read = (file) => ({ tool: 'Read', input: file, file });\nconst FAIL = 'FAIL expected \"No projects yet\", received \"\"';\n\nexport const SEQUENCES = {\n  // Slow but healthy: read, test fails, edit, test fails differently, edit, test passes, next item.\n  healthy: [\n    read('src/ProjectsTable.tsx'), read('src/EmptyState.tsx'), test(FAIL, false), edit('v1'),\n    test('FAIL expected 1 card, received 0', false), edit('v2'), test('PASS 12 tests', true),\n    { tool: 'TodoWrite', input: 'empty card', todoCompleted: true }, read('src/ProjectsTable.test.tsx'),\n    { tool: 'Bash', input: 'npm test -- Filter', output: 'FAIL expected \"No results\"', check: 'Filter', passed: false },\n    edit('v3'), { tool: 'Bash', input: 'npm test -- Filter', output: 'PASS 4 tests', check: 'Filter', passed: true },\n  ],\n  // A test that times out, retried again and again with small edits that change nothing.\n  flaky: Array.from({ length: 20 }, (_, i) => i % 2 === 0\n    ? { tool: 'Bash', input: 'npm test -- ProjectsTable', output: `FAIL Timeout of ${5000 + i} ms exceeded`, check: 'ProjectsTable', passed: false,\n        error: `Timeout of ${5000 + i} ms exceeded` }\n    : read('src/ProjectsTable.tsx')),\n  // An edit, then the opposite edit, then the first one again.\n  undo: [read('src/ProjectsTable.tsx'), edit('with card'), test(FAIL, false), edit('without card'), test(FAIL, false), edit('with card'), test(FAIL, false)],\n  // Two commands taking turns: A, B, A, B, A, B.\n  pingpong: Array.from({ length: 6 }, (_, i) => i % 2 === 0\n    ? { tool: 'Bash', input: 'git stash', output: 'Saved working directory' }\n    : { tool: 'Bash', input: 'git stash pop', output: 'Dropped refs/stash@{0}' }),\n};\nEOF",
+    "see": "(no output)"
    },
    {
-    "do": "Create src/watcher.ts: the lesson's Watcher with rememberFile filled in. A local HookCallback type and a state object replace the SDK and the run state, so nothing big is installed.\n\nimport { WatchEvent, type ToolInput } from \"./watch-event.js\";\n\ntype HookCallback = (input: ToolInput) => Promise<object>;\nexport const state: { verdict?: { flatFor: number; loopKind: string | null; evidence: string } } = {};\n\nexport class Watcher {\n  readonly events: WatchEvent[] = [];\n  readonly errors = new Map<string, number>();\n  readonly fileHashes = new Map<string, string[]>();\n  readonly failing = new Set<string>();\n  flatFor = 0;\n  onTool: HookCallback = async (input) => {\n    const ev = WatchEvent.of(input);\n    this.events.push(ev);\n    if (this.events.length > 200) this.events.shift();\n    this.flatFor = this.progressed(ev) ? 0 : this.flatFor + 1;\n    state.verdict = { flatFor: this.flatFor, loopKind: this.loopKind(ev), evidence: ev.evidence() };\n    return {};\n  };\n  progressed(ev: WatchEvent): boolean {\n    const fixed = ev.isCheck && ev.passed && this.failing.has(ev.check);\n    if (ev.isCheck) this.failing[ev.passed ? \"delete\" : \"add\"](ev.check);\n    return fixed || ev.todoCompleted || ev.firstRead;\n  }\n  loopKind(ev: WatchEvent): string | null {\n    const last = this.events.slice(-6);\n    if (ev.error) this.errors.set(ev.error, (this.errors.get(ev.error) ?? 0) + 1);\n    const undo = this.rememberFile(ev);\n    if (last.filter((e) => e.key === ev.key).length >= 3) return \"same command, same result\";\n    if (ev.error && (this.errors.get(ev.error) ?? 0) >= 3) return \"same error again\";\n    if (undo) return \"undo and redo\";\n    const keys = (from: number) => new Set(last.filter((_, i) => i % 2 === from).map((e) => e.key));\n    if (last.length === 6 && keys(0).size === 1 && keys(1).size === 1) return \"ping-pong\";\n    return null;\n  }\n  rememberFile(ev: WatchEvent): boolean {\n    if (!ev.file || !ev.fileHash) return false;\n    const seen = this.fileHashes.get(ev.file) ?? [];\n    const back = seen.slice(0, -1).includes(ev.fileHash);\n    this.fileHashes.set(ev.file, [...seen, ev.fileHash]);\n    return back;\n  }\n}",
-    "see": "(a file)"
+    "say": "Save the watcher. loopKind and rememberFile are done; progressed counts every tool call as progress, which is the mistake you will see first.",
+    "do": "cat > watcher.mjs <<'EOF'\n// The progress watcher: it looks for progress, not activity. No clocks, no turn counts.\nimport { createHash } from 'node:crypto';\n\nconst hash = (s) => createHash('sha256').update(String(s)).digest('hex').slice(0, 8);\nconst errorSignature = (e) => e?.split('\\n')[0].replace(/\\d+/g, 'N'); // first line, numbers masked\n\nexport class Watcher {\n  events = [];\n  errors = new Map();\n  fileHashes = new Map();\n  failing = new Set();\n  seen = new Set();\n  flatFor = 0;\n  lastLoop = null;\n\n  onTool(raw) { // the PostToolUse hook calls this with every tool call and its result\n    const ev = { ...raw, key: `${raw.tool}:${hash(raw.input)}:${hash(raw.output ?? raw.content)}`, error: errorSignature(raw.error) };\n    this.events.push(ev);\n    if (this.events.length > 200) this.events.shift();\n    const progressed = this.progressed(ev);\n    this.flatFor = progressed ? 0 : this.flatFor + 1;\n    const kind = this.loopKind(ev);\n    this.lastLoop = progressed ? null : kind ?? this.lastLoop; // the last loop seen since real progress\n    return { flatFor: this.flatFor, loopKind: this.lastLoop };\n  }\n\n  // Build it: real progress is a check that failed before and now passes, a plan item completed,\n  // or a file read for the first time. For now every tool call counts, so activity looks like progress.\n  progressed(ev) {\n    return true;\n  }\n\n  loopKind(ev) {\n    const last = this.events.slice(-6);\n    if (ev.error) this.errors.set(ev.error, (this.errors.get(ev.error) ?? 0) + 1);\n    const undo = this.rememberFile(ev);\n    if (last.filter((e) => e.key === ev.key).length >= 3) return 'same command, same result';\n    if (ev.error && this.errors.get(ev.error) >= 3) return 'same error again';\n    if (undo) return 'undo and redo';\n    const keys = (from) => new Set(last.filter((_, i) => i % 2 === from).map((e) => e.key));\n    if (last.length === 6 && keys(0).size === 1 && keys(1).size === 1) return 'ping-pong';\n    return null;\n  }\n\n  rememberFile(ev) { // true when an edit brings a file back to a state it had before\n    if (ev.tool !== 'Edit') return false;\n    const before = this.fileHashes.get(ev.file) ?? [];\n    const h = hash(ev.content);\n    this.fileHashes.set(ev.file, [...before, h]);\n    return before.slice(0, -1).includes(h);\n  }\n}\nEOF",
+    "see": "(no output)"
    },
    {
-    "do": "Record two event sequences. test/events/healthy-tdd.json is a test-driven loop: read, fail, edit, fail with a new error, edit, pass, todo done.\n\n[\n  { \"tool_name\": \"Read\", \"tool_input\": { \"file_path\": \"src/cart.ts\" }, \"tool_response\": \"export const total = ...\" },\n  { \"tool_name\": \"Bash\", \"tool_input\": { \"command\": \"npm test -- cart\" }, \"error\": \"1 failing: total adds tax\\nExpected 110, got 100\" },\n  { \"tool_name\": \"Edit\", \"tool_input\": { \"file_path\": \"src/cart.ts\", \"after_hash\": \"a1\" }, \"tool_response\": \"ok\" },\n  { \"tool_name\": \"Bash\", \"tool_input\": { \"command\": \"npm test -- cart\" }, \"error\": \"1 failing: total rounds cents\\nExpected 110.1, got 110.10000001\" },\n  { \"tool_name\": \"Edit\", \"tool_input\": { \"file_path\": \"src/cart.ts\", \"after_hash\": \"a2\" }, \"tool_response\": \"ok\" },\n  { \"tool_name\": \"Bash\", \"tool_input\": { \"command\": \"npm test -- cart\" }, \"tool_response\": \"pass 12, fail 0\" },\n  { \"tool_name\": \"TodoWrite\", \"tool_input\": { \"todos\": [{ \"content\": \"fix cart total\", \"status\": \"completed\" }] }, \"tool_response\": \"ok\" }\n]\n\nThen test/events/flaky-retry.json, the same Playwright timeout three times:\n\n[\n  { \"tool_name\": \"Bash\", \"tool_input\": { \"command\": \"npx playwright test login.spec.ts\" }, \"error\": \"Timeout 5000ms exceeded waiting for getByRole('button')\" },\n  { \"tool_name\": \"Bash\", \"tool_input\": { \"command\": \"npx playwright test login.spec.ts\" }, \"error\": \"Timeout 5000ms exceeded waiting for getByRole('button')\" },\n  { \"tool_name\": \"Bash\", \"tool_input\": { \"command\": \"npx playwright test login.spec.ts\" }, \"error\": \"Timeout 5000ms exceeded waiting for getByRole('button')\" }\n]",
-    "see": "(two files)"
+    "say": "Save the ladder and a script that feeds one recorded run to the watcher and prints what the ladder would do after each event.",
+    "do": "cat > ladder.mjs <<'EOF'\n// The ladder: when progress stays flat, step in one rung at a time. Never stop a run for being slow.\nexport const RUNGS = [\n  { at: 6, name: 'nudge', where: 'in the turn', say: (v) => `Heads up: ${v.loopKind ?? 'no progress'}. Try a different approach, or say what blocks you.` },\n  { at: 9, name: 'replan', where: 'in the turn', say: () => 'Step back: write a short new plan for this step before you do anything else.' },\n  { at: 12, name: 'think_harder', where: 'between turns', say: () => 'Re-run the step one effort level higher: medium -> high.' },\n  { at: 15, name: 'fresh_start', where: 'between turns', say: () => 'Checkpoint, end the session, start a new one from notes.md.' },\n  { at: 18, name: 'ask_person', where: 'between turns', say: (v) => `Ask in the ticket's thread: \"I'm stuck: ${v.loopKind ?? 'no progress'}. What should I try?\"` },\n];\n\nexport const rungFor = (verdict) => RUNGS.find((r) => r.at === verdict.flatFor);\nEOF\ncat > run.mjs <<'EOF'\n// Feeds one recorded run to the watcher and prints what the ladder would do.   node run.mjs flaky\nimport { SEQUENCES } from './events.mjs';\nimport { rungFor } from './ladder.mjs';\nimport { Watcher } from './watcher.mjs';\n\nconst name = process.argv[2] ?? 'healthy';\nconst watcher = new Watcher();\nconsole.log(` #  event                                   flat  loop`);\nSEQUENCES[name].forEach((raw, i) => {\n  const v = watcher.onTool(raw);\n  const what = `${raw.tool} ${raw.input}${raw.passed === true ? ' (pass)' : raw.passed === false ? ' (fail)' : ''}`;\n  console.log(`${String(i + 1).padStart(2)}  ${what.padEnd(40)} ${String(v.flatFor).padStart(4)}  ${v.loopKind ?? '-'}`);\n  const rung = rungFor(v);\n  if (rung) console.log(`    -> rung ${rung.name} (${rung.where}): ${rung.say(v)}`);\n});\nEOF",
+    "see": "(no output)"
    },
    {
-    "do": "Create test/watcher.test.ts. replay feeds a recording through onTool and collects the verdicts.\n\nimport { test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { readFileSync } from \"node:fs\";\nimport { Watcher, state } from \"../src/watcher.js\";\n\nconst replay = async (name: string) => {\n  const events = JSON.parse(readFileSync(new URL(`./events/${name}.json`, import.meta.url), \"utf8\"));\n  const watcher = new Watcher();\n  const verdicts = [];\n  for (const input of events) {\n    await watcher.onTool(input);\n    verdicts.push(state.verdict!);\n  }\n  return verdicts;\n};\n\ntest(\"a healthy test-driven loop is never flagged\", async () => {\n  const verdicts = await replay(\"healthy-tdd\");\n  assert.deepEqual(verdicts.map((v) => v.loopKind), Array(7).fill(null));\n  assert.equal(verdicts.at(-1)!.flatFor, 0);\n});\n\ntest(\"a flaky-test retry loop is flagged\", async () => {\n  const verdicts = await replay(\"flaky-retry\");\n  assert.equal(verdicts.at(-1)!.loopKind, \"same command, same result\");\n  assert.equal(verdicts.at(-1)!.flatFor, 3);\n});",
-    "see": "(a file)"
-   },
-   {
-    "do": "node --import tsx --test test/*.test.ts",
-    "see": "✔ a healthy test-driven loop is never flagged (11.9ms)\n✔ a flaky-test retry loop is flagged (0.6ms)\nℹ tests 2\nℹ pass 2\nℹ fail 0"
-   },
-   {
-    "do": "Predict, then check: change the second error in healthy-tdd.json to the first one (\"1 failing: total adds tax\"). Does the healthy test still pass? Run it, then change it back.",
-    "see": "It still passes: the same error only twice is not a loop, and the passing check resets flatFor."
+    "say": "Feed it the flaky run, because that is the loop from the story.",
+    "do": "node run.mjs flaky",
+    "see": " #  event                                   flat  loop\n 1  Bash npm test -- ProjectsTable (fail)       0  -\n 2  Read src/ProjectsTable.tsx                  0  -\n 3  Bash npm test -- ProjectsTable (fail)       0  -\n…\n20  Read src/ProjectsTable.tsx                  0  -\n(twenty events, the counter never moves, and the ladder never steps in: activity looks like progress)"
    }
   ],
-  "faded": "Record test/events/undo-redo.json: three Edit events on src/api.ts with after_hash h1, then h2, then h1 again. Add a test that replays it. The last step is yours: assert that the last verdict's loopKind is \"undo and redo\", and run the tests.",
-  "alone": "Record test/events/ping-pong.json: six Bash events that alternate \"git checkout -- src/a.ts\" (result ok) and \"git stash pop\" (result conflict). Before you run it, predict the last verdict's loopKind. Run it, and explain why it says \"same command, same result\" and not \"ping-pong\". Then write the one-line change to loopKind that names it ping-pong.",
-  "done": "The test run prints pass 3 and fail 0 with the undo-and-redo test. You can explain which rule catches A-B-A-B first."
+  "build": "Write progressed(ev) in watcher.mjs, following its comment: a check that is in this.failing and now passes (remember to add failing checks to the set and remove passing ones), a TodoWrite event with todoCompleted, or a Read of a file that is not yet in this.seen (add it). Then run node run.mjs healthy and node run.mjs flaky again, and compare the two.",
+  "checks": [
+   "node run.mjs healthy never shows a counter above 4 and prints no rung line.",
+   "In node run.mjs flaky, event 1 has flat 1 (a failing test is not progress) and event 2 has flat 0 (the first read of the file is).",
+   "node run.mjs flaky prints five rungs in order: nudge at event 8, replan at 11, think_harder at 14, fresh_start at 17 and ask_person at 20.",
+   "node run.mjs undo shows undo and redo at event 6, and after the fix below its nudge names undo and redo.",
+   "After the fix below, node run.mjs pingpong shows ping-pong at event 6 and its nudge says ping-pong."
+  ],
+  "solution": {
+   "lang": "javascript",
+   "file": "~/academy-labs/g3-14/watcher.mjs (progressed)",
+   "text": "  progressed(ev) {\n    const fixed = ev.check !== undefined && ev.passed && this.failing.has(ev.check); // failed before, passes now\n    if (ev.check !== undefined) ev.passed ? this.failing.delete(ev.check) : this.failing.add(ev.check);\n    const firstRead = ev.tool === 'Read' && !this.seen.has(ev.file); // a new fact\n    if (ev.tool === 'Read') this.seen.add(ev.file);\n    return fixed || ev.todoCompleted === true || firstRead;\n  }"
+  },
+  "fix": "Run node run.mjs pingpong. The agent alternates git stash and git stash pop, but the nudge says \"same command, same result\", which tells it to stop repeating one command, the wrong advice. The ping-pong rule never answers. Find out why: the same-command rule counts matching events anywhere in the last six, and A-B-A-B-A-B already contains A three times. Make that rule mean what its name says, three in a row (last.slice(-3) all equal to ev.key). Then pingpong ends with ping-pong, undo with undo and redo, and flaky with same error again.",
+  "explain": [
+   "Why does reading a new file count as progress, but reading the same file again does not?",
+   "Why do the first two rungs happen inside the turn, and the last three only at a step boundary after a checkpoint?",
+   "Why is a limit on turns or time the wrong tool for catching the loop in the story?"
+  ],
+  "done": "The healthy run is never touched, the flaky run climbs all five rungs, and every loop gets its right name.",
+  "mode": "guided"
  },
- "quiz": [
+ "check": [
   {
-   "q": "Why does the watcher measure progress instead of time or turns?",
+   "q": "A careful run reads twenty new files and runs the whole test suite before each change, so it uses many tool calls per step. Will the ladder step in?",
    "options": [
     {
-     "text": "Counting tool events is cheaper than reading a clock.",
+     "text": "Yes, after 6 tool calls in a step",
      "correct": false,
-     "why": "Cost is not the reason; the rule is guide, don't cage."
+     "why": "The counter counts events without progress, not tool calls. First reads and newly passing checks keep setting it back to 0."
     },
     {
-     "text": "A slow but useful run is never punished, and a fast loop is still caught.",
+     "text": "No, because reading new files and turning failing checks green is real progress",
      "correct": true,
-     "why": "Progress (a check that newly passes, a todo done, a new fact) is what matters."
+     "why": "That is the point of measuring progress: a slow, useful run is never punished."
     },
     {
-     "text": "Temporal workflows may not read the clock.",
+     "text": "Yes, once it passes twice its estimate",
      "correct": false,
-     "why": "The watcher runs in the harness, not in a workflow. The reason is about agents."
+     "why": "Passing the estimate only posts a check-in. Nothing stops or nudges the run because of time."
     }
    ]
   },
   {
-   "q": "A build step's checks fail at medium effort. What does routing do?",
+   "q": "The watcher has seen 12 tool events without progress. What happens next?",
    "options": [
     {
-     "text": "Restarts the session at high effort with a fresh context.",
+     "text": "The run is stopped and the ticket goes back to the requester",
      "correct": false,
-     "why": "A restart throws away the warm cache. The same session continues."
+     "why": "The ladder never stops a run. Even the last rung only asks a person a question."
     },
     {
-     "text": "Switches the step to Sonnet 5.5, which is faster.",
+     "text": "A person is asked in the thread right away",
      "correct": false,
-     "why": "The model stays; only the effort goes one level up."
+     "why": "Asking a person is the last rung, at 18. There are cheaper things to try first."
     },
     {
-     "text": "Re-runs that step once at high, in the same session, through applyFlagSettings.",
+     "text": "At the next step boundary, the step is re-run one effort level higher in the same session",
      "correct": true,
-     "why": "One level up, once, then the watcher decides."
+     "why": "Rung 3, think harder. It happens between turns, after a checkpoint, so nothing is lost."
     }
    ]
   },
   {
-   "q": "In shadow mode, a run's spend passes NOVA_BACKSTOP_USD. What happens?",
+   "q": "Why does the platform not set maxTurns or a budget limit to catch loops?",
    "options": [
     {
-     "text": "The counter ai_agents_backstop_would_pause_total goes up, the spend is logged, and the run continues.",
+     "text": "A limit stops slow but useful runs in the middle of their work, and throws that work away",
      "correct": true,
-     "why": "Shadow mode only counts and logs for the first 4 weeks."
+     "why": "The watcher catches the loop by its lack of progress, and the far backstop only pauses between turns, after a checkpoint."
     },
     {
-     "text": "The run checkpoints and asks Continue or Stop in the thread.",
+     "text": "The Agent SDK has no such options",
      "correct": false,
-     "why": "That is live mode, after 4 weeks of data and a decision."
+     "why": "It has them. We choose not to use them, and a test fails if anyone adds one."
     },
     {
-     "text": "The current turn is cut and the run ends.",
+     "text": "Limits would make the prompt cache cold",
      "correct": false,
-     "why": "Nothing ever cuts a turn. Even live mode waits for the step boundary."
+     "why": "The cache has nothing to do with it. The reason is the work a limit would throw away."
     }
    ]
   }
  ],
- "recall": [
-  "From lesson g3-11: what three things does a checkpoint save outside the VM?",
-  "From lesson p8-4: which hook event runs after a tool call, and what can it return to the model?"
- ],
- "videos": [],
+ "platform": {
+  "p": [
+   "The watcher is harness/src/watcher.ts, registered for PostToolUse and PostToolUseFailure; its verdict goes into the run state and the heartbeats. The ladder is harness/src/ladder.ts and counts ai_agents_watcher_handoffs_total{rung}. The routing table and rerunOneLevelUp are harness/src/routing.ts, with CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000 and a 1-hour prompt cache for runs that wait on people (5 minutes for routines), and test/no-limits.test.ts guards against maxTurns, maxBudgetUsd and taskBudget. The check-ins and the backstop are harness/src/backstop.ts, with NOVA_BACKSTOP_MODE=shadow for the first four weeks and spend read from the gateway's per-run endpoint.",
+   "Two things to fix while you build: in the G3-32 sketch the same-command rule counts matches anywhere in the last six events, so the ping-pong rule can never fire; make it three in a row as in this lesson. And applyFlagSettings for changing effort on a running query must be checked against the current SDK docs, together with the cache-read rate in the first spike."
+  ],
+  "tickets": [
+   {
+    "key": "G3-32",
+    "why": "The progress watcher: what counts as progress, and the four loop patterns."
+   },
+   {
+    "key": "G3-36",
+    "why": "The ladder: nudge, re-plan, think harder, fresh start, ask a person."
+   },
+   {
+    "key": "G3-33",
+    "why": "The routing table, one effort level up on failed checks, and no limits on the session."
+   },
+   {
+    "key": "G3-37",
+    "why": "Check-ins past the estimate and the far cost backstop, first in shadow mode."
+   }
+  ]
+ },
  "words": [
   {
    "term": "progress watcher",
-   "plain": "A hook that reads every tool result, counts real progress and names loops."
+   "plain": "A hook that sees every tool call and counts only real progress: a fixed check, a plan item done, a first read."
   },
   {
    "term": "flatFor",
-   "plain": "The number of tool events since the last real progress."
+   "plain": "How many tool events in a row brought no progress. Real progress sets it back to 0."
   },
   {
-   "term": "loop kind",
-   "plain": "The watcher's name for a loop: same command and result, same error, undo and redo, or ping-pong."
+   "term": "error signature",
+   "plain": "The first line of an error with numbers masked, so repeats of one error look the same."
   },
   {
    "term": "ladder",
-   "plain": "Five steps the harness takes on flat progress: nudge, re-plan, think harder, fresh start, ask a person."
+   "plain": "Five cheap steps when progress stays flat: nudge, re-plan, think harder, fresh start, ask a person."
   },
   {
    "term": "effort",
-   "plain": "How hard the model thinks before answering: low, medium, high or xhigh."
+   "plain": "How much work the model puts into an answer: low, medium, high or xhigh."
   },
   {
    "term": "backstop",
-   "plain": "A cost far above a normal ticket that pauses a run between steps and asks a person."
-  },
-  {
-   "term": "shadow mode",
-   "plain": "Running a rule that only counts and logs what it would do, to collect data first."
+   "plain": "A cost line far above a normal ticket where a run pauses between turns and asks; shadow mode first."
   }
  ],
- "tickets": [
+ "review": [
   {
-   "key": "G3-32",
-   "why": "This lesson explained the Watcher line by line: the event record, what counts as progress, and the four loop kinds.",
-   "walk": [
-    "Create ai-agents/harness/src/watcher.ts with the Watcher class (code above). WatchEvent.of strips timestamps and temp paths, masks numbers in errors, and hashes a file after an edit.",
-    "Register watcher.onTool in the session's hooks for PostToolUse and PostToolUseFailure (lesson g3-9's session options).",
-    "Write the verdict (flatFor, loopKind, evidence) into run state and the heartbeat. Take no action yet.",
-    "Log verdicts on real runs to tune the thresholds.",
-    "Write node:test cases with recorded event sequences: a healthy test-driven loop is never flagged; a flaky-test retry loop is.",
-    "Decide with the reviewer whether ping-pong is checked before the same-key rule."
-   ]
+   "q": "From memory: the three kinds of real progress and the four loop patterns.",
+   "a": "A check that failed now passes, a plan item done, a first read. Same command and result three times in a row, the same error three times, undo and redo, ping-pong."
   },
   {
-   "key": "G3-33",
-   "why": "This lesson explained the routing table, the one-level-up re-run in the same session, the output and cache settings, and the no-limits test.",
-   "walk": [
-    "Create ai-agents/harness/src/routing.ts with ROUTES, LEVELS, ROUTING_ENV, routeFor and rerunOneLevelUp (code above).",
-    "Read the job per step from the plan (G4). Give helpers their own model and effort in their AgentDefinitions.",
-    "When a step's checks fail, call rerunOneLevelUp once at the step boundary, then leave it to the watcher.",
-    "Set CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000 (up to 128000 for big steps) and CLAUDE_CODE_PROMPT_CACHE_TTL to 1h for Nova and bug fixers, 5m for routines.",
-    "Add test/no-limits.test.ts: it fails if the options ever contain maxTurns, maxBudgetUsd or taskBudget.",
-    "Ask G4's W6 spike to confirm cache reads stay at 80% or more after an effort change."
-   ]
+   "q": "From memory: the five rungs and when each one steps in.",
+   "a": "Nudge at 6 and re-plan at 9, inside the turn; think harder at 12, fresh start at 15 and ask a person at 18, between turns after a checkpoint. Progress resets the ladder."
   },
   {
-   "key": "G3-36",
-   "why": "This lesson explained the five rungs, which ones run inside the turn and which between turns, and when the ladder resets.",
-   "walk": [
-    "Create ai-agents/harness/src/ladder.ts with RUNGS, STEP_IN_AT, inTurnContext and betweenTurns (code above).",
-    "Make the watcher's hook return additionalContext when inTurnContext gives a text.",
-    "Call betweenTurns in the step loop after the checkpoint, with the latest verdict.",
-    "Count ai_agents_watcher_handoffs_total{rung} for the alerts (G3-34) and the weekly run review.",
-    "Send a review finding that returns after a fix, with the same fingerprint, straight to rung 5 (fingerprints from G4).",
-    "Test with recorded verdicts: flat progress climbs one rung at a time; real progress resets to rung 3."
-   ]
-  },
-  {
-   "key": "G3-37",
-   "why": "This lesson explained afterStep line by line: check-ins at 2, 4 and 8 times the estimate, and the backstop's two modes.",
-   "walk": [
-    "Create ai-agents/harness/src/backstop.ts with afterStep (code above) and call it at every step boundary.",
-    "Read spend from the gateway's GET /v1/runs/{run_id}/spend (G0). Use the SDK's total_cost_usd only as a fallback.",
-    "Set NOVA_BACKSTOP_USD far away and NOVA_BACKSTOP_MODE=shadow. Count ai_agents_backstop_would_pause_total{mode}.",
-    "After 4 weeks of data and a decision in the weekly review, switch to live: checkpoint, end with needs_answer and reason backstop.",
-    "In the workflow, post Continue and Stop in the thread. Continue (the resume signal from lesson g3-13) resumes the same session.",
-    "Leave monthly per-agent limits and the hold on new runs to the gateway and the queues."
-   ]
+   "q": "A teammate wants a 2-hour time limit \"just in case\". What do you answer?",
+   "a": "It would cut careful runs and throw away their work. Loops are caught by the watcher, cost runaways by the far backstop, which pauses between turns and asks; time only triggers a check-in."
   }
  ],
- "remember": "Measure progress, not time: name the loop, climb one rung at a time, and let the far backstop pause only between turns."
+ "remember": "Measure progress, not activity, and when progress stops, change the approach one cheap rung at a time instead of killing the run."
 }
