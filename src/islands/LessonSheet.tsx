@@ -117,7 +117,10 @@ function LessonSheet({ lesson, island, onClose, onComplete }: Props) {
           <section className="isl-arrive">
             <div className="isl-arrive-media">
               {island.video ? (
-                <video src={asset(`${island.video}.mp4`)} poster={asset(`${island.art}.webp`)} autoPlay muted loop playsInline aria-hidden="true" />
+                <>
+                  <video src={asset(`${island.video}.mp4`)} poster={asset(`${island.art}.webp`)} autoPlay muted loop playsInline aria-hidden="true" />
+                  <img className="isl-media-dark" src={asset(`${island.art}.webp`)} alt="" />
+                </>
               ) : (
                 <img src={asset(`${island.art}.webp`)} alt="" />
               )}

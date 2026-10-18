@@ -27,7 +27,10 @@ function IslandPanel({ island, lessons, done, celebrate, onClose, onStart }: Pro
       <button type="button" className="isl-panel-close" onClick={onClose} aria-label="Close the island">×</button>
       <div className="isl-panel-media">
         {island.video ? (
-          <video src={asset(`${island.video}.mp4`)} poster={asset(`${island.art}.webp`)} autoPlay muted loop playsInline aria-hidden="true" />
+          <>
+            <video src={asset(`${island.video}.mp4`)} poster={asset(`${island.art}.webp`)} autoPlay muted loop playsInline aria-hidden="true" />
+            <img className="isl-media-dark" src={asset(`${island.art}.webp`)} alt="" />
+          </>
         ) : (
           <img src={asset(`${island.art}.webp`)} alt="" />
         )}

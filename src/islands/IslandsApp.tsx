@@ -7,6 +7,7 @@ import { allLessons, course } from '../lib/course';
 import { getLesson, isV2 } from '../lib/lessons';
 import { useProgress } from '../lib/progress';
 import { href } from '../lib/router';
+import type { Theme } from '../lib/theme';
 import './islands.css';
 
 const REVEAL_KEY = 'apa.islands.revealed';
@@ -35,9 +36,9 @@ const phoneFrame = () => {
 // The path from zero to hero: the playable lessons in course order.
 const PATH = allLessons.filter((r) => PLAYABLE.has(r.lesson.id));
 
-type Props = { island?: string; lesson?: string };
+type Props = { island?: string; lesson?: string; theme: Theme; onToggleTheme: () => void };
 
-function IslandsApp({ island, lesson }: Props) {
+function IslandsApp({ island, lesson, theme, onToggleTheme }: Props) {
   const world = useRef<WorldHandle | null>(null);
   const { progress, setDone } = useProgress();
   const [revealed, setRevealed] = useState<Set<string>>(readRevealed);
@@ -137,6 +138,15 @@ function IslandsApp({ island, lesson }: Props) {
           <span className="isl-stat"><b>{doneCount}</b> of {course.lessonCount} lessons</span>
           <span className="isl-stat"><b>{revealed.size}</b> of {ISLANDS.length} islands explored</span>
           <a className="isl-classic" href={href.home()}>List view</a>
+          <button
+            type="button"
+            className="isl-theme-btn"
+            onClick={onToggleTheme}
+            aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+            title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+          >
+            {theme === 'dark' ? '☾' : '☀'}
+          </button>
         </div>
       </header>
 

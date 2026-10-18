@@ -33,6 +33,30 @@ test.describe('islands map', () => {
     });
   });
 
+  test('defaults to dark mode and toggles cleanly between dark and light', async ({ page }) => {
+    await test.step('Given the home page is open', async () => {
+      await page.emulateMedia({ reducedMotion: 'reduce' });
+      await page.goto('/#/');
+    });
+    await test.step('Then the document and the islands map are in dark mode by default', async () => {
+      await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+      const bg = await page.locator('.isl').evaluate((el) => getComputedStyle(el).backgroundColor);
+      expect(bg).toBe('rgb(21, 27, 51)');
+    });
+    await test.step('When the learner clicks the theme toggle button', async () => {
+      await page.getByRole('button', { name: 'Switch to light theme' }).click();
+    });
+    await test.step('Then the map switches to light mode and remembers it across routes', async () => {
+      await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+      const bg = await page.locator('.isl').evaluate((el) => getComputedStyle(el).backgroundColor);
+      expect(bg).toBe('rgb(238, 242, 248)');
+    });
+    await test.step('When the learner switches back to dark mode', async () => {
+      await page.getByRole('button', { name: 'Switch to dark theme' }).click();
+      await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+    });
+  });
+
   for (const size of [{ width: 1440, height: 900 }, { width: 760, height: 900 }, { width: 390, height: 700 }]) {
     test(`the path list scrolls inside its card and the tour button stays on screen at ${size.width}x${size.height}`, async ({ page }) => {
       await test.step('Given the home page is open', async () => {

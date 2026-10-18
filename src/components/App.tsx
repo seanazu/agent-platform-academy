@@ -22,7 +22,7 @@ function App() {
     window.scrollTo({ top: 0 });
   }, [routeKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (route.name === 'islands') return <IslandsApp island={route.island} lesson={route.lesson} />;
+  if (route.name === 'islands') return <IslandsApp island={route.island} lesson={route.lesson} theme={theme} onToggleTheme={toggle} />;
 
   return (
     <div className="app">
