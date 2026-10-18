@@ -1,0 +1,549 @@
+[
+ {
+  "key": "G2-01",
+  "title": "[Platform] Mine fcp history for the PRs that introduced shipped bugs",
+  "team": [
+   "plat"
+  ],
+  "days": 2,
+  "w": [
+   2,
+   3
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "",
+  "what": "A script that reads fcp's history and Jira Bug tickets and lists the PRs that most likely introduced each shipped bug, plus a pool of PRs that never caused one. Its output is the candidate list the guilds label for BYTE-GOLD.",
+  "why": "We can't say how good Byte is without real bugs it should have caught. Blaming the lines each fix changed (the SZZ method) finds most of them without weeks of digging by hand.",
+  "how": [
+   "Ask DevOps for a new private repo `RhinoHealth/byte-gold` (name to confirm) for the cases and answers. Don't install the Byte App on it: installed repos get repinned and reviewed, and Byte must never see the answers. Access: Sean, Nave and the labelers.",
+   "Add `scripts/gold-mine.ts` to RhinoHealth/byte, next to `scripts/sniff-fixtures.ts` (sketch). It runs from an operator's machine with a full fcp clone, `gh` and a read-only Jira token, never in CI.",
+   "Find fix commits on fcp main: Jira `project = RH AND issuetype = Bug AND statusCategory = Done AND resolved >= -540d` gives the keys to match in squash subjects (`[FE] RH-1234: ... (#2445)`); add every `Revert \"...\"` commit and subjects with fix or hotfix.",
+   "For each fix, blame the old-side lines it changed (`git blame -w -M -C --porcelain <fix>^`), skipping tests, lockfiles and `*_pb2.py`. The `(#NNNN)` at the end of the blamed commit's subject is the introducing PR.",
+   "Score candidates by blamed lines, days from merge to fix and PR size; drop PRs over 2,000 changed lines. Aim for about 300 candidates to end with 120 confirmed.",
+   "Clean pool: PRs merged 90-365 days ago, under 600 changed lines, never blamed by a fix and never reverted (about 150).",
+   "Write `candidates/real.jsonl`, `candidates/clean.jsonl` and the `case.json` template (in the README) to byte-gold. Keep only the Jira key, never ticket text: Bug tickets can name customers."
+  ],
+  "code": {
+   "file": "scripts/gold-mine.ts (RhinoHealth/byte)",
+   "lang": "ts",
+   "text": "// Operator-run, never in CI (needs a full fcp clone, gh, and a read-only Jira token in env):\n//   node --import tsx scripts/gold-mine.ts --fcp ~/src/fcp --since 540d --out ../byte-gold/candidates\nimport { execFileSync } from \"node:child_process\";\n\nconst PR_IN_SUBJECT = /\\(#(\\d+)\\)$/; // fcp squash merges: \"[FE] RH-6589: ... (#2445)\"\nconst SKIP = /(^|\\/)(tests?|e2e)\\/|(^|\\/)(package-lock\\.json|uv\\.lock)$|_pb2(_grpc)?\\.py$/;\nconst HUNK = /^@@ -(\\d+)(?:,(\\d+))? /;\n\nconst git = (fcp: string, ...args: string[]): string =>\n  execFileSync(\"git\", [\"-C\", fcp, ...args], { encoding: \"utf8\", maxBuffer: 256 * 1024 * 1024 });\n\n// SZZ: the old-side lines a fix changed, blamed at the fix's parent, point at the PR that wrote them.\nexport function introducingPrs(fcp: string, fixSha: string): Map<number, number> {\n  const blamedLines = new Map<number, number>(); // PR number -> lines it wrote that the fix changed\n  let path = \"\";\n  for (const line of git(fcp, \"diff\", \"-U0\", `${fixSha}^`, fixSha).split(\"\\n\")) {\n    if (line.startsWith(\"--- a/\")) path = line.slice(6);\n    const hunk = HUNK.exec(line);\n    const count = Number(hunk?.[2] ?? 1);\n    if (hunk === null || count === 0 || SKIP.test(path)) continue; // pure additions have nothing to blame\n    const from = Number(hunk[1]);\n    const porcelain = git(fcp, \"blame\", \"-w\", \"-M\", \"-C\", \"--porcelain\", `-L${from},${from + count - 1}`, `${fixSha}^`, \"--\", path);\n    for (const sha of porcelain.match(/^[0-9a-f]{40}(?= \\d+ \\d+)/gm) ?? []) {\n      const pr = Number(PR_IN_SUBJECT.exec(git(fcp, \"log\", \"-1\", \"--format=%s\", sha).trim())?.[1]);\n      if (pr > 0) blamedLines.set(pr, (blamedLines.get(pr) ?? 0) + 1);\n    }\n  }\n  return blamedLines;\n}\n// Row in candidates/real.jsonl: { id, bugKey, fixPr, introPr, blamedLines, daysToFix, changedLines }"
+  }
+ },
+ {
+  "key": "G2-02",
+  "title": "[Guilds] Label BYTE-GOLD: confirm 120 real bugs and write golden comments",
+  "team": [
+   "guild"
+  ],
+  "days": 2,
+  "w": [
+   3,
+   4
+  ],
+  "flag": null,
+  "deps": [
+   "G2-01"
+  ],
+  "needs": "",
+  "what": "FE and BE guild members check the miner's real-bug candidates and confirm 120 PRs that truly introduced a shipped bug. For each one they write the golden comment: where the bug is, how bad it is, and what a reviewer should have said.",
+  "why": "The golden comments are BYTE-GOLD's answer key. If they are vague or wrong, every precision and recall number built on them is wrong too.",
+  "how": [
+   "Sean splits `candidates/real.jsonl` by area (frontend/ and ohif/ to the FE guild; cloud/, client/, sdk/ and common/ to the BE guild) and posts a sign-up list in each guild channel. Budget about 10 minutes per candidate.",
+   "Per candidate, open the fix PR, the Jira Bug and the introducing PR. Keep it only if the cause is visible in the introducing PR's diff; otherwise mark it rejected with one word (refactor, config, unclear).",
+   "Fill `cases/<id>/case.json` in byte-gold from the template (sketch; the numbers there are made up). Severity uses Byte's scale: high means you would block the merge, medium is real but not blocking, low is minor.",
+   "Describe the code defect only. No customer names, ticket text or data from the Bug: an LLM judge reads this file.",
+   "Read the introducing PR's title and body. If they were edited later and mention the bug, set `blankBody: true` so the packer leaves the body out.",
+   "Open one byte-gold PR per batch; Sean reviews for consistent severities. Stop at 120 confirmed; leftover candidates wait for next quarter."
+  ],
+  "code": {
+   "file": "cases/real-0042/case.json (RhinoHealth/byte-gold)",
+   "lang": "json",
+   "text": "{\n  \"id\": \"real-0042\",\n  \"kind\": \"real\",\n  \"repository\": \"RhinoHealth/fcp\",\n  \"prNumber\": 1874,\n  \"team\": \"be\",\n  \"bugKey\": \"RH-8123\",\n  \"fixPr\": 1932,\n  \"blankBody\": false,\n  \"split\": null,\n  \"golden\": [\n    {\n      \"path\": \"cloud/rhinoCloud/rhinoCore/permissions.py\",\n      \"startLine\": 212,\n      \"endLine\": 218,\n      \"severity\": \"high\",\n      \"defect\": \"The new object check compares the user's active workgroup instead of the dataset's own workgroup, so a member of another workgroup can read the dataset.\",\n      \"labeler\": \"<labeler's GitHub login>\"\n    }\n  ]\n}"
+  }
+ },
+ {
+  "key": "G2-03",
+  "title": "[Guilds] Label BYTE-GOLD: confirm 60 clean PRs, plant 60 bugs",
+  "team": [
+   "guild"
+  ],
+  "days": 2,
+  "w": [
+   4,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G2-01"
+  ],
+  "needs": "",
+  "what": "Guild members confirm 60 clean PRs from the miner's pool and plant one realistic bug into each of 60 other clean PRs, with a golden comment for every planted bug.",
+  "why": "Clean PRs measure false alarms (the bar is at most 0.2 high or medium findings per clean PR). Planted bugs cover the bug classes we care about that history alone gives too few of.",
+  "how": [
+   "Clean: for each candidate in `candidates/clean.jsonl`, skim the diff and the code's later history, and keep it if nobody found a defect in it. Write `case.json` with `kind: clean` and an empty `golden` list.",
+   "Planted: take a different clean PR and write a small patch on its head that adds one bug from the README's class list: missing permission or workgroup check, unhandled status, swallowed error, off-by-one, N+1 query, migration that locks a big table, removed export still in use, unsafe HTML.",
+   "Save it as `cases/<id>/planted.patch` (it must pass `git apply --check` on the PR head) and write the golden comment in `case.json` with `kind: planted` (sketch).",
+   "Make planted bugs look like the code around them: no hinting comments, no TODOs, no odd names.",
+   "Fake data only: never put real dataset names, patient-like values or customer names in a patch.",
+   "About 10 minutes per clean PR and 20 per planted bug. One byte-gold PR per batch for Sean to review."
+  ],
+  "code": {
+   "file": "cases/planted-0017/case.json (RhinoHealth/byte-gold)",
+   "lang": "json",
+   "text": "{\n  \"id\": \"planted-0017\",\n  \"kind\": \"planted\",\n  \"repository\": \"RhinoHealth/fcp\",\n  \"prNumber\": 2190,\n  \"team\": \"fe\",\n  \"plantedPatch\": \"planted.patch\",\n  \"plantedClass\": \"missing-workgroup-scope\",\n  \"blankBody\": false,\n  \"split\": null,\n  \"golden\": [\n    {\n      \"path\": \"<the frontend file planted.patch edits>\",\n      \"startLine\": 41,\n      \"endLine\": 44,\n      \"severity\": \"high\",\n      \"defect\": \"The query key no longer includes the workgroup, so after a workgroup switch the page shows the previous workgroup's cached datasets.\",\n      \"labeler\": \"<labeler's GitHub login>\"\n    }\n  ]\n}"
+  }
+ },
+ {
+  "key": "G2-04",
+  "title": "[Platform] Build the BYTE-GOLD packer and an offline replay broker",
+  "team": [
+   "plat"
+  ],
+  "days": 2,
+  "w": [
+   4,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G2-01"
+  ],
+  "needs": "",
+  "what": "Two new Byte subcommands: `gold-pack` turns a case into a sealed input pack (PR metadata, the diff and the head tree, without git history), and `broker --replay` serves Byte's usual `gh` reads from that pack with no token, recording the review instead of posting it.",
+  "why": "Byte must review an old PR as it would have back then, without seeing what happened after. SWE-bench agents were caught reading future git history; a pack with no .git and a broker with no token close that path.",
+  "how": [
+   "Add `src/gold.ts` with `goldPack()` and wire `gold-pack` into `src/cli.ts` in the same `argsToMap`/`required` style as the other subcommands.",
+   "`gold-pack --case <dir> --fcp <clone> --out <pack>` writes `input/pr.json` (title, body unless `blankBody`, files with additions and deletions, refs and SHAs from `gh api repos/RhinoHealth/fcp/pulls/<n>` and `/files`, plus `reviewArgs`: the flags the gate would pass for fcp), `input/diff.patch` (`git diff <base>...<head>` plus `planted.patch`) and `input/tree.tar` (`git archive <head>` with the patch applied, no `.git`). A shallow fetch of the two SHAs is enough.",
+   "Give `BrokerSessionOptions` in `src/broker.ts` an optional `api`, next to the existing `executeRead` injection, so a session can run without a real `GitHubApi`.",
+   "Add `src/gold-broker.ts` (sketch): reads come from the pack, the review and comment listings are empty (every replay is a first review), publications go to `/output/publication.json`, and `/v1/head` always says unchanged. `broker --replay /input` starts it with `BYTE_BROKER_CAPABILITY` and no `BYTE_BROKER_TOKEN`.",
+   "Tests in `test/gold-broker.test.ts` (`node --test` via tsx): `gh pr diff` returns the pack's patch, an unknown endpoint is refused, a publication lands in the file, and nothing touches the network."
+  ],
+  "code": {
+   "file": "src/gold-broker.ts (RhinoHealth/byte)",
+   "lang": "ts",
+   "text": "import { readFile, writeFile } from \"node:fs/promises\";\nimport { join } from \"node:path\";\nimport { BrokerSession, type BrokerCommandResult } from \"./broker.js\";\n\n// `byte broker --replay /input`: Byte's usual gh reads, answered from a sealed\n// pack. No token, no network. Every replay is a first review, so the review\n// and comment listings are empty; anything the pack can't answer is refused.\nexport async function replaySession(inputDir: string, outputDir: string, capability: string): Promise<BrokerSession> {\n  const pr = JSON.parse(await readFile(join(inputDir, \"pr.json\"), \"utf8\")) as ReplayPr;\n  const diff = await readFile(join(inputDir, \"diff.patch\"), \"utf8\");\n  const ok = (stdout: string): BrokerCommandResult => ({ exitCode: 0, stdout, stderr: \"\" });\n  const published: unknown[] = [];\n  return new BrokerSession({\n    repository: pr.repository,\n    prNumber: pr.number,\n    headSha: pr.headSha,\n    token: \"\", // nothing to leak: both GitHub paths below are injected\n    forbiddenSecrets: [capability],\n    executeRead: async (args) => {\n      if (args[0] === \"pr\" && args[1] === \"diff\") return ok(diff);\n      if (args[0] === \"pr\" && args[1] === \"view\") return ok(JSON.stringify(pick(pr.view, jsonFields(args))));\n      if (args[0] === \"api\" && /\\/pulls\\/\\d+\\/files/.test(args[1] ?? \"\")) return ok(JSON.stringify(pr.files));\n      if (args[0] === \"api\" && /\\/(pulls|issues)\\/\\d+\\/(reviews|comments)/.test(args[1] ?? \"\")) return ok(\"[]\");\n      return { exitCode: 1, stdout: \"\", stderr: \"not in the replay pack\" };\n    },\n    // New optional injection in BrokerSessionOptions: publications are recorded, never posted.\n    api: recordingApi(async (review) => {\n      published.push(review);\n      await writeFile(join(outputDir, \"publication.json\"), `${JSON.stringify(published, null, 2)}\\n`);\n      return { id: published.length };\n    }),\n  });\n}"
+  }
+ },
+ {
+  "key": "G2-05",
+  "title": "[Platform] Enforce independent approval and green checks for Byte fixes",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   5,
+   5
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G0 independent-approval check; G0 fcp main ruleset (dismiss stale approvals, required checks); G1 nightly metrics job",
+  "what": "Turn two fix-mode habits into rules GitHub enforces: a Byte fix that reaches main needs an approval from someone other than the person who asked for it, and green required checks on the head that contains it. The existing fix-PR merge rate also goes to Grafana.",
+  "why": "Today 'a developer other than the requester reviews each fcp fix PR' is a team practice (SECURITY.md residual 1), and an approval on main can predate a merged fix. Fix PRs merge into unprotected feature branches, so main is the only place GitHub can enforce it.",
+  "how": [
+   "In `src/fix-render.ts`, add a `Requested-by: @<login>` line to `renderFixPrBody` and a `Requested-by: <login>` trailer to `renderFixCommitMessage` (sketch). The login is the gate's validated requester, not model text; update the 'No trailers' comment and SECURITY.md's commit-message rule to match.",
+   "Extend G0's independent-approval check on fcp main PRs: read the `Requested-by:` trailers of commits made by Byte's fix identity, and pass only when an approval newer than the last such commit comes from someone who is neither the PR author nor a fix requester.",
+   "Green checks need no new workflow: merging a fix changes the PR head, so G0's required checks run again and 'dismiss stale approvals' drops the old approval. Don't add a `pull_request` workflow for fix PRs; Security's sign-off (residual 3) relies on none running.",
+   "Say this plainly in the fix PR banner and the result comment: 'CI runs when you merge this into your branch; main then needs green checks and an approval from someone other than @<requester>.'",
+   "The merge rate already exists (`src/fix-fates.ts`, the dashboard's 'merge rate'). Have the G1 nightly metrics job read `data/fix-fates.jsonl` from the telemetry branch and write `byte_fix_prs_total{state}`.",
+   "Update SECURITY.md residuals 1 and 5, ask Security to re-confirm the fix-mode sign-off, and add cases to `test/fix-render.test.ts`."
+  ],
+  "code": {
+   "file": "src/fix-render.ts (RhinoHealth/byte)",
+   "lang": "ts",
+   "text": "// SECURITY.md keeps model text out of commit messages. The one trailer added\n// here is not model text: it is the gate-validated requester login, so G0's\n// independent-approval check on main can see who asked for the fix and\n// require an approval from someone else.\nconst REQUESTER_LOGIN = /^[A-Za-z0-9-]{1,39}$/;\n\nfunction requestedBy(requester: string): string {\n  if (!REQUESTER_LOGIN.test(requester)) {\n    throw new Error(\"fix requester is not a GitHub login\");\n  }\n  return `Requested-by: ${requester}`;\n}\n\nexport function renderFixCommitMessage(input: { selection: FixSelection; plan: FixValidatedPlan; requester: string }): string {\n  return [\n    ...todaysCommitLines(input), // unchanged: finding ids and plain-path locations, closing keywords defused\n    \"\",\n    requestedBy(input.requester),\n  ].join(\"\\n\");\n}\n\n// renderFixPrBody keeps its prose (\"requested by @...\") and adds the machine\n// line G0's check reads in PR bodies:\n//   `Requested-by: @${input.requester}`"
+  }
+ },
+ {
+  "key": "G2-06",
+  "title": "[Platform] Replay BYTE-GOLD sealed: no history, no token, one host out",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   5,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G2-04"
+  ],
+  "needs": "",
+  "what": "A script that replays one pack through the real Byte worker image on an isolated Docker network. The worker reaches only the replay broker and the Claude endpoint, and its checkout has no git history.",
+  "why": "This is what keeps BYTE-GOLD honest: Byte can't look up the fix, later comments or the answer key. It runs the same image and runner as production, so the score describes what ships.",
+  "how": [
+   "Add `scripts/gold-replay.sh <pack> <image> <out>` (sketch), reusing review.yml's container pattern: a per-run network, a capability from `openssl rand -hex 32`, and `--cap-drop ALL --read-only --security-opt no-new-privileges`.",
+   "Create the network with `--internal`, so nothing on it has a route out, and start the replay broker on it with the pack's `input/` mounted read-only.",
+   "Add `config/gold-squid.conf` and run one squid container (pinned by digest, like every third-party image) on the internal network and the default bridge. Reuse the allow-list lines from infrastructure's `modules/squid-proxy` template without the basic auth, allowing only `api.anthropic.com`.",
+   "Unpack `tree.tar` into a temp dir, mount it at `/workspace:ro`, and run the worker's `review` with `HTTPS_PROXY` pointing at squid, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and the pack's `reviewArgs`.",
+   "Never mount byte-gold or the answers. Keep `publication.json`, `claude-result.json` and `run-manifest.json` per case; a trap removes the containers and the network.",
+   "Smoke-test 5 packs on byte-runner-set: squid's log shows only api.anthropic.com, the broker's audit shows no refused reads, and the manifest has the same shape as a live review's."
+  ],
+  "code": {
+   "file": "scripts/gold-replay.sh (RhinoHealth/byte)",
+   "lang": "bash",
+   "text": "#!/usr/bin/env bash\n# scripts/gold-replay.sh <pack> <worker image> <out>: one BYTE-GOLD case, sealed.\n# The worker sees the tree (no .git), the replay broker (no token) and one host\n# out. The answer key is never mounted anywhere. SQUID_IMAGE is digest-pinned.\nset -euo pipefail\npack=\"$1\"; image=\"$2\"; out=\"$3\"\nid=\"$(jq -r .id \"$pack/input/pr.json\")\"\nnet=\"gold-$id-$$\"; cap=\"$(openssl rand -hex 32)\"; tree=\"$(mktemp -d)\"\nmapfile -t review_args < <(jq -r '.reviewArgs[]' \"$pack/input/pr.json\") # what the gate would pass for fcp\ntrap 'docker rm -f \"gb-$id\" \"ge-$id\" >/dev/null 2>&1 || true; docker network rm \"$net\" >/dev/null 2>&1 || true; rm -rf \"$tree\"' EXIT\ntar -xf \"$pack/input/tree.tar\" -C \"$tree\"\nmkdir -p \"$out/$id\"\n\ndocker network create --internal \"$net\" >/dev/null # no route out\ndocker run -d --name \"ge-$id\" --network \"$net\" --read-only --tmpfs /var/spool/squid --tmpfs /var/run \\\n  -v \"$PWD/config/gold-squid.conf:/etc/squid/squid.conf:ro\" \"$SQUID_IMAGE\" >/dev/null # allows api.anthropic.com only\ndocker network connect bridge \"ge-$id\" # the one container with a way out\ndocker run -d --name \"gb-$id\" --network \"$net\" --cap-drop ALL --read-only --security-opt no-new-privileges \\\n  -e BYTE_BROKER_CAPABILITY=\"$cap\" -v \"$pack/input:/input:ro\" -v \"$out/$id:/output\" \\\n  \"$image\" broker --replay /input >/dev/null\n# (wait for the broker's /health as review.yml does)\n\ndocker run --rm --network \"$net\" --user \"$(id -u):$(id -g)\" --cap-drop ALL --read-only \\\n  --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,nodev,size=256m -e HOME=/tmp/byte-home \\\n  -e HTTPS_PROXY=\"http://ge-$id:3128\" -e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 -e CLAUDE_CODE_OAUTH_TOKEN \\\n  -e BYTE_BROKER_URL=\"http://gb-$id:8080\" -e BYTE_BROKER_CAPABILITY=\"$cap\" \\\n  -v \"$tree:/workspace:ro\" -v \"$out/$id:/output\" -w /workspace \\\n  \"$image\" review \"${review_args[@]}\" --check-id 0 --output-directory /output \\\n  > \"$out/$id/runner-result.json\" 2> \"$out/$id/runner-stderr.log\""
+  }
+ },
+ {
+  "key": "G2-07",
+  "title": "[Platform] Skip fcp re-reviews when the sniff says every finding is fixed",
+  "team": [
+   "plat",
+   "nave"
+  ],
+  "days": 1.5,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "",
+  "what": "Take fcp's per-push sniff out of observe mode, so a push that only fixes Byte's open findings gets the short sniff line instead of a full re-review. The sniff stays on TypeSafe Jev.",
+  "why": "Re-reviewing pushes that only fix findings is review spend we can remove safely. fcp has run the sniff in observe mode, so every sniff there already has a paired full review to check it against.",
+  "how": [
+   "With Nave, read fcp's rows in `data/sniffs.jsonl` and `data/sniff-pairs.jsonl` on Byte's telemetry branch (the dashboard's sniff page): the false 'fulfilled' rate (fulfilled and sure, then re-flagged by the next full review) and the skip rate among all-fixed pushes.",
+   "Go live only if the campaign's fcp bars hold on live data: false fulfilled at most 2% (Wilson upper bound) and a skip rate of at least 40%. With too few pairs, wait a week rather than lower the bar.",
+   "Make the one-line policy PR in `config/repositories.json`: fcp's `sniff.observe` becomes `false`, every other key unchanged (sketch). Byte reviews it; Nave approves.",
+   "Nothing else changes: pushes on `SENSITIVE_PATH` (auth, migrations, workflows, infra) and any open high-severity finding still get a full review, and `@byte-review` still forces one.",
+   "Keep the sniff on Jev rather than Haiku 5.5: a sniff costs about $0.0001 ($0.042 per million input tokens against Haiku's $0.10), and its thresholds are tuned to jev-1.13.0 over four campaign runs.",
+   "Watch the weekly harvest's re-flag rate for 2 weeks; if false fulfilled goes over 2%, set `observe` back to `true`."
+  ],
+  "code": {
+   "file": "config/repositories.json (RhinoHealth/byte, fcp entry, other keys unchanged)",
+   "lang": "json",
+   "text": "{\n  \"repositories\": {\n    \"RhinoHealth/fcp\": {\n      \"sniff\": {\n        \"enabled\": true,\n        \"observe\": false,\n        \"fulfilConfidence\": 0.85\n      },\n      \"fix\": {\n        \"enabled\": true,\n        \"mode\": \"ci\"\n      },\n      \"authorRouting\": true\n    }\n  }\n}"
+  }
+ },
+ {
+  "key": "G2-08",
+  "title": "[Platform] Score BYTE-GOLD: judge findings, report recall by severity",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G2-02",
+   "G2-06"
+  ],
+  "needs": "G1 eval results store (suites write JSON to S3 and push pass rates as metrics)",
+  "what": "A `gold-score` subcommand that matches Byte's findings in each replay to the golden comments and reports recall by severity, precision, and false alarms per clean PR.",
+  "why": "This is the number the gate and every cost change are judged on. An LLM judge matching comments to golden comments is the Uber and Martian method; a location filter in code keeps it cheap and strict.",
+  "how": [
+   "Add `src/gold-score.ts` (sketch) and wire `gold-score --cases <byte-gold> --results <dir> --output <file>` into `src/cli.ts`.",
+   "Filter in code first: a finding can only match a golden comment on the same path within 10 lines of its range. Only those pairs reach the judge.",
+   "Judge each pair with `claude -p --model claude-haiku-5-5 --effort low`, no tools, JSON out: 'does this finding describe this defect?' Reuse the session flags and token handling of `weekly-analyze`.",
+   "Calibrate before the gate trusts it: Sean and Nave label 50 pairs by hand. Below 90% agreement, switch the judge to Sonnet 5.5 at medium and check again.",
+   "Report per split, team and kind: recall for high, medium and low golden bugs; precision (matched findings over findings on real and planted cases); high or medium findings per clean PR; API-equivalent cost and minutes per review from `claude-result.json`.",
+   "Output numbers only, like `data/runs.jsonl` (no path, code or finding text): the scorecard JSON goes to the G1 eval store and a markdown table to the job summary."
+  ],
+  "code": {
+   "file": "src/gold-score.ts (RhinoHealth/byte)",
+   "lang": "ts",
+   "text": "import type { ModelFinding } from \"./review.js\";\n\nexport interface GoldenComment { path: string; startLine: number; endLine: number; severity: \"high\" | \"medium\" | \"low\"; defect: string }\nexport interface GoldCase { id: string; kind: \"real\" | \"clean\" | \"planted\"; team: string; split: \"dev\" | \"holdout\"; golden: GoldenComment[] }\nexport type Judge = (finding: ModelFinding, golden: GoldenComment) => Promise<boolean>;\n\n// Routing table: Haiku 5.5 low for yes/no checks. Calibrated on 50 hand-labelled\n// pairs first; below 90% agreement, switch to Sonnet 5.5 medium.\nexport const JUDGE = { model: \"claude-haiku-5-5\", effort: \"low\" } as const;\nconst LINE_WINDOW = 10;\n\nconst near = (f: ModelFinding, g: GoldenComment): boolean =>\n  f.path === g.path && f.line >= g.startLine - LINE_WINDOW && f.line <= g.endLine + LINE_WINDOW;\n\n// Only numbers leave this function: no path, code or finding text.\nexport async function scoreCase(c: GoldCase, findings: ModelFinding[], judge: Judge) {\n  const matched = new Set<ModelFinding>();\n  const golden: Array<{ severity: GoldenComment[\"severity\"]; caught: boolean }> = [];\n  for (const g of c.golden) {\n    let caught = false;\n    for (const f of findings.filter((x) => !matched.has(x) && near(x, g))) {\n      if (await judge(f, g)) { matched.add(f); caught = true; break; }\n    }\n    golden.push({ severity: g.severity, caught });\n  }\n  const alarms = findings.filter((f) => f.severity !== \"low\").length; // unrecognised ranks as high\n  return {\n    id: c.id, kind: c.kind, team: c.team, split: c.split, golden,\n    findings: findings.length,\n    matchedFindings: matched.size,\n    cleanAlarms: c.kind === \"clean\" ? alarms : null, // pass bar: mean <= 0.2 per clean PR\n  };\n}"
+  }
+ },
+ {
+  "key": "G2-09",
+  "title": "[Platform] Gate Byte's prompt, model and playbook changes on BYTE-GOLD",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G2-03",
+   "G2-08"
+  ],
+  "needs": "G1 eval results store",
+  "what": "A required check in RhinoHealth/byte that replays the BYTE-GOLD dev split whenever a PR changes a prompt, the model, the effort or a playbook, and fails when quality drops. The holdout split runs once a month.",
+  "why": "Today every Byte change ships on review alone, and a merge to main repins the whole fleet within minutes. The gate makes 'rules must earn their place' measurable: a change stays only if BYTE-GOLD holds.",
+  "how": [
+   "Assign splits once in byte-gold: a stable hash of the case id, stratified by kind, team and severity, two thirds dev and one third holdout. Only Sean and Nave see per-case holdout results.",
+   "Add `.github/workflows/gold.yml` (sketch): on PRs touching `skills/**`, `src/engines.ts`, `src/limits.ts`, `src/review.ts`, `src/panel.ts`, `config/repositories.json` or `Dockerfile` (the Claude Code pin), on the same paths on main to refresh the baseline, and monthly for the holdout.",
+   "`scripts/gold-run.sh` packs the cases with a read-only App token for fcp (packs cached by case id; the token never enters a container), replays 4 at a time against the image built from the PR, and scores with `byte gold-score`.",
+   "Scope by change: a PR under `skills/<team>/` replays only that team's cases, so the weekly loop's MEMORY.md PRs stay cheap; engine, limits, review, panel, policy or Dockerfile changes replay every dev case.",
+   "Leak check first: fail if any case's PR number, head SHA or Jira key appears under `skills/` (the weekly loop writes MEMORY.md from live findings).",
+   "Pass bar: HIGH recall at most 3 points below the latest main row in `data/gold-runs.jsonl` (telemetry branch) and at most 0.2 high or medium findings per clean PR. Run main 3 times first to measure noise; if runs differ by more than 3 points, re-run only the cases that flipped.",
+   "Make BYTE-GOLD a required check on byte's main. Replays share Byte's Claude quota with live reviews, like fix mode: if live reviews start hitting 429s, move runs to the evening."
+  ],
+  "code": {
+   "file": ".github/workflows/gold.yml (RhinoHealth/byte)",
+   "lang": "yaml",
+   "text": "name: BYTE-GOLD\non:\n  pull_request:\n    paths: [\"skills/**\", \"src/engines.ts\", \"src/limits.ts\", \"src/review.ts\", \"src/panel.ts\", \"config/repositories.json\", \"Dockerfile\"]\n  push: # the merged result becomes the baseline row in data/gold-runs.jsonl\n    branches: [main]\n    paths: [\"skills/**\", \"src/engines.ts\", \"src/limits.ts\", \"src/review.ts\", \"src/panel.ts\", \"config/repositories.json\", \"Dockerfile\"]\n  schedule:\n    - cron: \"0 19 1 * *\" # holdout split, monthly, in the evening\npermissions:\n  contents: read\nconcurrency:\n  group: byte-gold-${{ github.event.pull_request.number || github.ref }}\n  cancel-in-progress: true # only a PR's newest head is worth scoring\njobs:\n  gold:\n    # Byte's own fix PRs are opened by the App: model-written code never runs next to the answer key.\n    if: github.event_name != 'pull_request' || github.event.pull_request.user.type != 'Bot'\n    runs-on: byte-runner-set\n    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with: { persist-credentials: false }\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        # decide: a read-only deploy key or a small read-only App for byte-gold\n        with: { repository: RhinoHealth/byte-gold, path: gold, ssh-key: \"${{ secrets.BYTE_GOLD_DEPLOY_KEY }}\", persist-credentials: false }\n      - id: fcp-token # packs fetch two SHAs per case; contents and PRs read only\n        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3\n        with: { client-id: \"${{ secrets.BYTE_GITHUB_APP_ID }}\", private-key: \"${{ secrets.BYTE_GITHUB_APP_PRIVATE_KEY }}\", owner: RhinoHealth, repositories: fcp, permission-contents: read, permission-pull-requests: read }\n      - run: docker build -t \"byte-worker:gold-$GITHUB_SHA\" . # local only: never pushed, never repinned\n      - env:\n          GH_TOKEN: ${{ steps.fcp-token.outputs.token }}\n          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.BYTE_CLAUDE_CODE_OAUTH_TOKEN }}\n          SPLIT: ${{ github.event_name == 'schedule' && 'holdout' || 'dev' }}\n        run: scripts/gold-run.sh \"$SPLIT\" \"byte-worker:gold-$GITHUB_SHA\" gold # leak check, pack, replay, score, pass bar"
+  }
+ },
+ {
+  "key": "G2-10",
+  "title": "[Platform] Track Byte live: addressed rate, wrong-finding rate, live recall",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G2-01",
+   "G2-08"
+  ],
+  "needs": "G1 nightly metrics job and Grafana dashboards",
+  "what": "Measure Byte on real PRs, not only on BYTE-GOLD: how many of its HIGH findings get addressed before merge, how many people mark wrong, and each month how many shipped bugs Byte had flagged.",
+  "why": "BYTE-GOLD is a fixed set; live numbers show whether people act on Byte. The targets are at least 65% of HIGH findings addressed and under 3% marked wrong, measured the way Uber's uReview counts 'addressed'.",
+  "how": [
+   "In the `weekly-harvest` stage of `src/weekly.ts`, give each Byte finding comment on PRs merged in the window a fate (sketch): addressed when a later sniff called it fulfilled and sure, or GitHub shows it outdated at merge (the code under it changed); otherwise open. It is wrong when a write collaborator gave it a thumbs-down.",
+   "Write `finding-fates.jsonl` rows with ids, severity and enums only, upload it as `byte-finding-fates-<runId>` like `byte-fix-fates-*`, and let the hourly sweep in `src/telemetry.ts` merge it into `data/finding-fates.jsonl`.",
+   "Add a 'Live quality' line per team to DASHBOARD.md: HIGH addressed %, wrong %, and n.",
+   "The G1 nightly metrics job reads `data/finding-fates.jsonl` from the telemetry branch and writes `byte_findings_addressed_ratio{severity,team}`, `byte_findings_wrong_ratio{team}` and `byte_live_recall` to VictoriaMetrics.",
+   "Live recall, monthly: the operator runs `scripts/gold-mine.ts --since 30d` on last month's fixed Bug tickets; for each introducing PR that Byte reviewed, `byte gold-score --live` checks whether a Byte finding matched the bug (same filter and judge as BYTE-GOLD).",
+   "Tests in `test/weekly.test.ts` for the fate rules: an outdated comment counts, a reply alone does not, a thumbs-down from a non-collaborator does not."
+  ],
+  "code": {
+   "file": "src/weekly.ts (RhinoHealth/byte)",
+   "lang": "ts",
+   "text": "// One row per Byte finding on a merged PR: ids, severity and enums only,\n// never a path or a body (the same rule as runs.jsonl).\nexport interface FindingFate {\n  schema: 1;\n  repository: string;\n  prNumber: number;\n  commentId: number;\n  severity: \"high\" | \"medium\" | \"low\" | null;\n  fate: \"addressed\" | \"open\";\n  wrong: boolean;\n  mergedAt: string;\n}\n\n// Addressed = a later sniff called it fulfilled and sure, or GitHub marks the\n// comment outdated at merge (`line` is null: the code under it changed). A\n// rebase can also outdate a comment, so the sniff verdict is the stronger signal.\nexport function findingFate(\n  comment: ReviewComment,\n  sniff: { verdict: string; sure: boolean } | undefined,\n  thumbsDownFromWriters: number,\n): Pick<FindingFate, \"fate\" | \"wrong\"> {\n  const outdated = comment.line === null && typeof comment.original_line === \"number\";\n  const fulfilled = sniff?.verdict === \"fulfilled\" && sniff.sure;\n  return { fate: outdated || fulfilled ? \"addressed\" : \"open\", wrong: thumbsDownFromWriters > 0 };\n}"
+  }
+ },
+ {
+  "key": "G2-11",
+  "title": "[Platform] Pick review model and effort by PR size and kind",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G2-09"
+  ],
+  "needs": "",
+  "what": "Byte's gate picks the model and effort for each review from the PR's size and kind, instead of always running Opus 5.5 at high. Each route stays only while its BYTE-GOLD slice holds.",
+  "why": "Every review runs at high today (`CLAUDE_EFFORT` in `src/limits.ts`), even a one-line docs fix. Anthropic measured medium matching the old high at about half the tokens, and the routing table says low for docs-, test- and dependency-only PRs.",
+  "how": [
+   "Add `src/route.ts` (sketch): `reviewRoute(files)` returns `{ model, effort, reason }` from changed lines (additions plus deletions, lockfiles and generated files left out) and kind (docs-only, test-only, deps-only).",
+   "Extend `PullRequestFile` in `src/types.ts` with `additions` and `deletions` (GitHub already returns them), and call `reviewRoute` in `gate()` where `model` is resolved today. A team `model` in policy still wins.",
+   "Add an `effort` gate output; pass `--effort \"$EFFORT\"` in `review.yml`; read it in `cli.ts` as optional with `CLAUDE_EFFORT` as the default (the same caller-skew pattern as `--model`), and use it in `engines.ts` instead of the constant.",
+   "Add `claude-sonnet-5-5` to `SUPPORTED_MODELS` for the panel's conventions lens later; reviews stay on Opus 5.5.",
+   "Prove each route on its BYTE-GOLD dev slice: HIGH recall within 3 points of today's high and no more clean false alarms. A route that loses goes back to high. It ships through the G2-09 gate.",
+   "Show the route on the dashboard's runs table (model and effort) and its reason in the status comment. Nave reviews the PR."
+  ],
+  "code": {
+   "file": "src/route.ts (RhinoHealth/byte)",
+   "lang": "ts",
+   "text": "import { DEFAULT_MODEL } from \"./limits.js\";\nimport type { PullRequestFile } from \"./types.js\";\n\nexport type Effort = \"low\" | \"medium\" | \"high\";\nexport interface ReviewRoute { model: string; effort: Effort; reason: string }\n\n// Starting values from the routing table. Each route stays only while its\n// BYTE-GOLD slice holds (HIGH recall within 3 points of `high`).\nconst LARGE_PR_LINES = 400;\nconst GENERATED = /(^|\\/)(package-lock\\.json|uv\\.lock|yarn\\.lock)$|_pb2(_grpc)?\\.pyi?$/;\nconst DOCS = /\\.(md|mdx|txt)$|(^|\\/)docs\\//;\nconst TESTS = /(^|\\/)(tests?|e2e|__tests__)\\/|\\.(test|spec)\\.[jt]sx?$|(^|\\/)test_[^/]+\\.py$/;\nconst DEPS = /(^|\\/)(package\\.json|pyproject\\.toml|requirements[^/]*\\.txt)$/;\n\nexport function reviewRoute(files: PullRequestFile[]): ReviewRoute {\n  const counted = files.filter((file) => !GENERATED.test(file.filename));\n  const lines = counted.reduce((sum, file) => sum + file.additions + file.deletions, 0);\n  const all = (pattern: RegExp): boolean => counted.every((file) => pattern.test(file.filename));\n  if (all(DOCS) || all(TESTS) || all(DEPS)) {\n    return { model: DEFAULT_MODEL, effort: \"low\", reason: \"docs-, test- or dependency-only\" };\n  }\n  if (lines > LARGE_PR_LINES) {\n    return { model: DEFAULT_MODEL, effort: \"high\", reason: `${lines} changed lines` };\n  }\n  return { model: DEFAULT_MODEL, effort: \"medium\", reason: `${lines} changed lines` };\n}"
+  }
+ },
+ {
+  "key": "G2-12",
+  "title": "[Platform] Label every fcp PR risk:low, med or high, with the reason",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G2-11"
+  ],
+  "needs": "G0 fcp main ruleset (the label never changes the 1-approval rule); G8 pr-story shows the label",
+  "what": "Every fcp PR gets a `risk:low`, `risk:med` or `risk:high` label from Byte, with the reason in a neutral 'Byte risk' check. It tells the one reviewer where to look and never changes who may approve or how many approvals are needed.",
+  "why": "With exactly one approval per PR, the reviewer needs to know which PRs touch migrations, permissions or the cloud-client contract. The same tier drives Byte's deep mode later.",
+  "how": [
+   "Put the tiers in Byte's policy, not in fcp: a `risk` block per repository in `config/repositories.json` (paths to a tier, with a reason). Policy is baked into the signed image and never read from the reviewed repo, so a PR can't lower its own tier; this replaces the plan's risk-tiers.yml (Byte also has no YAML parser).",
+   "Draft fcp's tiers with the BE and FE guilds. High: `cloud/rhinoCloud/rhinoCore/migrations/**`, `cloud/rhinoCloud/rhinoCore/permissions.py`, `common/fcp_common/rhinoAgentRpc/**`, `client/rhinoOnPrem/rhinoAgentRpc/**`, `frontend/src/app/(auth)/**`, `frontend/src/app/api/auth/**`, `frontend/src/proxy.ts`, `.github/workflows/**`. Low: docs, stories and tests only. Everything else med; more than 800 changed lines raises one tier.",
+   "Add `src/risk.ts` (sketch) and a `risk` subcommand in `src/cli.ts`: list the PR's files with the read token, compute the tier, set the label (removing the other two), and create a completed check run 'Byte risk' with conclusion `neutral` and the matched rules.",
+   "Add a reusable `.github/workflows/risk.yml` in byte (App token with `issues: write`, `checks: write`, `pull-requests: read`; worker image by digest, like review.yml) and a new caller `.github/workflows/byte-risk.yml` in fcp on `pull_request` opened, reopened, synchronize and ready_for_review for base `main`, pinned by SHA and moved by `scripts/fleet-sync.sh`.",
+   "Use a separate caller file: adding `opened` to fcp's `byte-review.yml` would also start a full review on every new PR. Add the new file to SECURITY.md's list of pull_request workflows that hold the App key.",
+   "Create the three labels in fcp once (`gh label create risk:high --color B60205`, and so on) and never add the check to the ruleset: it is information only."
+  ],
+  "code": {
+   "file": "src/risk.ts (RhinoHealth/byte)",
+   "lang": "ts",
+   "text": "import { isPathAllowed } from \"./policy.js\";\nimport type { PullRequestFile } from \"./types.js\";\n\n// Per repository in config/repositories.json, baked into the signed image:\n// \"risk\": { \"high\": { \"paths\": [\"cloud/rhinoCloud/rhinoCore/migrations/**\", ...], \"reason\": \"schema change\" },\n//           \"low\":  { \"paths\": [\"**/*.md\", \"**/*.stories.tsx\", \"**/tests/**\"], \"reason\": \"docs or tests only\" } }\n// Files no rule claims are \"med\".\nexport type RiskTier = \"low\" | \"med\" | \"high\";\ninterface RiskRule { paths: string[]; reason: string }\nexport interface RiskPolicy { high?: RiskRule; low?: RiskRule }\n\nconst RAISE_ABOVE_LINES = 800;\nconst ORDER: RiskTier[] = [\"low\", \"med\", \"high\"];\n\nexport function riskFor(files: PullRequestFile[], policy: RiskPolicy): { tier: RiskTier; reasons: string[] } {\n  const { high, low } = policy;\n  const reasons: string[] = [];\n  let tier: RiskTier = low !== undefined && files.every((f) => isPathAllowed(f.filename, low.paths)) ? \"low\" : \"med\";\n  const risky = high === undefined ? [] : files.filter((f) => isPathAllowed(f.filename, high.paths));\n  if (high !== undefined && risky.length > 0) {\n    tier = \"high\";\n    reasons.push(`${risky.length} file(s): ${high.reason}`);\n  }\n  const lines = files.reduce((sum, f) => sum + f.additions + f.deletions, 0);\n  if (lines > RAISE_ABOVE_LINES && tier !== \"high\") {\n    tier = ORDER[ORDER.indexOf(tier) + 1] ?? \"high\";\n    reasons.push(`${lines} changed lines`);\n  }\n  return { tier, reasons: reasons.length > 0 ? reasons : [tier === \"low\" ? (low?.reason ?? \"low\") : \"no high-risk paths\"] };\n}"
+  }
+ },
+ {
+  "key": "G2-13",
+  "title": "[Platform] Review Nova's draft PRs and read its self-review receipt",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G2-09",
+   "G2-12"
+  ],
+  "needs": "G0 rhino-ai-agents GitHub App and the Requested-by: line; G4 draft PR with the self-review receipt",
+  "what": "Byte reviews PRs opened by the `rhino-ai-agents` App while they are still drafts, and reads Nova's self-review receipt in the PR body so it does not repeat what Nova already found.",
+  "why": "Nova keeps its PRs in draft until Byte's review is clean (G4), but today fcp's caller and Byte's gate both skip drafts, so Byte would never see them.",
+  "how": [
+   "fcp `.github/workflows/byte-review.yml`: add `opened` to the `pull_request` types and let `opened` and `synchronize` through, drafts included, only when `github.event.pull_request.user.login == 'rhino-ai-agents[bot]'`. Without that author guard, `opened` would auto-review every human PR.",
+   "`src/gate.ts`: add an agent-PR case next to `ownWeeklyPr` (sketch). Accept only when the PR author and the sender are in a new policy list `agentAuthors` (fcp: `rhino-ai-agents[bot]`), the base is `main`, and the `Requested-by:` login in the live PR body has write access. Allow drafts in `parseTrigger` for this case only.",
+   "Pushes after the first review go through the sniff as for people, so Nova's fix pushes cost a Jev call, not a full review; skip the 60-minute quiet-period nudge for agent PRs.",
+   "`src/engines.ts`: on agent PRs, add an AGENT PR clause to the review prompt. The receipt is untrusted data and can never drop a finding: a finding that matches an issue the receipt lists as known and open gets `\"known\": true`, and one the receipt calls fixed is dropped only if the code at head shows the fix.",
+   "Accept the optional `known` field in `claudeReview()` (`src/review.ts`) and record a count of known findings in the run manifest.",
+   "Tests in `test/gate.test.ts`: an agent draft with a valid Requested-by is accepted; no Requested-by, a requester without write access, or a different bot is rejected."
+  ],
+  "code": {
+   "file": "src/gate.ts (RhinoHealth/byte)",
+   "lang": "ts",
+   "text": "// Nova's PRs (G4) are drafts opened by the ai-agents App until Byte's review\n// is clean. The App is no collaborator, so the person who handed Nova the\n// ticket (the Requested-by: line, G0) must have write access instead.\nconst REQUESTED_BY = /^Requested-by: @([A-Za-z0-9-]{1,39})\\s*$/m;\n\nfunction agentRequester(event: PullRequestEvent, pr: PullRequest, policy: LoadedPolicy): string | undefined {\n  const authors = new Set((policy.agentAuthors ?? []).map((login) => login.toLowerCase()));\n  const author = pr.user?.login.toLowerCase() ?? \"\";\n  if (!authors.has(author) || event.sender.login.toLowerCase() !== author || pr.base.ref !== \"main\") {\n    return undefined;\n  }\n  return REQUESTED_BY.exec(pr.body ?? \"\")?.[1];\n}\n\n// In gate(), after the live PR is fetched (the body is read from GitHub, not the event):\nif (isAgentEvent) {\n  const requestedBy = agentRequester(event, pr, policy);\n  if (requestedBy === undefined) {\n    return reject(\"agent PRs need a Requested-by: line naming the person who asked\");\n  }\n  const permission = await readApi.getCollaboratorPermission(repository, requestedBy);\n  if (!ALLOWED_PERMISSIONS.has(permission)) {\n    return reject(\"the requester must currently have write, maintain, or admin access\");\n  }\n}"
+  }
+ },
+ {
+  "key": "G2-14",
+  "title": "[Platform] On agent PRs, post only important findings; count the rest",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   9,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G2-13",
+   "G2-10"
+  ],
+  "needs": "G4 draft to ready (Nova fixes or explains each important finding)",
+  "what": "On Nova's PRs, Byte posts inline only new high and medium findings, counts the rest in one check run with a severity table, and keeps quiet the finding types people keep marking with a thumbs-down.",
+  "why": "Nova acts on every inline comment, so noise turns into churn and extra rounds. Precision comes first: a reviewer that cries wolf gets ignored (GitHub's Copilot posts nothing on 29% of reviews).",
+  "how": [
+   "Add an optional `category` to Byte's output contract in `src/engines.ts`, from a fixed list (correctness, security, data-loss, performance, convention, test-gap, docs, naming, style); the FE passes already produce one. Record it in `TelemetryFinding` as an enum.",
+   "In `src/review.ts`, for agent PRs (sketch): inline means high and medium findings that are not `known`; low and known findings are counted, not posted. From round 2 on, the existing rule already holds unchanged code to high only.",
+   "Pass the counts to finalize by env (like `FIXABLE_COUNT`) and render one table in the 'Byte' check run summary: rows for posted inline, known from the receipt and counted only; columns for high, medium and low.",
+   "Quiet types: G2-10's harvest computes the thumbs-down rate per team and category. A category with at least 30% thumbs-down over at least 20 findings goes into a new `quietCategories` list for that team in `config/repositories.json`, by a reviewed PR; on agent PRs those findings are counted, not posted.",
+   "Never quiet a high-severity security or data-loss finding, whatever its thumbs-down rate.",
+   "Each `quietCategories` change runs the G2-09 gate (it is a config change), so a quiet category must cost no HIGH recall on BYTE-GOLD."
+  ],
+  "code": {
+   "file": "src/review.ts (RhinoHealth/byte)",
+   "lang": "ts",
+   "text": "const NEVER_QUIET: ReadonlySet<string> = new Set([\"security\", \"data-loss\"]);\nconst zero = (): Record<FindingSeverity, number> => ({ high: 0, medium: 0, low: 0 });\n\n// Agent PRs (G2-13): post only what Nova should act on. Everything else is a\n// number in the check run's severity table, so nothing disappears silently.\nexport function selectInline(\n  findings: ModelFinding[],\n  options: { agentPr: boolean; quietCategories: ReadonlySet<string> },\n): { inline: ModelFinding[]; counted: Record<\"known\" | \"minor\" | \"quiet\", Record<FindingSeverity, number>> } {\n  const counted = { known: zero(), minor: zero(), quiet: zero() };\n  if (!options.agentPr) {\n    return { inline: findings, counted };\n  }\n  const inline: ModelFinding[] = [];\n  for (const finding of findings) {\n    const severity = finding.severity ?? \"high\"; // unrecognised ranks as high, as in brand.ts\n    const category = finding.category ?? \"\";\n    const quiet = options.quietCategories.has(category) && !(severity === \"high\" && NEVER_QUIET.has(category));\n    if (finding.known === true) counted.known[severity] += 1;\n    else if (severity === \"low\") counted.minor[severity] += 1;\n    else if (quiet) counted.quiet[severity] += 1;\n    else inline.push(finding);\n  }\n  return { inline, counted };\n}"
+  }
+ },
+ {
+  "key": "G2-15",
+  "title": "[Platform] Run Byte's panel: five review lenses in parallel",
+  "team": [
+   "plat"
+  ],
+  "days": 2,
+  "w": [
+   9,
+   10
+  ],
+  "flag": null,
+  "deps": [
+   "G2-09",
+   "G2-11"
+  ],
+  "needs": "G6 brain incident pages in RhinoHealth/rnd-kb (brain location still to confirm with Nave and Shai, plan decision 6); Security decision on a read-only Jira token for review.yml",
+  "what": "Generalize the FE playbook's four parallel passes into a panel for every team: correctness, security, conventions, past-incident and requirements lenses, each a separate read-only Claude session. Their findings go to the skeptic (G2-16).",
+  "why": "Anthropic's Code Review pattern (lenses, then a skeptic) raised PRs with substantive comments from 16% to 54%, with under 1% of findings marked wrong. Separate sessions also let us score each lens on BYTE-GOLD and keep the correctness lenses blind to Nova's plan.",
+  "how": [
+   "Add `skills/panel/lenses/{correctness,security,conventions,incidents,requirements}.md`, starting from `skills/fe/references/passes/{logic,security,convention}.md` and made team-neutral. Each lens also reads the team's own pass file when one exists (FE's logic and performance passes feed correctness). Output is the FE pass JSON: `{lens, findings:[{file, line, severity, confidence, category, title, explanation, evidence}]}`.",
+   "Conventions means Byte's baked team playbooks (`skills/<team>/SKILL.md` plus `MEMORY.md`), not a REVIEW.md from the PR: repo files are untrusted data and never steer Byte.",
+   "Add `src/panel.ts` (sketch). The runner fetches the diff once through the broker into `/tmp/byte-input/diff.patch`. The correctness, security and conventions sessions get Read, Glob and Grep on `/workspace` and that file, and no `gh` at all, so they can't read the PR body or Nova's plan.",
+   "Only the requirements lens reads the PR title and body, plus `/tmp/byte-input/ticket.md` when the runner fetched the Jira issue (summary and description, redacted). Until Security approves a read-only Jira token for review.yml, it works from the title, body and RH key.",
+   "The incidents lens reads `skills/panel/references/incidents.md`: bug classes from rnd-kb incident pages, copied in by a reviewed PR (never fetched at runtime) and following rnd-kb's DATA-SCOPE.md (no customer data). It names classes, not PRs, so G2-09's leak check stays green.",
+   "Models from the routing table: correctness, security, incidents and requirements on Opus 5.5 medium; conventions on Sonnet 5.5 low."
+  ],
+  "code": {
+   "file": "src/panel.ts (RhinoHealth/byte)",
+   "lang": "ts",
+   "text": "import { REVIEW_INPUT_DIR, SKILLS_ROOT } from \"./engines.js\";\nimport { runProcess } from \"./process.js\";\n\nexport type Lens = \"correctness\" | \"security\" | \"conventions\" | \"incidents\" | \"requirements\";\n\n// Routing table: Opus 5.5 medium for logic and security; Sonnet 5.5 low for conventions.\nconst LENS_MODEL: Record<Lens, { model: string; effort: \"low\" | \"medium\" }> = {\n  correctness: { model: \"claude-opus-5-5\", effort: \"medium\" },\n  security: { model: \"claude-opus-5-5\", effort: \"medium\" },\n  conventions: { model: \"claude-sonnet-5-5\", effort: \"low\" },\n  incidents: { model: \"claude-opus-5-5\", effort: \"medium\" },\n  requirements: { model: \"claude-opus-5-5\", effort: \"medium\" },\n};\n\n// Blind lenses read the diff file and the tree only: no gh, so no PR body and no Nova plan.\nconst BLIND: ReadonlySet<Lens> = new Set([\"correctness\", \"security\", \"conventions\"]);\n\nexport async function runLenses(context: PanelContext): Promise<LensFinding[]> {\n  const runs = (Object.keys(LENS_MODEL) as Lens[]).map(async (lens) => {\n    const tools = [\n      \"Read(//workspace/**)\", \"Glob(//workspace/**)\", \"Grep(//workspace/**)\",\n      `Read(/${SKILLS_ROOT}/**)`, `Read(/${REVIEW_INPUT_DIR}/**)`,\n      ...(BLIND.has(lens) ? [] : [\"Bash(gh pr view *)\"]),\n    ];\n    const argv = lensArguments(lens, LENS_MODEL[lens], tools, context); // same safety flags as CLAUDE_BUILTIN\n    const result = await runProcess(\"claude\", argv, context.timeoutMs, context.env);\n    return parseLensFindings(lens, result.stdout); // bad JSON: retry once, then drop the lens and say so\n  });\n  return (await Promise.all(runs)).flat();\n}"
+  }
+ },
+ {
+  "key": "G2-16",
+  "title": "[Platform] Add the panel skeptic: refute each finding with file:line",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   10,
+   10
+  ],
+  "flag": null,
+  "deps": [
+   "G2-15"
+  ],
+  "needs": "",
+  "what": "After the lenses, a skeptic session tries to refute each finding and must cite the file and line that proves its answer. Byte then ranks what survives and posts it through the existing publish path.",
+  "why": "A reviewer told to find gaps always finds some. One skeptic checking each finding beats many reviewers voting: Cursor's 8 passes with a vote lost to one strong reviewer plus checking.",
+  "how": [
+   "Dedupe lens findings in code first with the FE playbook's key: same file, normalized title, line within 5. Keep the higher severity, then the higher confidence, then security > correctness > requirements > incidents > conventions.",
+   "Add `skeptic()` to `src/panel.ts`: one Opus 5.5 medium session per remaining finding (at most 15, 4 at a time), read-only on `/workspace`, prompt in `skills/panel/skeptic.md`: try to show the finding is wrong; answer confirmed, refuted or unsure, with a `path:line` cite.",
+   "Check the cite in code (sketch): the file exists in `/workspace` and the line is inside it. A 'confirmed' without a valid cite counts as unsure.",
+   "Refuted findings are dropped. Unsure ones go down one step in severity and confidence, then `skills/fe/references/confidence-rubric.md`'s filter applies (low confidence is dropped).",
+   "Rank by severity then confidence, cap at 25 with '+N more below the cut' in the summary, and return a `ModelReview` so `review.ts` publishes exactly as today.",
+   "Record per lens in the run manifest how many findings were raised, refuted and kept (numbers only), so BYTE-GOLD shows what each lens and the skeptic add."
+  ],
+  "code": {
+   "file": "src/panel.ts (RhinoHealth/byte)",
+   "lang": "ts",
+   "text": "import { existsSync, readFileSync } from \"node:fs\";\nimport { join } from \"node:path\";\n\ntype Level = \"high\" | \"medium\" | \"low\";\ninterface Verdict { verdict: \"confirmed\" | \"refuted\" | \"unsure\"; cite: string; reason: string }\nconst CITE = /^([A-Za-z0-9._/()-]+):(\\d+)$/;\nconst down = (level: Level): Level => (level === \"high\" ? \"medium\" : \"low\");\n\n// The skeptic must point at real code: a cite that doesn't resolve in the\n// checkout turns \"confirmed\" into \"unsure\".\nexport function citeHolds(cite: string, workspace = \"/workspace\"): boolean {\n  const match = CITE.exec(cite.trim());\n  const path = match?.[1];\n  if (path === undefined || path.split(\"/\").includes(\"..\")) return false;\n  const file = join(workspace, path);\n  const line = Number(match?.[2]);\n  return existsSync(file) && line >= 1 && line <= readFileSync(file, \"utf8\").split(\"\\n\").length;\n}\n\nexport function applyVerdict(finding: LensFinding, skeptic: Verdict): LensFinding | undefined {\n  const verdict = skeptic.verdict === \"confirmed\" && !citeHolds(skeptic.cite) ? \"unsure\" : skeptic.verdict;\n  if (verdict === \"refuted\") return undefined;\n  if (verdict === \"unsure\") {\n    // The confidence rubric then drops whatever fell to low confidence.\n    return { ...finding, severity: down(finding.severity), confidence: down(finding.confidence) };\n  }\n  return { ...finding, skepticCite: skeptic.cite };\n}"
+  }
+ },
+ {
+  "key": "G2-17",
+  "title": "[Platform] Turn on deep mode for risky PRs after measuring its cost",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   10,
+   11
+  ],
+  "flag": null,
+  "deps": [
+   "G2-16",
+   "G2-12"
+  ],
+  "needs": "G1 spend view (cost per merged PR)",
+  "what": "Byte runs the full panel only on risk:high PRs, PRs over 800 changed lines, or when someone comments `@byte-review deep`; every other PR keeps today's single session. Before widening it, we measure the panel's cost and quality on BYTE-GOLD in W10.",
+  "why": "Anthropic's multi-agent review costs about $15-25 a PR at list price, against about $2 for Byte today. Deep mode has to earn that on the PRs where a miss hurts most, and ships only if BYTE-GOLD precision and recall hold.",
+  "how": [
+   "Add `reviewMode()` to `src/route.ts` (sketch) and call it in the gate with the tier from `riskFor()` and the changed lines; a new gate output `review_mode` carries it to review.yml. Teach the command parser that `deep` after `@byte-review` is a mode, not a team.",
+   "`review.ts` calls the panel (`runLenses()` and `skeptic()`, G2-15 and G2-16) in deep mode and the single CLAUDE_BUILTIN session otherwise; both end in the same `ModelReview`, publish path and check run.",
+   "W10: replay the BYTE-GOLD dev split in both modes and compare HIGH recall, precision, clean false alarms, API-equivalent cost and minutes per PR, per lens.",
+   "Ship deep mode for risk:high only if HIGH recall is not lower and clean false alarms stay at most 0.2 per PR. Widening it (more PRs, or the panel as the default) is Sean and Nave's call from those numbers.",
+   "Tag runs `mode: deep` in `data/runs.jsonl` and show deep runs, their cost and any quota hits on the dashboard; they share the Claude quota with every other Byte run.",
+   "Write the result in Byte's ROADMAP.md: the numbers, the decision, and what would change it."
+  ],
+  "code": {
+   "file": "src/route.ts (RhinoHealth/byte)",
+   "lang": "ts",
+   "text": "import type { RiskTier } from \"./risk.js\";\n\nexport type ReviewMode = \"standard\" | \"deep\";\nconst DEEP_ABOVE_LINES = 800;\n\n// Deep = the panel (lenses, then a skeptic per finding, then rank). Starting\n// rule; widened only from the W10 BYTE-GOLD numbers (cost and quality per PR).\nexport function reviewMode(input: { risk: RiskTier; changedLines: number; asked?: \"deep\" }): { mode: ReviewMode; reason: string } {\n  if (input.asked === \"deep\") {\n    return { mode: \"deep\", reason: \"asked with @byte-review deep\" };\n  }\n  if (input.risk === \"high\") {\n    return { mode: \"deep\", reason: \"risk:high\" };\n  }\n  if (input.changedLines > DEEP_ABOVE_LINES) {\n    return { mode: \"deep\", reason: `${input.changedLines} changed lines` };\n  }\n  return { mode: \"standard\", reason: \"single review session\" };\n}"
+  }
+ }
+]

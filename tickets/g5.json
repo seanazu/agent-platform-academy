@@ -1,0 +1,1143 @@
+[
+ {
+  "key": "G5-01",
+  "title": "[Platform] Close RH-7207 (n8n Jira→PR flow); n8n stays for business flows",
+  "team": [
+   "plat"
+  ],
+  "days": 0,
+  "w": [
+   3,
+   3
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "Nave (assignee of RH-7207)",
+  "what": "Close RH-7207, the n8n story for a Jira→PR agent flow, because Nova (G4) and the routines (G5) replace it on the ai-agents platform. n8n stays for business workflows.",
+  "why": "Two bots that turn tickets into PRs would confuse people and double the security work. Closing it now makes the ai-agents platform the only place agent PRs come from.",
+  "how": [
+   "Read RH-7207 and its parent RH-6493 (n8n infra, infrastructure PR #1346). Sean is the requester, Nave the assignee.",
+   "15 minutes with Nave: what the n8n flow already does, and what is worth keeping (Jira fields it read, prompts, failure cases). Copy useful notes into the G4 Jira-poller ticket and into G5-13.",
+   "In n8n, check that no Jira→PR or Claude Code workflow is active. Deactivate it, don't delete it (the n8n backup from G0 keeps a copy).",
+   "Comment on RH-7207: replaced by Nova (G4) and routines (G5) in RhinoHealth/ai-agents; n8n stays for business workflows such as Vanil. Link the Q4 plan.",
+   "Close it as Won't Do."
+  ],
+  "code": null
+ },
+ {
+  "key": "G5-02",
+  "title": "[Platform] Noise rules: one open PR per routine, drafts, 7-day idle close",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   5,
+   5
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G3 broker (GitHub scope of the rhino-ai-agents App); G3 Temporal namespace ai-agents",
+  "what": "Build the PR rules every routine must pass: at most one open PR per routine, a routine:<name> label on each PR, every PR opens as a draft, and a routine PR with no activity for 7 days is closed with a note.",
+  "why": "Our last dependency bot had 13 of 14 PRs closed unreviewed. These rules ship before any routine, so routines start quiet and earn attention instead of burning it.",
+  "how": [
+   "Add orchestrator/src/activities/noise.ts to RhinoHealth/ai-agents with mayOpenPr and closeIdlePrs (sketch), plain async functions exported from activities/index.ts so the worker registers them. All GitHub calls go through the broker; the activity holds no token. Ask the broker owner (G3) for an orchestrator scope: read PRs, comment on and close PRs labelled routine:*.",
+   "mayOpenPr searches open PRs labelled routine:<name>. If one exists, the run waits and re-checks hourly with a Temporal timer instead of opening a second PR.",
+   "Every routine PR opens as a draft with the labels routine:<name> and agent. Marking it ready is G4's draft→ready step (green CI, nothing important open). This ticket never marks a PR ready.",
+   "closeIdlePrs runs daily from a Temporal schedule at an odd minute (23 3 * * *). Idle means no commit, comment or review for 7 days. It says why, closes the PR and comments on the linked Jira ticket.",
+   "Renovate PRs are out of scope here: Renovate manages its own PRs on its monthly schedule (G5-04).",
+   "Test with node:test (orchestrator/test/noise.test.ts) and a fake broker client over made-up PRs. No real repo in tests."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/activities/noise.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/activities/noise.ts — sketch, not final code. Activities may use the clock; workflows may not.\nimport { Gate } from \"@rhinohealth/ai-agents-shared\";\n\nconst IDLE_MS = 7 * 24 * 60 * 60 * 1000;  // 7 days\n\nexport async function mayOpenPr(routine: string, repo: string): Promise<Gate> {\n  const openPrs = await broker.github.searchPrs(repo, { labels: [`routine:${routine}`], state: \"open\" });\n  if (openPrs.length) {  // one open PR per routine; the run waits, it doesn't open a second one\n    return Gate.wait(`${routine} already has #${openPrs[0].number} open`);\n  }\n  return Gate.go({ labels: [`routine:${routine}`, \"agent\"], draft: true });  // always a draft first\n}\n\nexport async function closeIdlePrs(repo: string): Promise<number[]> {\n  const closed: number[] = [];\n  for (const pr of await broker.github.searchPrs(repo, { labelPrefix: \"routine:\", state: \"open\" })) {\n    if (Date.now() - pr.lastActivityAt.getTime() < IDLE_MS) continue;  // commits, comments and reviews all count\n    await broker.github.comment(pr.number, \"Closing: no activity for 7 days. Reopen it to pick it up again.\");\n    await broker.github.close(pr.number);\n    await broker.jira.comment(pr.jiraKey, `Routine PR #${pr.number} was closed after 7 idle days.`);\n    closed.push(pr.number);\n  }\n  return closed;\n}"
+  }
+ },
+ {
+  "key": "G5-03",
+  "title": "[Platform] Noise rules: daily team digest and auto-pause under 50% merged",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   5,
+   5
+  ],
+  "flag": null,
+  "deps": [
+   "G5-02"
+  ],
+  "needs": "G3 Slack app (Bolt, Socket Mode) and the kill-switch flag store; G0 gateway spend tags",
+  "what": "Post one Slack digest per team per day about its routines, and pause any routine when fewer than half of its last 20 closed PRs were merged.",
+  "why": "One short message a day replaces many pings. A routine whose PRs people keep closing is noise, so it stops itself until its owner looks.",
+  "how": [
+   "Add orchestrator/src/activities/digest.ts (sketch): one message per team (FE, BE, DevOps) with ready PRs waiting for review, drafts per owner, PRs closed as idle, paused routines with the reason, and yesterday's cost per routine from the gateway's spend tags.",
+   "Post it from the G3 Slack app to each team's channel, taken from config/people.yaml (G5-07). Schedule 37 6 * * 0-4 in Asia/Jerusalem (Sunday to Thursday). No message on a day with no routine activity.",
+   "mergeRate(routine): the last 20 closed PRs labelled routine:<name>, merged ÷ 20. With fewer than 20 there is no verdict, so a new routine is never paused on a handful of PRs.",
+   "Below 0.5: set routine:<name>:paused in the G3 flag store with the reason and DM the owner. Only the owner (or Sean) resumes it, with a Slack button.",
+   "The trust ladder (G5-15) reuses mergeRate for its demotion rule. Keep one function."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/activities/digest.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/activities/digest.ts — sketch\nconst WINDOW = 20, MIN_MERGED = 0.5;\n\nexport async function mergeRate(routine: string, repo: string): Promise<number | undefined> {\n  const closed = await broker.github.searchPrs(repo, { labels: [`routine:${routine}`], state: \"closed\",\n                                                      sort: \"closed\", limit: WINDOW });\n  if (closed.length < WINDOW) {\n    return undefined;  // not enough data: never pause on a few PRs\n  }\n  return closed.filter((pr) => pr.merged).length / WINDOW;\n}\n\nexport async function autoPause(routine: Routine): Promise<string | undefined> {\n  const rate = await mergeRate(routine.name, routine.repo);\n  if (rate === undefined || rate >= MIN_MERGED) {\n    return undefined;\n  }\n  const reason = `only ${Math.round(rate * 100)}% of its last ${WINDOW} PRs were merged`;\n  await flags.set(`routine:${routine.name}:paused`, reason);  // G3 flag store, checked before every run\n  await slack.dm(routine.owner, `${routine.name} is paused: ${reason}.`, { buttons: [\"Resume\", \"Keep paused\"] });\n  return reason;\n}\n\nexport async function postTeamDigest(team: string): Promise<void> {\n  const items = await collectDigest(team);  // ready PRs, drafts per owner, idle closes, pauses, cost per routine\n  if (items.empty) {\n    return;  // a quiet day sends nothing\n  }\n  await slack.post(people.channel(team), renderDigest(team, items));\n}"
+  }
+ },
+ {
+  "key": "G5-04",
+  "title": "[BE] Renovate for fcp: grouped monthly updates; retire the weekly workflow",
+  "team": [
+   "be",
+   "devops"
+  ],
+  "days": 1,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "DevOps: the rhino-actions-pr-creator App needs workflows: write (Action bumps) and Dependabot alerts: read (security PRs)",
+  "what": "Run Renovate ourselves for fcp (npm, uv/pep621, the uv pip-compile files, base images, GitHub Actions) with grouped, monthly PRs and a 7-day minimum release age. Delete .github/workflows/weekly-dependency-upgrades.yml in the same PR.",
+  "why": "Renovate stays a plain bot: fewer, grouped PRs, and nothing younger than a week. The upgrade fixers (G5-23, G5-24) repair only the PRs that break, so people see few dependency PRs, and green ones.",
+  "how": [
+   "Add renovate.json5 at the fcp root (sketch; json5 so it can keep comments). It keeps today's scope and reviewers: frontend (frontend-guild), cloud/rhinoCloud, client and sdk (backend-guild), cloud/mcp-server (yaniv-rhino), cloud/connect-api (richard-engineering). ohif/ and cloud/rhinoCloud/rhino-containers/** stay out until the BE guild says otherwise.",
+   "fcp has no Terraform, and its one chart (client/.devops/charts/rhino-agent) has no dependencies, so the Terraform-provider and Helm rules live in G5-05.",
+   "Self-host it: add .github/workflows/renovate.yml on fcp-runner-set, cron 41 1 * * * (daily runs keep PRs rebased; new PRs appear only on the 1st), token from actions/create-github-app-token with RHINO_PR_CREATOR_APP_ID / RHINO_PR_CREATOR_PRIVATE_KEY, renovatebot/github-action pinned by SHA, RENOVATE_REPOSITORIES=RhinoHealth/fcp. Mend's hosted app can't run postUpgradeTasks, so self-hosting is required.",
+   "Allow only the post-upgrade commands in the sketch (global allowedCommands, env RENOVATE_ALLOWED_COMMANDS): make -C cloud/rhinoCloud update-deps keeps rhinoCore/integration-tests/requirements.txt in step, and the stub regeneration keeps gRPC in lockstep. Check the full Renovate image has uv and make.",
+   "Move the old workflow's 'gRPC versions match across client and cloud' Python check into cloud-ci's Lint job, so it guards Renovate and people alike.",
+   "Keep .github/dependabot.yml as it is (security alerts only, open-pull-requests-limit: 0). Renovate's vulnerabilityAlerts opens security fixes at once, outside the monthly schedule. frontend-ci runs only on pull_request, so leave prCreation at its default: the PR must exist for FE checks to run.",
+   "Dry run with RENOVATE_DRY_RUN=full and read the log before merging. Remove weekly-dependency-upgrades.yml in the same PR (no shim)."
+  ],
+  "code": {
+   "file": "renovate.json5",
+   "lang": "json5",
+   "text": "// renovate.json5 (fcp root) — sketch. Replaces .github/workflows/weekly-dependency-upgrades.yml.\n{\n  $schema: \"https://docs.renovatebot.com/renovate-schema.json\",\n  extends: [\"config:recommended\"],\n  timezone: \"Asia/Jerusalem\",\n  schedule: [\"* 2-6 1 * *\"],               // monthly: new PRs only on the 1st\n  minimumReleaseAge: \"7 days\",\n  internalChecksFilter: \"strict\",          // no branch at all until the release is 7 days old\n  rangeStrategy: \"update-lockfile\",        // like `uv lock --upgrade` / `npm update`: stay inside our ranges\n  lockFileMaintenance: { enabled: true },  // monthly refresh of transitive dependencies\n  labels: [\"dependencies\"],\n  prConcurrentLimit: 10,\n  enabledManagers: [\"npm\", \"pep621\", \"pip-compile\", \"dockerfile\", \"github-actions\"],\n  ignorePaths: [\"**/node_modules/**\", \"ohif/**\", \"cloud/rhinoCloud/rhino-containers/**\", \"cloud/rhinoCloud/rhinoCore/integration-tests/**\"],\n  \"pip-compile\": { managerFilePatterns: [\"/^sdk/requirements\\\\.txt$/\", \"/^cloud/mcp-server/requirements/.+\\\\.txt$/\"] },\n  packageRules: [\n    { matchFileNames: [\"frontend/**\"], groupName: \"frontend npm\", reviewers: [\"team:frontend-guild\"] },\n    { matchFileNames: [\"cloud/rhinoCloud/**\"], groupName: \"cloud python\", reviewers: [\"team:backend-guild\"],\n      postUpgradeTasks: { executionMode: \"branch\", commands: [\"make -C cloud/rhinoCloud update-deps\"], fileFilters: [\"cloud/rhinoCloud/**\"] } },\n    { matchFileNames: [\"client/**\"], groupName: \"client python\", reviewers: [\"team:backend-guild\"] },\n    { matchFileNames: [\"sdk/**\"], groupName: \"sdk python\", reviewers: [\"team:backend-guild\"] },\n    { matchFileNames: [\"cloud/mcp-server/**\"], groupName: \"mcp-server\", reviewers: [\"yaniv-rhino\"] },\n    { matchFileNames: [\"cloud/connect-api/**\"], groupName: \"connect-api python\", reviewers: [\"richard-engineering\"] },\n    { matchUpdateTypes: [\"major\"], groupName: null },   // one PR per major, so a fixer can take it alone\n    { matchPackageNames: [\"grpcio\", \"grpcio-tools\", \"grpcio-status\", \"grpcio-health-checking\", \"protobuf\"],\n      groupName: \"grpc stack\", reviewers: [\"team:backend-guild\"],   // client + cloud + stubs move together, majors too\n      postUpgradeTasks: { executionMode: \"branch\", fileFilters: [\"common/fcp_common/rhinoAgentRpc/**\", \"cloud/rhinoCloud/**\"],\n        commands: [\"cd cloud/rhinoCloud && uv sync --frozen --no-install-project --only-group grpc-stub-gen && uv run --no-sync make -C ../../common/fcp_common/rhinoAgentRpc protoc\",\n                   \"make -C cloud/rhinoCloud update-deps\"] } },\n    { matchManagers: [\"github-actions\"], groupName: \"github actions\" },\n    { matchManagers: [\"dockerfile\"], groupName: \"base images\" },\n    { matchPackageNames: [\"RhinoHealth/byte\"], enabled: false },   // Byte's own fleet sync pins it\n  ],\n}"
+  }
+ },
+ {
+  "key": "G5-05",
+  "title": "[DevOps] Renovate for infrastructure and gitops: providers, charts, Actions",
+  "team": [
+   "devops"
+  ],
+  "days": 1,
+  "w": [
+   5,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G5-04"
+  ],
+  "needs": "",
+  "what": "Run the same Renovate setup in the infrastructure repo (OpenTofu providers, tfr:/// modules, Helm chart versions in modules, Action SHAs, the runner image's base image) and in gitops (Helm chart dependencies, Action pins).",
+  "why": "Provider, chart and Action updates are the infra side of the same noise problem. Grouped monthly PRs with a 7-day wait are easy to review, and the infra upgrade fixer (G5-32) repairs the ones that fail.",
+  "how": [
+   "Add .github/renovate.json5 to infrastructure (sketch) and .github/workflows/renovate.yml on infrastructure-runner-set, the same shape as fcp's (G5-04), with actions pinned by SHA like the rest of the repo. Check which GitHub App may open PRs there; the PR-creator App may not be installed on infrastructure.",
+   "Providers are pinned inside a heredoc string in multi_tenant/common.hcl, single_tenant/common.hcl and terraform/accounts/common.hcl, so Renovate's Terraform manager can't see them. The first regex custom manager reads them. We run OpenTofu 1.12: check each bump also resolves on registry.opentofu.org.",
+   "Chart versions are module variable defaults (modules/n8n/variables.tf n8n_chart_version, modules/github-runner-scale-sets/variables.tf helm_chart_version). Add one line '# renovate: datasource=docker depName=<oci chart path>' above each default; the second custom manager reads them.",
+   "Infrastructure already pins Actions by SHA with a '# vX.Y.Z' comment through Dependabot (daily, 5-day cooldown). helpers:pinGitHubActionDigestsToSemver keeps that style. When Renovate's first Actions PR merges, remove the github-actions version-update block from .github/dependabot.yml (security alerts stay). Keep RhinoHealth/byte ignored.",
+   "gitops: .github/renovate.json5 with the helmv3 manager for Chart.yaml dependencies (for example cloud/temporal → temporal 1.5.0) and github-actions, on gitops-runner-set. Do not turn on helm-values: our own image tags in values files are written by the fcp publish jobs.",
+   "Infrastructure PRs keep their existing CODEOWNERS review (@RhinoHealth/devops). There is no plan in CI yet, so majors stay one PR each and a person runs the plan before merging."
+  ],
+  "code": {
+   "file": "infrastructure/.github/renovate.json5",
+   "lang": "json5",
+   "text": "// infrastructure/.github/renovate.json5 — sketch. gitops gets the same base with helmv3 instead of the custom managers.\n{\n  $schema: \"https://docs.renovatebot.com/renovate-schema.json\",\n  extends: [\"config:recommended\", \"helpers:pinGitHubActionDigestsToSemver\"],   // keeps the SHA + \"# vX.Y.Z\" style\n  timezone: \"Asia/Jerusalem\",\n  schedule: [\"* 2-6 1 * *\"],\n  minimumReleaseAge: \"7 days\",\n  internalChecksFilter: \"strict\",\n  labels: [\"dependencies\"],                // CODEOWNERS already requests @RhinoHealth/devops here\n  enabledManagers: [\"custom.regex\", \"terragrunt\", \"github-actions\", \"dockerfile\"],\n  customManagers: [\n    { // providers live in a heredoc in multi_tenant/, single_tenant/ and terraform/accounts/ common.hcl\n      customType: \"regex\",\n      managerFilePatterns: [\"/(^|/)common\\\\.hcl$/\"],\n      matchStrings: [\"source\\\\s*=\\\\s*\\\"(?<depName>[\\\\w-]+/[\\\\w-]+)\\\"\\\\s*\\\\n\\\\s*version\\\\s*=\\\\s*\\\"(?<currentValue>[\\\\d.]+)\\\"\"],\n      datasourceTemplate: \"terraform-provider\",\n    },\n    { // chart versions are module variable defaults, each with a \"# renovate:\" line right above `default`\n      customType: \"regex\",\n      managerFilePatterns: [\"/^modules/.+/variables\\\\.tf$/\"],\n      matchStrings: [\"# renovate: datasource=(?<datasource>\\\\S+) depName=(?<depName>\\\\S+)\\\\s*\\\\n\\\\s*default\\\\s*=\\\\s*\\\"(?<currentValue>[^\\\"]+)\\\"\"],\n    },\n  ],\n  packageRules: [\n    { matchDatasources: [\"terraform-provider\"], groupName: \"opentofu providers\" },\n    { matchManagers: [\"terragrunt\"], groupName: \"registry modules\" },          // tfr:/// sources in units\n    { matchManagers: [\"custom.regex\"], matchDatasources: [\"docker\", \"helm\"], groupName: \"helm charts\" },\n    { matchManagers: [\"github-actions\"], groupName: \"github actions\" },\n    { matchPackageNames: [\"RhinoHealth/byte\"], enabled: false },\n    { matchUpdateTypes: [\"major\"], groupName: null },   // majors one by one: a person reads the plan\n  ],\n}"
+  }
+ },
+ {
+  "key": "G5-06",
+  "title": "[Platform] Routine charters: YAML format, loader and path limits in hooks",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G3 harness hooks (blockProtectedPaths) and the broker's git proxy; G0 locked checks; G8 skills",
+  "what": "Define the charter every routine has (owner, trigger, allowed paths, never-list, skills, model, VM size, done), load it in the orchestrator, and enforce its paths with the harness hooks.",
+  "why": "A charter turns 'Nova with a different trigger' into something concrete and reviewable. Paths are a wall, so they live in hooks and the broker, not in a prompt.",
+  "how": [
+   "Add routines/charters/<name>.yaml to RhinoHealth/ai-agents, one file per routine, and a zod schema Charter in shared/src/schemas.ts (z.strictObject; the type comes from z.infer), read with the yaml package by orchestrator/src/routines/charter.ts. Reject unknown keys, more than 6 skills and an empty allowed_paths.",
+   "Load charters in an activity, loadCharter(name, sha), pinned to the ai-agents commit, so a Temporal replay sees the same charter.",
+   "Pass allowed_paths, denied_paths and never to the harness. Extend G3's blockProtectedPaths PreToolUse hook (a HookCallback in the harness that returns permissionDecision \"deny\") to refuse Edit and Write outside the allowed paths with a clear message; refusals are listed in the PR.",
+   "Bash can write files the hook can't see. Ask the broker owner (G3) to re-check the changed paths against the same charter at git push in the git proxy. That is the real wall; the hook gives an early, readable refusal.",
+   "Default paths per team: FE frontend/**; BE cloud/**, client/**, sdk/** with **/migrations/** denied in the pilot; DevOps the infrastructure and gitops repos plus .github/**. Lint, type and test config stay denied (G0 locked checks).",
+   "Write the first charter, fe-ci-fixer (sketch), and a node:test test (orchestrator/test/charters.test.ts) that loads every charter in CI.",
+   "Optional keys for routines outside fcp: repo (default RhinoHealth/fcp), read_only (extra read scopes for the broker) and setup (a command run in the VM before the session). The kb-ingest charter (G6-20) uses all three."
+  ],
+  "code": {
+   "file": "ai-agents/routines/charters/fe-ci-fixer.yaml",
+   "lang": "yaml",
+   "text": "# ai-agents/routines/charters/fe-ci-fixer.yaml — sketch; one file per routine, loaded by routineRun (G5-08)\nname: fe-ci-fixer\nteam: fe\nowner: from people.yaml              # never approves this routine's PRs (Requested-by: line, G5-07)\nstage: shadow                        # shadow → drafts → normal (G5-15); promotions only by PR\ntrigger:\n  kind: github.workflow_run\n  repo: RhinoHealth/fcp\n  workflows: [\"[FRONTEND] - CI\"]\n  branch: main\n  conclusion: failure\nrun_id: \"cifix:fcp:{fingerprint}\"    # one run per root cause (G5-09)\ngather_minutes: 7                    # wait, then group (G5-17)\nqueue: cifix                         # task queue ai-agents-cifix; 2 VM slots (G3-25)\nvm: { size: lite, spot: true }       # full when the failed job needs FCP Lab (jobs.yaml, G5-20)\nmodel: { name: claude-opus-5-5, effort: low, on_failed_checks: medium }\nallowed_paths: [\"frontend/**\"]       # PreToolUse hook, and again in the broker's git proxy at push\ndenied_paths: [\".github/**\", \"frontend/biome.json\", \"frontend/tsconfig.json\", \"frontend/playwright.config.ts\"]\nnever: [edit_test_assertions]        # on top of the false heals every routine is checked for (G5-14)\nskills: [fix-ci, fe-codebase, verify, fcp-lab, pr-story]   # 5 of at most 6\ndone:\n  - the failed job's commands fail on the red commit and pass on the fix, in the VM\n  - npm run verify is green\n  - no test weakened (false-heal check clean)\npr:\n  title: \"[FE] {jira}: fix red main: {summary}\"\n  labels: [\"routine:fe-ci-fixer\"]\n  jira: create                       # a ticket is created or linked for every routine PR"
+  }
+ },
+ {
+  "key": "G5-07",
+  "title": "[Guilds] Name routine owners and a reviewer of the day per team",
+  "team": [
+   "guild",
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [
+   "G5-06"
+  ],
+  "needs": "G0 independent-approval check (reads the Requested-by: line); G0 review rules agreed with Nir and Tal",
+  "what": "Each guild names one owner per routine and a daily reviewer rotation. The owner is written as the requester on every PR of its routine, so the owner's approval never counts.",
+  "why": "A routine needs a person who answers for it, and its PRs need a reviewer who did not ask for them. Exactly one approval, by someone who is not the requester, is a wall GitHub already enforces.",
+  "how": [
+   "FE guild, BE guild and DevOps fill the teams block of config/people.yaml in ai-agents (sketch; the same file maps each person's Slack ID, Jira accountId and GitHub login for G4-05): an owner per routine, a reviewer rotation per team (GitHub handles) and the team's Slack channel for the digest.",
+   "Every routine PR body carries 'Requested-by: @<owner>'. G0's independent-approval check fails when the only approval is the requester's, so no new check is needed.",
+   "Reviewer of the day: the orchestrator picks rotation[workingDayIndex % rotation.length], skips the owner, and requests that one person when the PR is marked ready (stage normal). No CODEOWNERS file, no team-wide review request.",
+   "Agree how a Bug counts as triaged into a team. Today it is mixed: labels FE / frontend, title prefixes [FE] / [BE], components cloud / on-prem / infra, and the Team field (FE Guild, Infra Guild, squads). Proposal: the label FE or BE on a Bug in To Do. G5-13 uses the answer.",
+   "Swaps for holidays or sick days are a one-line PR to people.yaml. No calendar integration."
+  ],
+  "code": {
+   "file": "ai-agents/config/people.yaml",
+   "lang": "yaml",
+   "text": "# ai-agents/config/people.yaml (teams block) — sketch. Each guild fills its own block; the handles are placeholders.\nteams:\n  fe:\n    channel: \"<FE guild Slack channel>\"          # daily digest (G5-03)\n    reviewers: [\"<gh-handle>\", \"<gh-handle>\", \"<gh-handle>\"]   # one per working day, Sun–Thu, in order\n  be:\n    channel: \"<BE guild Slack channel>\"\n    reviewers: [\"<gh-handle>\", \"<gh-handle>\", \"<gh-handle>\", \"<gh-handle>\"]\n  devops:\n    channel: \"<DevOps Slack channel>\"\n    reviewers: [\"<gh-handle>\", \"<gh-handle>\"]\nowners:                                           # written as Requested-by: on every PR of the routine,\n  fe-ci-fixer: \"<gh-handle>\"                      # so the owner's approval never counts (G0 check)\n  fe-upgrade-fixer: \"<gh-handle>\"\n  fe-bug-fixer: \"<gh-handle>\"\n  fe-dead-code: \"<gh-handle>\"\n  be-ci-fixer: \"<gh-handle>\"\n  be-upgrade-fixer: \"<gh-handle>\"\n  be-bug-fixer: \"<gh-handle>\"\n  be-flaky-fixer: \"<gh-handle>\"\n  pipeline-fixer: \"<gh-handle>\"\n  infra-upgrade-fixer: \"<gh-handle>\"\ntriage:                                           # how a Bug counts as triaged into a team (G5-13)\n  fe: { labels: [\"FE\"] }                          # proposal: today labels, title prefixes and the Team field are mixed\n  be: { labels: [\"BE\"] }"
+  }
+ },
+ {
+  "key": "G5-08",
+  "title": "[Platform] routineRun workflow: Nova's harness driven by a charter",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G5-06"
+  ],
+  "needs": "G3 ticketToPr activities (acquireSandbox, workInSandbox, releaseSandbox), task queues with slots, kill switch; G4 scope judge, review panel, Byte on drafts, draft→ready",
+  "what": "Build routineRun, the Temporal workflow every routine runs: load the charter, gather triggers, pass the gates, work in a fresh VM with Nova's harness, then ship through the same review layers as Nova, or save the result in shadow mode.",
+  "why": "Routines must not fork Nova: same harness, same VMs, same walls, same review layers. Only the trigger and the charter differ, so safety is built once.",
+  "how": [
+   "Add orchestrator/src/workflows/routine-run.ts (sketch). Reuse ticketToPr's activities unchanged. Extract the PR half of ticketToPr (scope judge with the charter, draft PR, Byte, fixing findings, ready) into a child workflow shipPr that both workflows use; agree the split with the G4 owner.",
+   "Signals: addTrigger (another event with the same root cause joins the run, G5-09) and decidePlan (the same Slack Approve / Change / Stop buttons as Nova).",
+   "preRunGate checks, in order: the G3 kill switch, routine:<name>:paused, incident mode (G5-17) and one open PR per routine (G5-02). A gate that says wait parks the run on a timer and never starts a VM.",
+   "TaskSpec.fromCharter builds the goal, done list, skills, paths, model and effort from the charter and the triggers. No maxTurns, no maxBudgetUsd, no taskBudget, no time limit: the 7-day activity timeout and 5-minute heartbeats only catch a dead worker.",
+   "Create or link the Jira ticket before the PR, so the title reads '[FE] RH-1234: …' and add-jira-links works. In shadow mode nothing is created: the diff and the proof go to S3 for the weekly comparison (G5-16).",
+   "Register keyword search attributes on namespace ai-agents: Routine, RunKind, RoutineOutcome, Stage. G5-17 and G5-21 query them.",
+   "Queues and slots as in G3-25: one task queue per routine family (ai-agents-cifix, ai-agents-upgrade, ai-agents-flaky, ai-agents-bugfix, ai-agents-health, ai-agents-security; a charter's queue key names it, and queueFor reads it) and VM slots per family (2, 2, 1, 2, 1, 1 to start) held by the slots workflow, not by routineRun."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/workflows/routine-run.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/workflows/routine-run.ts — sketch, not final code. Workflow code: deterministic, no Node APIs.\nimport { proxyActivities, defineSignal, setHandler, sleep, executeChild, workflowInfo } from \"@temporalio/workflow\";\nimport type * as activities from \"../activities/index.js\";\nimport type { PlanDecision, RoutineRequest, RunOutcome, Trigger } from \"@rhinohealth/ai-agents-shared\";\nimport { TaskSpec } from \"../routines/task-spec.js\";  // pure code, safe to bundle into a workflow\nimport { shipPr } from \"./ship-pr.js\";  // the PR half of ticketToPr, shared with Nova\nconst { loadCharter, preRunGate, saveShadowResult } = proxyActivities<typeof activities>({ startToCloseTimeout: \"1 minute\" });\nconst { acquireSandbox } = proxyActivities<typeof activities>({ startToCloseTimeout: \"10 minutes\" });\nconst { releaseSandbox } = proxyActivities<typeof activities>({ startToCloseTimeout: \"5 minutes\" });\nconst { workInSandbox } = proxyActivities<typeof activities>({  // ticketToPr's activity (G3)\n  startToCloseTimeout: \"7 days\", heartbeatTimeout: \"5 minutes\" });  // no work-time limit: these only catch a dead worker\nexport const addTrigger = defineSignal<[Trigger]>(\"addTrigger\");  // target of signal-with-start (G5-09)\nexport const decidePlan = defineSignal<[PlanDecision]>(\"decidePlan\");  // same Slack buttons as Nova; bug fixers (G5-27)\n\nexport async function routineRun(req: RoutineRequest): Promise<string> {\n  const triggers: Trigger[] = [];  // every event with the same root cause lands here\n  let planDecision: PlanDecision | undefined;  // read by the bug fixers' plan step (G5-27)\n  setHandler(addTrigger, (t) => void triggers.push(t));\n  setHandler(decidePlan, (d) => { planDecision = d; });\n  const charter = await loadCharter(req.routine, req.charterSha);\n  if (req.trigger) triggers.push(req.trigger);  // schedules and Jira start without a signal\n  if (charter.gather_minutes) await sleep(charter.gather_minutes * 60_000);  // 7 for red main, 0 for bugs (G5-17)\n  const gate = await preRunGate(charter, triggers);\n  if (gate.verdict !== \"go\") return park(charter, gate);  // kill switch, paused, incident mode, an open PR: no VM\n  const task = TaskSpec.fromCharter(charter, triggers);  // goal, done, skills, paths, model and effort\n  const vm = await acquireSandbox({ runId: workflowInfo().runId, agent: req.routine, ...charter.vm });\n  let result: RunOutcome;\n  try {  // a bigger bug fix returns needs_plan_approval, waits on decidePlan, then resumes in the same VM (G5-27)\n    result = await workInSandbox(vm, task);\n  } finally {\n    await releaseSandbox(vm);\n  }\n  if (charter.effectiveStage === \"shadow\") return saveShadowResult(charter, result);  // opens nothing: diff + proof to S3\n  return executeChild(shipPr, { args: [{ charter, result }] });\n}"
+  }
+ },
+ {
+  "key": "G5-09",
+  "title": "[Platform] Start routine runs by root cause with signal-with-start",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G5-08"
+  ],
+  "needs": "G3 Temporal (namespace ai-agents), the broker's read-only GitHub scope, and the orchestrator service on inf-rhinohealth",
+  "what": "Add the trigger service that turns an event into exactly one routineRun per root cause: it computes the workflow ID (the fingerprint) and uses signal-with-start, so a second event joins the open run.",
+  "why": "When main goes red, every push and every PR fails the same way. One run per root cause is the first wall against a storm of agents.",
+  "how": [
+   "Add orchestrator/src/triggers/github-events.ts (sketch) behind POST /v1/events in the orchestrator service on inf-rhinohealth (node:http, a small router, like Byte's broker). Internal only, no public route, so still no new public webhook.",
+   "Authenticate callers with GitHub OIDC: issuer https://token.actions.githubusercontent.com, audience rhino-ai-agents, repository in an allow-list, job_workflow_ref equal to the trigger workflow on main (G5-12). The runner holds no Temporal credential.",
+   "Never trust the request body: re-read the run by run_id through the broker (read-only, actions: read) to get the failing jobs and the first error line of each job's log.",
+   "IDs: cifix:<repo>:<fingerprint> for red main; upgrade:<repo>:pr-<n> for a failed Renovate PR; bugfix:RH-1234 for bugs (G5-13); sched:<name> for schedules. The fingerprint is the last green commit of that workflow on main, the failing job names and each job's normalized first error. The last green commit doesn't move while main stays red, so later pushes join the same run.",
+   "client.workflow.signalWithStart, the signal-with-start form of G3-25's startRun (same <agent>:<thing> ID, queue ai-agents-<agent> and Agent search attribute, so the kill switch's batch stop finds these runs; put it in fanout.ts with the G3 owner), with workflowIdReusePolicy REJECT_DUPLICATE: a root cause that comes back after its run closed goes to a person in #ai-agents-alerts (likely ping-pong), never to a new run. Namespace retention bounds how long an ID is remembered.",
+   "Unit-test fingerprint and normalize with node:test (orchestrator/test/github-events.test.ts) on 10 saved logs from real red builds (G5-11): the same failure on two commits must give the same ID."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/triggers/github-events.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/triggers/github-events.ts — sketch: POST /v1/events → one routineRun per root cause\nimport { createHash } from \"node:crypto\";\nimport { WorkflowExecutionAlreadyStartedError, WorkflowIdReusePolicy, type Client } from \"@temporalio/client\";\nimport { addTrigger, routineRun } from \"../workflows/routine-run.js\";\nconst ROUTINES: Record<string, string> = {  // \"<workflow name>|<main or renovate>\" → routine\n  \"[FRONTEND] - CI|main\": \"fe-ci-fixer\", \"[CLOUD] - CI|main\": \"be-ci-fixer\", \"[CLIENT] - CI|main\": \"be-ci-fixer\",\n  \"[FRONTEND] - CI|renovate\": \"fe-upgrade-fixer\", \"[CLOUD] - CI|renovate\": \"be-upgrade-fixer\",\n  \"[CLIENT] - CI|renovate\": \"be-upgrade-fixer\", \"[SDK] - CI|renovate\": \"be-upgrade-fixer\" };\n\nexport async function onFailedRun(temporal: Client, ev: WorkflowRunEvent): Promise<string | undefined> {\n  const run = await broker.github.getRun(ev.repo, ev.run_id);  // re-read from GitHub; never trust the body\n  const kind = run.head_branch === \"main\" ? \"main\" : run.head_branch.startsWith(\"renovate/\") ? \"renovate\" : undefined;\n  const routine = kind && ROUTINES[`${run.name}|${kind}`];  // run.name: the workflow's name in GitHub's JSON\n  if (!routine || run.conclusion !== \"failure\") return undefined;\n  const workflowId = kind === \"renovate\"\n    ? `upgrade:${ev.repo}:pr-${await broker.github.prForBranch(ev.repo, run.head_branch)}`\n    : `cifix:${ev.repo}:${fingerprint(await broker.github.lastGreenSha(ev.repo, run.workflow_id, { branch: \"main\" }),\n                                      await broker.github.failedJobs(ev.repo, run.id))}`;  // name + first error line of each log\n  await temporal.workflow.signalWithStart(routineRun, { workflowId, taskQueue: queueFor(routine), args: [{ routine }],\n    signal: addTrigger, signalArgs: [Trigger.fromRun(run)],  // joins an open run\n    typedSearchAttributes: agentAttribute(routine),  // Agent=cifix|upgrade, as startRun sets it (G3-25)\n    workflowIdReusePolicy: WorkflowIdReusePolicy.REJECT_DUPLICATE,  // one run per root cause\n  }).catch(async (err: unknown) => {\n    if (!(err instanceof WorkflowExecutionAlreadyStartedError)) throw err;\n    await alerts.post(`${workflowId} came back after its run closed; a person should look (ping-pong?)`);\n  });\n  return workflowId;\n}\n\nexport function fingerprint(baseSha: string, jobs: FailedJob[]): string {\n  const parts = jobs.map((j) => `${j.name}|${normalize(j.firstError)}`).sort();\n  return createHash(\"sha256\").update([baseSha, ...parts].join(\"\\n\")).digest(\"hex\").slice(0, 12);\n}\nexport function normalize(line: string): string {  // drop what changes between runs of the same failure\n  return line.toLowerCase().replace(/\\b[0-9a-f]{7,40}\\b|0x[0-9a-f]+/g, \"<hex>\").replace(/\\d+(\\.\\d+)?/g, \"<n>\").slice(0, 200);\n}"
+  }
+ },
+ {
+  "key": "G5-10",
+  "title": "[Platform] ROUTINE-BENCH: case format, runner and per-routine score",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   6,
+   6
+  ],
+  "flag": null,
+  "deps": [],
+  "needs": "G4 TICKET-BENCH runner (Harbor on the sandbox image) and its restricted golden-set repo; G1 eval results store",
+  "what": "Define one case format for every routine slice, turn cases into Harbor tasks, run each case 3 times, and score each routine's slice.",
+  "why": "A routine leaves shadow only when its slice passes, and every skill or charter change re-runs that slice. One format keeps the slices comparable and cheap to grow.",
+  "how": [
+   "Add evals/routine-bench/<slice>/<case-id>/case.yaml to ai-agents (sketch). Golden data (logs, human fixes, hidden tests) lives in the restricted golden-set repo that G4 sets up for TICKET-BENCH, never in ai-agents itself.",
+   "Write evals/routine-bench/to_harbor.py: one Harbor task per case (the instruction is the trigger, the environment is the sandbox image at base_commit, the tests are the grade block). Reuse the G4 runner; don't build a second one.",
+   "Grading: must_pass commands green; hidden tests from the human fix copied in only at grading time; the false-heal check (G5-14) clean; changed paths inside the charter. For bug fixers, reproduced means the routine's new test fails on base and passes with the human fix.",
+   "Score per slice: solved rate (pass@1 and pass^3), reproduce rate, false heals, cost and minutes per case. Time and cost are measured, never limits. Results go as JSON to the G1 eval results store.",
+   "CI in ai-agents: a change to routines/charters/<name>.yaml or to that routine's skills re-runs its slice and posts the score on the PR.",
+   "Data rule for every case: fake seed data only, saved logs scrubbed with gitleaks, no customer text."
+  ],
+  "code": {
+   "file": "ai-agents/evals/routine-bench/red-builds/fe-ci-0412/case.yaml",
+   "lang": "yaml",
+   "text": "# ai-agents/evals/routine-bench/red-builds/fe-ci-0412/case.yaml — sketch; every slice uses this shape\nid: fe-ci-0412\nroutine: fe-ci-fixer\nslice: red-builds\ncause: code                         # code | test | environment | flaky (environment cases expect hand_off)\nrepo: RhinoHealth/fcp\nbase_commit: \"<sha of the first red commit>\"\ntrigger:                            # exactly what the routine would have received (G5-09)\n  kind: github.workflow_run\n  workflow: \"[FRONTEND] - CI\"\n  failed_jobs: [\"Unit Tests\"]\n  log: golden://red-builds/fe-ci-0412/failed.log   # restricted golden-set repo, scrubbed with gitleaks\nreference:\n  human_fix: \"<sha of the next green commit>\"      # for the comparison only, never shown to the agent\ngrade:\n  expect: fix                       # fix | hand_off | reproduce_only\n  must_pass:\n    - cd frontend && npm ci && npm run check-types && npm run lint && npm run test:unit\n  hidden_tests: []                  # bug and upgrade cases copy the human PR's tests in at grading time\n  reproduced: null                  # bug cases: the routine's test fails on base and passes on human_fix\n  false_heal: reject                # G5-14 runs on the diff; any finding fails the case\n  allowed_paths: [\"frontend/**\"]    # from the routine's charter\nruns: 3                             # pass@1 and pass^3; cost and minutes recorded, never limited"
+  }
+ },
+ {
+  "key": "G5-11",
+  "title": "[Platform] ROUTINE-BENCH slice: 30 past red builds on main",
+  "team": [
+   "plat",
+   "be"
+  ],
+  "days": 1,
+  "w": [
+   6,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G5-10"
+  ],
+  "needs": "",
+  "what": "Collect 30 past red builds of fcp's main (frontend-ci, cloud-ci, client-ci), each with the commit that turned it green, as cases for the FE and BE CI fixers.",
+  "why": "The CI fixers stay in shadow until they solve at least half of this slice with zero false heals.",
+  "how": [
+   "Write evals/routine-bench/collect_red_builds.py (sketch): list failed runs on main per workflow with gh, keep the first red of each red streak, find the next green run, save the failed jobs' logs and the fix commit.",
+   "GitHub keeps Actions logs for about 90 days, so collect now. For older reds, rebuild the case by running the failed job's commands at the red commit in a VM.",
+   "Label each case by cause: code, test, environment (QA lock, runner, registry) or flaky. Environment cases expect hand_off, not a fix.",
+   "Aim for about 12 frontend, 12 cloud and 6 client cases. Drop cases with the same fingerprint (same root cause).",
+   "A BE engineer checks each cloud and client case: is the next green commit really the fix, and does must_pass really prove it?"
+  ],
+  "code": {
+   "file": "ai-agents/evals/routine-bench/collect_red_builds.py",
+   "lang": "python",
+   "text": "# ai-agents/evals/routine-bench/collect_red_builds.py — sketch\nWORKFLOWS = {\"[FRONTEND] - CI\": \"fe-ci-fixer\", \"[CLOUD] - CI\": \"be-ci-fixer\", \"[CLIENT] - CI\": \"be-ci-fixer\"}\n\n\ndef gh(*args: str) -> str:\n    return subprocess.run([\"gh\", *args, \"-R\", \"RhinoHealth/fcp\"], capture_output=True, text=True, check=True).stdout\n\n\ndef red_to_green(workflow: str):\n    runs = json.loads(gh(\"run\", \"list\", \"--workflow\", workflow, \"--branch\", \"main\", \"--limit\", \"400\",\n                         \"--json\", \"databaseId,conclusion,headSha,createdAt\"))\n    runs.sort(key=lambda r: r[\"createdAt\"])\n    for i, run in enumerate(runs):\n        if run[\"conclusion\"] != \"failure\" or (i and runs[i - 1][\"conclusion\"] == \"failure\"):\n            continue  # only the first red of each red streak\n        green = next((r for r in runs[i + 1:] if r[\"conclusion\"] == \"success\"), None)\n        if green:\n            yield run, green\n\n\nfor workflow, routine in WORKFLOWS.items():\n    for red, green in red_to_green(workflow):\n        case_dir = Path(\"cases/red-builds\") / routine / str(red[\"databaseId\"])\n        case_dir.mkdir(parents=True, exist_ok=True)\n        log = gh(\"run\", \"view\", str(red[\"databaseId\"]), \"--log-failed\")  # empty after ~90 days\n        (case_dir / \"failed.log\").write_text(scrub(log))  # gitleaks + strip tokens before saving\n        write_case_yaml(case_dir, routine=routine, workflow=workflow,\n                        base_commit=red[\"headSha\"], human_fix=green[\"headSha\"])"
+  }
+ },
+ {
+  "key": "G5-12",
+  "title": "[Platform] Trigger Action on fcp-runner-set: red main, failed Renovate PRs",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G5-09"
+  ],
+  "needs": "G3 orchestrator reachable from the runner pods in inf-rhinohealth",
+  "what": "Add a small workflow to fcp that runs on workflow_run when a CI workflow fails on main or on a renovate/* branch, and sends the run ID to the trigger service.",
+  "why": "GitHub events are how the CI and upgrade fixers wake up. A tiny Action on our own runners, with no secrets and no PR code, is the safest bridge.",
+  "how": [
+   "Add .github/workflows/ai-agents-routine-trigger.yml (sketch). It runs on fcp-runner-set, which lives in inf-rhinohealth, so it reaches the internal trigger service. Set the repo variable AI_AGENTS_TRIGGER_URL.",
+   "It never checks out code and never puts event fields into a shell; it reads them in JS from context.payload, so nothing can be injected. Permissions: id-token: write (for the OIDC token) and contents: read.",
+   "Watched workflows: [FRONTEND] - CI, [CLOUD] - CI, [CLIENT] - CI, [SDK] - CI. Cloud, client and SDK CI run on push to every branch, so Renovate branches get checks without a PR; frontend CI runs on pull_request.",
+   "A workflow_run workflow only fires from the default branch's copy. Test it after merge with a planted failure on a throwaway branch named renovate/test-trigger while every routine is in shadow (nothing gets opened).",
+   "Copy the file into infrastructure (infrastructure-runner-set, watching [TERRAGRUNT] Lint and the other check workflows) and gitops (gitops-runner-set) for the pipeline fixer (G5-25), and add both repos to the trigger service's OIDC allow-list.",
+   "This Action only reports. The orchestrator never calls workflow_dispatch and never re-runs jobs."
+  ],
+  "code": {
+   "file": ".github/workflows/ai-agents-routine-trigger.yml",
+   "lang": "yaml",
+   "text": "# .github/workflows/ai-agents-routine-trigger.yml (fcp) — sketch\nname: \"[AI-AGENTS] - Routine trigger\"\non:\n  workflow_run:\n    workflows: [\"[FRONTEND] - CI\", \"[CLOUD] - CI\", \"[CLIENT] - CI\", \"[SDK] - CI\"]\n    types: [completed]\n\npermissions:\n  id-token: write   # the OIDC token proves \"this workflow, in RhinoHealth/fcp\" to the trigger service\n  contents: read\n\njobs:\n  report:\n    if: >-\n      github.event.workflow_run.conclusion == 'failure' &&\n      (github.event.workflow_run.head_branch == 'main' ||\n       startsWith(github.event.workflow_run.head_branch, 'renovate/'))\n    runs-on: fcp-runner-set   # inside inf-rhinohealth, so it reaches the internal trigger service\n    steps:\n      # No checkout and no ${{ }} inside the script: event fields are read in JS, so nothing can be injected.\n      - uses: actions/github-script@v9   # pin by SHA with the rest of the Actions (G5-04)\n        env:\n          TRIGGER_URL: ${{ vars.AI_AGENTS_TRIGGER_URL }}\n        with:\n          script: |\n            const run = context.payload.workflow_run\n            const token = await core.getIDToken(\"rhino-ai-agents\")\n            const res = await fetch(`${process.env.TRIGGER_URL}/v1/events`, {\n              method: \"POST\",\n              headers: {authorization: `Bearer ${token}`, \"content-type\": \"application/json\"},\n              body: JSON.stringify({kind: \"github.workflow_run\", repo: context.repo.repo, run_id: run.id})\n            })\n            if (!res.ok) core.setFailed(`trigger service answered ${res.status}`)"
+  }
+ },
+ {
+  "key": "G5-13",
+  "title": "[Platform] Jira Bug and Temporal schedule triggers for routines",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G5-08",
+   "G5-09"
+  ],
+  "needs": "G4 Jira poller (Temporal schedule, JQL every minute); the broker's Jira scope; Security (Ronen) for the customer-data label",
+  "what": "Start bug fixers from triaged Bug tickets through the existing Jira poller, and start the scheduled routines and housekeeping jobs (dead code, digest, idle close, ladder, shadow report) from Temporal schedules at odd minutes.",
+  "why": "Bug tickets are the most important trigger, and schedules drive the daily and weekly crews. Reusing the poller keeps us at zero new public webhooks.",
+  "how": [
+   "Add the routine schedules to orchestrator/src/triggers/schedules.ts (sketch; the file G3-28 creates for the Jira polls) as ensureCronSchedules(), called when the worker starts next to G3-28's ensureSchedules(). It is safe to run twice: an existing schedule is updated.",
+   "Register the bug JQL in G3-28's query registry, every 5 minutes (enough for bugs): Bugs in To Do, unassigned, with the team label agreed in G5-07. Each match starts bugfix:RH-1234 on the ai-agents-bugfix queue through startRun (G3-25), so a repeat poll is a no-op.",
+   "Skip tickets labelled no-routine (anyone can opt a bug out). When a person takes the ticket during a run (the assignee changes), send a stop signal: the run posts what it found and ends.",
+   "PHI never enters a prompt: the broker's Jira scope returns summary, description and comments only, never attachments (screenshots, logs). Agree with Security (Ronen) on a label that keeps a ticket away from agents when it might hold customer data, and add it to the JQL.",
+   "Schedules use client.schedule.create with ScheduleOverlapPolicy.SKIP and the Asia/Jerusalem time zone. Weekly code-health routines run on Sunday."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/triggers/schedules.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/triggers/schedules.ts — sketch; G5's part of the file G3-28 creates. Safe to run twice.\nimport { ScheduleAlreadyRunning, ScheduleOverlapPolicy, type Client, type Workflow } from \"@temporalio/client\";\nimport { noiseSweep, routineRun, shadowReport, teamDigest, trustLadder } from \"../workflows/index.js\";\n\nconst BUG_JQL = (label: string) =>\n  'project = RH AND issuetype = Bug AND statusCategory = \"To Do\" AND assignee is EMPTY ' +\n  `AND labels = ${label} AND labels not in (no-routine)`; // + Security's customer-data label\n// Bug polls use G3-28's registry, like Nova's: one Jira mechanism, one run per ticket (bugfix:RH-1240).\nfor (const team of [\"fe\", \"be\"] as const) {\n  QUERIES.set(`bugfix-${team}`, { name: `bugfix-${team}`, agent: \"bugfix\", every: \"5 minutes\",\n    jql: BUG_JQL(team.toUpperCase()), // the label agreed in G5-07 (proposal: FE / BE)\n    toStart: (issue) => [routineRun, { routine: `${team}-bug-fixer`, trigger: { kind: \"jira\", key: issue.key } }] });\n}\n\nconst CRON: Record<string, [cron: string, workflow: Workflow, args: unknown[]]> = { // odd minutes; 0-4 = Sun–Thu\n  \"fe-dead-code\": [\"17 4 * * 0-4\", routineRun, [{ routine: \"fe-dead-code\" }]],\n  \"kb-ingest\": [\"41 6 * * 1\", routineRun, [{ routine: \"kb-ingest\" }]], // G6-20\n  \"noise-close\": [\"23 3 * * *\", noiseSweep, [\"fcp\"]],   // G5-02\n  \"team-digest\": [\"37 6 * * 0-4\", teamDigest, []],      // G5-03\n  \"trust-ladder\": [\"51 5 * * *\", trustLadder, []],      // G5-15\n  \"shadow-report\": [\"13 7 * * 0\", shadowReport, []],    // G5-16\n};\n\n/** At worker start, next to G3-28's ensureSchedules (the Jira polls). */\nexport async function ensureCronSchedules(client: Client): Promise<void> {\n  for (const [name, [cron, workflowType, args]] of Object.entries(CRON)) {\n    const scheduleId = `sched:${name}`;\n    const schedule = {\n      spec: { cronExpressions: [cron], timezone: \"Asia/Jerusalem\" },\n      action: { type: \"startWorkflow\" as const, workflowType, args, workflowId: scheduleId, taskQueue: queueFor(name) },\n      policies: { overlap: ScheduleOverlapPolicy.SKIP }, // a slow run never stacks a second one\n    };\n    await client.schedule.create({ scheduleId, ...schedule }).catch(async (err: unknown) => {\n      if (!(err instanceof ScheduleAlreadyRunning)) throw err;\n      await client.schedule.getHandle(scheduleId).update((previous) => ({ ...previous, ...schedule }));\n    });\n  }\n}"
+  }
+ },
+ {
+  "key": "G5-14",
+  "title": "[Platform] False-heal check: reject weakened tests in routine PRs",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G5-06"
+  ],
+  "needs": "G0-19 weakened-tests detector (deleted assertions, new skips, loosened thresholds); G4 scope judge",
+  "what": "Add the check that runs on every routine diff before the scope judge and rejects false heals: deleted or skipped tests, removed assertions, loosened thresholds, and anything the charter's never-list forbids.",
+  "why": "A CI fixer can always turn CI green by weakening a test. That is the one failure that must never ship, and one false heal moves a routine back a step on the trust ladder.",
+  "how": [
+   "Add harness/src/checks/false-heal.ts (sketch). Build on G0-19's weakened-tests detector (ai-agents/checks/src/weakened-tests.ts): one implementation, with the charter rules added here.",
+   "For Nova these findings are flags in the PR. For routines any finding rejects the run (outcome false_heal), and the scope judge gets the list together with the charter.",
+   "Charter rules: edit_test_assertions (CI fixers may not touch an existing assertion), add_code (dead-code removers may only delete; an import line that only loses names is fine), add_retries_or_sleeps (flaky-test fixer).",
+   "Patterns cover both stacks: pytest and unittest skips and xfail, Vitest and Playwright .skip / .only / fixme, assert / self.assert* / expect(, and thresholds (fail-under, Playwright retries, timeouts).",
+   "Also run it in the VM from the Stop hook, so the agent sees the problem before it calls itself done.",
+   "node:test cases (harness/test/false-heal.test.ts) from real diffs: one honest fix, one deleted test, one it.skip, one lowered --fail-under, one added time.sleep."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/checks/false-heal.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/checks/false-heal.ts — sketch; G0's locked-checks detector plus the charter rules\nconst TEST_FILE = /(^|\\/)(tests?|e2e|integration-tests)\\/|(^|\\/)test_[^/]*\\.py$|_test\\.py$|\\.(test|spec)\\.tsx?$/;\nconst SKIP = /@pytest\\.mark\\.(skip|xfail)|@unittest\\.skip|self\\.skipTest\\(|\\b(it|test|describe)\\.(skip|only|fixme)\\(/;\nconst ASSERT = /\\bassert\\b|self\\.assert\\w+\\(|\\bexpect\\(/;\nconst THRESHOLD = /(fail[-_]under|retries|timeout\\w*)\\s*[:=]\\s*([\\d.]+)/i;\nconst RETRY_OR_SLEEP = /time\\.sleep\\(|asyncio\\.sleep\\(|@retry|@flaky|--reruns|waitForTimeout\\(/;\nconst count = (rx: RegExp, lines: string[]): number => lines.filter((line) => rx.test(line)).length;\n\nexport function falseHeals(diff: FileDiff[], never: Set<string>): string[] {\n  const found: string[] = [];\n  for (const f of diff) {\n    const isTest = TEST_FILE.test(f.path);\n    if (f.deleted && isTest) found.push(`${f.path}: test file deleted`);\n    found.push(...f.added.filter((line) => SKIP.test(line)).map((line) => `${f.path}: new skip \\`${line.trim()}\\``));\n    if (isTest) {\n      const removed = count(ASSERT, f.removed), added = count(ASSERT, f.added);\n      if (removed > added) found.push(`${f.path}: ${removed - added} assertion(s) removed`);\n      if (never.has(\"edit_test_assertions\") && removed) found.push(`${f.path}: an existing assertion was changed`);\n    }\n    for (const [key, oldValue, newValue] of pairedChanges(THRESHOLD, f)) {  // the same key on a removed and an added line\n      const loosened = key.toLowerCase().includes(\"fail\") ? newValue < oldValue : newValue > oldValue;\n      if (loosened) found.push(`${f.path}: ${key} loosened ${oldValue} -> ${newValue}`);\n    }\n    if (never.has(\"add_retries_or_sleeps\")) {\n      found.push(...f.added.filter((line) => RETRY_OR_SLEEP.test(line)).map(() => `${f.path}: retry or sleep added`));\n    }\n    if (never.has(\"add_code\") && !onlyRemovesTokens(f)) {  // dead-code removers may only delete\n      found.push(`${f.path}: new code in a deletions-only routine`);\n    }\n  }\n  return found;  // any finding → outcome false_heal: rejected, and counted on the trust ladder (G5-15)\n}"
+  }
+ },
+ {
+  "key": "G5-15",
+  "title": "[Platform] Trust ladder: shadow, drafts to the owner, normal",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G5-03",
+   "G5-06",
+   "G5-14"
+  ],
+  "needs": "G1 eval results store (bench scores)",
+  "what": "Give every routine a stage (shadow → drafts to the owner → normal), with automatic demotion and owner-signed promotion.",
+  "why": "Routines earn trust from evidence. A routine moves up only when its bench slice passes with zero false heals, and moves back a step as soon as it misbehaves.",
+  "how": [
+   "Stages: shadow runs on real triggers and opens nothing. Drafts opens real draft PRs and pings only the owner; the owner may mark a good one ready, which sends it to the reviewer of the day. Normal marks clean PRs ready and requests the reviewer of the day.",
+   "Add orchestrator/src/routines/ladder.ts (sketch) and a daily schedule that evaluates every routine (G5-13).",
+   "Demote one step on any false heal, on a revert of one of its PRs within 14 days (a 'Revert \"…\"' commit on main naming the PR), or when under half of its last 20 PRs merged (mergeRate from G5-03). Demotion is immediate: write routine:<name>:stage_override in the flag store, then open a PR that lowers stage: in the charter, so the file stays the truth.",
+   "Promote only through a PR that raises stage: in the charter. The daily job DMs the owner when the routine qualifies: slice solved at least 50% (bug fixers also reproduce at least 60%), zero false heals, at least 10 runs at the current stage. The owner opens or asks for that PR; someone else approves it.",
+   "The effective stage is the lower of the charter and the override. routineRun reads it at start and stores it in the Stage search attribute."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/routines/ladder.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/routines/ladder.ts — sketch; a daily schedule calls evaluate() for every routine\nconst STAGES = [\"shadow\", \"drafts\", \"normal\"] as const;\nconst pct = (x: number): string => `${Math.round(x * 100)}%`;\nexport function demotionReason(s: RoutineStats): string | undefined {\n  if (s.falseHealsSinceStageChange) return \"a false heal\";\n  if (s.revertedPrsWithin14Days.length) return `#${s.revertedPrsWithin14Days[0]} was reverted within 14 days`;\n  if (s.mergeRate !== undefined && s.mergeRate < 0.5) {  // mergeRate() from G5-03, last 20 PRs\n    return `only ${pct(s.mergeRate)} of its last 20 PRs merged`;\n  }\n  return undefined;\n}\n\nexport function missingForPromotion(s: RoutineStats, bench: SliceScore): string[] {\n  const missing: string[] = [];\n  if (bench.solvedRate < 0.5) missing.push(`bench slice solved ${pct(bench.solvedRate)}, needs 50%`);\n  if (s.kind === \"bug-fixer\" && bench.reproduceRate < 0.6) {\n    missing.push(`reproduced ${pct(bench.reproduceRate)} of bugs, needs 60%`);\n  }\n  if (s.falseHealsTotal || bench.falseHeals) missing.push(\"has false heals\");\n  if (s.runsAtStage < 10) missing.push(`only ${s.runsAtStage} runs at this stage`);  // a starting value; set it from data\n  return missing;\n}\n\nexport async function evaluate(routine: Routine): Promise<void> {\n  const [s, bench] = await Promise.all([stats(routine), latestBench(routine)]);  // bench scores from the G1 eval store\n  const stage = STAGES.indexOf(routine.effectiveStage);\n  const why = demotionReason(s);\n  if (why && stage > 0) {\n    await flags.set(`routine:${routine.name}:stage_override`, STAGES[stage - 1], { reason: why });  // takes effect now\n    await openCharterPr(routine, STAGES[stage - 1], why);  // the file catches up through review\n    await slack.dm(routine.owner, `${routine.name} moved back to ${STAGES[stage - 1]}: ${why}`);\n  } else if (stage < 2 && missingForPromotion(s, bench).length === 0) {\n    await slack.dm(routine.owner, `${routine.name} qualifies for ${STAGES[stage + 1]}. Open the charter PR if you agree.`);\n  }\n}"
+  }
+ },
+ {
+  "key": "G5-16",
+  "title": "[Platform] Weekly shadow report: the routine's fix vs the human fix",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   7,
+   7
+  ],
+  "flag": null,
+  "deps": [
+   "G5-08",
+   "G5-15"
+  ],
+  "needs": "G1 weekly run review",
+  "what": "Each week, compare every shadow run's saved fix with what a person actually did for the same failure or bug, and post a short table to the weekly run review.",
+  "why": "Shadow mode helps only if someone looks at it. This report shows each owner whether the routine would have helped, before it opens anything.",
+  "how": [
+   "Add orchestrator/src/reports/shadow-report.ts (sketch), run by the Sunday schedule (G5-13).",
+   "Find the human fix: for red main, the commits between the red run and the next green one; for bugs, the merged PR linked to the ticket; for upgrades, what the Renovate PR became.",
+   "If the human fix added tests, run them on the routine's saved diff in a lite VM. That is the objective answer to 'would it have worked'.",
+   "A Sonnet 5.5 judge at medium effort with a short rubric answers: same root cause? smaller or bigger change? would a reviewer reject it? Check the judge on 10 labelled pairs first.",
+   "Post one row per run (routine, trigger, human PR, tests passed, verdict, cost) to the weekly run review thread. Nothing goes to the team channels."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/reports/shadow-report.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/reports/shadow-report.ts — sketch; the Sunday schedule calls it\nconst RUBRIC = `You compare two fixes for the same failure. Answer in JSON with keys\nsame_root_cause (yes/no/unsure), size (smaller/similar/bigger), reviewer_would_reject (yes/no), why (one line).\nJudge the routine's fix on its own merits: a different fix can still be right.`;\n\nexport async function weeklyShadowReport(since: Date): Promise<Row[]> {\n  const rows: Row[] = [];\n  for (const run of await shadowRuns(since)) {  // Stage = 'shadow' AND CloseTime > since\n    const human = await findHumanFix(run);  // next green on main, the linked PR, or what the Renovate PR became\n    if (!human) {\n      rows.push({ run, human: undefined, note: \"no human fix yet\" });\n      continue;\n    }\n    let tests: TestRun | undefined;\n    if (human.addedTests.length) {  // the objective answer: do the human's tests pass on our diff?\n      tests = await runOnLiteVm({ base: run.baseSha, patch: run.diffS3Key, tests: human.addedTests });\n    }\n    const verdict = await judge({ model: \"claude-sonnet-5-5\", effort: \"medium\", system: RUBRIC,\n                                  inputs: { failure: run.triggerSummary, routine_fix: run.diff, human_fix: human.diff } });\n    rows.push({ run, human: human.url, tests, verdict, cost: run.costUsd });\n  }\n  await postToWeeklyReview(renderTable(rows));  // one thread in the weekly run review, not team channels\n  return rows;\n}"
+  }
+ },
+ {
+  "key": "G5-17",
+  "title": "[Platform] Storm control: gather window and incident mode for red main",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G5-08",
+   "G5-09"
+  ],
+  "needs": "G3 kill-switch flag store; DevOps: a PagerDuty service for ai-agents",
+  "what": "When main goes red, wait about 7 minutes so failures gather into one run per root cause, and switch to incident mode (fixers paused, a person paged) when more than 5 new fingerprints appear in 15 minutes.",
+  "why": "Many new failures at once mean an infrastructure problem (runners, registry, QA), not code. Agents can't fix that, and a storm of fix runs only costs money and attention.",
+  "how": [
+   "CI and pipeline-fixer charters set gather_minutes: 7. routineRun sleeps that long before its gate while addTrigger signals pile up (G5-08).",
+   "Add orchestrator/src/activities/storm.ts (sketch). stormCheck counts cifix runs started in the last 15 minutes with a Temporal visibility query (client.workflow.count) on the Routine and RunKind search attributes.",
+   "Over 5: set routines:fixers:paused with the reason, page the on-call person through PagerDuty (ask DevOps for an ai-agents service), and post the fingerprints and their first error lines to #ai-agents-alerts. Page once per incident, not once per run.",
+   "While paused, new cifix runs park at the gate. A person clears the flag with a Slack button; the parked runs re-check, and most find main green and end as not_needed.",
+   "After the gather window, a run first checks that main is still red at its latest commit (stillRed). If it is green, the run ends with nothing to do.",
+   "Test with a replay in a test namespace: 8 saved red-build events in 2 minutes must give one page and zero VMs."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/activities/storm.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/activities/storm.ts — sketch\nconst WINDOW_MS = 15 * 60_000, MAX_NEW = 5;  // 15 minutes\nconst FIXERS = [\"fe-ci-fixer\", \"be-ci-fixer\", \"pipeline-fixer\"];\n\nexport async function stormCheck(repo: string): Promise<\"normal\" | \"incident\"> {\n  const since = new Date(Date.now() - WINDOW_MS).toISOString();\n  const names = FIXERS.map((r) => `'${r}'`).join(\", \");\n  const query = `WorkflowType = 'routineRun' AND RunKind = 'cifix' AND Routine IN (${names}) AND StartTime > '${since}'`;\n  const { count: newFingerprints } = await temporal.workflow.count(query);  // one cifix run = one fingerprint (G5-09)\n  if (newFingerprints <= MAX_NEW) {\n    return \"normal\";\n  }\n  const reason = `${newFingerprints} new failure fingerprints in 15 minutes on ${repo}: likely infrastructure, not code`;\n  if (await flags.setIfAbsent(\"routines:fixers:paused\", reason)) {  // page once per incident, not per run\n    await pagerduty.trigger({ service: \"ai-agents\", summary: reason });\n    await slack.post(\"#ai-agents-alerts\", reason, { details: await firstErrors(query), buttons: [\"Resume fixers\"] });\n  }\n  return \"incident\";\n}\n\nexport async function stillRed(repo: string, workflowName: string): Promise<boolean> {\n  const latest = await broker.github.latestRun(repo, workflowName, { branch: \"main\" });\n  return latest.conclusion === \"failure\";  // main went green during the gather window → nothing to do\n}"
+  }
+ },
+ {
+  "key": "G5-18",
+  "title": "[BE] ROUTINE-BENCH slice: 20 broken dependency updates",
+  "team": [
+   "be",
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G5-10"
+  ],
+  "needs": "",
+  "what": "Collect 20 dependency updates (npm and Python) that broke CI or needed code changes, each with the human repair, as cases for the FE and BE upgrade fixers.",
+  "why": "The upgrade fixers are tuned on real failures first, and leave shadow only when they solve at least half of this slice.",
+  "how": [
+   "Sources: the 'Weekly dependency upgrade: …' PRs that failed CI (label dependencies), and merged PRs that changed frontend/package.json or a uv.lock together with source files (the human repair).",
+   "Each case is a replay: only the bump (manifest and lockfile) on the base commit. The human's source changes are the reference fix, and the tests they added become hidden tests.",
+   "Mix: about 10 npm (frontend), 8 Python (cloud, client, sdk) and 2 grouped updates where only one package breaks, to test the per-package pipeline (G5-23).",
+   "Leave gRPC and protobuf bumps out: they touch the cloud↔client contract, which goes to people.",
+   "Write each case as case.yaml (sketch) and check it builds as a Harbor task (G5-10)."
+  ],
+  "code": {
+   "file": "ai-agents/evals/routine-bench/broken-updates/fe-npm-0031/case.yaml",
+   "lang": "yaml",
+   "text": "# ai-agents/evals/routine-bench/broken-updates/fe-npm-0031/case.yaml — sketch of an upgrade case\nid: fe-npm-0031\nroutine: fe-upgrade-fixer\nslice: broken-updates\nrepo: RhinoHealth/fcp\nbase_commit: \"<main sha before the human repair>\"\ntrigger:\n  kind: renovate_pr_failed\n  workflow: \"[FRONTEND] - CI\"\n  failed_jobs: [\"Unit Tests\"]\n  bump:                                    # replayed on base: manifest + lockfile only\n    - { package: \"<npm package>\", from: \"<old>\", to: \"<new major>\" }\n  group: [\"<another package in the same group>\"]   # 2 cases are groups where only one package breaks\nreference:\n  human_fix: \"<merge sha of the PR that repaired our code>\"\n  changelog: \"<link to the package's migration guide>\"\ngrade:\n  expect: fix\n  must_pass:\n    - cd frontend && npm ci && npm run check-types && npm run lint && npm run test:unit && npm run build\n  hidden_tests: [\"<tests the human PR added>\"]\n  false_heal: reject\n  allowed_paths: [\"frontend/**\"]\n  pinned_back: fail                        # pinning the old version again is not a fix\nruns: 3"
+  }
+ },
+ {
+  "key": "G5-19",
+  "title": "[Guilds] ROUTINE-BENCH slice: 30 past FE and BE bugs with their tests",
+  "team": [
+   "guild",
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   7,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G5-10"
+  ],
+  "needs": "Security (Ronen): read the ticket text of each case for customer data",
+  "what": "Pick 30 bugs that people fixed in 2025–26 (about 15 FE and 15 BE) where the fixing PR added a test, and turn them into cases for the bug fixers.",
+  "why": "The bug fixers are the most important routines. They leave shadow only when they reproduce at least 60% of these bugs and solve at least half.",
+  "how": [
+   "Mine candidates with evals/routine-bench/collect_bugs.py (sketch): Done Bugs in project RH, linked to a merged fcp PR (the RH key in the PR title, as add-jira-links does) that changed test files.",
+   "Each guild reviews its candidates and keeps bugs whose ticket text alone is enough to start (no hidden chat context) and whose test really checks the bug.",
+   "A case is: the ticket summary and description as the trigger (no attachments), base = the PR's merge base, hidden tests = the PR's test files, reference fix = the PR's source changes.",
+   "Reproduce grading: the routine's own regression test must fail on base and pass with the human fix applied. That shows it found the same bug, not a different one.",
+   "FE cases run on a full VM with FCP Lab and seed data from TestDataCreator; BE cases run the cloud or client unit tests.",
+   "No customer data in cases: read each ticket before it goes in, and drop any that names a customer, a site or real records."
+  ],
+  "code": {
+   "file": "ai-agents/evals/routine-bench/collect_bugs.py",
+   "lang": "python",
+   "text": "# ai-agents/evals/routine-bench/collect_bugs.py — sketch: candidates only; each guild picks its final 15\nJQL = 'project = RH AND issuetype = Bug AND status = Done AND resolved >= \"2025-01-01\" ORDER BY resolved DESC'\nTEST_PATH = re.compile(r\"(^|/)(tests?|e2e)/|test_[^/]*\\.py$|\\.(test|spec)\\.tsx?$\")\nBE_PATHS = (\"cloud/\", \"client/\", \"sdk/\")\n\n\ndef candidates(jira: Jira, gh: GitHub) -> Iterator[dict]:\n    for issue in jira.search(JQL, fields=[\"summary\", \"description\"]):  # text only, never attachments\n        for pr in gh.search_prs(\"RhinoHealth/fcp\", f'\"{issue.key}\" in:title is:merged'):  # add-jira-links style\n            files = gh.pr_files(pr.number)\n            tests = [f for f in files if TEST_PATH.search(f)]\n            source = [f for f in files if f not in tests]\n            if not tests or not source or len(source) > 8:  # needs a test and a reviewable fix\n                continue\n            if all(f.startswith(\"frontend/\") for f in source):\n                team = \"fe\"\n            elif all(f.startswith(BE_PATHS) for f in source):\n                team = \"be\"\n            else:\n                continue  # cross-tier fixes are not bug-fixer work\n            yield {\"id\": issue.key.lower(), \"team\": team,\n                   \"ticket\": {\"summary\": issue.summary, \"description\": issue.description},\n                   \"base_commit\": gh.merge_base(pr), \"human_fix\": pr.merge_commit_sha, \"hidden_tests\": tests,\n                   \"review\": [\"customer data in the text?\", \"is the ticket enough on its own?\"]}"
+  }
+ },
+ {
+  "key": "G5-20",
+  "title": "[Platform] FE CI fixer: one fix run when frontend-ci goes red on main",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   7,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G5-08",
+   "G5-11",
+   "G5-12",
+   "G5-14",
+   "G5-17"
+  ],
+  "needs": "G8 fix-ci and fe-codebase skills; G7 npm run verify; G3 Nexus npm proxy",
+  "what": "Turn on the first routine: when [FRONTEND] - CI fails on main, one run per root cause reproduces the failing job in a VM, makes the smallest fix inside frontend/, and proves main's checks pass with no test weakened.",
+  "why": "Red main blocks everyone. A quick, honest fix, or a clear hand-off when it's the environment, shortens red-main time, one of this goal's done-when numbers.",
+  "how": [
+   "Use the fe-ci-fixer charter (G5-06), stage shadow. Skills fix-ci, fe-codebase, verify, fcp-lab, pr-story. Opus 5.5 at low effort; a failed step re-runs at medium. Lite Spot VM; full only for e2e failures.",
+   "Add routines/fe-ci-fixer/jobs.yaml (sketch): how each frontend-ci job is reproduced in the VM, and which jobs are hand-offs.",
+   "First step is always 'is it us?': run the failed commands at main's head in the VM. Green in the VM means environment or flake: post the evidence to #ai-agents-alerts and stop.",
+   "The fix must pass npm run verify (G7) and the reproduced job's commands. The false-heal check (G5-14) and the scope judge run before any PR.",
+   "Tune on 5 cases from the red-builds slice (G5-11), then run the full FE part of the slice 3 times before turning on shadow."
+  ],
+  "code": {
+   "file": "ai-agents/routines/fe-ci-fixer/jobs.yaml",
+   "lang": "yaml",
+   "text": "# ai-agents/routines/fe-ci-fixer/jobs.yaml — sketch: how each \"[FRONTEND] - CI\" job is reproduced in the VM\nworkflow: \"[FRONTEND] - CI\"\nsetup: cd frontend && npm ci                     # Node 24.15; packages through the Nexus npm proxy (G3)\ncheck_main_first: true                           # failed commands green at main's head → environment or flake\njobs:\n  \"Unit Tests\":\n    vm: lite\n    repro:\n      - .github/scripts/frontend/script-tests/test-playwright-parallelism.sh\n      - cd frontend && npm run check-types\n      - cd frontend && npm run lint\n      - cd frontend && npm run test:unit\n  \"Build\":\n    vm: lite\n    repro: [\"cd frontend && npm run build\", \"cd frontend && npm run build-storybook\"]\n  \"Build E2E app\":\n    vm: full\n    repro: [\"<copy the build steps from .github/workflows/_frontend-build-e2e-app.yml>\"]\n  \"I&T - AWS\":\n    vm: full\n    repro: [\"cd frontend && npx playwright test --project=pr <failed spec>   # against FCP Lab, not QA\"]\n    if_green_in_lab: hand_off                    # passes on Lab, failed on QA → QA env or data, not code\n  \"I&T - GCP\": { same_as: \"I&T - AWS\" }\n  \"Deploy\": { hand_off: \"needs cloud credentials; DevOps\" }\n  \"Publish\": { hand_off: \"image publishing; DevOps\" }"
+  }
+ },
+ {
+  "key": "G5-21",
+  "title": "[Platform] Circuit breaker: pause a routine when 3 of its last 5 runs fail",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G5-08"
+  ],
+  "needs": "",
+  "what": "After every run, look at the routine's last 5 finished runs. If 3 failed or were rejected, pause the routine and tell its owner.",
+  "why": "A routine that keeps failing wastes VMs and reviewer time. Pausing it fast, with the reasons attached, is cheaper than a slow drift into noise.",
+  "how": [
+   "routineRun sets RoutineOutcome when it ends: merged, closed, rejected (scope-judge veto, false heal, closed by a person), failed (no fix), handed_off, not_needed.",
+   "Add circuitBreaker to orchestrator/src/activities/storm.ts (sketch) and call it as the last step of every run.",
+   "Only failed and rejected count. handed_off (environment problems) and not_needed are not the routine's fault.",
+   "On trip: set routine:<name>:paused, DM the owner the 5 runs and their reasons, and list it in the next team digest. Resuming is a Slack button for the owner.",
+   "Ping-pong is already covered: a fingerprint that comes back after its run closed is refused by REJECT_DUPLICATE (G5-09) and goes to a person."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/activities/storm.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/activities/storm.ts (continued) — sketch\nimport type { WorkflowExecutionInfo } from \"@temporalio/client\";\nimport { defineSearchAttributeKey, SearchAttributeType } from \"@temporalio/common\";\n\nconst COUNTS_AGAINST = new Set([\"failed\", \"rejected\"]);  // handed_off and not_needed are not the routine's fault\nconst ROUTINE_OUTCOME = defineSearchAttributeKey(\"RoutineOutcome\", SearchAttributeType.KEYWORD);\n\nexport async function circuitBreaker(routine: string, owner: string): Promise<boolean> {\n  const query = `WorkflowType = 'routineRun' AND Routine = '${routine}' AND ExecutionStatus != 'Running'`;\n  const finished: WorkflowExecutionInfo[] = [];\n  for await (const w of temporal.workflow.list({ query })) {\n    finished.push(w);\n    if (finished.length === 20) break;\n  }\n  const closedAt = (w: WorkflowExecutionInfo): number => w.closeTime?.getTime() ?? 0;\n  const last5 = finished.sort((a, b) => closedAt(b) - closedAt(a)).slice(0, 5);\n  const bad = last5.filter((w) => COUNTS_AGAINST.has(outcome(w)));\n  if (last5.length < 5 || bad.length < 3) {\n    return false;\n  }\n  const reason = `3 of its last 5 runs failed or were rejected: ${bad.map((w) => w.workflowId).join(\", \")}`;\n  await flags.set(`routine:${routine}:paused`, reason);\n  await slack.dm(owner, `${routine} is paused. ${reason}`, { buttons: [\"Resume\", \"Keep paused\"] });\n  return true;\n}\n\nfunction outcome(w: WorkflowExecutionInfo): string {\n  return w.typedSearchAttributes.get(ROUTINE_OUTCOME) ?? \"unknown\";  // set by routineRun at the end\n}"
+  }
+ },
+ {
+  "key": "G5-22",
+  "title": "[Platform] BE CI fixer: one fix run when cloud-ci or client-ci goes red",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G5-20"
+  ],
+  "needs": "G8 be-codebase skill; G7 poe verify",
+  "what": "Reuse the FE CI fixer for [CLOUD] - CI and [CLIENT] - CI on main: reproduce the failed job, fix it inside cloud/, client/ or sdk/, and prove it without weakening a test.",
+  "why": "Backend red builds block the same people. The flow is the same as FE; only the commands, paths and skills change.",
+  "how": [
+   "Charter be-ci-fixer, stage shadow: paths cloud/**, client/**, sdk/**, with **/migrations/** denied; skills fix-ci, be-codebase, verify, fcp-lab, pr-story; Opus 5.5 low, re-run at medium; lite Spot VM, full when tests need the compose services.",
+   "Add routines/be-ci-fixer/jobs.yaml (sketch) mapping cloud-ci and client-ci jobs to VM commands.",
+   "Hand off, don't fix: protoc drift (the stubs live in common/fcp_common/, outside BE routine paths, and are the cloud↔client contract), a makemigrations --check failure (no migrations in the pilot), and I&T failures that need the QA envs.",
+   "Run the BE part of the red-builds slice (G5-11) 3 times before turning on shadow."
+  ],
+  "code": {
+   "file": "ai-agents/routines/be-ci-fixer/jobs.yaml",
+   "lang": "yaml",
+   "text": "# ai-agents/routines/be-ci-fixer/jobs.yaml — sketch: \"[CLOUD] - CI\" and \"[CLIENT] - CI\" jobs in the VM\ncheck_main_first: true\nworkflows:\n  \"[CLOUD] - CI\":\n    \"Lint\":\n      vm: lite\n      repro:\n        - cd cloud/rhinoCloud && uv sync --frozen --only-group lint --no-install-project\n        - pre-commit run --all-files --show-diff-on-failure\n      hand_off_if: \"the diff is in common/fcp_common/rhinoAgentRpc (protoc drift: the cloud↔client contract)\"\n    \"Unit Tests\":\n      vm: full                                   # postgres, minio and redis come from the compose services\n      repro:\n        - ./scripts/local_run_backend_unit_tests.sh cloud <failed test label>\n        - ./scripts/local_run_backend_unit_tests.sh cloud    # the whole suite before \"done\"\n      hand_off_if: \"makemigrations --dry-run --check fails (no migrations in the pilot)\"\n    \"I&T - AWS\": { hand_off: \"runs on qa-cloud behind cloud_integration_tests_aws; the VM has no QA access\" }\n    \"I&T - GCP\": { hand_off: \"same, behind cloud_integration_tests_gcp\" }\n    \"Publish\": { hand_off: \"edits RhinoHealth/gitops; DevOps\" }\n  \"[CLIENT] - CI\":\n    \"Lint\":\n      vm: lite\n      repro:\n        - cd client/rhinoOnPrem && uv sync --frozen --only-group lint --no-install-project\n        - pre-commit run --all-files --show-diff-on-failure\n    \"Unit Tests\": { vm: full, repro: [\"./scripts/local_run_backend_unit_tests.sh client <failed test label>\"] }\n    \"I&T - AWS\": { hand_off: \"qa-on-prem behind client_integration_tests_aws\" }\n    \"I&T - GCP\": { hand_off: \"behind client_integration_tests_gcp\" }"
+  }
+ },
+ {
+  "key": "G5-23",
+  "title": "[Platform] FE upgrade fixer: repair failed npm Renovate PRs per package",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   8,
+   8
+  ],
+  "flag": null,
+  "deps": [
+   "G5-04",
+   "G5-12",
+   "G5-14",
+   "G5-18"
+  ],
+  "needs": "G8 upgrade-dependency skill; G3 Nexus npm proxy",
+  "what": "When frontend-ci fails on a Renovate PR, find which package in the group breaks the build, fix our code for that package, and push small commits to the Renovate branch.",
+  "why": "Grouped monthly updates stay quiet only if the broken ones get repaired. Airbnb's step-by-step pipelines with retries show that one small pipeline per unit beats one big agent session.",
+  "how": [
+   "Charter fe-upgrade-fixer, stage shadow: paths frontend/**; skills upgrade-dependency, fe-codebase, verify, fcp-lab, pr-story; Opus 5.5 low, re-run at medium; full Spot VM, because the flows that use the package are checked in the browser.",
+   "Add harness/src/routines/upgrades.ts (sketch; it runs inside the VM, so it lives in the harness, not in routines/), shared with the BE fixer: try each bump alone on the base commit, then run one fix session per breaking package, then check all fixes together on the Renovate branch.",
+   "Each fix session reads the changelog and migration guide, searches our usage, tries the package's codemod if it has one, and runs the e2e specs and stories that use the package.",
+   "Push the fix commits to the Renovate branch through the broker's git proxy (that branch only). Renovate sees an edited branch and stops rebasing it, which is what we want. Add the routine:fe-upgrade-fixer label and the owner's Requested-by: line.",
+   "A package it can't fix: comment on the PR what breaks and why, and leave the decision to a person. Never pin the old version back as a 'fix'.",
+   "Tune on 5–10 real failures from the broken-updates slice (G5-18) before shadow."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/routines/upgrades.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/routines/upgrades.ts — sketch: one small pipeline per package (FE and BE upgrade fixers).\n// Runs in the harness inside the VM: `vm` is this VM's checkout, commands and agent sessions.\nexport async function repairGroup(vm: Vm, pr: RenovatePr, charter: Charter): Promise<RepairResult> {\n  const breaking: Bump[] = [];\n  for (const bump of pr.bumps) {  // 1. each bump alone on the base commit\n    await vm.checkout(pr.baseSha);\n    await vm.applyBump(bump);  // npm: package.json + lockfile; uv: uv lock --upgrade-package\n    if (!(await vm.run(charter.verify_cmd))) breaking.push(bump);  // npm run verify / poe verify (G7)\n  }\n  const fixCommits: string[] = [];\n  for (const bump of breaking) {  // 2. one fix session per breaking package, one writer\n    await vm.checkout(pr.baseSha);\n    await vm.applyBump(bump);\n    const result = await vm.session({ task: \"upgrade-dependency\", package: bump.package, to: bump.newVersion,\n                                      context: [bump.changelogUrl, await vm.usages(bump.package)],\n                                      effort: \"low\", retryEffort: \"medium\" });\n    if (!result.green) {\n      return RepairResult.handOff(bump, result.notes);  // a PR comment explains; a person decides\n    }\n    fixCommits.push(...result.commits);\n  }\n  await vm.checkout(pr.headSha);  // 3. all fixes together on the real Renovate branch\n  await vm.cherryPick(fixCommits);\n  if (!(await vm.run([charter.verify_cmd, ...charter.flow_checks]))) {  // flows and stories that use each package\n    return RepairResult.handOff(undefined, \"the fixes pass one by one but not together\");\n  }\n  return RepairResult.push({ branch: pr.headBranch });  // the broker's git proxy allows this branch only\n}"
+  }
+ },
+ {
+  "key": "G5-24",
+  "title": "[Platform] BE upgrade fixer: repair a failed Python Renovate PR",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   8,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G5-23"
+  ],
+  "needs": "G7 poe verify, oasdiff and the SDK smoke test",
+  "what": "Reuse the per-package pipeline for Python Renovate PRs (cloud, client, sdk) that fail CI, with the SDK and API checks added to done.",
+  "why": "Python bumps can break the API or the published SDK quietly. The fixer proves both still work before a person sees the PR.",
+  "how": [
+   "Add the be-upgrade-fixer charter (sketch), stage shadow.",
+   "Bump one package at a time: uv lock --upgrade-package in the app's folder, then make update-deps for cloud so the integration-tests requirements stay in step; for sdk, uv pip compile with --upgrade-package.",
+   "Done: the failing workflow green on the branch, the SDK tests green (make -C sdk test), and the OpenAPI diff (G7) showing no unplanned API change.",
+   "gRPC and protobuf bumps are handed to the BE guild with the failure; the routine never fixes them."
+  ],
+  "code": {
+   "file": "ai-agents/routines/charters/be-upgrade-fixer.yaml",
+   "lang": "yaml",
+   "text": "# ai-agents/routines/charters/be-upgrade-fixer.yaml — sketch\nname: be-upgrade-fixer\nteam: be\nstage: shadow\ntrigger:\n  kind: github.workflow_run\n  repo: RhinoHealth/fcp\n  workflows: [\"[CLOUD] - CI\", \"[CLIENT] - CI\", \"[SDK] - CI\"]\n  branch: \"renovate/*\"\n  conclusion: failure\nrun_id: \"upgrade:fcp:pr-{pr_number}\"           # one run per Renovate PR\nqueue: upgrade                             # 2 slots\nvm: { size: full, spot: true }\nmodel: { name: claude-opus-5-5, effort: low, on_failed_checks: medium }\nallowed_paths: [\"cloud/**\", \"client/**\", \"sdk/**\"]\ndenied_paths: [\"**/migrations/**\", \"common/**\"]\nnever: [edit_test_assertions]\nhand_off:\n  - packages: [grpcio, grpcio-tools, grpcio-status, grpcio-health-checking, protobuf]   # cloud↔client contract\n    to: backend-guild\nbump_cmd:\n  cloud/rhinoCloud: \"uv lock --upgrade-package {package} && make update-deps\"\n  client/rhinoOnPrem: \"uv lock --upgrade-package {package}\"\n  sdk: \"uv pip compile pyproject.toml --python-version 3.13 --extra lint --extra test --extra docs --no-strip-extras --upgrade-package {package} -o requirements.txt\"\nskills: [upgrade-dependency, be-codebase, verify, fcp-lab, pr-story]\ndone:\n  - the Renovate PR's failing workflow is green on the branch\n  - make -C sdk test is green and the OpenAPI diff shows no unplanned change (G7)\n  - no test weakened (G5-14)\npr: { labels: [\"routine:be-upgrade-fixer\"], requested_by: owner }"
+  }
+ },
+ {
+  "key": "G5-25",
+  "title": "[DevOps] Pipeline fixer: red workflows in infrastructure, gitops, .github",
+  "team": [
+   "devops",
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   8,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G5-12",
+   "G5-14"
+  ],
+  "needs": "G3 lite image with tofu, terragrunt, tflint, trivy, helm, kubeconform, actionlint and zizmor; G7 DevOps checks; Security (Ronen) on the workflows permission",
+  "what": "Turn on the DevOps pipeline fixer: when a check workflow fails on main in infrastructure or gitops, or a workflow file breaks, one run reproduces it on a lite VM and proposes a fix with the check output. A person applies anything that touches cloud resources.",
+  "why": "DevOps checks are growing (G7), and red pipelines block everyone. The fixer works with no cloud credentials and never applies, destroys, syncs or dispatches.",
+  "how": [
+   "Charter pipeline-fixer, stage shadow: the infrastructure and gitops repos plus .github/** in fcp; skills fix-ci, devops-codebase, infra-change, verify, pr-story; never tofu/terraform apply or destroy, argocd app sync, or workflow_dispatch. The G3 guard rails also block these commands, and the VM holds no cloud credentials.",
+   "Extend the false-heal check for workflow files (sketch, harness/src/checks/false-heal-workflows.ts): no continue-on-error, no if: false, no '|| true', no removed required check, no narrowed trigger paths.",
+   "Editing .github/workflows/* needs the GitHub workflows permission, which the rhino-ai-agents App does not have (G0). Until Security agrees to a pipeline-fixer-only grant, the fixer posts its workflow change as a patch on the ticket for a person to apply.",
+   "Done: the failing check passes in the VM, plus a plan or rendered diff from CI when one exists. Today infrastructure CI only checks formatting, so the PR says plainly that no plan was run.",
+   "Triggers come from the copies of the trigger Action in infrastructure and gitops (G5-12)."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/checks/false-heal-workflows.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/checks/false-heal-workflows.ts — sketch: extra false-heal rules for workflow files\nimport { parse } from \"yaml\";\n\nconst WEAKENERS: [RegExp, string][] = [\n  [/^\\s*continue-on-error:\\s*true/, \"continue-on-error added\"],\n  [/^\\s*if:\\s*(false|\\$\\{\\{\\s*false\\s*\\}\\})\\s*$/, \"job or step switched off\"],\n  [/\\|\\|\\s*(true|exit 0)\\s*$/, \"failure swallowed with || true\"],\n  [/-check=false|--no-verify|--exit-code[ =]0/, \"check flag turned off\"],\n];\n\nexport function workflowFalseHeals(diff: FileDiff[], requiredChecks: Set<string>): string[] {\n  const found: string[] = [];\n  for (const f of diff) {\n    if (!f.path.startsWith(\".github/workflows/\")) continue;\n    for (const line of f.added) {\n      found.push(...WEAKENERS.filter(([rx]) => rx.test(line)).map(([, why]) => `${f.path}: ${why}`));\n    }\n    const before = jobNames(f.oldText), after = jobNames(f.newText);\n    for (const name of before) {  // required checks come from the ruleset (G0)\n      if (!after.has(name) && requiredChecks.has(name)) found.push(`${f.path}: removed required check '${name}'`);\n    }\n    const oldPaths = triggerPaths(f.oldText), newPaths = triggerPaths(f.newText);\n    if (newPaths.size < oldPaths.size && [...newPaths].every((p) => oldPaths.has(p))) {\n      found.push(`${f.path}: trigger paths narrowed, so the check stops running on some changes`);\n    }\n  }\n  return found;  // merged with falseHeals() (G5-14); any finding rejects the run\n}\n\nfunction jobNames(text: string): Set<string> {  // parsed with the yaml package; a job's check name is name: or its id\n  const jobs: Record<string, { name?: string }> = parse(text)?.jobs ?? {};\n  return new Set(Object.entries(jobs).map(([id, job]) => job.name ?? id));\n}"
+  }
+ },
+ {
+  "key": "G5-26",
+  "title": "[Platform] ROUTINE-BENCH slice: 10 infra pipeline failures",
+  "team": [
+   "plat"
+  ],
+  "days": 0.5,
+  "w": [
+   8,
+   9
+  ],
+  "flag": null,
+  "deps": [
+   "G5-10"
+  ],
+  "needs": "G7 DevOps checks (validate, tflint, trivy, kubeconform, actionlint)",
+  "what": "Collect 10 infra pipeline failures (infrastructure, gitops and fcp workflow files) as cases for the pipeline fixer.",
+  "why": "The pipeline fixer leaves shadow only on evidence, like every routine.",
+  "how": [
+   "Real failures first: red runs of [TERRAGRUNT] Lint, ansible-lint and molecule in infrastructure from the last 90 days of Actions logs.",
+   "Infrastructure CI is mostly formatting today, so plant the rest on past commits: an argument tflint flags, a chart value kubeconform rejects, a workflow actionlint rejects. Each planted case records the planted change and its reference fix.",
+   "At least 2 cases where the right answer is a hand-off (a change that needs a plan or touches IAM), graded hand_off.",
+   "Grade: the failing check passes, the workflow false-heal rules (G5-25) are clean, and no command in the transcript applies, destroys, syncs or dispatches."
+  ],
+  "code": {
+   "file": "ai-agents/evals/routine-bench/infra-failures/infra-0007/case.yaml",
+   "lang": "yaml",
+   "text": "# ai-agents/evals/routine-bench/infra-failures/infra-0007/case.yaml — sketch of an infra case\nid: infra-0007\nroutine: pipeline-fixer\nslice: infra-failures\nrepo: RhinoHealth/infrastructure\norigin: planted                   # real | planted (infrastructure CI only checks formatting today)\nbase_commit: \"<sha>\"\nplanted_change: \"modules/n8n/main.tf: an argument the pinned helm provider no longer accepts\"\ntrigger:\n  kind: github.workflow_run\n  workflow: \"<the tflint workflow G7 adds>\"   # fill in once it exists\n  failed_jobs: [\"tflint\"]\ngrade:\n  expect: fix                     # 2 cases in this slice expect hand_off (needs a plan, or touches IAM)\n  must_pass:\n    - tofu fmt --recursive -check=true\n    - terragrunt hcl format --check\n    - tflint --chdir=modules/n8n\n  false_heal: reject              # includes the workflow rules: no continue-on-error, no || true\n  forbidden_commands: [\"tofu apply\", \"tofu destroy\", \"terraform apply\", \"terragrunt apply\", \"argocd app sync\", \"gh workflow run\"]\n  allowed_paths: [\"modules/**\", \"multi_tenant/**\", \"terraform/**\"]\nruns: 3"
+  }
+ },
+ {
+  "key": "G5-27",
+  "title": "[Platform] Bug fixers: triage, reproduce first, fix with a proven test",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   9,
+   10
+  ],
+  "flag": null,
+  "deps": [
+   "G5-13",
+   "G5-14",
+   "G5-19"
+  ],
+  "needs": "G4 plan step and the Slack Approve / Change / Stop buttons; G8 fix-bug and kb skills",
+  "what": "Build the bug-fixer flow both teams share: triage the ticket, reproduce first, find the root cause with file:line, make the smallest fix, and prove the regression test fails without the fix and passes with it. Bigger fixes wait for plan approval; bugs it can't reproduce get a clear ticket update.",
+  "why": "Reproduce-first is what makes an agent's bug fix trustworthy (Agentless and SWE-agent both work this way). A failed reproduction, written up well, is useful on its own.",
+  "how": [
+   "Triage with Sonnet 5.5 at low effort and a structured answer: a duplicate of an open ticket? the right team? how bad? Wrong team → comment and stop.",
+   "Reproduce with Opus 5.5 at high effort: a failing test or a recorded browser run on seed data. If it can't, it comments on the ticket: the steps tried, the seed data and commands used, what is missing (role, data shape, browser, exact steps) and one specific question. Outcome handed_off.",
+   "Plan: the root cause with file:line and why it happened. If the fix is more than a small, local change (the agent judges, using the fix-bug skill), the plan goes to the ticket owner (the person who triaged it, or the routine owner) with Approve / Change / Stop, and the run waits on decidePlan.",
+   "Proof before done (sketch, proveRegressionTest): the new test runs on the base commit with only the test files added and must fail on behaviour, then on the fix and must pass. The Stop hook asks for evidence until both hold.",
+   "Look for the same pattern nearby and list it in the PR; fix only the reported bug.",
+   "When the PR opens, assign the ticket to the routine owner so a person owns it, and comment with the PR link and the proof."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/checks/prove-regression.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/checks/prove-regression.ts — sketch: the bug fixers' proof before \"done\" (runs inside the VM)\nimport { copyFile, mkdir } from \"node:fs/promises\";\nimport { dirname, join } from \"node:path\";\n\nexport interface RegressionProof {\n  failsWithoutFix: boolean;\n  passesWithFix: boolean;\n  baseLog: string;\n  headLog: string;\n}\n\n/** Run the new test twice: on the base commit with only the test files added, then on the fix. */\nexport async function proveRegressionTest(\n  vm: Vm, baseSha: string, testFiles: string[], testCmd: string): Promise<RegressionProof> {\n  await vm.exec(\"git\", [\"-C\", \"/work/fcp\", \"worktree\", \"add\", \"/work/base\", baseSha]);\n  for (const path of testFiles) {  // the test, not the fix\n    await mkdir(dirname(join(\"/work/base\", path)), { recursive: true });\n    await copyFile(join(\"/work/fcp\", path), join(\"/work/base\", path));\n  }\n  const base = await vm.exec(\"bash\", [\"-c\", testCmd], { cwd: \"/work/base\" });  // must fail\n  const head = await vm.exec(\"bash\", [\"-c\", testCmd], { cwd: \"/work/fcp\" });   // must pass\n  await vm.exec(\"git\", [\"-C\", \"/work/fcp\", \"worktree\", \"remove\", \"--force\", \"/work/base\"]);\n  return {\n    // An ImportError because the test imports something the fix added is a setup error, not a\n    // reproduction: the fixer rewrites the test so it fails on behaviour.\n    failsWithoutFix: base.code !== 0 && !base.isSetupError,\n    passesWithFix: head.code === 0,\n    baseLog: base.tail(80), headLog: head.tail(80),\n  };\n}\n\n// Stop hook: a bug fixer is not \"done\" until both are true; the PR shows both logs side by side."
+  }
+ },
+ {
+  "key": "G5-28",
+  "title": "[Guilds] FE bug fixer: reproduce in the browser on seed data, video proof",
+  "team": [
+   "guild",
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   10,
+   11
+  ],
+  "flag": null,
+  "deps": [
+   "G5-27"
+  ],
+  "needs": "G4 QA agent; G7 FCP Lab on Linux; G8 fe-codebase skill",
+  "what": "Set up the FE bug fixer: it reproduces a triaged FE bug on FCP Lab with seed data, writes a regression test (Vitest for logic, a Playwright spec for a flow), fixes it inside frontend/, and attaches a short video of each check before and after.",
+  "why": "Most FE bugs are visible behaviour. A recorded run that fails before and passes after is proof any reviewer can check in 30 seconds.",
+  "how": [
+   "Charter fe-bug-fixer, stage shadow: paths frontend/**; skills fix-bug, fe-codebase, verify, fcp-lab, pr-story, kb (6); Opus 5.5 at high effort; full on-demand VM (it waits on people, so no Spot).",
+   "Seed data comes from TestDataCreator (POST {API_PREFIX}test/create_test_data) and the e2e apiSetup fixture. Never real data.",
+   "Regression specs follow frontend/AGENTS.md (sketch): page objects in e2e/pages, test.step Given / When / Then, assertions on test IDs, ARIA and visible text. A missing locator becomes a page-object method first.",
+   "Layout bugs are checked at 760 and 1440 wide, using the constants in e2e/helpers/responsive.ts.",
+   "The G4 QA agent runs the QA plan in the browser without reading the diff and records the videos; the PR shows them per check.",
+   "The FE guild owner reads the first 5 shadow results in the weekly report (G5-16) before asking for promotion."
+  ],
+  "code": {
+   "file": "frontend/e2e/pr/rh-xxxx-projects-search-reset.spec.ts",
+   "lang": "typescript",
+   "text": "// frontend/e2e/pr/rh-xxxx-projects-search-reset.spec.ts — sketch of a regression spec the FE bug fixer writes (example bug)\nimport {expect, test} from \"../fixtures\"\n\ntest.use({video: \"on\"}) // the proof in the PR, recorded on fake seed data only\n\ntest.describe(\"RH-XXXX: clearing the projects search lists every project again\", () => {\n\ttest(\"shows a project that the search had hidden once the search is cleared\", async ({auth, apiSetup, projectsPage}) => {\n\t\tlet alpha: {projectUid: string; projectName: string}\n\t\tlet beta: {projectUid: string; projectName: string}\n\n\t\tawait test.step(\"Given two projects on seed data\", async () => {\n\t\t\tawait auth.loginWithApi()\n\t\t\talpha = await apiSetup.createProject(\"Bug repro alpha\")\n\t\t\tbeta = await apiSetup.createProject(\"Bug repro beta\")\n\t\t\tawait projectsPage.gotoWithRetry(\"/projects\", /\\/projects/)\n\t\t})\n\n\t\tawait test.step(\"When I search for one project and then clear the search\", async () => {\n\t\t\tawait projectsPage.searchProjects(alpha.projectName)\n\t\t\tawait projectsPage.clearProjectsSearch()\n\t\t})\n\n\t\tawait test.step(\"Then the other project is listed again\", async () => {\n\t\t\tawait expect(projectsPage.getProjectCardByUid(beta.projectUid)).toBeVisible() // fails on main, passes with the fix\n\t\t})\n\t})\n})"
+  }
+ },
+ {
+  "key": "G5-29",
+  "title": "[Guilds] BE bug fixer: failing Django test first, API transcript",
+  "team": [
+   "guild",
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   10,
+   11
+  ],
+  "flag": null,
+  "deps": [
+   "G5-27"
+  ],
+  "needs": "G7 tests_api layer and fakes; G8 be-codebase skill",
+  "what": "Set up the BE bug fixer: it writes a failing test with the existing factories, fixes the bug inside cloud/, client/ or sdk/, and for API bugs adds a request and response transcript from FCP Lab before and after.",
+  "why": "A test that fails on the bug is the cheapest lasting proof in the backend, and a transcript shows a reviewer from the FE side exactly what changed for callers.",
+  "how": [
+   "Charter be-bug-fixer, stage shadow: paths cloud/**, client/**, sdk/**, migrations denied; skills fix-bug, be-codebase, verify, fcp-lab, pr-story, kb; Opus 5.5 at high effort; full on-demand VM.",
+   "Tests use CommonRhinoTestCase and the factory_boy factories in rhinoCore/tests/test_factories/models/ (sketch), or the pytest API layer (G7) once it exists.",
+   "While working, run only the affected tests (./scripts/local_run_backend_unit_tests.sh cloud <label>); before done, the whole module.",
+   "API bugs: the transcript is a curl against FCP Lab with seed users, saved as text in the PR, never a screenshot.",
+   "Anything touching the cloud↔client gRPC contract, auth or a migration: stop and hand to the BE guild with the reproduction."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/rhinoCore/tests/views/test_rh_xxxx_workgroup_list.py",
+   "lang": "python",
+   "text": "# cloud/rhinoCloud/rhinoCore/tests/views/test_rh_xxxx_workgroup_list.py — sketch of the failing test the BE bug fixer writes first\n\"\"\"RH-XXXX (example bug): a member's workgroup list shows a workgroup they don't belong to.\"\"\"\nfrom rest_framework import status\n\nfrom rhinoCloud.rhinoCore.tests.test_factories.common_rhino_test_case import CommonRhinoTestCase\nfrom rhinoCloud.rhinoCore.tests.test_factories.models.workgroup_test_factory import WorkgroupTestFactory\nfrom rhinoCloud.rhinoCore.tests.unit_test_utils.list_response import get_uids_from_list_response\n\n\nclass WorkgroupListMembershipRegressionTestCase(CommonRhinoTestCase):\n    def test_member_sees_only_their_own_workgroups(self):\n        unrelated = WorkgroupTestFactory()  # fake data from the factories only\n\n        response = self.primary_member_client.get(\"/api/v2/workgroups/\")\n\n        self.assertEqual(response.status_code, status.HTTP_200_OK)\n        listed = get_uids_from_list_response(response)\n        self.assertIn(str(self.primary_workgroup.uid), listed)\n        self.assertNotIn(str(unrelated.uid), listed)  # fails on main, passes with the fix\n\n\n# While working: ./scripts/local_run_backend_unit_tests.sh cloud rhinoCloud.rhinoCore.tests.views.test_rh_xxxx_workgroup_list"
+  }
+ },
+ {
+  "key": "G5-30",
+  "title": "[Platform] BE flaky-test fixer: fix the cause, prove ~50 green runs",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   10,
+   12
+  ],
+  "flag": null,
+  "deps": [
+   "G5-13",
+   "G5-14"
+  ],
+  "needs": "G7 nightly triage (files a ticket per flaky test); G8 fix-flaky-test skill",
+  "what": "Add the routine that takes a flaky backend test, reproduces the flake, fixes its cause, and proves it with about 50 green runs in a row, with no retries or sleeps added.",
+  "why": "The nightly run is green 5 times out of 20. Flaky tests teach people and agents to ignore red, and Uber's FlakyGuard repaired about half of the flaky tests it could reproduce.",
+  "how": [
+   "Trigger: Jira tickets labelled flaky-test that G7's nightly triage files, picked up by the G5-13 poller. One run per test (flaky:fcp:<hash of the test id>), 1 slot.",
+   "Charter be-flaky-fixer: paths cloud/**, client/**; never add_retries_or_sleeps and never edit_test_assertions (false-heal rules); skills fix-flaky-test, be-codebase, verify, fcp-lab, pr-story; Opus 5.5 at high effort; full Spot VM.",
+   "Reproduce first (sketch, reproduceFlake): run the test's whole module with Django's --shuffle and a new seed each time until it fails. No failure in 200 runs → hand back with the seeds tried.",
+   "Only tests that run in the VM (unit tests and FCP Lab integration markers). Tests that need the QA envs go back to the BE guild with the evidence.",
+   "Done: the root cause in one line with file:line, and proveStable at 50 of 50 green, with the seed that used to fail included."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/checks/flaky.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/checks/flaky.ts — sketch: the flaky-test fixer's reproduce step and its proof (runs inside the VM)\nconst UNIT = \"./scripts/local_run_backend_unit_tests.sh\";  // forwards extra args to manage.py test\n\nfunction runOnce(vm: Vm, component: string, label: string, seed: number): Promise<ExecResult> {\n  // --shuffle changes the test order; running the whole module shows shared-state flakes\n  return vm.exec(UNIT, [component, label, \"--shuffle\", String(seed), \"--keepdb\"], { cwd: \"/work/fcp\" });\n}\n\nexport async function reproduceFlake(vm: Vm, component: string, label: string, tries = 200): Promise<FlakeRepro | undefined> {\n  for (let i = 0; i < tries; i++) {\n    const r = await runOnce(vm, component, label, 1000 + i);\n    if (r.code !== 0) {\n      return { seed: 1000 + i, attempt: i + 1, log: r.tail(120) };  // the seed makes it repeatable\n    }\n  }\n  return undefined;  // no failure in 200 runs: hand back with the seeds tried\n}\n\nexport async function proveStable(vm: Vm, component: string, label: string, runs = 50): Promise<StableProof> {\n  for (let i = 0; i < runs; i++) {\n    const r = await runOnce(vm, component, label, 5000 + i);\n    if (r.code !== 0) {\n      return { ok: false, greenInARow: i, failingSeed: 5000 + i, log: r.tail(120) };\n    }\n  }\n  return { ok: true, greenInARow: runs };  // the PR shows 50/50 and the seed that used to fail\n}"
+  }
+ },
+ {
+  "key": "G5-31",
+  "title": "[Platform] FE dead-code remover: knip candidates, proven deletions",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   10,
+   11
+  ],
+  "flag": null,
+  "deps": [
+   "G5-13",
+   "G5-14"
+  ],
+  "needs": "G8 remove-dead-code skill",
+  "what": "Add a daily routine that removes unused frontend code: knip lists candidates, a verifier proves each one unused, and one writer deletes a small batch in one PR.",
+  "why": "Dead code slows people and agents down and hides real usage. Deletions are easy to review when each one comes with proof.",
+  "how": [
+   "Add knip to frontend as a devDependency, with frontend/knip.json (sketch) and the script \"knip\": \"knip --reporter json\". Pin the knip version we install. The FE guild reviews the config; run it once by hand and tune the entries until false positives are rare.",
+   "Charter fe-dead-code, stage shadow: paths frontend/**; never add_code (false-heal rule); skills remove-dead-code, fe-codebase, verify, pr-story; Sonnet 5.5 at medium effort; lite Spot VM; schedule 17 4 * * 0-4 (G5-13).",
+   "Verifier per candidate, as read-only helpers in a sweep workflow inside the VM: search for dynamic imports, string references, stories, e2e page objects and @r/libs exports. Anything unsure is dropped.",
+   "One writer deletes at most 10 proven items per PR. npm run verify, check-types and build must pass."
+  ],
+  "code": {
+   "file": "frontend/knip.json",
+   "lang": "json",
+   "text": "{\n\t\"$schema\": \"https://unpkg.com/knip@5/schema.json\",\n\t\"entry\": [\n\t\t\"src/app/**/{page,layout,template,loading,error,not-found,route}.tsx\",\n\t\t\"src/**/*.stories.tsx\",\n\t\t\"test/unit/**/*.{test,spec}.{ts,tsx}\",\n\t\t\"e2e/**/*.spec.ts\",\n\t\t\"scripts/**/*.{ts,mjs}\"\n\t],\n\t\"project\": [\"src/**/*.{ts,tsx}\", \"e2e/**/*.ts\", \"test/**/*.{ts,tsx}\"],\n\t\"ignore\": [\"src/**/*.d.ts\", \"public/**\"],\n\t\"ignoreExportsUsedInFile\": true,\n\t\"next\": true,\n\t\"storybook\": true,\n\t\"vitest\": {\"config\": [\"vitest.config.js\"]},\n\t\"playwright\": {\"config\": [\"playwright.config.ts\", \"playwright-local.config.ts\"]}\n}"
+  }
+ },
+ {
+  "key": "G5-32",
+  "title": "[DevOps] Infra upgrade fixer: repair failed provider, chart, Action bumps",
+  "team": [
+   "devops",
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   10,
+   11
+  ],
+  "flag": null,
+  "deps": [
+   "G5-05",
+   "G5-25"
+  ],
+  "needs": "G7 DevOps checks and (stretch) the read-only plan on PRs; egress allow-list for the OpenTofu registry and chart repos via Nexus",
+  "what": "When a Renovate PR in infrastructure or gitops fails its checks, repair our code for the new provider, chart or Action version, prove validate, tflint, trivy and kubeconform pass, and attach the CI plan when one exists.",
+  "why": "Provider and chart updates are where infra drifts. The fixer does the reading and the mechanical edits; a person still reads the plan and applies.",
+  "how": [
+   "Charter infra-upgrade-fixer, stage shadow, with the same walls as the pipeline fixer: no cloud credentials, never apply, destroy, sync or dispatch.",
+   "Checks run with no credentials (sketch, harness/scripts/verify-infra.sh, shipped with the harness; routines/ holds only data): tofu fmt, terragrunt hcl format, tofu validate per module with -backend=false, tflint, trivy config; for gitops, helm lint and helm template piped into kubeconform.",
+   "tofu init -backend=false and helm dependency build download providers and charts. Ask DevOps to serve them through Nexus or add the registries to the egress allow-list.",
+   "Provider majors: read the upgrade guide, search our modules, fix one module at a time, and list every resource the guide says may be replaced.",
+   "Plan: if G7's read-only plan job exists, link its output. Otherwise the PR says no plan was run and asks DevOps to run it before merging."
+  ],
+  "code": {
+   "file": "ai-agents/harness/scripts/verify-infra.sh",
+   "lang": "bash",
+   "text": "#!/usr/bin/env bash\n# ai-agents/harness/scripts/verify-infra.sh — sketch: checks that need no cloud credentials\nset -euo pipefail\ncd /work/infrastructure\ntenv tofu install && tenv tg install            # versions from .opentofu-version and .terragrunt-version\ntofu fmt --recursive -check=true\nterragrunt hcl format --check\nfor module in modules/*/; do                    # validate modules directly: no backend, no state, no credentials\n  tofu -chdir=\"$module\" init -backend=false -input=false >/dev/null\n  tofu -chdir=\"$module\" validate -no-color\ndone\ntflint --recursive                              # rules from G7's .tflint.hcl\ntrivy config --exit-code 1 --severity HIGH,CRITICAL modules/\nif [[ -d /work/gitops ]]; then                  # gitops PRs: render every changed chart and check it\n  for chart in $(git -C /work/gitops diff --name-only origin/main... | grep 'Chart.yaml$' | xargs -r -n1 dirname); do\n    helm dependency build \"/work/gitops/$chart\"\n    helm lint \"/work/gitops/$chart\"\n    helm template \"/work/gitops/$chart\" | kubeconform -strict -ignore-missing-schemas -summary\n  done\nfi\n# Never here: a plan with real state, apply, destroy or argocd sync. The plan comes from CI (G7) or a person."
+  }
+ },
+ {
+  "key": "G5-33",
+  "title": "[Platform] Test-gap routine: plant a bug, filter it, write the test",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   11,
+   12
+  ],
+  "flag": "stretch",
+  "deps": [
+   "G5-13",
+   "G5-14"
+  ],
+  "needs": "G8 add-tests skill; G7 mutation report (stretch)",
+  "what": "Add a weekly routine that fills test gaps with Meta's ACH roles: one agent plants a small realistic bug, one filters out fake ones, one writes a test that catches it.",
+  "why": "Coverage numbers don't say whether tests catch bugs. A test that fails on a planted bug proves it does, and Meta's ACH had 73% of such tests accepted by engineers.",
+  "how": [
+   "Weekly per area (frontend/src and cloud/rhinoCloud/rhinoCore), on recently changed code with low coverage (Vitest monocart coverage; coverage run in cloud-ci).",
+   "Three roles (sketch, harness/src/routines/test-gaps.ts: it runs inside the VM). Stryker survivors (npm run test:unit:mutation) are a cheap extra source of planted bugs for FE.",
+   "A test is kept only if it fails on its planted bug and passes on clean code. At most 5 tests per PR.",
+   "Tests at the right level: user-visible for FE (test IDs, ARIA, text, never class names), API-level for BE. Sonnet 5.5 at medium effort.",
+   "Charter test-gaps may add tests only: paths frontend/test/**, frontend/e2e/** and **/tests/**. Any source change is a false heal."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/routines/test-gaps.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/routines/test-gaps.ts — sketch of Meta's ACH roles; the test writer is the one writer.\n// Runs in the harness inside the VM; the planter and the filter are helper sessions.\nexport async function fillGaps(vm: Vm, module: string): Promise<NewTest[]> {\n  const lines = await vm.uncoveredChangedLines(module, { sinceDays: 30 });  // coverage report ∩ recent changes\n  const mutants = await vm.helper({ role: \"planter\", model: \"claude-sonnet-5-5\", effort: \"medium\",\n                                    task: \"plant one small realistic bug per behaviour\", lines, n: 8 });\n  const real: Mutant[] = [];\n  for (const m of mutants) {\n    if ((await vm.builds(m)) && !(await vm.helper({ role: \"filter\", task: \"is this mutant equivalent?\", mutant: m }))) {\n      real.push(m);\n    }\n  }\n  const kept: NewTest[] = [];\n  for (const m of real) {\n    const test = await vm.session({ task: \"add-tests\", target: m.behaviour, rules: [\"test what the user or API caller sees\"] });\n    if ((await vm.failsOn(test, { mutant: m })) && (await vm.passesOn(test, { clean: true }))) {\n      kept.push(test);  // kept only if it catches its planted bug\n    }\n  }\n  return kept.slice(0, 5);  // a small PR: at most 5 tests per run\n}"
+  }
+ },
+ {
+  "key": "G5-34",
+  "title": "[Platform] Duplicates sweep: one merge proposal a week",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   11,
+   12
+  ],
+  "flag": "stretch",
+  "deps": [
+   "G5-13"
+  ],
+  "needs": "G8 merge-duplicates skill",
+  "what": "Add a weekly 'abstraction police' sweep: finders list near-duplicate code, read-only judges decide which are real duplication, and one writer proposes one merge with no behaviour change.",
+  "why": "Copies drift apart and double the bug fixing. One careful proposal a week is reviewable; a refactor storm is not.",
+  "how": [
+   "Weekly sweep in a lite VM (sketch, harness/src/routines/duplicates.ts): jscpd for frontend, pylint's duplicate-code check for cloud/rhinoCloud/rhinoCore.",
+   "Parallel read-only judges (Sonnet 5.5 at medium effort) decide real duplication versus coincidence: two pieces that change for different reasons stay apart.",
+   "One writer proposes one merge. Proof: the existing tests and verify pass unchanged, and the PR shows the copies side by side.",
+   "Charter duplicates, stage shadow, one open PR; jscpd runs through the Nexus npm proxy or is baked into the image."
+  ],
+  "code": {
+   "file": "ai-agents/harness/src/routines/duplicates.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/harness/src/routines/duplicates.ts — sketch: weekly \"abstraction police\"; many readers, one writer.\n// Runs in the harness inside the lite VM.\nconst FINDERS: Record<\"fe\" | \"be\", string> = {\n  fe: \"npx jscpd --min-tokens 60 --reporters json --output /tmp/jscpd frontend/src\",\n  be: \"pylint --disable=all --enable=duplicate-code --min-similarity-lines=12 --output-format=json cloud/rhinoCloud/rhinoCore\",\n};\n\nexport async function sweep(vm: Vm, area: \"fe\" | \"be\"): Promise<Proposal | undefined> {\n  const clones = parseClones(area, await vm.exec(\"bash\", [\"-c\", FINDERS[area]], { cwd: \"/work/fcp\" }));\n  const top = clones.sort((a, b) => b.tokens * b.copies.length - a.tokens * a.copies.length).slice(0, 10);\n  const verdicts = await Promise.all(top.map((clone) =>  // parallel read-only judges\n    vm.helper({ model: \"claude-sonnet-5-5\", effort: \"medium\", task: \"is-real-duplication\", clone })));\n  const real = top.filter((_, i) => verdicts[i].real && verdicts[i].sameReasonToChange);  // coincidences stay apart\n  if (real.length === 0) {\n    return undefined;\n  }\n  return vm.session({ task: \"merge-duplicates\", clone: real[0],  // one writer, one proposal a week\n                      rules: [\"no behaviour change\", \"existing tests unchanged and green\"] });\n}"
+  }
+ },
+ {
+  "key": "G5-35",
+  "title": "[Platform] BE dead-code remover: vulture candidates, proven deletions",
+  "team": [
+   "plat"
+  ],
+  "days": 1,
+  "w": [
+   11,
+   12
+  ],
+  "flag": "stretch",
+  "deps": [
+   "G5-31"
+  ],
+  "needs": "G8 remove-dead-code skill",
+  "what": "Reuse the FE dead-code flow for the cloud backend, with vulture as the finder and a verifier that knows the ways Django hides usage.",
+  "why": "Unused backend code is harder to spot than FE code, because Django finds much of it by name. Proof per deletion keeps the PRs safe to approve.",
+  "how": [
+   "Add a [tool.vulture] block to cloud/rhinoCloud/pyproject.toml (sketch). Start at confidence 80.",
+   "Django hides usage in URLs, admin, signals, Celery tasks (@app.task), DRF hooks, management commands, settings strings and the SDK's use of the API. The verifier checks each one; the SDK and the public API are never touched.",
+   "Same flow as G5-31: finders propose, the verifier proves, one writer deletes at most 10 items per PR, never add_code.",
+   "Before done: the cloud unit tests and makemigrations --check."
+  ],
+  "code": {
+   "file": "cloud/rhinoCloud/pyproject.toml",
+   "lang": "toml",
+   "text": "# cloud/rhinoCloud/pyproject.toml — sketch of the [tool.vulture] block for the BE dead-code remover\n[tool.vulture]\npaths = [\"rhinoCore\", \"rhinoTaskServices\", \"vulture_allowlist.py\"]\nexclude = [\"*/migrations/*\", \"*/tests/*\", \"*/integration-tests/*\", \"*/rhino-containers/*\"]\nmin_confidence = 80                 # start strict; lower it only if the verifier keeps up\nignore_decorators = [\n    \"@app.task\",                    # Celery: app = Celery(\"rhinoCloud.rhinoCore.tasks\") in celery_tasks/app.py\n    \"@receiver\",                    # Django signals\n    \"@admin.register\",\n    \"@action\",                      # DRF viewset extra actions\n    \"@property\",\n    \"@*.setter\",\n]\nignore_names = [\n    \"Meta\", \"get_queryset\", \"get_serializer_class\", \"perform_create\", \"perform_update\",\n    \"has_permission\", \"has_object_permission\", \"to_representation\", \"validate_*\",\n    \"handle\", \"add_arguments\",      # management commands\n    \"setUpTestData\", \"setUp\", \"tearDown\",\n]\n# vulture_allowlist.py lists names used only by URL configs, settings strings or the published SDK."
+  }
+ },
+ {
+  "key": "G5-36",
+  "title": "[Platform] Security fixer: version bumps for findings with a fixed release",
+  "team": [
+   "plat"
+  ],
+  "days": 1.5,
+  "w": [
+   11,
+   12
+  ],
+  "flag": "stretch",
+  "deps": [
+   "G5-24",
+   "G5-32"
+  ],
+  "needs": "Security (Ronen) sign-off; the Vanta findings Vanil files in Jira",
+  "what": "Add a routine that takes a scanner finding with a fixed version (Dependabot alerts, and the Vanta findings already filed in Jira), upgrades to it, and proves with a scanner before and after that the finding is gone.",
+  "why": "Findings with a known fix are pure busywork for people and have audit deadlines. The fixer does the bump and the proof; a person still approves.",
+  "how": [
+   "Intake (sketch, orchestrator/src/triggers/security-findings.ts): open Dependabot alerts on fcp that have a first patched version, plus the Vanta findings that Vanil files in Jira. Agents get no Wiz or Vanta credentials: ask Ronen for the JQL, and whether Wiz findings reach Jira the same way or need their own read-only feed.",
+   "Is it reachable? The fixer says whether our code uses the vulnerable path. Unreachable findings are still bumped, labelled low risk.",
+   "The fix reuses the upgrade fixers' pipeline (G5-23, G5-24) or a base-image bump (G5-32). Proof: the scanner (trivy fs on the lockfile, or the image scan) run before and after in the VM, with a link to the finding.",
+   "Charter security-fixer: Opus 5.5 at low effort, re-run at medium; owner from DevOps; reviewer of the day from the owning team. The noise and ladder rules apply as for every routine."
+  ],
+  "code": {
+   "file": "ai-agents/orchestrator/src/triggers/security-findings.ts",
+   "lang": "typescript",
+   "text": "// ai-agents/orchestrator/src/triggers/security-findings.ts — sketch: only findings a version bump can fix\nexport async function fixableFindings(repo: string): Promise<Finding[]> {\n  const found: Finding[] = [];\n  for (const alert of await broker.github.dependabotAlerts(repo, { state: \"open\" })) {  // read-only scope\n    const fixed = alert.security_vulnerability.first_patched_version;  // GitHub's JSON field names\n    if (fixed) {\n      found.push({ source: \"dependabot\", repo, url: alert.html_url, package: alert.dependency.package.name,\n                   manifest: alert.dependency.manifest_path, fixed: fixed.identifier });\n    }\n  }\n  for (const issue of await broker.jira.search(VANTA_FINDINGS_JQL)) {  // Vanta findings that Vanil files; JQL from Ronen\n    if (issue.fixedVersion) {  // no fixed release yet → stays with people\n      found.push(Finding.fromJira(issue));\n    }\n  }\n  return found;\n}\n\nexport function workflowId(f: Finding): string {\n  return `sec:${f.repo}:${f.package}@${f.fixed}`;  // one run per package and fixed version\n}"
+  }
+ }
+]
